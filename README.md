@@ -44,6 +44,52 @@ AutoTest AI is a no-code, AI-powered test automation platform that helps users g
 
 You can sign up a new user via the UI at `/signup`.
 
+## Running Without Docker (Manual Setup)
+
+If you clone this repo on a new system and want to run it without Docker:
+
+### Backend Setup
+
+```bash
+cd backend
+
+# Create a virtual environment
+python3 -m venv venv
+
+# Activate it
+source venv/bin/activate        # macOS/Linux
+# venv\Scripts\activate          # Windows
+
+# Install all dependencies
+pip install -r requirements.txt
+
+# Install Playwright browsers (needed for test execution)
+playwright install
+
+# Run the backend
+uvicorn app.main:app --reload
+```
+
+### Frontend Setup
+
+```bash
+cd frontend
+
+# Install Node.js dependencies
+npm install
+
+# Run the frontend
+npm run dev
+```
+
+### Database
+
+You'll need a PostgreSQL 16 instance running. Update the database connection string in your `.env` file accordingly. You can initialize the schema using:
+
+```bash
+psql -U <username> -d <database> -f scripts/init.sql
+```
+
 ## Development
 
 - **Frontend**: `cd frontend && npm run dev`
