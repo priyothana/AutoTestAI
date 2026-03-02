@@ -1,0 +1,60 @@
+services:
+  frontend:
+    build: ./frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+  backend:
+    build: ./backend
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autotestdb
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - SALESFORCE_ENCRYPTION_KEY=${SALESFORCE_ENCRYPTION_KEY}
+      - SALESFORCE_CLIENT_ID=${SALESFORCE_CLIENT_ID}
+      - SALESFORCE_CLIENT_SECRET=${SALESFORCE_CLIENT_SECRET}
+      - SALESFORCE_REDIRECT_URI=${SALESFORCE_REDIRECT_URI}
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:16-alpine
+    container_name: autotest-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: autotestdb
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d autotestdb" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
