@@ -2,11 +2,13 @@
 Salesforce OAuth Service
 Handles the OAuth 2.0 Authorization Code Flow with per-project credential support.
 
-Credential Resolution Order:
-  1. From project_integrations DB record (per-project)
-  2. Fallback to environment variables (global)
+Credential Resolution:
+  From project_integrations DB record (per-project only — no env fallback).
 """
 import httpx
+import secrets
+import hashlib
+import base64
 from typing import Optional
 from uuid import UUID
 from datetime import datetime, timedelta
@@ -27,25 +29,29 @@ class SalesforceOAuthService:
     ) -> str:
         """
         Build the Salesforce OAuth authorization URL using per-project
-        credentials from the DB, with env var fallback.
+        credentials from the DB.
         """
         integration = await IntegrationService.get_integration(db, project_id)
 
-        # Resolve credentials: DB first, env fallback
-        if integration and integration.category == "salesforce" and integration.client_id:
-            cid = integration.client_id
-            redirect_uri = integration.salesforce_redirect_uri or settings.SALESFORCE_REDIRECT_URI
-            login_url = integration.salesforce_login_url or "https://login.salesforce.com"
-        else:
-            cid = settings.SALESFORCE_CLIENT_ID
-            redirect_uri = settings.SALESFORCE_REDIRECT_URI
-            login_url = "https://login.salesforce.com"
-
-        if not cid:
+        # Per-project credentials only — no env fallback
+        if not integration or integration.category != "salesforce" or not integration.client_id:
             raise ValueError(
-                "No Salesforce client_id found. "
-                "Save Connected App credentials first, or set SALESFORCE_CLIENT_ID in .env."
+                "No Salesforce credentials found for this project. "
+                "Please save your Connected App Client ID and Secret first."
             )
+
+        cid = integration.client_id
+        redirect_uri = integration.salesforce_redirect_uri or settings.SALESFORCE_REDIRECT_URI
+        login_url = integration.salesforce_login_url or "https://login.salesforce.com"
+
+        # Generate PKCE code_verifier and code_challenge
+        code_verifier = secrets.token_urlsafe(64)[:128]
+        challenge_digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        code_challenge = base64.urlsafe_b64encode(challenge_digest).rstrip(b"=").decode("ascii")
+
+        # Store the code_verifier in auth_config so handle_callback can use it
+        integration.auth_config = {**(integration.auth_config or {}), "pkce_verifier": code_verifier}
+        await db.commit()
 
         auth_endpoint = f"{login_url}/services/oauth2/authorize"
         return (
@@ -55,6 +61,8 @@ class SalesforceOAuthService:
             f"&redirect_uri={quote(redirect_uri, safe='')}"
             f"&state={project_id}"
             f"&scope=api+refresh_token+full"
+            f"&code_challenge={code_challenge}"
+            f"&code_challenge_method=S256"
         )
 
     @staticmethod
@@ -65,42 +73,46 @@ class SalesforceOAuthService:
     ) -> dict:
         """
         Exchange the authorization code for access/refresh tokens.
-        Reads per-project credentials from DB, falls back to env vars.
+        Uses per-project credentials from DB only.
         """
         project_id = UUID(state)
         integration = await IntegrationService.get_integration(db, project_id)
 
-        # Resolve credentials
-        if integration and integration.category == "salesforce" and integration.client_id:
-            cid = integration.client_id
-            csecret = _decrypt(integration.client_secret)
-            redirect_uri = integration.salesforce_redirect_uri or settings.SALESFORCE_REDIRECT_URI
-            login_url = integration.salesforce_login_url or "https://login.salesforce.com"
-        else:
-            cid = settings.SALESFORCE_CLIENT_ID
-            csecret = settings.SALESFORCE_CLIENT_SECRET
-            redirect_uri = settings.SALESFORCE_REDIRECT_URI
-            login_url = "https://login.salesforce.com"
-
-        if not cid or not csecret:
+        # Per-project credentials only — no env fallback
+        if not integration or integration.category != "salesforce" or not integration.client_id:
             raise ValueError(
-                "Salesforce client_id and client_secret are required. "
-                "Save Connected App credentials or set env vars."
+                "No Salesforce credentials found for this project. "
+                "Please save your Connected App Client ID and Secret first."
+            )
+
+        cid = integration.client_id
+        csecret = _decrypt(integration.client_secret)
+        redirect_uri = integration.salesforce_redirect_uri or settings.SALESFORCE_REDIRECT_URI
+        login_url = integration.salesforce_login_url or "https://login.salesforce.com"
+
+        if not csecret:
+            raise ValueError(
+                "Salesforce client_secret is missing for this project. "
+                "Please re-save your Connected App credentials."
             )
 
         token_url = f"{login_url}/services/oauth2/token"
 
+        # Retrieve PKCE code_verifier stored during get_auth_url
+        code_verifier = (integration.auth_config or {}).get("pkce_verifier")
+
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": cid,
+            "client_secret": csecret,
+            "redirect_uri": redirect_uri,
+        }
+        if code_verifier:
+            token_data["code_verifier"] = code_verifier
+
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                token_url,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "client_id": cid,
-                    "client_secret": csecret,
-                    "redirect_uri": redirect_uri,
-                },
-            )
+            response = await client.post(token_url, data=token_data)
 
         if response.status_code != 200:
             raise Exception(
@@ -148,9 +160,11 @@ class SalesforceOAuthService:
         tokens = await IntegrationService.get_decrypted_tokens(integration)
         refresh_tok = tokens.get("refresh_token")
         csecret = tokens.get("client_secret")
-        cid = integration.client_id or settings.SALESFORCE_CLIENT_ID
+        cid = integration.client_id
         login_url = integration.salesforce_login_url or "https://login.salesforce.com"
 
+        if not cid:
+            raise ValueError("No Salesforce client_id found — re-save Connected App credentials.")
         if not refresh_tok:
             raise ValueError("No refresh token available — re-authorize needed")
 
@@ -163,7 +177,7 @@ class SalesforceOAuthService:
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_tok,
                     "client_id": cid,
-                    "client_secret": csecret or settings.SALESFORCE_CLIENT_SECRET,
+                    "client_secret": csecret or "",
                 },
             )
 

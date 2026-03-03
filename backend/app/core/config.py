@@ -35,8 +35,6 @@ class Settings(BaseSettings):
 
     # Salesforce Integration
     SALESFORCE_ENCRYPTION_KEY: Optional[str] = Field(None, env="SALESFORCE_ENCRYPTION_KEY")
-    SALESFORCE_CLIENT_ID: Optional[str] = Field(None, env="SALESFORCE_CLIENT_ID")
-    SALESFORCE_CLIENT_SECRET: Optional[str] = Field(None, env="SALESFORCE_CLIENT_SECRET")
     SALESFORCE_REDIRECT_URI: str = Field(
         "http://localhost:8000/api/v1/integrations/salesforce/callback",
         env="SALESFORCE_REDIRECT_URI",
