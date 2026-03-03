@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
+import { useRouter } from "next/navigation"
 import { Plus, Search, Edit, Trash2, Eye, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -8,7 +9,6 @@ import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog"
-import { CreateProjectModal } from "@/components/projects/CreateProjectModal"
 import { EmptyState } from "@/components/projects/EmptyState"
 import { toast } from "sonner"
 import Link from "next/link"
@@ -25,9 +25,9 @@ interface Project {
 }
 
 export default function ProjectsPage() {
+    const router = useRouter()
     const [projects, setProjects] = useState<Project[]>([])
     const [isLoading, setIsLoading] = useState(true)
-    const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
     const [searchQuery, setSearchQuery] = useState("")
     const [statusFilter, setStatusFilter] = useState<string>("all")
     const [typeFilter, setTypeFilter] = useState<string>("all")
@@ -107,7 +107,7 @@ export default function ProjectsPage() {
                     <h2 className="text-3xl font-bold tracking-tight">Projects</h2>
                     <p className="text-muted-foreground">Manage your test automation projects</p>
                 </div>
-                <Button onClick={() => setIsCreateModalOpen(true)} className="bg-green-600 hover:bg-green-700">
+                <Button onClick={() => router.push("/dashboard/projects/create")} className="bg-green-600 hover:bg-green-700">
                     <Plus className="mr-2 h-4 w-4" />
                     Create New Project
                 </Button>
@@ -159,7 +159,7 @@ export default function ProjectsPage() {
                     <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
                 </div>
             ) : projects.length === 0 ? (
-                <EmptyState onCreateClick={() => setIsCreateModalOpen(true)} />
+                <EmptyState onCreateClick={() => router.push("/dashboard/projects/create")} />
             ) : (
                 <>
                     {/* Desktop Table */}
@@ -281,12 +281,7 @@ export default function ProjectsPage() {
                 </>
             )}
 
-            {/* Create Modal */}
-            <CreateProjectModal
-                open={isCreateModalOpen}
-                onOpenChange={setIsCreateModalOpen}
-                onSuccess={fetchProjects}
-            />
+
 
             {/* Delete Confirmation */}
             <AlertDialog open={!!deleteProjectId} onOpenChange={() => setDeleteProjectId(null)}>
