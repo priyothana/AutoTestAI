@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1.endpoints import users, projects, tests, test_runs, ai, analytics, settings, salesforce, integrations
+from app.api.v1.endpoints import users, projects, tests, test_runs, ai, analytics, settings, salesforce, integrations, mcp
 
 api_router = APIRouter()
 api_router.include_router(users.router, prefix="/users", tags=["users"])
@@ -11,3 +11,5 @@ api_router.include_router(analytics.router, prefix="/analytics", tags=["analytic
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(salesforce.router, prefix="/salesforce", tags=["salesforce"])
 api_router.include_router(integrations.router, tags=["integrations"])
+api_router.include_router(mcp.router, prefix="/mcp", tags=["mcp"])
+

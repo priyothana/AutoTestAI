@@ -10,7 +10,6 @@ from uuid import UUID
 from typing import Dict, Any
 
 from app.db.session import get_db
-from app.models.salesforce_connection import SalesforceConnection
 from app.models.metadata_raw import MetadataRaw
 from app.models.metadata_normalized import MetadataNormalized
 from app.models.domain_model import DomainModel
@@ -23,6 +22,7 @@ from app.schemas.salesforce import (
     RAGGenerateRequest,
     RAGGenerateResponse,
 )
+from app.services.integration_service import IntegrationService
 from app.services.salesforce_metadata_extractor import SalesforceMetadataExtractor
 from app.services.metadata_normalizer import MetadataNormalizer
 from app.services.domain_model_builder import DomainModelBuilder
@@ -42,17 +42,23 @@ async def create_connection(
     data: SalesforceConnectionCreate,
     db: AsyncSession = Depends(get_db),
 ):
-    """Save a Salesforce org connection for a project."""
+    """Save a Salesforce org connection for a project (via IntegrationService)."""
     try:
-        conn = await SalesforceMetadataExtractor.save_connection(
+        integration = await IntegrationService.create_sf_integration(
             db=db,
             project_id=data.project_id,
             instance_url=data.instance_url,
             access_token=data.access_token,
             refresh_token=data.refresh_token,
-            org_name=data.org_name,
+            org_id=data.org_name,
         )
-        return conn
+        return SalesforceConnectionResponse(
+            id=integration.id,
+            project_id=integration.project_id,
+            instance_url=integration.instance_url or "",
+            org_name=data.org_name,
+            created_at=integration.created_at,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save connection: {str(e)}")
 
@@ -63,10 +69,16 @@ async def get_connection(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the Salesforce connection for a project."""
-    conn = await SalesforceMetadataExtractor.get_connection(db, project_id)
-    if not conn:
+    integration = await IntegrationService.get_integration(db, project_id)
+    if not integration or integration.category != "salesforce":
         raise HTTPException(status_code=404, detail="No Salesforce connection found for this project")
-    return conn
+    return SalesforceConnectionResponse(
+        id=integration.id,
+        project_id=integration.project_id,
+        instance_url=integration.instance_url or "",
+        org_name=integration.org_id,
+        created_at=integration.created_at,
+    )
 
 
 @router.delete("/connections/{connection_id}", status_code=204)
@@ -74,14 +86,17 @@ async def delete_connection(
     connection_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a Salesforce connection."""
+    """Delete a Salesforce connection by deleting the integration."""
+    # Use project_id-based deletion; connection_id is the integration id
+    from sqlalchemy.future import select as sa_select
+    from app.models.project_integration import ProjectIntegration
     result = await db.execute(
-        select(SalesforceConnection).where(SalesforceConnection.id == connection_id)
+        sa_select(ProjectIntegration).where(ProjectIntegration.id == connection_id)
     )
-    conn = result.scalars().first()
-    if not conn:
+    integration = result.scalars().first()
+    if not integration:
         raise HTTPException(status_code=404, detail="Connection not found")
-    await db.delete(conn)
+    await db.delete(integration)
     await db.commit()
     return None
 

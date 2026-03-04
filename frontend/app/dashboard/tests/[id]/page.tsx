@@ -70,6 +70,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const [steps, setSteps] = useState<TestStep[]>([])
     const [testStatus, setTestStatus] = useState<string>("draft")
+    const [projectError, setProjectError] = useState(false)
 
     useEffect(() => {
         fetchProjects()
@@ -154,6 +155,11 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [lastRunResult, setLastRunResult] = useState<any>(null)
 
     const handleRunTest = async () => {
+        if (!selectedProjectId) {
+            toast.error("Please select a project before running the test")
+            setProjectError(true)
+            return
+        }
         if (isInternalNew) {
             toast.error("Please save the test case before running")
             return
@@ -235,7 +241,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             return
         }
         if (!selectedProjectId) {
-            toast.error("Please select a project")
+            toast.error("Please select a project before saving")
+            setProjectError(true)
             return
         }
 
@@ -390,9 +397,9 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         <CardContent className="space-y-4">
                             <div className="space-y-2">
                                 <span className="text-sm font-medium">Project Mapping</span>
-                                <Select value={selectedProjectId} onValueChange={setSelectedProjectId}>
-                                    <SelectTrigger>
-                                        <SelectValue placeholder="Select a project" />
+                                <Select value={selectedProjectId} onValueChange={(val) => { setSelectedProjectId(val); setProjectError(false) }}>
+                                    <SelectTrigger className={projectError ? "border-red-500 ring-1 ring-red-500" : ""}>
+                                        <SelectValue placeholder="Select a project *" />
                                     </SelectTrigger>
                                     <SelectContent>
                                         {projects.map((project) => (

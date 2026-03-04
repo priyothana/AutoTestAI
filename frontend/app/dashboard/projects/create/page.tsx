@@ -55,9 +55,12 @@ export default function CreateProjectPage() {
     // Salesforce Connected App creds
     const [sfClientId, setSfClientId] = useState("")
     const [sfClientSecret, setSfClientSecret] = useState("")
+    const [sfUsername, setSfUsername] = useState("")
+    const [sfPassword, setSfPassword] = useState("")
     const [sfLoginUrl, setSfLoginUrl] = useState("https://login.salesforce.com")
     const [sfRedirectUri, setSfRedirectUri] = useState("http://localhost:8000/api/v1/integrations/salesforce/callback")
     const [showSfSecret, setShowSfSecret] = useState(false)
+    const [showSfPassword, setShowSfPassword] = useState(false)
 
     // API connect
     const [apiKey, setApiKey] = useState("")
@@ -153,6 +156,8 @@ export default function CreateProjectPage() {
                     client_secret: sfClientSecret,
                     redirect_uri: sfRedirectUri,
                     login_url: sfLoginUrl,
+                    sf_username: sfUsername || undefined,
+                    sf_password: sfPassword || undefined,
                 }),
             })
             if (!saveRes.ok) {
@@ -421,13 +426,29 @@ export default function CreateProjectPage() {
                                             </p>
                                             <div className="grid gap-4">
                                                 <div>
+                                                    <label className="text-sm font-medium mb-1 block">Salesforce Username</label>
+                                                    <Input placeholder="e.g. admin@myorg.sandbox" value={sfUsername} onChange={(e) => setSfUsername(e.target.value)} autoComplete="off" />
+                                                    <p className="text-xs text-muted-foreground mt-1">Your Salesforce login email/username (used for browser-based login)</p>
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium mb-1 block">Salesforce Password</label>
+                                                    <div className="relative">
+                                                        <Input type={showSfPassword ? "text" : "password"} placeholder="Password + Security Token" value={sfPassword} onChange={(e) => setSfPassword(e.target.value)} autoComplete="new-password" />
+                                                        <button type="button" onClick={() => setShowSfPassword(!showSfPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                                            {showSfPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                                        </button>
+                                                    </div>
+                                                    <p className="text-xs text-muted-foreground mt-1">Used to login via browser before test execution</p>
+                                                </div>
+                                                <hr className="border-purple-200 dark:border-purple-800" />
+                                                <div>
                                                     <label className="text-sm font-medium mb-1 block">Connected App Client ID <span className="text-red-500">*</span></label>
-                                                    <Input placeholder="3MVG9..." value={sfClientId} onChange={(e) => setSfClientId(e.target.value)} />
+                                                    <Input placeholder="Enter Consumer Key from Connected App" value={sfClientId} onChange={(e) => setSfClientId(e.target.value)} autoComplete="off" />
                                                 </div>
                                                 <div>
                                                     <label className="text-sm font-medium mb-1 block">Connected App Client Secret <span className="text-red-500">*</span></label>
                                                     <div className="relative">
-                                                        <Input type={showSfSecret ? "text" : "password"} placeholder="Enter client secret" value={sfClientSecret} onChange={(e) => setSfClientSecret(e.target.value)} />
+                                                        <Input type={showSfSecret ? "text" : "password"} placeholder="Enter Consumer Secret" value={sfClientSecret} onChange={(e) => setSfClientSecret(e.target.value)} autoComplete="new-password" />
                                                         <button type="button" onClick={() => setShowSfSecret(!showSfSecret)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                                                             {showSfSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                                                         </button>

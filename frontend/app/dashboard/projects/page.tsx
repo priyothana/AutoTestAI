@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
-import { Plus, Search, Edit, Trash2, Eye, Loader2 } from "lucide-react"
+import { Plus, Search, Edit, Trash2, Eye, Loader2, Check, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -34,6 +34,7 @@ export default function ProjectsPage() {
     const [deleteProjectId, setDeleteProjectId] = useState<string | null>(null)
     const [page, setPage] = useState(0)
     const [hasMore, setHasMore] = useState(true)
+    const [integrationStatuses, setIntegrationStatuses] = useState<Record<string, string>>({})
 
     const fetchProjects = async () => {
         setIsLoading(true)
@@ -57,6 +58,25 @@ export default function ProjectsPage() {
             const projectsList = Array.isArray(data) ? data : []
             setProjects(projectsList)
             setHasMore(projectsList.length === 10)
+
+            // Fetch integration status for each project
+            const statuses: Record<string, string> = {}
+            await Promise.all(
+                projectsList.map(async (p: Project) => {
+                    try {
+                        const intRes = await fetch(`http://localhost:8000/api/v1/projects/${p.id}/integration-status`)
+                        if (intRes.ok) {
+                            const intData = await intRes.json()
+                            statuses[p.id] = intData.status || "disconnected"
+                        } else {
+                            statuses[p.id] = "disconnected"
+                        }
+                    } catch {
+                        statuses[p.id] = "disconnected"
+                    }
+                })
+            )
+            setIntegrationStatuses(statuses)
         } catch (error: any) {
             console.error("Failed to fetch projects:", error)
             toast.error(error.message || "Connection error: Could not reach the backend server.")
@@ -171,6 +191,7 @@ export default function ProjectsPage() {
                                     <TableHead>Description</TableHead>
                                     <TableHead>Type</TableHead>
                                     <TableHead>Status</TableHead>
+                                    <TableHead>Connection</TableHead>
                                     <TableHead>Created</TableHead>
                                     <TableHead className="text-right">Actions</TableHead>
                                 </TableRow>
@@ -193,6 +214,17 @@ export default function ProjectsPage() {
                                             <Badge variant={getStatusBadgeVariant(project.status)}>
                                                 {project.status}
                                             </Badge>
+                                        </TableCell>
+                                        <TableCell>
+                                            {integrationStatuses[project.id] === "connected" ? (
+                                                <Badge className="bg-green-100 text-green-700 border-green-200 hover:bg-green-100">
+                                                    <Check className="h-3 w-3 mr-1" /> Connected
+                                                </Badge>
+                                            ) : (
+                                                <Badge variant="outline" className="text-muted-foreground">
+                                                    <X className="h-3 w-3 mr-1" /> Not Connected
+                                                </Badge>
+                                            )}
                                         </TableCell>
                                         <TableCell>{formatDate(project.created_at)}</TableCell>
                                         <TableCell className="text-right">
@@ -236,6 +268,16 @@ export default function ProjectsPage() {
                                 </div>
                                 <div className="flex items-center gap-2 text-sm">
                                     <Badge variant="outline">{project.type}</Badge>
+                                    <span className="text-muted-foreground">•</span>
+                                    {integrationStatuses[project.id] === "connected" ? (
+                                        <Badge className="bg-green-100 text-green-700 border-green-200 hover:bg-green-100 text-xs">
+                                            <Check className="h-3 w-3 mr-1" /> Connected
+                                        </Badge>
+                                    ) : (
+                                        <Badge variant="outline" className="text-muted-foreground text-xs">
+                                            <X className="h-3 w-3 mr-1" /> Not Connected
+                                        </Badge>
+                                    )}
                                     <span className="text-muted-foreground">•</span>
                                     <span className="text-muted-foreground">{formatDate(project.created_at)}</span>
                                 </div>

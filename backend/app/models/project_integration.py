@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Text, ForeignKey, DateTime, JSON
+from sqlalchemy import Column, String, Text, ForeignKey, DateTime, JSON, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -36,6 +36,10 @@ class ProjectIntegration(Base, TimestampMixin):
     salesforce_redirect_uri = Column(Text, nullable=True)
     salesforce_login_url = Column(Text, default="https://login.salesforce.com")
     org_id = Column(Text, nullable=True)
+
+    # MCP Server fields
+    security_token = Column(Text, nullable=True)  # Salesforce security token (encrypted)
+    mcp_connected = Column(Boolean, default=False)  # True when connected via MCP (not OAuth)
 
     # Flexible auth config (API keys, bearer tokens, etc.)
     auth_config = Column(JSON, nullable=True)

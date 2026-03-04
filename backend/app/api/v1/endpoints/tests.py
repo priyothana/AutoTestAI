@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from uuid import UUID
 import openai
 
@@ -13,16 +13,58 @@ from app.services.ai_service import AIService
 router = APIRouter()
 
 @router.post("/generate-test-steps", response_model=Dict[str, Any])
-async def generate_test_steps_endpoint(prompt_data: Dict[str, str]):
+async def generate_test_steps_endpoint(
+    prompt_data: Dict[str, str],
+    db: AsyncSession = Depends(get_db),
+):
     prompt = prompt_data.get("prompt")
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required")
 
     provider = prompt_data.get("provider", "openai")
     model = prompt_data.get("model")
+    project_id = prompt_data.get("project_id")
+
+    # --- Gate login step generation for Salesforce projects ---
+    session_instruction = ""
+    if project_id:
+        try:
+            from app.models.project import Project
+            from app.models.project_integration import ProjectIntegration
+            from app.services.session_service import SessionService
+
+            pid = UUID(project_id)
+            proj_result = await db.execute(select(Project).where(Project.id == pid))
+            project = proj_result.scalars().first()
+
+            if project and project.category == "salesforce":
+                int_result = await db.execute(
+                    select(ProjectIntegration).where(ProjectIntegration.project_id == pid)
+                )
+                integration = int_result.scalars().first()
+                is_connected = integration and integration.status == "connected"
+                has_session = await SessionService.has_valid_session(db, pid)
+
+                if is_connected:
+                    session_instruction = (
+                        "\n\nIMPORTANT: This is a Salesforce project with an active OAuth connection. "
+                        "DO NOT generate any login/authentication steps. The user is already authenticated. "
+                        "Start the test from the application's home page or the relevant object page directly."
+                    )
+                elif has_session:
+                    session_instruction = (
+                        "\n\nIMPORTANT: This Salesforce project has an active browser session. "
+                        "DO NOT include login/authentication steps. The session will be reused automatically. "
+                        "Start the test from the Lightning home page or the relevant object page."
+                    )
+                # else: no session, no connection → allow login steps (no instruction appended)
+        except Exception:
+            pass  # Non-critical; fall back to normal generation
+
+    effective_prompt = prompt + session_instruction
 
     try:
-        test_case = await AIService.generate_test_case(prompt, provider=provider, model=model)
+        test_case = await AIService.generate_test_case(effective_prompt, provider=provider, model=model)
         return test_case
     except openai.RateLimitError:
         raise HTTPException(

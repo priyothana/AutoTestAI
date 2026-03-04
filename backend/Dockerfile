@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Ensure Python output is not buffered (visible in Docker logs)
+ENV PYTHONUNBUFFERED=1
+
 # Install system dependencies
 # Node.js and npm are needed for Cypress (if running locally in container)
 RUN apt-get update && apt-get install -y \

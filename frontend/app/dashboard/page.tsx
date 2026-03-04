@@ -23,6 +23,7 @@ export default function DashboardPage() {
     const [distribution, setDistribution] = useState<{ name: string, value: number, color: string }[]>([])
     const [recentRuns, setRecentRuns] = useState<any[]>([])
     const [isLoadingData, setIsLoadingData] = useState(true)
+    const [projects, setProjects] = useState<any[]>([])
 
     useEffect(() => {
         const safeFetch = async (url: string): Promise<Response | null> => {
@@ -68,6 +69,15 @@ export default function DashboardPage() {
         }
 
         fetchDashboardData()
+
+        // Fetch projects for save
+        const fetchProjects = async () => {
+            try {
+                const res = await fetch("http://localhost:8000/api/v1/projects/")
+                if (res?.ok) setProjects(await res.json())
+            } catch { }
+        }
+        fetchProjects()
     }, [])
 
     const handleGenerate = async () => {
@@ -110,14 +120,22 @@ export default function DashboardPage() {
 
         try {
             console.log("Saving test...", generatedTest)
-            const response = await fetch("http://localhost:8000/api/tests", {
+
+            const projectId = projects.length > 0 ? projects[0].id : null
+            if (!projectId) {
+                setStatusMessage({ type: 'error', text: "No projects available. Please create a project first." })
+                setIsLoading(false)
+                return
+            }
+
+            const response = await fetch("http://localhost:8000/api/v1/tests", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
                     name: generatedTest.name,
-                    project_id: 1, // Hardcoded as requested
+                    project_id: projectId,
                     steps: generatedTest.steps,
                     description: generatedTest.description,
                     priority: generatedTest.priority
@@ -159,7 +177,7 @@ export default function DashboardPage() {
                 ? { test_case_id: generatedTest.id, environment: "default" }
                 : { test_case: generatedTest, environment: "default" } // Fallback if API supports ad-hoc run
 
-            const response = await fetch("http://localhost:8000/api/executions", {
+            const response = await fetch("http://localhost:8000/api/v1/test-runs", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

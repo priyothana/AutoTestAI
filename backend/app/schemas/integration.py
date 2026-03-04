@@ -47,6 +47,8 @@ class SalesforceCredentialsRequest(BaseModel):
     client_secret: str
     redirect_uri: Optional[str] = None  # auto-generated if empty
     login_url: Optional[str] = "https://login.salesforce.com"
+    sf_username: Optional[str] = None
+    sf_password: Optional[str] = None
 
 
 class ApiKeyConnectRequest(BaseModel):
@@ -64,3 +66,29 @@ class MetadataSyncResponse(BaseModel):
     normalized_count: int = 0
     domain_model_count: int = 0
     embedding_count: int = 0
+
+
+# ─── MCP Server Request Schemas ──────────────
+
+class McpConnectRequest(BaseModel):
+    """Connect to Salesforce via MCP Server (Username + Password + Security Token)."""
+    sf_username: str
+    sf_password: str
+    sf_security_token: str
+    domain: Optional[str] = "login"  # 'login' for production, 'test' for sandbox
+
+
+class McpQueryRequest(BaseModel):
+    """Execute a SOQL query via MCP."""
+    query: str
+    include_deleted: bool = False
+
+
+class McpRecordRequest(BaseModel):
+    """Create or update a Salesforce record via MCP."""
+    data: dict
+
+
+class McpSearchRequest(BaseModel):
+    """Execute a SOSL search via MCP."""
+    search_query: str

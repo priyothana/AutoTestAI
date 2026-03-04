@@ -4,6 +4,9 @@ Project Integration API Endpoints
 Handles project connection (Web App / Salesforce / API), OAuth flow,
 per-project credential management, metadata sync, and integration status.
 """
+import logging
+
+logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -136,6 +139,8 @@ async def save_sf_credentials(
         client_secret=payload.client_secret,
         redirect_uri=payload.redirect_uri,
         login_url=payload.login_url or "https://login.salesforce.com",
+        sf_username=payload.sf_username,
+        sf_password=payload.sf_password,
     )
     return {
         "status": "credentials_saved",
@@ -155,8 +160,11 @@ async def get_integration_status(
     project_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get the connection status + metadata sync counts for a project."""
+    """Get the connection status + metadata sync counts + session info for a project."""
+    from app.services.session_service import SessionService
+
     integration = await IntegrationService.get_integration(db, project_id)
+    session_status = await SessionService.get_session_status(db, project_id)
 
     if not integration:
         return {
@@ -164,6 +172,7 @@ async def get_integration_status(
             "category": None,
             "message": "No integration configured for this project",
             "sync_counts": None,
+            "ui_session": session_status,
         }
 
     sync_counts = await MetadataSyncWorker.get_sync_counts(db, project_id)
@@ -179,9 +188,11 @@ async def get_integration_status(
         "org_id": integration.org_id,
         "salesforce_login_url": integration.salesforce_login_url,
         "has_sf_credentials": bool(integration.client_id) if integration.category == "salesforce" else None,
+        "mcp_connected": bool(integration.mcp_connected),
         "last_synced_at": integration.last_synced_at.isoformat() if integration.last_synced_at else None,
         "sync_error": integration.sync_error,
         "sync_counts": sync_counts,
+        "ui_session": session_status,
         "created_at": integration.created_at.isoformat() if integration.created_at else None,
         "updated_at": integration.updated_at.isoformat() if integration.updated_at else None,
     }
@@ -209,15 +220,26 @@ async def salesforce_auth_url(
 
 @router.get("/integrations/salesforce/callback")
 async def salesforce_callback(
-    code: str = Query(...),
     state: str = Query(...),  # project_id
+    code: str = Query(None),
+    error: str = Query(None),
+    error_description: str = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Salesforce OAuth callback.
     Exchanges code for tokens using per-project credentials.
+    Handles OAuth errors (e.g., authorization blocked).
     Triggers metadata sync automatically.
     """
+    # Handle OAuth error from Salesforce
+    if error or not code:
+        err_msg = error_description or error or "OAuth authorization failed"
+        return RedirectResponse(
+            url=f"http://localhost:3000/dashboard/projects/{state}?error={err_msg}",
+            status_code=302,
+        )
+
     try:
         result = await SalesforceOAuthService.handle_callback(
             db=db, code=code, state=state
@@ -225,9 +247,10 @@ async def salesforce_callback(
 
         # Auto-trigger metadata sync
         try:
-            await MetadataSyncWorker.sync_metadata(db, UUID(state))
+            sync_result = await MetadataSyncWorker.sync_metadata(db, UUID(state))
+            logger.info(f"[metadata_sync] Auto-sync result for project {state}: {sync_result}")
         except Exception as sync_err:
-            print(f"[metadata_sync] Auto-sync after OAuth failed: {sync_err}")
+            logger.error(f"[metadata_sync] Auto-sync after OAuth failed for project {state}: {sync_err}", exc_info=True)
 
         # Redirect back to project page
         return RedirectResponse(

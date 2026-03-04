@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS projects (
     tags JSONB DEFAULT '[]'::jsonb,
     members JSONB DEFAULT '[]'::jsonb,
     owner_id INTEGER REFERENCES users(id),
+    ui_session_active BOOLEAN DEFAULT FALSE,
+    ui_session_last_created_at TIMESTAMP WITH TIME ZONE,
+    ui_session_source VARCHAR(20),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -114,6 +117,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
     parallel_execution BOOLEAN DEFAULT FALSE,
     retry_count INTEGER DEFAULT 0,
     screenshot_mode VARCHAR(50) DEFAULT 'on-failure',
+    use_session_reuse BOOLEAN DEFAULT TRUE,
     base_url VARCHAR(255),
     browser VARCHAR(50) DEFAULT 'chromium',
     device VARCHAR(50) DEFAULT 'desktop',
@@ -215,6 +219,8 @@ CREATE TABLE IF NOT EXISTS project_integrations (
     salesforce_redirect_uri TEXT,
     salesforce_login_url TEXT DEFAULT 'https://login.salesforce.com',
     org_id TEXT,
+    security_token TEXT,
+    mcp_connected BOOLEAN DEFAULT FALSE,
     auth_config JSONB,
     last_synced_at TIMESTAMP WITH TIME ZONE,
     sync_error TEXT,

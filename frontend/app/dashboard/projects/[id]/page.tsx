@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation"
 import {
     ArrowLeft, Loader2, Settings, FileText, BarChart3, Link2,
     Cloud, Globe, Check, X, RefreshCw, Unplug, Plug, AlertCircle,
-    Key, Server, ExternalLink
+    Key, Server, ExternalLink, Clock, Database, Search, Plus, Trash2, Edit, Play, Zap
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -38,6 +38,7 @@ interface IntegrationStatus {
     org_id?: string
     salesforce_login_url?: string
     has_sf_credentials?: boolean
+    mcp_connected?: boolean
     last_synced_at?: string
     sync_error?: string
     sync_counts?: {
@@ -45,6 +46,12 @@ interface IntegrationStatus {
         normalized_count: number
         domain_model_count: number
         embedding_count: number
+    }
+    ui_session?: {
+        active: boolean
+        status: string
+        source: string | null
+        last_created_at: string | null
     }
 }
 
@@ -58,6 +65,32 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const [integrationLoading, setIntegrationLoading] = useState(false)
     const [syncing, setSyncing] = useState(false)
     const [disconnecting, setDisconnecting] = useState(false)
+
+    // MCP Connection Form
+    const [mcpUsername, setMcpUsername] = useState("")
+    const [mcpPassword, setMcpPassword] = useState("")
+    const [mcpSecurityToken, setMcpSecurityToken] = useState("")
+    const [mcpDomain, setMcpDomain] = useState("login")
+    const [mcpConnecting, setMcpConnecting] = useState(false)
+
+    // MCP CRUD State
+    const [soqlQuery, setSoqlQuery] = useState("SELECT Id, Name FROM Account LIMIT 10")
+    const [queryResults, setQueryResults] = useState<any>(null)
+    const [queryLoading, setQueryLoading] = useState(false)
+    const [createObjectType, setCreateObjectType] = useState("Account")
+    const [createData, setCreateData] = useState('{"Name": "Test Account"}')
+    const [createLoading, setCreateLoading] = useState(false)
+    const [updateObjectType, setUpdateObjectType] = useState("Account")
+    const [updateRecordId, setUpdateRecordId] = useState("")
+    const [updateData, setUpdateData] = useState('{"Name": "Updated Name"}')
+    const [updateLoading, setUpdateLoading] = useState(false)
+    const [deleteObjectType, setDeleteObjectType] = useState("Account")
+    const [deleteRecordId, setDeleteRecordId] = useState("")
+    const [deleteLoading, setDeleteLoading] = useState(false)
+    const [crudTab, setCrudTab] = useState("query")
+    const [orgLimits, setOrgLimits] = useState<any>(null)
+    const [limitsLoading, setLimitsLoading] = useState(false)
+    const [mcpSyncing, setMcpSyncing] = useState(false)
 
     useEffect(() => {
         if (id) {
@@ -91,10 +124,18 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const handleSyncMetadata = async () => {
         setSyncing(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${id}/sync-metadata`, { method: "POST" })
+            // Use MCP sync endpoint if connected via MCP, otherwise use standard sync
+            const isMcpConn = integration?.mcp_connected
+            const url = isMcpConn
+                ? `http://localhost:8000/api/v1/mcp/projects/${id}/mcp/sync-metadata`
+                : `http://localhost:8000/api/v1/projects/${id}/sync-metadata`
+            const response = await fetch(url, { method: "POST" })
             const data = await response.json()
-            if (data.status === "completed") toast.success("Metadata synced successfully!")
-            else toast.error(data.message || "Sync failed")
+            if (data.status === "completed") {
+                toast.success(`Metadata synced! (${data.raw_count || 0} raw, ${data.normalized_count || 0} normalized, ${data.domain_model_count || 0} domain, ${data.embedding_count || 0} embeddings)`)
+            } else {
+                toast.error(data.message || "Sync failed")
+            }
             fetchIntegration()
         } catch { toast.error("Sync request failed") }
         finally { setSyncing(false) }
@@ -131,6 +172,140 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         }
     }
 
+    // MCP Connect
+    const handleMcpConnect = async () => {
+        if (!mcpUsername || !mcpPassword || !mcpSecurityToken) {
+            toast.error("Please fill in all credential fields")
+            return
+        }
+        setMcpConnecting(true)
+        try {
+            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp-connect`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    sf_username: mcpUsername,
+                    sf_password: mcpPassword,
+                    sf_security_token: mcpSecurityToken,
+                    domain: mcpDomain,
+                }),
+            })
+            const data = await response.json()
+            if (response.ok) {
+                toast.success(`Connected to Salesforce via MCP! (${data.org_name || data.instance_url})`)
+                setMcpUsername("")
+                setMcpPassword("")
+                setMcpSecurityToken("")
+                fetchIntegration()
+            } else {
+                toast.error(data.detail || "MCP connection failed")
+            }
+        } catch { toast.error("MCP connection request failed") }
+        finally { setMcpConnecting(false) }
+    }
+
+    // MCP SOQL Query
+    const handleQuery = async () => {
+        if (!soqlQuery.trim()) return
+        setQueryLoading(true)
+        try {
+            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/query`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: soqlQuery }),
+            })
+            const data = await response.json()
+            if (response.ok) {
+                setQueryResults(data)
+                toast.success(`Query returned ${data.total_size} record(s)`)
+            } else {
+                toast.error(data.detail || "Query failed")
+                setQueryResults(null)
+            }
+        } catch { toast.error("Query request failed") }
+        finally { setQueryLoading(false) }
+    }
+
+    // MCP Create Record
+    const handleCreateRecord = async () => {
+        setCreateLoading(true)
+        try {
+            const parsedData = JSON.parse(createData)
+            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/records/${createObjectType}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ data: parsedData }),
+            })
+            const data = await response.json()
+            if (response.ok && data.success) {
+                toast.success(`${createObjectType} created! ID: ${data.id}`)
+            } else {
+                toast.error(data.detail || "Create failed")
+            }
+        } catch (e: any) {
+            toast.error(e.message?.includes("JSON") ? "Invalid JSON data" : "Create request failed")
+        }
+        finally { setCreateLoading(false) }
+    }
+
+    // MCP Update Record
+    const handleUpdateRecord = async () => {
+        if (!updateRecordId.trim()) { toast.error("Record ID is required"); return }
+        setUpdateLoading(true)
+        try {
+            const parsedData = JSON.parse(updateData)
+            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/records/${updateObjectType}/${updateRecordId}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ data: parsedData }),
+            })
+            const data = await response.json()
+            if (response.ok && data.success) {
+                toast.success(`${updateObjectType} record updated!`)
+            } else {
+                toast.error(data.detail || "Update failed")
+            }
+        } catch (e: any) {
+            toast.error(e.message?.includes("JSON") ? "Invalid JSON data" : "Update request failed")
+        }
+        finally { setUpdateLoading(false) }
+    }
+
+    // MCP Delete Record
+    const handleDeleteRecord = async () => {
+        if (!deleteRecordId.trim()) { toast.error("Record ID is required"); return }
+        if (!confirm(`Delete ${deleteObjectType} record ${deleteRecordId}?`)) return
+        setDeleteLoading(true)
+        try {
+            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/records/${deleteObjectType}/${deleteRecordId}`, {
+                method: "DELETE",
+            })
+            const data = await response.json()
+            if (response.ok && data.success) {
+                toast.success(`${deleteObjectType} record deleted!`)
+                setDeleteRecordId("")
+            } else {
+                toast.error(data.detail || "Delete failed")
+            }
+        } catch { toast.error("Delete request failed") }
+        finally { setDeleteLoading(false) }
+    }
+
+    // MCP Org Limits
+    const handleFetchLimits = async () => {
+        setLimitsLoading(true)
+        try {
+            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/limits`)
+            const data = await response.json()
+            if (response.ok) {
+                setOrgLimits(data.key_limits)
+            } else {
+                toast.error(data.detail || "Failed to fetch limits")
+            }
+        } catch { toast.error("Limits request failed") }
+        finally { setLimitsLoading(false) }
+    }
+
     if (isLoading) return (
         <div className="flex items-center justify-center py-16">
             <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
@@ -145,18 +320,25 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
 
     const isConnected = integration?.status === "connected"
     const isSalesforce = integration?.category === "salesforce"
+    const isMcp = integration?.mcp_connected === true
     const isApi = integration?.category === "api"
+    const isSalesforceProject = (project?.category || "webapp") === "salesforce" || (project?.type || "").toUpperCase() === "SALESFORCE"
 
     const getCategoryIcon = () => {
+        if (isSalesforce && isMcp) return <Zap className="h-5 w-5 text-orange-500" />
         if (isSalesforce) return <Cloud className="h-5 w-5 text-purple-600" />
         if (isApi) return <Server className="h-5 w-5 text-green-600" />
         return <Globe className="h-5 w-5 text-blue-600" />
     }
     const getCategoryLabel = () => {
+        if (isSalesforce && isMcp) return "Salesforce MCP Server"
         if (isSalesforce) return "Salesforce Organization"
         if (isApi) return "API Service"
         return "Web Application"
     }
+
+    const inputClass = "w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-background text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+    const labelClass = "block text-sm font-medium text-muted-foreground mb-1"
 
     return (
         <div className="space-y-6">
@@ -179,6 +361,11 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                 <Check className="h-3 w-3 mr-1" /> Connected
                             </Badge>
                         )}
+                        {isConnected && isMcp && (
+                            <Badge className="bg-orange-100 text-orange-700 border-orange-200">
+                                <Zap className="h-3 w-3 mr-1" /> MCP
+                            </Badge>
+                        )}
                     </div>
                     <p className="text-muted-foreground">{project.description || "No description provided"}</p>
                 </div>
@@ -192,6 +379,9 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                 <TabsList>
                     <TabsTrigger value="overview"><BarChart3 className="mr-2 h-4 w-4" /> Overview</TabsTrigger>
                     <TabsTrigger value="integration"><Link2 className="mr-2 h-4 w-4" /> Integration</TabsTrigger>
+                    {isConnected && isMcp && (
+                        <TabsTrigger value="mcp-ops"><Database className="mr-2 h-4 w-4" /> MCP Operations</TabsTrigger>
+                    )}
                     <TabsTrigger value="tests"><FileText className="mr-2 h-4 w-4" /> Test Cases</TabsTrigger>
                     <TabsTrigger value="settings"><Settings className="mr-2 h-4 w-4" /> Settings</TabsTrigger>
                 </TabsList>
@@ -212,7 +402,6 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                             <CardContent><div className="text-2xl font-bold">-</div><p className="text-xs text-muted-foreground">No data available</p></CardContent>
                         </Card>
                     </div>
-
                     <Card>
                         <CardHeader><CardTitle>Project Information</CardTitle></CardHeader>
                         <CardContent>
@@ -248,6 +437,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                             {getCategoryIcon()}
                                             <CardTitle>{getCategoryLabel()}</CardTitle>
                                             <Badge className="bg-green-100 text-green-700">Connected</Badge>
+                                            {isMcp && <Badge className="bg-orange-100 text-orange-700">MCP Server</Badge>}
                                         </div>
                                         <div className="flex gap-2">
                                             {(isSalesforce || isApi) && (
@@ -282,7 +472,15 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                 <p className="text-sm font-mono">{integration.org_id}</p>
                                             </div>
                                         )}
-                                        {integration?.salesforce_login_url && isSalesforce && (
+                                        {isMcp && (
+                                            <div>
+                                                <p className="text-sm font-medium text-muted-foreground">Connection Type</p>
+                                                <p className="text-sm flex items-center gap-1">
+                                                    <Zap className="h-3 w-3 text-orange-500" /> MCP Server (Direct API)
+                                                </p>
+                                            </div>
+                                        )}
+                                        {integration?.salesforce_login_url && isSalesforce && !isMcp && (
                                             <div>
                                                 <p className="text-sm font-medium text-muted-foreground">Login URL</p>
                                                 <p className="text-sm truncate">{integration.salesforce_login_url}</p>
@@ -294,7 +492,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                 <p className="text-sm capitalize">{integration.login_strategy}</p>
                                             </div>
                                         )}
-                                        {isSalesforce && (
+                                        {isSalesforce && !isMcp && (
                                             <div>
                                                 <p className="text-sm font-medium text-muted-foreground">Connected App</p>
                                                 <p className="text-sm">
@@ -340,24 +538,345 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                     ))}
                                 </div>
                             )}
+
+                            {/* Session Status Card (OAuth Salesforce only) */}
+                            {isSalesforce && !isMcp && (
+                                <Card>
+                                    <CardHeader>
+                                        <div className="flex items-center gap-2">
+                                            <Key className="h-5 w-5 text-amber-600" />
+                                            <CardTitle className="text-lg">Session Status</CardTitle>
+                                        </div>
+                                    </CardHeader>
+                                    <CardContent>
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                            <div>
+                                                <p className="text-sm font-medium text-muted-foreground">OAuth Status</p>
+                                                <p className="text-sm mt-1">
+                                                    {isConnected ? (
+                                                        <Badge className="bg-green-100 text-green-700 border-green-200">
+                                                            <Check className="h-3 w-3 mr-1" /> Connected
+                                                        </Badge>
+                                                    ) : (
+                                                        <Badge variant="outline" className="text-muted-foreground">
+                                                            <X className="h-3 w-3 mr-1" /> Not Connected
+                                                        </Badge>
+                                                    )}
+                                                </p>
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-medium text-muted-foreground">UI Session</p>
+                                                <p className="text-sm mt-1">
+                                                    {integration?.ui_session?.status === "active" ? (
+                                                        <Badge className="bg-green-100 text-green-700 border-green-200">🟢 Active</Badge>
+                                                    ) : integration?.ui_session?.status === "expired" ? (
+                                                        <Badge className="bg-yellow-100 text-yellow-700 border-yellow-200">🟡 Expired</Badge>
+                                                    ) : (
+                                                        <Badge variant="outline" className="text-muted-foreground">⚪ Not Created</Badge>
+                                                    )}
+                                                </p>
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-medium text-muted-foreground">Session Source</p>
+                                                <p className="text-sm mt-1 capitalize">
+                                                    {integration?.ui_session?.source ? integration.ui_session.source.replace("_", " ") : "—"}
+                                                </p>
+                                            </div>
+                                            <div>
+                                                <p className="text-sm font-medium text-muted-foreground">Last Session Refresh</p>
+                                                <p className="text-sm mt-1 flex items-center gap-1">
+                                                    <Clock className="h-3 w-3 text-muted-foreground" />
+                                                    {integration?.ui_session?.last_created_at
+                                                        ? new Date(integration.ui_session.last_created_at).toLocaleString()
+                                                        : "Never"}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </CardContent>
+                                </Card>
+                            )}
                         </>
                     ) : (
-                        <Card>
-                            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
-                                <div className="bg-gray-100 dark:bg-gray-900 p-4 rounded-full mb-4">
-                                    <Plug className="h-8 w-8 text-muted-foreground" />
-                                </div>
-                                <h3 className="text-lg font-semibold mb-2">No Integration Connected</h3>
-                                <p className="text-muted-foreground mb-6 max-w-md">
-                                    Connect your project to enable authentication, metadata extraction, and AI-powered test generation.
-                                </p>
-                                <Button onClick={handleConnect} className="bg-blue-600 hover:bg-blue-700">
-                                    <Link2 className="mr-2 h-4 w-4" /> Connect to Project
-                                </Button>
-                            </CardContent>
-                        </Card>
+                        <div className="space-y-4">
+                            {/* MCP Server Connection Form (Salesforce projects) */}
+                            {isSalesforceProject && (
+                                <Card className="border-orange-200 dark:border-orange-900">
+                                    <CardHeader>
+                                        <div className="flex items-center gap-2">
+                                            <Zap className="h-5 w-5 text-orange-500" />
+                                            <CardTitle>Connect via MCP Server</CardTitle>
+                                        </div>
+                                        <CardDescription>
+                                            Connect to your Salesforce org using Username, Password, and Security Token for direct API access via MCP Server protocol.
+                                        </CardDescription>
+                                    </CardHeader>
+                                    <CardContent>
+                                        <div className="grid gap-4 max-w-lg">
+                                            <div>
+                                                <label className={labelClass}>Org Username</label>
+                                                <input
+                                                    type="text"
+                                                    placeholder="your_username@company.com"
+                                                    value={mcpUsername}
+                                                    onChange={(e) => setMcpUsername(e.target.value)}
+                                                    className={inputClass}
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className={labelClass}>Password</label>
+                                                <input
+                                                    type="password"
+                                                    placeholder="Your Salesforce password"
+                                                    value={mcpPassword}
+                                                    onChange={(e) => setMcpPassword(e.target.value)}
+                                                    className={inputClass}
+                                                />
+                                            </div>
+                                            <div>
+                                                <label className={labelClass}>Security Token</label>
+                                                <input
+                                                    type="password"
+                                                    placeholder="Your Salesforce security token"
+                                                    value={mcpSecurityToken}
+                                                    onChange={(e) => setMcpSecurityToken(e.target.value)}
+                                                    className={inputClass}
+                                                />
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    Find it in Salesforce → Settings → My Personal Information → Reset My Security Token
+                                                </p>
+                                            </div>
+                                            <div>
+                                                <label className={labelClass}>Environment</label>
+                                                <select
+                                                    value={mcpDomain}
+                                                    onChange={(e) => setMcpDomain(e.target.value)}
+                                                    className={inputClass}
+                                                >
+                                                    <option value="login">Production / Developer (login.salesforce.com)</option>
+                                                    <option value="test">Sandbox (test.salesforce.com)</option>
+                                                </select>
+                                            </div>
+                                            <Button
+                                                onClick={handleMcpConnect}
+                                                disabled={mcpConnecting || !mcpUsername || !mcpPassword || !mcpSecurityToken}
+                                                className="bg-orange-600 hover:bg-orange-700 w-fit"
+                                            >
+                                                {mcpConnecting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Zap className="mr-2 h-4 w-4" />}
+                                                Connect via MCP
+                                            </Button>
+                                        </div>
+                                    </CardContent>
+                                </Card>
+                            )}
+
+                            {/* Fallback connect card */}
+                            <Card>
+                                <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+                                    <div className="bg-gray-100 dark:bg-gray-900 p-4 rounded-full mb-4">
+                                        <Plug className="h-8 w-8 text-muted-foreground" />
+                                    </div>
+                                    <h3 className="text-lg font-semibold mb-2">
+                                        {isSalesforceProject ? "Or Connect via OAuth" : "No Integration Connected"}
+                                    </h3>
+                                    <p className="text-muted-foreground mb-6 max-w-md">
+                                        {isSalesforceProject
+                                            ? "Alternatively, connect using Salesforce OAuth with Connected App credentials."
+                                            : "Connect your project to enable authentication, metadata extraction, and AI-powered test generation."
+                                        }
+                                    </p>
+                                    <Button onClick={handleConnect} className="bg-blue-600 hover:bg-blue-700">
+                                        <Link2 className="mr-2 h-4 w-4" /> {isSalesforceProject ? "Connect via OAuth" : "Connect to Project"}
+                                    </Button>
+                                </CardContent>
+                            </Card>
+                        </div>
                     )}
                 </TabsContent>
+
+                {/* MCP Operations Tab */}
+                {isConnected && isMcp && (
+                    <TabsContent value="mcp-ops" className="space-y-4">
+                        <Card>
+                            <CardHeader>
+                                <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-2">
+                                        <Database className="h-5 w-5 text-orange-500" />
+                                        <CardTitle>Salesforce MCP Operations</CardTitle>
+                                    </div>
+                                    <Button variant="outline" size="sm" onClick={handleFetchLimits} disabled={limitsLoading}>
+                                        {limitsLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <BarChart3 className="mr-2 h-4 w-4" />}
+                                        Org Limits
+                                    </Button>
+                                </div>
+                            </CardHeader>
+                            <CardContent>
+                                {/* CRUD Sub-tabs */}
+                                <div className="flex gap-2 mb-4 border-b pb-2">
+                                    {[
+                                        { key: "query", label: "SOQL Query", icon: <Search className="h-3 w-3" /> },
+                                        { key: "create", label: "Create", icon: <Plus className="h-3 w-3" /> },
+                                        { key: "update", label: "Update", icon: <Edit className="h-3 w-3" /> },
+                                        { key: "delete", label: "Delete", icon: <Trash2 className="h-3 w-3" /> },
+                                    ].map((tab) => (
+                                        <button
+                                            key={tab.key}
+                                            onClick={() => setCrudTab(tab.key)}
+                                            className={`flex items-center gap-1 px-3 py-1.5 text-sm rounded-md font-medium transition-colors ${crudTab === tab.key
+                                                ? "bg-orange-100 text-orange-700 dark:bg-orange-950 dark:text-orange-300"
+                                                : "text-muted-foreground hover:bg-gray-100 dark:hover:bg-gray-800"
+                                                }`}
+                                        >
+                                            {tab.icon} {tab.label}
+                                        </button>
+                                    ))}
+                                </div>
+
+                                {/* SOQL Query */}
+                                {crudTab === "query" && (
+                                    <div className="space-y-3">
+                                        <div>
+                                            <label className={labelClass}>SOQL Query</label>
+                                            <textarea
+                                                value={soqlQuery}
+                                                onChange={(e) => setSoqlQuery(e.target.value)}
+                                                rows={3}
+                                                className={inputClass + " font-mono text-xs"}
+                                                placeholder="SELECT Id, Name FROM Account LIMIT 10"
+                                            />
+                                        </div>
+                                        <Button onClick={handleQuery} disabled={queryLoading} size="sm" className="bg-orange-600 hover:bg-orange-700">
+                                            {queryLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
+                                            Execute Query
+                                        </Button>
+                                        {queryResults && (
+                                            <div className="mt-4">
+                                                <p className="text-sm text-muted-foreground mb-2">
+                                                    Results: {queryResults.total_size} record(s)
+                                                </p>
+                                                <div className="max-h-80 overflow-auto border rounded-md">
+                                                    <table className="w-full text-xs">
+                                                        <thead className="bg-gray-50 dark:bg-gray-900 sticky top-0">
+                                                            <tr>
+                                                                {queryResults.records?.[0] &&
+                                                                    Object.keys(queryResults.records[0])
+                                                                        .filter((k) => k !== "attributes")
+                                                                        .map((key) => (
+                                                                            <th key={key} className="px-3 py-2 text-left font-medium text-muted-foreground border-b">
+                                                                                {key}
+                                                                            </th>
+                                                                        ))}
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {queryResults.records?.map((record: any, i: number) => (
+                                                                <tr key={i} className="border-b hover:bg-gray-50 dark:hover:bg-gray-900">
+                                                                    {Object.entries(record)
+                                                                        .filter(([k]) => k !== "attributes")
+                                                                        .map(([key, val]) => (
+                                                                            <td key={key} className="px-3 py-2 truncate max-w-[200px]">
+                                                                                {typeof val === "object" ? JSON.stringify(val) : String(val ?? "")}
+                                                                            </td>
+                                                                        ))}
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {/* Create Record */}
+                                {crudTab === "create" && (
+                                    <div className="space-y-3 max-w-lg">
+                                        <div>
+                                            <label className={labelClass}>Object Type</label>
+                                            <input type="text" value={createObjectType} onChange={(e) => setCreateObjectType(e.target.value)} className={inputClass} placeholder="Account" />
+                                        </div>
+                                        <div>
+                                            <label className={labelClass}>Record Data (JSON)</label>
+                                            <textarea value={createData} onChange={(e) => setCreateData(e.target.value)} rows={4} className={inputClass + " font-mono text-xs"} placeholder='{"Name": "Test Account"}' />
+                                        </div>
+                                        <Button onClick={handleCreateRecord} disabled={createLoading} size="sm" className="bg-green-600 hover:bg-green-700">
+                                            {createLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}
+                                            Create Record
+                                        </Button>
+                                    </div>
+                                )}
+
+                                {/* Update Record */}
+                                {crudTab === "update" && (
+                                    <div className="space-y-3 max-w-lg">
+                                        <div>
+                                            <label className={labelClass}>Object Type</label>
+                                            <input type="text" value={updateObjectType} onChange={(e) => setUpdateObjectType(e.target.value)} className={inputClass} placeholder="Account" />
+                                        </div>
+                                        <div>
+                                            <label className={labelClass}>Record ID</label>
+                                            <input type="text" value={updateRecordId} onChange={(e) => setUpdateRecordId(e.target.value)} className={inputClass} placeholder="001XX000003DHPh" />
+                                        </div>
+                                        <div>
+                                            <label className={labelClass}>Update Data (JSON)</label>
+                                            <textarea value={updateData} onChange={(e) => setUpdateData(e.target.value)} rows={4} className={inputClass + " font-mono text-xs"} placeholder='{"Name": "Updated Name"}' />
+                                        </div>
+                                        <Button onClick={handleUpdateRecord} disabled={updateLoading} size="sm" className="bg-blue-600 hover:bg-blue-700">
+                                            {updateLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Edit className="mr-2 h-4 w-4" />}
+                                            Update Record
+                                        </Button>
+                                    </div>
+                                )}
+
+                                {/* Delete Record */}
+                                {crudTab === "delete" && (
+                                    <div className="space-y-3 max-w-lg">
+                                        <div>
+                                            <label className={labelClass}>Object Type</label>
+                                            <input type="text" value={deleteObjectType} onChange={(e) => setDeleteObjectType(e.target.value)} className={inputClass} placeholder="Account" />
+                                        </div>
+                                        <div>
+                                            <label className={labelClass}>Record ID</label>
+                                            <input type="text" value={deleteRecordId} onChange={(e) => setDeleteRecordId(e.target.value)} className={inputClass} placeholder="001XX000003DHPh" />
+                                        </div>
+                                        <Button onClick={handleDeleteRecord} disabled={deleteLoading} size="sm" variant="destructive">
+                                            {deleteLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+                                            Delete Record
+                                        </Button>
+                                    </div>
+                                )}
+                            </CardContent>
+                        </Card>
+
+                        {/* Org Limits */}
+                        {orgLimits && (
+                            <Card>
+                                <CardHeader>
+                                    <CardTitle className="text-lg">Organization API Limits</CardTitle>
+                                </CardHeader>
+                                <CardContent>
+                                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                                        {Object.entries(orgLimits).map(([key, val]: [string, any]) => (
+                                            <div key={key} className="p-3 rounded-md border">
+                                                <p className="text-xs font-medium text-muted-foreground">{key}</p>
+                                                <p className="text-sm font-bold mt-1">
+                                                    {val?.Remaining ?? "—"} / {val?.Max ?? "—"}
+                                                </p>
+                                                {val?.Max > 0 && (
+                                                    <div className="w-full h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full mt-1">
+                                                        <div
+                                                            className="h-full bg-orange-500 rounded-full"
+                                                            style={{ width: `${Math.min(100, ((val.Max - val.Remaining) / val.Max) * 100)}%` }}
+                                                        />
+                                                    </div>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </CardContent>
+                            </Card>
+                        )}
+                    </TabsContent>
+                )}
 
                 {/* Test Cases Tab */}
                 <TabsContent value="tests" className="space-y-4">
