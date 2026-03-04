@@ -31,3 +31,8 @@ npm-debug.log*
 # Database
 *.db
 *.sqlite3
+
+# Runtime artifacts (screenshots, traces, sessions)
+backend/static/test-runs/
+backend/app/sessions/
+backend/screenshots/
