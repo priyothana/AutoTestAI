@@ -105,6 +105,9 @@ async def create_test_run(
     sf_username = None
     sf_password = None
     sf_login_url = None
+    mcp_connected = False
+    sf_session_id = None
+    sf_security_token = None
     try:
         int_result_for_status = await db.execute(
             select(ProjectIntegration).where(ProjectIntegration.project_id == test_case.project_id)
@@ -127,6 +130,11 @@ async def create_test_run(
 
             print(f"[DEBUG] project_category={project_category}, has_token={bool(sf_access_token)}, instance={sf_instance_url}")
 
+            # --- Detect MCP connection ---
+            if hasattr(int_record, 'mcp_connected') and int_record.mcp_connected:
+                mcp_connected = True
+                print(f"[DEBUG] MCP connected project detected")
+
             # --- Extract SF login credentials (decrypted) ---
             if project_category == "salesforce" and integration_status == "connected":
                 from app.services.integration_service import IntegrationService
@@ -135,8 +143,32 @@ async def create_test_run(
                     sf_username = decrypted["username"]
                 if decrypted.get("password"):
                     sf_password = decrypted["password"]
+                if decrypted.get("security_token"):
+                    sf_security_token = decrypted["security_token"]
                 sf_login_url = int_record.salesforce_login_url
-                print(f"[DEBUG] SF creds: username={bool(sf_username)}, password={bool(sf_password)}, login_url={sf_login_url}")
+                print(f"[DEBUG] SF creds: username={bool(sf_username)}, password={bool(sf_password)}, login_url={sf_login_url}, mcp={mcp_connected}")
+
+                # --- For MCP projects: get a fresh session_id via API (bypasses UI login + 2FA) ---
+                if mcp_connected and sf_username and sf_password and sf_security_token:
+                    try:
+                        from app.services.salesforce_mcp_service import SalesforceMCPService
+                        domain = "login"
+                        if sf_login_url and "test.salesforce.com" in sf_login_url:
+                            domain = "test"
+                        conn_info = SalesforceMCPService.connect(
+                            username=sf_username,
+                            password=sf_password,
+                            security_token=sf_security_token,
+                            domain=domain,
+                        )
+                        sf_session_id = conn_info.get("session_id")
+                        if conn_info.get("instance_url"):
+                            sf_instance_url = conn_info["instance_url"]
+                            base_url = f"https://{sf_instance_url}" if not sf_instance_url.startswith("http") else sf_instance_url
+                        print(f"[MCP-SESSION] Got fresh session_id for frontdoor.jsp (len={len(sf_session_id) if sf_session_id else 0})")
+                    except Exception as e:
+                        print(f"[MCP-SESSION] Failed to get fresh session: {e}")
+                        sf_session_id = None
 
             # --- Refresh expired Salesforce access token ---
             if (
@@ -203,7 +235,7 @@ async def create_test_run(
         print(f"[ERROR] Session resolution failed: {e}")
         traceback.print_exc()
 
-    print(f"[RUN] category={project_category} status={integration_status} base_url={base_url} has_token={bool(sf_access_token)} instance={sf_instance_url}")
+    print(f"[RUN] category={project_category} status={integration_status} base_url={base_url} has_token={bool(sf_access_token)} instance={sf_instance_url} mcp={mcp_connected} has_session={bool(sf_session_id)}")
 
     # 4. Trigger Background Execution
     background_tasks.add_task(
@@ -221,6 +253,9 @@ async def create_test_run(
         sf_username,
         sf_password,
         sf_login_url,
+        mcp_connected,
+        sf_session_id,
+        sf_security_token,
     )
 
     return new_run
@@ -239,6 +274,9 @@ async def run_playwright_test(
     sf_username: str = None,
     sf_password: str = None,
     sf_login_url: str = None,
+    mcp_connected: bool = False,
+    sf_session_id: str = None,
+    sf_security_token: str = None,
 ):
     from app.db.session import AsyncSessionLocal
     from sqlalchemy import update
@@ -257,6 +295,7 @@ async def run_playwright_test(
             project_category, integration_status,
             sf_access_token, sf_instance_url,
             sf_username, sf_password, sf_login_url,
+            mcp_connected, sf_session_id, sf_security_token,
         )
     except Exception as e:
         logger.error(f"CRITICAL ERROR in run_playwright_test wrapper for {run_id}: {e}", exc_info=True)

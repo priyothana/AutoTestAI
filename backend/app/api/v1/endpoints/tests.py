@@ -25,8 +25,10 @@ async def generate_test_steps_endpoint(
     model = prompt_data.get("model")
     project_id = prompt_data.get("project_id")
 
-    # --- Gate login step generation for Salesforce projects ---
+    # --- Gate login step generation and detect MCP projects ---
     session_instruction = ""
+    use_mcp_rag = False
+
     if project_id:
         try:
             from app.models.project import Project
@@ -37,30 +39,105 @@ async def generate_test_steps_endpoint(
             proj_result = await db.execute(select(Project).where(Project.id == pid))
             project = proj_result.scalars().first()
 
-            if project and project.category == "salesforce":
+            if project:
                 int_result = await db.execute(
                     select(ProjectIntegration).where(ProjectIntegration.project_id == pid)
                 )
                 integration = int_result.scalars().first()
                 is_connected = integration and integration.status == "connected"
-                has_session = await SessionService.has_valid_session(db, pid)
+                is_mcp = integration and getattr(integration, 'mcp_connected', False)
 
-                if is_connected:
+                # --- MCP + Metadata → Strict metadata-driven RAG generation ---
+                # This check runs for ANY project category with MCP connection
+                if is_mcp and is_connected:
+                    from sqlalchemy import func as sa_func
+                    from app.models.vector_embedding import VectorEmbedding
+                    embedding_count = (await db.execute(
+                        select(sa_func.count()).select_from(VectorEmbedding).where(
+                            VectorEmbedding.project_id == pid
+                        )
+                    )).scalar_one()
+
+                    if embedding_count > 0:
+                        use_mcp_rag = True
+                        print(f"[TEST-GEN] MCP project {pid} has {embedding_count} embeddings → using strict metadata RAG")
+                    else:
+                        session_instruction = (
+                            "\n\nIMPORTANT: This is a Salesforce MCP-connected project. "
+                            "DO NOT generate any login/authentication steps. The user is already authenticated. "
+                            "Start the test from the Lightning home page or the relevant object page directly. "
+                            "Use Salesforce Lightning URL patterns like /lightning/o/ObjectName/list."
+                        )
+
+                elif project.category == "salesforce" and is_connected:
                     session_instruction = (
                         "\n\nIMPORTANT: This is a Salesforce project with an active OAuth connection. "
                         "DO NOT generate any login/authentication steps. The user is already authenticated. "
                         "Start the test from the application's home page or the relevant object page directly."
                     )
-                elif has_session:
-                    session_instruction = (
-                        "\n\nIMPORTANT: This Salesforce project has an active browser session. "
-                        "DO NOT include login/authentication steps. The session will be reused automatically. "
-                        "Start the test from the Lightning home page or the relevant object page."
-                    )
-                # else: no session, no connection → allow login steps (no instruction appended)
-        except Exception:
+                elif project.category == "salesforce":
+                    has_session = await SessionService.has_valid_session(db, pid)
+                    if has_session:
+                        session_instruction = (
+                            "\n\nIMPORTANT: This Salesforce project has an active browser session. "
+                            "DO NOT include login/authentication steps. The session will be reused automatically. "
+                            "Start the test from the Lightning home page or the relevant object page."
+                        )
+        except Exception as e:
+            print(f"[TEST-GEN] Project detection error: {e}")
             pass  # Non-critical; fall back to normal generation
 
+    # --- MCP RAG path: strict metadata-driven generation ---
+    if use_mcp_rag:
+        try:
+            from app.services.rag_service import RAGService
+
+            retrieved_chunks = await RAGService.retrieve(
+                db=db,
+                project_id=UUID(project_id),
+                query_text=prompt,
+                top_k=8,
+            )
+
+            if retrieved_chunks:
+                # --- Filter chunks to target object only ---
+                # Extract object name from user prompt to filter out unrelated metadata
+                import re as _re
+                prompt_lower = prompt.lower()
+                # Try to extract the object name from common prompt patterns
+                obj_match = _re.search(
+                    r'(?:create|new|edit|update|delete|view|test)\s+(?:a\s+)?(?:new\s+)?'
+                    r'(\w[\w\s]*?)(?:\s+record|\s+for|\s+with|\s+-|\s*$)',
+                    prompt_lower
+                )
+                target_obj = obj_match.group(1).strip() if obj_match else None
+
+                if target_obj:
+                    # Filter chunks that mention the target object
+                    filtered = [c for c in retrieved_chunks if target_obj in c.lower()]
+                    if filtered:
+                        print(f"[TEST-GEN] Filtered {len(retrieved_chunks)} chunks → {len(filtered)} chunks for object '{target_obj}'")
+                        retrieved_chunks = filtered
+                    else:
+                        print(f"[TEST-GEN] No chunks matched '{target_obj}', using all {len(retrieved_chunks)} chunks")
+
+                rag_context = await RAGService.build_rag_context(retrieved_chunks)
+                test_case = await AIService.generate_test_case_with_mcp_rag(
+                    prompt, rag_context, provider=provider, model=model
+                )
+                print(f"[TEST-GEN] MCP RAG generation successful with {len(retrieved_chunks)} chunks")
+                return test_case
+            else:
+                print(f"[TEST-GEN] No RAG chunks found, falling back to standard with MCP instruction")
+                session_instruction = (
+                    "\n\nIMPORTANT: This is a Salesforce MCP-connected project. "
+                    "DO NOT generate any login/authentication steps. "
+                    "Use Salesforce Lightning URL patterns like /lightning/o/ObjectName/list."
+                )
+        except Exception as rag_err:
+            print(f"[TEST-GEN] MCP RAG failed, falling back to standard: {rag_err}")
+
+    # --- Standard path ---
     effective_prompt = prompt + session_instruction
 
     try:

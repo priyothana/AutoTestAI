@@ -62,7 +62,7 @@ class SalesforceMCPService:
     ) -> Dict[str, Any]:
         """
         Validate credentials and return connection information.
-        Returns instance_url, org_id, and user info.
+        Returns instance_url, org_id, user info, and session_id for frontdoor.jsp.
         """
         sf = SalesforceMCPService._get_client(
             username, password, security_token, domain
@@ -76,12 +76,14 @@ class SalesforceMCPService:
                 "instance_url": sf.sf_instance,
                 "org_id": sf.sf_instance.split(".")[0] if sf.sf_instance else None,
                 "api_version": sf.sf_version,
+                "session_id": sf.session_id,
             }
         except Exception:
             org_info = {
                 "instance_url": sf.sf_instance,
                 "org_id": None,
                 "api_version": sf.sf_version,
+                "session_id": sf.session_id,
             }
 
         # Try to get org name via query

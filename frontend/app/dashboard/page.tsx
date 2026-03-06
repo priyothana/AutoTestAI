@@ -93,7 +93,7 @@ export default function DashboardPage() {
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ prompt, provider: selectedProvider }),
+                body: JSON.stringify({ prompt, provider: selectedProvider, project_id: projects.length > 0 ? projects[0].id : undefined }),
             })
 
             const data = await response.json()

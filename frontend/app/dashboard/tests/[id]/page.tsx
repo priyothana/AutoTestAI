@@ -71,12 +71,10 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [steps, setSteps] = useState<TestStep[]>([])
     const [testStatus, setTestStatus] = useState<string>("draft")
     const [projectError, setProjectError] = useState(false)
+    const [hasMounted, setHasMounted] = useState(false)
 
     useEffect(() => {
-        fetchProjects()
-        if (!isInternalNew) {
-            fetchTestCase()
-        }
+        setHasMounted(true)
     }, [])
 
     const fetchProjects = async () => {
@@ -109,6 +107,13 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         }
     }
 
+    useEffect(() => {
+        fetchProjects()
+        if (!isInternalNew) {
+            fetchTestCase()
+        }
+    }, [])
+
     const handleGenerate = async () => {
         if (!prompt) {
             toast.error("Please enter a description for the test case")
@@ -120,7 +125,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             const response = await fetch("http://localhost:8000/api/v1/tests/generate-test-steps", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt, provider: selectedProvider })
+                body: JSON.stringify({ prompt, provider: selectedProvider, project_id: selectedProjectId || undefined })
             })
 
             if (!response.ok) {
