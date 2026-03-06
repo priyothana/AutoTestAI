@@ -232,6 +232,79 @@ class PlaywrightRunner:
                 except Exception:
                     pass
 
+                # ── Salesforce compound address field fallback ──
+                # Fields like "Billing Postal Code", "Shipping City" etc. are
+                # rendered inside <lightning-input-address> and don't have
+                # standard labels. Map sub-field names to input[name] attributes.
+                address_sub_fields = {
+                    "postal code": "postalCode",
+                    "zip code": "postalCode",
+                    "zip": "postalCode",
+                    "street": "street",
+                    "city": "city",
+                    "state": "province",
+                    "province": "province",
+                    "state/province": "province",
+                    "country": "country",
+                }
+                label_lower = label_target.lower()
+                # Strip common prefixes like "Billing ", "Shipping ", "Mailing ", "Other "
+                stripped = label_lower
+                for prefix in ("billing ", "shipping ", "mailing ", "other "):
+                    if label_lower.startswith(prefix):
+                        stripped = label_lower[len(prefix):]
+                        break
+
+                if stripped in address_sub_fields:
+                    input_name = address_sub_fields[stripped]
+                    # Determine address group prefix for scoping
+                    group_prefix = label_lower.replace(stripped, "").strip()
+                    try:
+                        # Try to find the address compound component scoped to
+                        # the correct group (Billing vs Shipping)
+                        if group_prefix:
+                            addr_loc = page.locator(
+                                f"lightning-input-address input[name='{input_name}']"
+                            )
+                            if addr_loc.count() > 0:
+                                # If multiple address groups, find the right one by
+                                # checking for a nearby group label
+                                for idx in range(addr_loc.count()):
+                                    candidate = addr_loc.nth(idx)
+                                    try:
+                                        if candidate.is_visible():
+                                            # Check parent component for group label
+                                            parent = candidate.locator("xpath=ancestor::lightning-input-address[1]")
+                                            parent_text = parent.inner_text() if parent.count() > 0 else ""
+                                            if group_prefix in parent_text.lower():
+                                                return candidate
+                                    except Exception:
+                                        continue
+                                # Fallback: return first visible
+                                vis = self._first_visible_sync(addr_loc)
+                                if vis.is_visible():
+                                    return vis
+                        else:
+                            addr_loc = page.locator(
+                                f"lightning-input-address input[name='{input_name}']"
+                            )
+                            if addr_loc.count() > 0:
+                                vis = self._first_visible_sync(addr_loc)
+                                if vis.is_visible():
+                                    return vis
+                    except Exception:
+                        pass
+
+                # ── Try get_by_label with exact=False as a softer match ──
+                try:
+                    soft_label = page.get_by_label(label_target, exact=False)
+                    if soft_label.count() > 0:
+                        vis = self._first_visible_sync(soft_label)
+                        if vis.is_visible():
+                            return vis
+                except Exception:
+                    pass
+
             return page.get_by_label(target, exact=True).first
 
         elif locator_type == "text":
@@ -281,7 +354,22 @@ class PlaywrightRunner:
         elif action == ActionType.TYPE:
             locator = self._resolve_locator_sync(page, target, locator_type)
             locator.wait_for(state="visible", timeout=15000)
-            locator.fill(value)
+            # Try-fill-first pattern: if locator matches a container element
+            # (e.g. a div with aria-label), find the actual input inside it.
+            try:
+                locator.fill(value)
+            except Exception as fill_err:
+                err_msg = str(fill_err).lower()
+                if "not an input" in err_msg or "not fillable" in err_msg or "element is not" in err_msg:
+                    # Search for an actual input inside the container
+                    inner = locator.locator("input:not([type='file']), textarea, [contenteditable]")
+                    if inner.count() > 0:
+                        vis_inner = self._first_visible_sync(inner)
+                        if vis_inner.is_visible():
+                            vis_inner.fill(value)
+                            return
+                # Re-raise if it's a different error or no inner input found
+                raise
 
         elif action == ActionType.ASSERT_TEXT:
             locator = self._resolve_locator_sync(page, target, locator_type)
