@@ -44,6 +44,13 @@ class ProjectIntegration(Base, TimestampMixin):
     # Flexible auth config (API keys, bearer tokens, etc.)
     auth_config = Column(JSON, nullable=True)
 
+    # Jira Integration (encrypted where sensitive)
+    jira_domain = Column(Text, nullable=True)
+    jira_email = Column(Text, nullable=True)
+    jira_token = Column(Text, nullable=True)       # encrypted
+    jira_board_id = Column(String(50), nullable=True)
+    jira_board_name = Column(Text, nullable=True)
+
     # Sync tracking
     last_synced_at = Column(DateTime, nullable=True)
     sync_error = Column(Text, nullable=True)

@@ -66,6 +66,19 @@ export default function CreateProjectPage() {
     const [apiKey, setApiKey] = useState("")
     const [bearerToken, setBearerToken] = useState("")
 
+    // Jira Integration
+    const [jiraDomain, setJiraDomain] = useState("")
+    const [jiraEmail, setJiraEmail] = useState("")
+    const [jiraApiToken, setJiraApiToken] = useState("")
+    const [jiraConnecting, setJiraConnecting] = useState(false)
+    const [jiraConnected, setJiraConnected] = useState(false)
+    const [jiraBoards, setJiraBoards] = useState<{id: string; name: string}[]>([])
+    const [selectedJiraBoard, setSelectedJiraBoard] = useState("")
+    const [selectedJiraBoardName, setSelectedJiraBoardName] = useState("")
+    const [jiraSaving, setJiraSaving] = useState(false)
+    const [jiraSaved, setJiraSaved] = useState(false)
+    const [showJiraToken, setShowJiraToken] = useState(false)
+
     const form = useForm<z.infer<typeof formSchema>>({
         resolver: zodResolver(formSchema),
         defaultValues: { name: "", description: "", type: "WEB", baseUrl: "" },
@@ -213,6 +226,81 @@ export default function CreateProjectPage() {
             toast.error(error.message || "API connection failed")
         } finally {
             setConnectLoading(false)
+        }
+    }
+
+    const handleJiraConnect = async () => {
+        if (!jiraDomain || !jiraEmail || !jiraApiToken) {
+            toast.error("Please fill in all Jira connection fields")
+            return
+        }
+        setJiraConnecting(true)
+        try {
+            // Step 1: Validate credentials
+            const connectRes = await fetch("http://localhost:8000/api/v1/jira/connect", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
+            })
+            if (!connectRes.ok) {
+                const err = await connectRes.json().catch(() => ({}))
+                throw new Error(err.detail || "Failed to connect to Jira")
+            }
+
+            // Step 2: Fetch boards
+            const boardsRes = await fetch("http://localhost:8000/api/v1/jira/boards", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
+            })
+            if (!boardsRes.ok) {
+                const err = await boardsRes.json().catch(() => ({}))
+                throw new Error(err.detail || "Failed to fetch boards")
+            }
+            const boardsData = await boardsRes.json()
+            const boardsList = boardsData.boards || []
+            setJiraBoards(boardsList)
+            setJiraConnected(true)
+            if (boardsList.length > 0) {
+                setSelectedJiraBoard(boardsList[0].id)
+                setSelectedJiraBoardName(boardsList[0].name)
+            }
+            toast.success("Connected to Jira successfully!")
+        } catch (error: any) {
+            toast.error(error.message || "Jira connection failed")
+        } finally {
+            setJiraConnecting(false)
+        }
+    }
+
+    const handleSaveJiraConfig = async () => {
+        if (!createdProjectId || !selectedJiraBoard) {
+            toast.error("Please select a Jira board first")
+            return
+        }
+        setJiraSaving(true)
+        try {
+            const response = await fetch(`http://localhost:8000/api/v1/jira/projects/${createdProjectId}/config`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    domain: jiraDomain,
+                    email: jiraEmail,
+                    api_token: jiraApiToken,
+                    board_id: selectedJiraBoard,
+                    board_name: selectedJiraBoardName,
+                }),
+            })
+            if (!response.ok) {
+                const err = await response.json().catch(() => ({}))
+                throw new Error(err.detail || "Failed to save Jira config")
+            }
+            setJiraSaved(true)
+            toast.success("Jira configuration saved to project!")
+        } catch (error: any) {
+            toast.error(error.message || "Failed to save Jira config")
+        } finally {
+            setJiraSaving(false)
         }
     }
 
@@ -503,6 +591,113 @@ export default function CreateProjectPage() {
                                             </div>
                                         </div>
                                     )}
+
+                                    {/* ── Jira Integration (available for all project types) ── */}
+                                    <div className="space-y-4 rounded-lg border-2 border-purple-100 dark:border-purple-900 p-6 bg-purple-50/30 dark:bg-purple-950/10 mt-6">
+                                        <div className="flex items-center gap-2 mb-2">
+                                            <svg className="h-5 w-5 text-purple-600" viewBox="0 0 24 24" fill="currentColor">
+                                                <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83H6.77zM2 11.6a4.35 4.35 0 0 0 4.34 4.34h1.8v1.72A4.35 4.35 0 0 0 12.48 22v-9.57a.84.84 0 0 0-.84-.84H2z" />
+                                            </svg>
+                                            <h3 className="font-semibold text-purple-700 dark:text-purple-400">Jira Integration (Optional)</h3>
+                                        </div>
+                                        <p className="text-sm text-muted-foreground mb-3">
+                                            Connect your Jira account to import user stories when creating test cases.
+                                        </p>
+
+                                        {jiraSaved ? (
+                                            <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800 rounded-md">
+                                                <Check className="h-4 w-4 text-green-600" />
+                                                <span className="text-sm text-green-700 dark:text-green-400 font-medium">
+                                                    Jira configured — Board: {selectedJiraBoardName}
+                                                </span>
+                                            </div>
+                                        ) : !jiraConnected ? (
+                                            <div className="grid gap-4">
+                                                <div>
+                                                    <label className="text-sm font-medium mb-1 block">Jira Domain</label>
+                                                    <Input
+                                                        placeholder="https://yourcompany.atlassian.net"
+                                                        value={jiraDomain}
+                                                        onChange={(e) => setJiraDomain(e.target.value)}
+                                                    />
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium mb-1 block">Email</label>
+                                                    <Input
+                                                        type="email"
+                                                        placeholder="you@company.com"
+                                                        value={jiraEmail}
+                                                        onChange={(e) => setJiraEmail(e.target.value)}
+                                                    />
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium mb-1 block">API Token</label>
+                                                    <div className="relative">
+                                                        <Input
+                                                            type={showJiraToken ? "text" : "password"}
+                                                            placeholder="Enter your Jira API token"
+                                                            value={jiraApiToken}
+                                                            onChange={(e) => setJiraApiToken(e.target.value)}
+                                                        />
+                                                        <button type="button" onClick={() => setShowJiraToken(!showJiraToken)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                                            {showJiraToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                                        </button>
+                                                    </div>
+                                                    <p className="text-xs text-muted-foreground mt-1">
+                                                        Generate at <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noreferrer" className="text-purple-600 hover:underline">Atlassian API Tokens</a>
+                                                    </p>
+                                                </div>
+                                                <Button
+                                                    type="button"
+                                                    variant="outline"
+                                                    onClick={handleJiraConnect}
+                                                    disabled={jiraConnecting || !jiraDomain || !jiraEmail || !jiraApiToken}
+                                                    className="w-fit border-purple-300 text-purple-700 hover:bg-purple-100"
+                                                >
+                                                    {jiraConnecting ? (
+                                                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</>
+                                                    ) : (
+                                                        <><Link2 className="mr-2 h-4 w-4" />Connect & Fetch Boards</>
+                                                    )}
+                                                </Button>
+                                            </div>
+                                        ) : (
+                                            <div className="grid gap-4">
+                                                <div className="flex items-center gap-2">
+                                                    <Check className="h-4 w-4 text-green-600" />
+                                                    <span className="text-sm text-green-700 dark:text-green-400 font-medium">Connected to Jira</span>
+                                                </div>
+                                                <div>
+                                                    <label className="text-sm font-medium mb-1 block">Select Jira Board</label>
+                                                    <select
+                                                        value={selectedJiraBoard}
+                                                        onChange={(e) => {
+                                                            setSelectedJiraBoard(e.target.value)
+                                                            const board = jiraBoards.find(b => b.id === e.target.value)
+                                                            setSelectedJiraBoardName(board?.name || "")
+                                                        }}
+                                                        className="w-full h-9 rounded-md border border-purple-200 dark:border-purple-800 bg-white/50 dark:bg-black/20 px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-purple-400 cursor-pointer"
+                                                    >
+                                                        {jiraBoards.map((board) => (
+                                                            <option key={board.id} value={board.id}>{board.name}</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                                <Button
+                                                    type="button"
+                                                    onClick={handleSaveJiraConfig}
+                                                    disabled={jiraSaving || !selectedJiraBoard}
+                                                    className="w-fit bg-purple-600 hover:bg-purple-700"
+                                                >
+                                                    {jiraSaving ? (
+                                                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Saving...</>
+                                                    ) : (
+                                                        <><Check className="mr-2 h-4 w-4" />Save Jira Configuration</>
+                                                    )}
+                                                </Button>
+                                            </div>
+                                        )}
+                                    </div>
                                 </div>
                             )}
 

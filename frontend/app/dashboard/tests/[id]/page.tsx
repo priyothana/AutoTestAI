@@ -77,6 +77,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [testStatus, setTestStatus] = useState<string>("draft")
     const [projectError, setProjectError] = useState(false)
     const [hasMounted, setHasMounted] = useState(false)
+    const [testSource, setTestSource] = useState<'manual' | 'jira' | null>(null)
+    const [jiraConfigured, setJiraConfigured] = useState<boolean | null>(null) // null = loading
 
     useEffect(() => {
         setHasMounted(true)
@@ -117,6 +119,29 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             fetchTestCase()
         }
     }, [])
+
+    // Check Jira config when project changes
+    useEffect(() => {
+        if (selectedProjectId) {
+            checkJiraConfig(selectedProjectId)
+        } else {
+            setJiraConfigured(null)
+        }
+    }, [selectedProjectId])
+
+    const checkJiraConfig = async (projectId: string) => {
+        try {
+            const res = await fetch(`http://localhost:8000/api/v1/jira/projects/${projectId}/config`)
+            if (res.ok) {
+                const data = await res.json()
+                setJiraConfigured(data.configured === true)
+            } else {
+                setJiraConfigured(false)
+            }
+        } catch {
+            setJiraConfigured(false)
+        }
+    }
 
     const handleGenerate = async () => {
         if (!prompt) {
@@ -357,12 +382,72 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         Test Case Source
                     </h3>
                     <p className="text-sm text-muted-foreground mt-0.5">
-                        Provide a test case via manual input or import user stories from Jira.
+                        Choose how to provide your test case.
                     </p>
                 </div>
 
+                {/* Source Selector Cards */}
                 <div className="grid gap-4 md:grid-cols-2">
-                    {/* Card 1 — Manual Test Case Input */}
+                    {/* Option 1 — Manual */}
+                    <button
+                        type="button"
+                        onClick={() => setTestSource('manual')}
+                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${
+                            testSource === 'manual'
+                                ? 'border-blue-500 bg-blue-50/80 dark:bg-blue-950/20 shadow-md ring-2 ring-blue-200 dark:ring-blue-800'
+                                : 'border-gray-200 dark:border-gray-800 hover:border-blue-300 dark:hover:border-blue-700 hover:bg-blue-50/40 dark:hover:bg-blue-950/10'
+                        }`}
+                    >
+                        <div className="flex items-center gap-3 mb-2">
+                            <div className={`p-2 rounded-lg ${testSource === 'manual' ? 'bg-blue-100 dark:bg-blue-900/40' : 'bg-gray-100 dark:bg-gray-800'}`}>
+                                <FileText className={`h-5 w-5 ${testSource === 'manual' ? 'text-blue-600' : 'text-gray-500'}`} />
+                            </div>
+                            <div>
+                                <h4 className="font-semibold text-sm">Manual Test Case</h4>
+                                <p className="text-xs text-muted-foreground">Enter a test case or user story in plain English</p>
+                            </div>
+                        </div>
+                    </button>
+
+                    {/* Option 2 — Import from Jira */}
+                    <button
+                        type="button"
+                        onClick={() => {
+                            if (jiraConfigured) setTestSource('jira')
+                        }}
+                        disabled={!jiraConfigured}
+                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${
+                            !jiraConfigured
+                                ? 'border-gray-200 dark:border-gray-800 opacity-60 cursor-not-allowed'
+                                : testSource === 'jira'
+                                    ? 'border-purple-500 bg-purple-50/80 dark:bg-purple-950/20 shadow-md ring-2 ring-purple-200 dark:ring-purple-800'
+                                    : 'border-gray-200 dark:border-gray-800 hover:border-purple-300 dark:hover:border-purple-700 hover:bg-purple-50/40 dark:hover:bg-purple-950/10'
+                        }`}
+                    >
+                        <div className="flex items-center gap-3 mb-2">
+                            <div className={`p-2 rounded-lg ${testSource === 'jira' ? 'bg-purple-100 dark:bg-purple-900/40' : 'bg-gray-100 dark:bg-gray-800'}`}>
+                                <svg className={`h-5 w-5 ${testSource === 'jira' ? 'text-purple-600' : 'text-gray-500'}`} viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83H6.77zM2 11.6a4.35 4.35 0 0 0 4.34 4.34h1.8v1.72A4.35 4.35 0 0 0 12.48 22v-9.57a.84.84 0 0 0-.84-.84H2z" />
+                                </svg>
+                            </div>
+                            <div>
+                                <h4 className="font-semibold text-sm">Import from Jira</h4>
+                                <p className="text-xs text-muted-foreground">
+                                    {!selectedProjectId
+                                        ? 'Select a project first'
+                                        : jiraConfigured === null
+                                            ? 'Checking Jira config...'
+                                            : jiraConfigured
+                                                ? 'Import user stories from your connected Jira board'
+                                                : 'Jira not configured for this project. Configure in Project Settings.'}
+                                </p>
+                            </div>
+                        </div>
+                    </button>
+                </div>
+
+                {/* Conditional Content based on selection */}
+                {testSource === 'manual' && (
                     <Card className="bg-gradient-to-br from-blue-50/80 to-indigo-50/60 dark:from-blue-950/20 dark:to-indigo-950/15 border-blue-200/70 dark:border-blue-900">
                         <CardHeader className="pb-2 pt-4 px-4">
                             <CardTitle className="flex items-center gap-2 text-blue-700 dark:text-blue-300 text-base">
@@ -382,77 +467,85 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                             />
                         </CardContent>
                     </Card>
+                )}
 
-                    {/* Card 2 — Import from Jira */}
+                {testSource === 'jira' && selectedProjectId && (
                     <JiraImportPanel
+                        projectId={selectedProjectId}
                         onImport={(stories) => {
                             setPrompt((prev) => {
-                                const newContent = stories.join("\n")
-                                return prev ? prev + "\n" + newContent : newContent
+                                const newContent = stories.join("\n\n")
+                                return prev ? prev + "\n\n" + newContent : newContent
                             })
+                            // Automatically switch back to manual source to show the populated input and generator
+                            setTestSource('manual')
                         }}
                     />
-                </div>
+                )}
             </div>
 
             {/* ── Flow Arrow ──────────────────────────────────────────────── */}
-            <div className="flex justify-center -my-1">
-                <div className="flex flex-col items-center gap-0.5 text-muted-foreground">
-                    <ArrowDown className="h-4 w-4 animate-bounce" />
+            {testSource === 'manual' && (
+                <div className="flex justify-center -my-1">
+                    <div className="flex flex-col items-center gap-0.5 text-muted-foreground">
+                        <ArrowDown className="h-4 w-4 animate-bounce" />
+                    </div>
                 </div>
-            </div>
+            )}
 
             {/* ══════════════════════════════════════════════════════════════
                 SECTION 2 — AI Test Step Generator
                ══════════════════════════════════════════════════════════════ */}
-            <Card className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-950/20 dark:to-indigo-950/20 border-blue-200 dark:border-blue-900">
-                <CardHeader className="pb-3">
-                    <CardTitle className="flex items-center gap-2 text-blue-700 dark:text-blue-400">
-                        <Sparkles className="h-5 w-5" />
-                        AI Test Step Generator
-                    </CardTitle>
-                    <CardDescription>
-                        Convert the provided test case or imported Jira user story into optimized Playwright test steps.
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>
-                    <div className="flex items-end gap-4">
-                        <div className="space-y-2 w-60">
-                            <label className="text-sm font-medium text-blue-700 dark:text-blue-400">AI Model</label>
-                            <select
-                                value={selectedProvider}
-                                onChange={(e) => setSelectedProvider(e.target.value)}
-                                className="w-full h-9 rounded-md border border-blue-200 dark:border-blue-800 bg-white/50 dark:bg-black/20 px-3 py-1 text-sm shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-400 cursor-pointer"
+            {testSource === 'manual' && (
+                <Card className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-950/20 dark:to-indigo-950/20 border-blue-200 dark:border-blue-900">
+                    <CardHeader className="pb-3">
+                        <CardTitle className="flex items-center gap-2 text-blue-700 dark:text-blue-400">
+                            <Sparkles className="h-5 w-5" />
+                            AI Test Step Generator
+                        </CardTitle>
+                        <CardDescription>
+                            Convert the provided test case or imported Jira user story into optimized Playwright test steps.
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        <div className="flex items-end gap-4">
+                            <div className="space-y-2 w-60">
+                                <label className="text-sm font-medium text-blue-700 dark:text-blue-400">AI Model</label>
+                                <select
+                                    value={selectedProvider}
+                                    onChange={(e) => setSelectedProvider(e.target.value)}
+                                    className="w-full h-9 rounded-md border border-blue-200 dark:border-blue-800 bg-white/50 dark:bg-black/20 px-3 py-1 text-sm shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-400 cursor-pointer"
+                                >
+                                    <option value="openai">🟢 OpenAI (GPT-4o Mini)</option>
+                                    <option value="claude">🟣 Claude (Sonnet 4)</option>
+                                </select>
+                            </div>
+                            <Button
+                                className="bg-blue-600 hover:bg-blue-700 shadow-md h-9 px-6"
+                                onClick={handleGenerate}
+                                disabled={isGenerating || !prompt}
                             >
-                                <option value="openai">🟢 OpenAI (GPT-4o Mini)</option>
-                                <option value="claude">🟣 Claude (Sonnet 4)</option>
-                            </select>
-                        </div>
-                        <Button
-                            className="bg-blue-600 hover:bg-blue-700 shadow-md h-9 px-6"
-                            onClick={handleGenerate}
-                            disabled={isGenerating || !prompt}
-                        >
-                            {isGenerating ? (
-                                <>
-                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                                    Generating...
-                                </>
-                            ) : (
-                                <>
-                                    <Wand2 className="mr-2 h-4 w-4" />
-                                    Generate Test Steps
-                                </>
+                                {isGenerating ? (
+                                    <>
+                                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                        Generating...
+                                    </>
+                                ) : (
+                                    <>
+                                        <Wand2 className="mr-2 h-4 w-4" />
+                                        Generate Test Steps
+                                    </>
+                                )}
+                            </Button>
+                            {prompt && (
+                                <p className="text-xs text-muted-foreground ml-auto self-center max-w-[200px] truncate">
+                                    Input: &quot;{prompt.split("\n")[0]}&quot;
+                                </p>
                             )}
-                        </Button>
-                        {prompt && (
-                            <p className="text-xs text-muted-foreground ml-auto self-center max-w-[200px] truncate">
-                                Input: &quot;{prompt.split("\n")[0]}&quot;
-                            </p>
-                        )}
-                    </div>
-                </CardContent>
-            </Card>
+                        </div>
+                    </CardContent>
+                </Card>
+            )}
 
             {/* ── Flow Arrow ──────────────────────────────────────────────── */}
             <div className="flex justify-center -my-1">
