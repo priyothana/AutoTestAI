@@ -25,24 +25,32 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 class PlaywrightService:
     @staticmethod
-    async def _first_visible(locator, logger, description=""):
-        """Find the first visible element from a multi-match locator."""
+    async def _first_visible(locator, logger, description="", max_wait_ms=3000):
+        """Wait briefly and find the first visible element from a multi-match locator."""
+        import asyncio as _aio
+        
         count = await locator.count()
         if count == 0:
             return locator.first  # will fail with clear error at wait_for
         if count == 1:
-            return locator.first
-        # Multiple matches — find the first visible one
-        for i in range(count):
-            el = locator.nth(i)
-            try:
-                if await el.is_visible():
-                    logger.info(f"  → Found visible match at index {i}/{count} for {description}")
-                    return el
-            except Exception:
-                continue
-        # No visible element found — return first and let caller handle timeout
-        logger.warning(f"  ⚠ No visible element found among {count} matches for {description}")
+            return locator.first  # let caller's wait_for handle visibility
+            
+        # Multiple matches — poll until one becomes visible (for animating modals)
+        start = datetime.utcnow()
+        while (datetime.utcnow() - start).total_seconds() * 1000 < max_wait_ms:
+            count = await locator.count()
+            for i in range(count):
+                el = locator.nth(i)
+                try:
+                    if await el.is_visible():
+                        logger.info(f"  → Found visible match at index {i}/{count} for {description}")
+                        return el
+                except Exception:
+                    continue
+            await _aio.sleep(0.5)
+            
+        # No visible element found after polling — return first and let caller handle timeout
+        logger.warning(f"  ⚠ No visible element found after {max_wait_ms}ms among {count} matches for {description}")
         return locator.first
 
     @staticmethod
@@ -77,12 +85,70 @@ class PlaywrightService:
             if role_match:
                 role = role_match.group(1).strip()
                 name = role_match.group(2).strip()
-                locator = page.get_by_role(role, name=name, exact=False)
-                logger.info(f"  → Resolved via get_by_role('{role}', name='{name}')")
-                return await PlaywrightService._first_visible(locator, logger, f"role={role}, name={name}")
+                
+                # Check original role first
+                loc = page.get_by_role(role, name=name, exact=False)
+                if await loc.count() > 0:
+                    vis_loc = await PlaywrightService._first_visible(loc, logger, f"role={role}, name={name}")
+                    try:
+                        if await vis_loc.is_visible():
+                            logger.info(f"  → Resolved via get_by_role('{role}', name='{name}')")
+                            return vis_loc
+                    except Exception:
+                        pass
+                
+                # Salesforce Fallbacks
+                logger.info(f"  ℹ Strict role '{role}' failed or not visible. Trying fallbacks for name='{name}'")
+                
+                # Try alternative roles (button <-> link <-> menuitem)
+                alt_roles = ["button", "link", "menuitem", "tab"]
+                for alt_role in alt_roles:
+                    if alt_role == role: continue
+                    alt_loc = page.get_by_role(alt_role, name=name, exact=False)
+                    if await alt_loc.count() > 0:
+                        vis_alt = await PlaywrightService._first_visible(alt_loc, logger, f"fallback role={alt_role}, name={name}")
+                        try:
+                            if await vis_alt.is_visible():
+                                logger.info(f"  → Resolved via fallback get_by_role('{alt_role}', name='{name}')")
+                                return vis_alt
+                        except Exception:
+                            pass
+
+                # Try exact/substring text
+                try:
+                    text_loc = page.get_by_text(name, exact=True)
+                    if await text_loc.count() > 0:
+                        vis_text = await PlaywrightService._first_visible(text_loc, logger, f"fallback exact text='{name}'")
+                        try:
+                            if await vis_text.is_visible():
+                                logger.info(f"  → Resolved via fallback exact text: '{name}'")
+                                return vis_text
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Try title attribute (very common in Salesforce actions)
+                try:
+                    title_loc = page.locator(f"[title~='{name}']")
+                    if await title_loc.count() > 0:
+                        vis_title = await PlaywrightService._first_visible(title_loc, logger, f"fallback title~='{name}'")
+                        try:
+                            if await vis_title.is_visible():
+                                logger.info(f"  → Resolved via fallback title: '{name}'")
+                                return vis_title
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # If all fail, return the original to show standard error trace
+                logger.warning(f"  ⚠ All role fallbacks failed. Returning original role locator to wait/fail naturally.")
+                return page.get_by_role(role, name=name, exact=False).first
+
             else:
                 logger.warning(f"  ⚠ Could not parse role target: '{target}', trying as CSS")
-                return page.locator(target)
+                return page.locator(target).first
 
         elif locator_type == "label":
             # ── SALESFORCE LIGHTNING FORM FIELD RESOLUTION ──
@@ -179,9 +245,84 @@ class PlaywrightService:
                 except Exception:
                     pass
 
-            # Final fallback: full-page get_by_label with original target
+                # Strategy 5: Salesforce Lightning date / special input fields
+                # Lightning Web Components use Shadow DOM that get_by_label CANNOT pierce.
+                # Return immediately if found — element may be scrolled out of modal viewport
+                # and is_visible() would incorrectly return false. Playwright's wait_for + fill
+                # will auto-scroll it into view.
+                try:
+                    component_locators = [
+                        page.locator("lightning-datepicker").filter(has_text=label_target).locator("input"),
+                        page.locator("lightning-input").filter(has_text=label_target).locator("input"),
+                        page.locator("lightning-input-field").filter(has_text=label_target).locator("input"),
+                        page.locator(".slds-form-element").filter(has_text=label_target).locator("input"),
+                        page.locator(f"input[name='{label_target}']"),
+                        page.locator(f"input[aria-label='{label_target}']"),
+                    ]
+                    
+                    for loc in component_locators:
+                        try:
+                            if await loc.count() > 0:
+                                logger.info(f"  → Found via shadow-piercing component for '{label_target}' (count={await loc.count()})")
+                                return loc.first
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # Strategy 6: JavaScript shadow DOM traversal (last resort before fallback)
+                # This can find inputs inside CLOSED shadow roots that no CSS/XPath can pierce
+                try:
+                    js_handle = await page.evaluate_handle("""(labelText) => {
+                        function findInShadow(root, text) {
+                            // Check labels in this root
+                            const labels = root.querySelectorAll ? root.querySelectorAll('label, span.slds-form-element__label') : [];
+                            for (const label of labels) {
+                                if (label.textContent && label.textContent.trim().includes(text)) {
+                                    // Found the label — now find the nearest input
+                                    const parent = label.closest('lightning-input-field, lightning-input, lightning-datepicker, .slds-form-element') || label.parentElement;
+                                    if (parent) {
+                                        const input = parent.querySelector('input');
+                                        if (input) return input;
+                                    }
+                                    // Try next sibling or following elements
+                                    let el = label;
+                                    while (el = el.nextElementSibling) {
+                                        const inp = el.tagName === 'INPUT' ? el : el.querySelector && el.querySelector('input');
+                                        if (inp) return inp;
+                                    }
+                                }
+                            }
+                            // Recurse into shadow roots
+                            const allElements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                            for (const el of allElements) {
+                                if (el.shadowRoot) {
+                                    const found = findInShadow(el.shadowRoot, text);
+                                    if (found) return found;
+                                }
+                            }
+                            return null;
+                        }
+                        // Search from the visible modal first, then the whole document
+                        const modal = document.querySelector('div.modal-body, div.slds-modal__content, section.slds-modal, records-record-edit-form');
+                        if (modal) {
+                            const found = findInShadow(modal, labelText);
+                            if (found) return found;
+                        }
+                        return findInShadow(document, labelText);
+                    }""", label_target)
+                    
+                    if js_handle:
+                        el = js_handle.as_element()
+                        if el:
+                            logger.info(f"  → Resolved '{label_target}' via JS shadow DOM traversal")
+                            return el
+                except Exception as js_err:
+                    logger.warning(f"  ⚠ JS shadow traversal failed for '{label_target}': {js_err}")
+
+            # Final fallback: full-page get_by_label with original target (relaxed match)
             logger.warning(f"  ⚠ All label strategies failed for '{target}', returning get_by_label fallback")
-            return page.get_by_label(target, exact=True).first
+            return page.get_by_label(target, exact=False).first
 
         elif locator_type == "text":
             locator = page.get_by_text(target, exact=False)
@@ -553,11 +694,19 @@ class PlaywrightService:
                                 except Exception:
                                     pass
                                 import asyncio as _aio
-                                await _aio.sleep(2)  # Salesforce SPA needs time to initialize Lightning components
+                                await _aio.sleep(4)  # Salesforce SPA needs time to initialize Lightning components
 
                             elif action == "click":
                                 locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
-                                await locator.wait_for(state="visible", timeout=15000)
+                                try:
+                                    await locator.wait_for(state="visible", timeout=15000)
+                                except Exception:
+                                    # Retry: Salesforce Lightning components may render late
+                                    import asyncio as _aio
+                                    logger.info(f"  ℹ Element not visible yet, waiting 3s and retrying...")
+                                    await _aio.sleep(3)
+                                    locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
+                                    await locator.wait_for(state="visible", timeout=15000)
                                 await locator.click(timeout=15000)
 
                                 # Smart post-click waits for Salesforce
@@ -586,39 +735,33 @@ class PlaywrightService:
 
                             elif action in ["fill", "input", "type"]:
                                 import asyncio as _aio
-                                await _aio.sleep(0.5)  # Brief pause for Salesforce input focus readiness
+                                await _aio.sleep(0.3)
                                 locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
+
+                                # Ensure element exists in DOM
+                                await locator.wait_for(state="attached", timeout=15000)
+
+                                # Scroll into view (important for Salesforce modals)
+                                try:
+                                    await locator.scroll_into_view_if_needed(timeout=5000)
+                                except Exception:
+                                    pass
+
                                 await locator.wait_for(state="visible", timeout=15000)
 
+                                # Fill safely for Salesforce inputs
                                 try:
                                     await locator.fill(value or "", timeout=15000)
-                                except Exception as fill_err:
-                                    err_msg = str(fill_err)
-                                    if "Element is not an" in err_msg or "not fillable" in err_msg.lower():
-                                        # Resolved element is a container (e.g. <div role="group">), not a form input
-                                        logger.info(f"  ℹ Element is not fillable, looking for input/textarea inside")
-                                        inner = locator.locator("input:not([type='file']):not([type='hidden']), textarea, [contenteditable='true']")
-                                        filled = False
-                                        if await inner.count() > 0:
-                                            for idx in range(await inner.count()):
-                                                el = inner.nth(idx)
-                                                try:
-                                                    if await el.is_visible():
-                                                        await el.fill(value or "", timeout=10000)
-                                                        filled = True
-                                                        logger.info(f"  → Filled via inner element at index {idx}")
-                                                        break
-                                                except Exception:
-                                                    continue
-                                        if not filled:
-                                            # Non-text field (signature pad, file upload) — skip gracefully
-                                            logger.warning(f"  ⚠ Field '{target}' is a non-text component, skipping fill")
-                                            step_results[index]["status"] = "passed"
-                                            step_results[index]["note"] = f"Skipped: '{target}' is a non-text component"
-                                            step_results[index]["completed_at"] = datetime.utcnow().isoformat()
-                                            continue
-                                    else:
-                                        raise  # Re-raise other errors
+                                except Exception:
+                                    # Fallback: simulate real keyboard input (works with Lightning date pickers)
+                                    logger.info(f"  ℹ fill() failed, using keyboard typing fallback")
+                                    await locator.click(timeout=5000)
+                                    await locator.press("Control+A")
+                                    await locator.type(value or "", delay=50)
+
+                                # Tab out to close any datepicker/dropdown
+                                await page.keyboard.press("Tab")
+                                await _aio.sleep(0.3)
 
                             elif action == "assert_text":
                                 # Determine expected text: use value if set, otherwise target IS the text to find

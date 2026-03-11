@@ -92,16 +92,83 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const [limitsLoading, setLimitsLoading] = useState(false)
     const [mcpSyncing, setMcpSyncing] = useState(false)
 
+    // Jira Integration
+    const [jiraConfig, setJiraConfig] = useState<any>(null)
+    const [jiraConfigLoading, setJiraConfigLoading] = useState(false)
+    const [jiraDomain, setJiraDomain] = useState("")
+    const [jiraEmail, setJiraEmail] = useState("")
+    const [jiraApiToken, setJiraApiToken] = useState("")
+    const [jiraConnecting, setJiraConnecting] = useState(false)
+    const [jiraConnected, setJiraConnected] = useState(false)
+    const [jiraBoards, setJiraBoards] = useState<{id: string; name: string}[]>([])
+    const [selectedJiraBoard, setSelectedJiraBoard] = useState("")
+    const [selectedJiraBoardName, setSelectedJiraBoardName] = useState("")
+    const [jiraSaving, setJiraSaving] = useState(false)
+    const [jiraReconfiguring, setJiraReconfiguring] = useState(false)
+
     useEffect(() => {
         if (id) {
             fetchProject()
             fetchIntegration()
+            fetchJiraConfig()
         }
         const connected = searchParams.get("connected")
         if (connected === "salesforce") toast.success("Salesforce connected & metadata sync started!")
         const error = searchParams.get("error")
         if (error) toast.error(`Connection error: ${error}`)
     }, [id])
+
+    const fetchJiraConfig = async () => {
+        setJiraConfigLoading(true)
+        try {
+            const res = await fetch(`http://localhost:8000/api/v1/jira/projects/${id}/config`)
+            if (res.ok) {
+                const data = await res.json()
+                if (data.configured) setJiraConfig(data)
+            }
+        } catch (e) { console.error("Failed to fetch Jira config:", e) }
+        finally { setJiraConfigLoading(false) }
+    }
+
+    const handleJiraConnect = async () => {
+        if (!jiraDomain || !jiraEmail || !jiraApiToken) { toast.error("Please fill in all Jira fields"); return }
+        setJiraConnecting(true)
+        try {
+            const connectRes = await fetch("http://localhost:8000/api/v1/jira/connect", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
+            })
+            if (!connectRes.ok) { const err = await connectRes.json().catch(() => ({})); throw new Error(err.detail || "Connection failed") }
+            const boardsRes = await fetch("http://localhost:8000/api/v1/jira/boards", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
+            })
+            if (!boardsRes.ok) { const err = await boardsRes.json().catch(() => ({})); throw new Error(err.detail || "Failed to fetch boards") }
+            const data = await boardsRes.json()
+            const boards = data.boards || []
+            setJiraBoards(boards)
+            setJiraConnected(true)
+            if (boards.length > 0) { setSelectedJiraBoard(boards[0].id); setSelectedJiraBoardName(boards[0].name) }
+            toast.success("Connected to Jira!")
+        } catch (error: any) { toast.error(error.message || "Jira connection failed") }
+        finally { setJiraConnecting(false) }
+    }
+
+    const handleSaveJiraConfig = async () => {
+        if (!selectedJiraBoard) { toast.error("Select a board first"); return }
+        setJiraSaving(true)
+        try {
+            const res = await fetch(`http://localhost:8000/api/v1/jira/projects/${id}/config`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken, board_id: selectedJiraBoard, board_name: selectedJiraBoardName }),
+            })
+            if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || "Save failed") }
+            toast.success("Jira configuration saved!")
+            setJiraReconfiguring(false)
+            fetchJiraConfig()
+        } catch (error: any) { toast.error(error.message || "Failed to save") }
+        finally { setJiraSaving(false) }
+    }
 
     const fetchProject = async () => {
         try {
@@ -383,7 +450,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                         <TabsTrigger value="mcp-ops"><Database className="mr-2 h-4 w-4" /> MCP Operations</TabsTrigger>
                     )}
                     <TabsTrigger value="tests"><FileText className="mr-2 h-4 w-4" /> Test Cases</TabsTrigger>
-                    <TabsTrigger value="settings"><Settings className="mr-2 h-4 w-4" /> Settings</TabsTrigger>
+                    <TabsTrigger value="settings"><Settings className="mr-2 h-4 w-4" /> Jira Integration</TabsTrigger>
                 </TabsList>
 
                 {/* Overview Tab */}
@@ -896,8 +963,106 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                 {/* Settings Tab */}
                 <TabsContent value="settings" className="space-y-4">
                     <Card>
-                        <CardHeader><CardTitle>Project Settings</CardTitle><CardDescription>Configure project settings and preferences</CardDescription></CardHeader>
-                        <CardContent><p className="text-sm text-muted-foreground">Settings panel coming soon...</p></CardContent>
+                        <CardHeader><CardTitle>Jira Integration</CardTitle><CardDescription>Configure Jira connection for this project</CardDescription></CardHeader>
+                        <CardContent><p className="text-sm text-muted-foreground">General settings coming soon...</p></CardContent>
+                    </Card>
+
+                    {/* Jira Integration Card */}
+                    <Card className="border-purple-200 dark:border-purple-900">
+                        <CardHeader>
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                    <svg className="h-5 w-5 text-purple-600" viewBox="0 0 24 24" fill="currentColor">
+                                        <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83H6.77zM2 11.6a4.35 4.35 0 0 0 4.34 4.34h1.8v1.72A4.35 4.35 0 0 0 12.48 22v-9.57a.84.84 0 0 0-.84-.84H2z" />
+                                    </svg>
+                                    <CardTitle>Jira Integration</CardTitle>
+                                </div>
+                                {jiraConfig && !jiraReconfiguring && (
+                                    <Button variant="outline" size="sm" onClick={() => setJiraReconfiguring(true)}>
+                                        <Settings className="mr-2 h-4 w-4" /> Reconfigure
+                                    </Button>
+                                )}
+                            </div>
+                            <CardDescription>Connect Jira to import user stories when creating test cases</CardDescription>
+                        </CardHeader>
+                        <CardContent>
+                            {jiraConfigLoading ? (
+                                <div className="flex justify-center py-4"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
+                            ) : jiraConfig && !jiraReconfiguring ? (
+                                <div className="space-y-3">
+                                    <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800 rounded-md">
+                                        <Check className="h-4 w-4 text-green-600" />
+                                        <span className="text-sm text-green-700 dark:text-green-400 font-medium">Jira Connected</span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-4">
+                                        <div>
+                                            <p className="text-sm font-medium text-muted-foreground">Domain</p>
+                                            <p className="text-sm">{jiraConfig.jira_domain}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-medium text-muted-foreground">Email</p>
+                                            <p className="text-sm">{jiraConfig.jira_email}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-medium text-muted-foreground">Board</p>
+                                            <p className="text-sm font-medium">{jiraConfig.jira_board_name}</p>
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-medium text-muted-foreground">Board ID</p>
+                                            <p className="text-sm font-mono">{jiraConfig.jira_board_id}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    {!jiraConnected ? (
+                                        <div className="grid gap-4 max-w-lg">
+                                            <div>
+                                                <label className={labelClass}>Jira Domain</label>
+                                                <input type="text" placeholder="https://yourcompany.atlassian.net" value={jiraDomain} onChange={(e) => setJiraDomain(e.target.value)} className={inputClass} />
+                                            </div>
+                                            <div>
+                                                <label className={labelClass}>Email</label>
+                                                <input type="email" placeholder="you@company.com" value={jiraEmail} onChange={(e) => setJiraEmail(e.target.value)} className={inputClass} />
+                                            </div>
+                                            <div>
+                                                <label className={labelClass}>API Token</label>
+                                                <input type="password" placeholder="Enter your Jira API token" value={jiraApiToken} onChange={(e) => setJiraApiToken(e.target.value)} className={inputClass} />
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <Button onClick={handleJiraConnect} disabled={jiraConnecting || !jiraDomain || !jiraEmail || !jiraApiToken} className="bg-purple-600 hover:bg-purple-700">
+                                                    {jiraConnecting ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</> : <><Link2 className="mr-2 h-4 w-4" />Connect & Fetch Boards</>}
+                                                </Button>
+                                                {jiraReconfiguring && (
+                                                    <Button variant="outline" onClick={() => setJiraReconfiguring(false)}>Cancel</Button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="grid gap-4 max-w-lg">
+                                            <div className="flex items-center gap-2">
+                                                <Check className="h-4 w-4 text-green-600" />
+                                                <span className="text-sm text-green-700 dark:text-green-400 font-medium">Connected to Jira</span>
+                                            </div>
+                                            <div>
+                                                <label className={labelClass}>Select Board</label>
+                                                <select value={selectedJiraBoard} onChange={(e) => { setSelectedJiraBoard(e.target.value); const b = jiraBoards.find(x => x.id === e.target.value); setSelectedJiraBoardName(b?.name || "") }} className={inputClass + " cursor-pointer"}>
+                                                    {jiraBoards.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
+                                                </select>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <Button onClick={handleSaveJiraConfig} disabled={jiraSaving || !selectedJiraBoard} className="bg-purple-600 hover:bg-purple-700">
+                                                    {jiraSaving ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Saving...</> : <><Check className="mr-2 h-4 w-4" />Save Jira Configuration</>}
+                                                </Button>
+                                                {jiraReconfiguring && (
+                                                    <Button variant="outline" onClick={() => { setJiraReconfiguring(false); setJiraConnected(false) }}>Cancel</Button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </CardContent>
                     </Card>
                 </TabsContent>
             </Tabs>

@@ -313,3 +313,61 @@ class IntegrationService:
             integration.last_synced_at = datetime.utcnow()
         await db.commit()
         await db.refresh(integration)
+
+    # ─── Jira Integration helpers ────────────
+
+    @staticmethod
+    async def save_jira_config(
+        db: AsyncSession,
+        project_id: UUID,
+        domain: str,
+        email: str,
+        token: str,
+        board_id: str,
+        board_name: str,
+    ) -> ProjectIntegration:
+        """Save (or update) Jira configuration on the project's integration."""
+        existing = await IntegrationService.get_integration(db, project_id)
+
+        if existing:
+            existing.jira_domain = domain
+            existing.jira_email = email
+            existing.jira_token = _encrypt(token)
+            existing.jira_board_id = board_id
+            existing.jira_board_name = board_name
+            await db.commit()
+            await db.refresh(existing)
+            return existing
+
+        # No integration yet — create a minimal one just for Jira
+        integration = ProjectIntegration(
+            project_id=project_id,
+            category="web_app",
+            status="disconnected",
+            jira_domain=domain,
+            jira_email=email,
+            jira_token=_encrypt(token),
+            jira_board_id=board_id,
+            jira_board_name=board_name,
+        )
+        db.add(integration)
+        await db.commit()
+        await db.refresh(integration)
+        return integration
+
+    @staticmethod
+    async def get_jira_config(
+        db: AsyncSession, project_id: UUID
+    ) -> Optional[dict]:
+        """Return decrypted Jira configuration for a project, or None."""
+        integration = await IntegrationService.get_integration(db, project_id)
+        if not integration or not integration.jira_domain:
+            return None
+        return {
+            "jira_domain": integration.jira_domain,
+            "jira_email": integration.jira_email,
+            "jira_token": _decrypt(integration.jira_token),
+            "jira_board_id": integration.jira_board_id,
+            "jira_board_name": integration.jira_board_name,
+        }
+
