@@ -85,17 +85,24 @@ class RAGService:
             return []
 
         # Compute similarities
-        scored: List[Tuple[float, str]] = []
+        scored: List[Tuple[float, str, str]] = []
         for vec in all_embeddings:
             stored_embedding = vec.embedding_vector
             if not stored_embedding:
                 continue
             similarity = cosine_similarity(query_embedding, stored_embedding)
-            scored.append((similarity, vec.text_chunk))
+            chunk_type = getattr(vec, "chunk_type", "metadata") or "metadata"
+            scored.append((similarity, vec.text_chunk, chunk_type))
 
         # Sort by similarity (highest first) and take top-K
         scored.sort(key=lambda x: x[0], reverse=True)
-        top_chunks = [chunk for _, chunk in scored[:top_k]]
+        top_results = scored[:top_k]
+        top_chunks = [chunk for _, chunk, _ in top_results]
+
+        # Track chunk source breakdown for logging
+        chunk_sources: Dict[str, int] = {}
+        for _, _, ct in top_results:
+            chunk_sources[ct] = chunk_sources.get(ct, 0) + 1
 
         # Log the query and results
         try:
@@ -104,37 +111,115 @@ class RAGService:
                 test_case_id=test_case_id,
                 query_text=query_text,
                 retrieved_chunks=[
-                    {"rank": i + 1, "similarity": round(scored[i][0], 4), "chunk_preview": scored[i][1][:200]}
+                    {
+                        "rank": i + 1,
+                        "similarity": round(scored[i][0], 4),
+                        "chunk_preview": scored[i][1][:200],
+                        "chunk_type": scored[i][2],
+                    }
                     for i in range(min(top_k, len(scored)))
                 ],
+                chunk_sources=chunk_sources if chunk_sources else None,
             )
             db.add(log_entry)
             await db.commit()
         except Exception as e:
             logger.warning(f"Failed to log RAG query: {e}")
 
-        logger.info(f"RAG retrieved {len(top_chunks)} chunks for query: '{query_text[:80]}...'")
+        logger.info(
+            f"RAG retrieved {len(top_chunks)} chunks for query: '{query_text[:80]}...' "
+            f"(sources: {chunk_sources})"
+        )
         return top_chunks
 
     @staticmethod
-    async def build_rag_context(chunks: List[str]) -> str:
+    async def build_rag_context(
+        chunks: List[str],
+        categorize: bool = True,
+    ) -> str:
         """
         Format retrieved chunks into a context string for the LLM prompt.
+
+        When categorize=True (default), chunks are organized into three sections:
+          - SALESFORCE METADATA
+          - FIELD INTERACTION RULES
+          - SUCCESSFUL EXECUTION PATTERNS
+
+        When categorize=False, chunks are listed sequentially (original behavior).
         """
         if not chunks:
             return ""
 
-        context_parts = [
-            "=== SALESFORCE ORG METADATA CONTEXT (Retrieved via RAG) ===",
-            "Use the following metadata to generate accurate, org-specific Playwright test steps.",
-            "This metadata describes the actual Salesforce objects, fields, flows, and components in the org.",
-            "",
-        ]
+        if not categorize:
+            # Original behavior — flat list of chunks
+            context_parts = [
+                "=== SALESFORCE ORG METADATA CONTEXT (Retrieved via RAG) ===",
+                "Use the following metadata to generate accurate, org-specific Playwright test steps.",
+                "This metadata describes the actual Salesforce objects, fields, flows, and components in the org.",
+                "",
+            ]
+            for i, chunk in enumerate(chunks, 1):
+                context_parts.append(f"--- Relevant Context #{i} ---")
+                context_parts.append(chunk)
+                context_parts.append("")
+            context_parts.append("=== END OF METADATA CONTEXT ===")
+            return "\n".join(context_parts)
 
-        for i, chunk in enumerate(chunks, 1):
-            context_parts.append(f"--- Relevant Context #{i} ---")
-            context_parts.append(chunk)
+        # Categorized mode — separate metadata from execution learning
+        metadata_chunks = []
+        field_rule_chunks = []
+        success_pattern_chunks = []
+
+        for chunk in chunks:
+            chunk_lower = chunk.lower()
+            if chunk_lower.startswith("field behavior rules"):
+                field_rule_chunks.append(chunk)
+            elif chunk_lower.startswith("successful test execution pattern"):
+                success_pattern_chunks.append(chunk)
+            elif chunk_lower.startswith("failure correction pattern"):
+                field_rule_chunks.append(chunk)
+            else:
+                metadata_chunks.append(chunk)
+
+        context_parts = []
+
+        # Section 1: Salesforce Metadata
+        if metadata_chunks:
+            context_parts.append("=== SALESFORCE METADATA ===")
+            context_parts.append(
+                "Use the following metadata to generate accurate, org-specific Playwright test steps."
+            )
             context_parts.append("")
+            for i, chunk in enumerate(metadata_chunks, 1):
+                context_parts.append(f"--- Metadata #{i} ---")
+                context_parts.append(chunk)
+                context_parts.append("")
 
-        context_parts.append("=== END OF METADATA CONTEXT ===")
+        # Section 2: Field Interaction Rules (from failure corrections + field behaviors)
+        if field_rule_chunks:
+            context_parts.append("=== FIELD INTERACTION RULES ===")
+            context_parts.append(
+                "The following rules were learned from past test executions. "
+                "Apply these when generating test steps to avoid known failures."
+            )
+            context_parts.append("")
+            for i, chunk in enumerate(field_rule_chunks, 1):
+                context_parts.append(f"--- Rule #{i} ---")
+                context_parts.append(chunk)
+                context_parts.append("")
+
+        # Section 3: Successful Execution Patterns
+        if success_pattern_chunks:
+            context_parts.append("=== SUCCESSFUL EXECUTION PATTERNS ===")
+            context_parts.append(
+                "The following patterns were successful in past test executions. "
+                "Use these as reference for generating similar test steps."
+            )
+            context_parts.append("")
+            for i, chunk in enumerate(success_pattern_chunks, 1):
+                context_parts.append(f"--- Pattern #{i} ---")
+                context_parts.append(chunk)
+                context_parts.append("")
+
+        context_parts.append("=== END OF RAG CONTEXT ===")
         return "\n".join(context_parts)

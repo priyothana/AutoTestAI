@@ -10,7 +10,9 @@ Supports session management for Salesforce projects:
   - Auto-refreshes expired sessions
 """
 from playwright.async_api import async_playwright
+from app.services.salesforce_engine import SalesforceLightningEngine
 from datetime import datetime
+import asyncio
 import json
 import os
 import logging
@@ -52,6 +54,207 @@ class PlaywrightService:
         # No visible element found after polling — return first and let caller handle timeout
         logger.warning(f"  ⚠ No visible element found after {max_wait_ms}ms among {count} matches for {description}")
         return locator.first
+
+    @staticmethod
+    async def _safe_click(page, locator, logger, timeout=20000):
+        """Salesforce-safe click: page-load aware → scroll → visible → click.
+        Waits for page to finish loading before declaring element absent."""
+        # Quick DOM check (8s)
+        try:
+            await locator.wait_for(state="attached", timeout=8000)
+        except Exception:
+            logger.info("  ℹ Element not in DOM after 8s — checking if page is still loading...")
+
+            # Wait for page to finish loading (VF pages, PDFs, iframes)
+            for wait_round in range(6):  # up to 18s more
+                try:
+                    load_info = await page.evaluate("""() => ({
+                        ready: document.readyState === 'complete',
+                        spinner: !!document.querySelector(
+                            '.slds-spinner:not(.slds-hide), lightning-spinner, .forceSpinner'
+                        )
+                    })""")
+                    page_done = load_info.get("ready", True) and not load_info.get("spinner", False)
+                except Exception:
+                    page_done = True
+
+                if page_done and wait_round > 0:
+                    break
+                await asyncio.sleep(3)
+                # Re-check element
+                try:
+                    await locator.wait_for(state="attached", timeout=2000)
+                    logger.info(f"  → Element appeared after page load wait ({(wait_round+1)*3}s)")
+                    break
+                except Exception:
+                    continue
+            else:
+                # Final attempt
+                try:
+                    await locator.wait_for(state="attached", timeout=5000)
+                except Exception:
+                    raise Exception("Element not found in DOM after page fully loaded")
+        try:
+            await locator.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+        await locator.wait_for(state="visible", timeout=10000)
+        await locator.click(timeout=10000)
+        logger.info("  → safe_click succeeded")
+
+    @staticmethod
+    async def _retry_action(action, logger, retries=3, delay=2):
+        """Retry an async action up to `retries` times with a sleep between each."""
+        last_err = None
+        for attempt in range(retries):
+            try:
+                return await action()
+            except Exception as e:
+                last_err = e
+                if attempt < retries - 1:
+                    logger.info(f"  ℹ Attempt {attempt+1}/{retries} failed, retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+        raise last_err
+
+    @staticmethod
+    async def _scan_page_elements(page, logger):
+        """Scan the current page/modal for interactive elements (debug aid)."""
+        try:
+            scan = await page.evaluate("""() => {
+                const modal = document.querySelector(
+                    '.slds-modal__content, records-record-edit-form, lightning-record-edit-form, section.slds-modal'
+                );
+                const root = modal || document.body;
+                const buttons = [...root.querySelectorAll('button, a[role=button], [role=button]')]
+                    .filter(b => b.offsetParent !== null)
+                    .map(b => b.textContent?.trim()).filter(Boolean).slice(0, 15);
+                const inputs = [...root.querySelectorAll('input:not([type=hidden]), textarea, [contenteditable=true]')]
+                    .filter(i => i.offsetParent !== null)
+                    .map(i => i.getAttribute('aria-label') || i.getAttribute('name') || i.getAttribute('placeholder') || i.type)
+                    .filter(Boolean).slice(0, 20);
+                const picklists = [...root.querySelectorAll('lightning-combobox, lightning-picklist, select')]
+                    .filter(p => p.offsetParent !== null).length;
+                const hasModal = !!document.querySelector('.slds-modal, records-record-edit-form, lightning-record-edit-form');
+                return { buttons, inputs, picklists, hasModal };
+            }""")
+            logger.info(f"  📋 Page scan: buttons={scan.get('buttons', [])}, inputs={scan.get('inputs', [])}, picklists={scan.get('picklists', 0)}, modal={scan.get('hasModal', False)}")
+            return scan
+        except Exception as e:
+            logger.debug(f"  Page scan failed: {e}")
+            return {}
+
+    @staticmethod
+    async def _fill_salesforce_field(page, label, value, logger):
+        """Try to fill a Salesforce Lightning field by component type.
+        Returns True if successful, False otherwise.
+        Handles: lightning-input-field, lightning-datepicker, lightning-combobox, etc.
+        Scrolls the modal container to reveal off-screen fields."""
+
+        # Step 1: Scroll the modal container to bring the field into view
+        # Fields at the bottom of long forms (like field 11/12) are off-screen
+        try:
+            await page.evaluate("""(labelText) => {
+                const modal = document.querySelector('.slds-modal__content, div.modal-body, records-record-edit-form');
+                if (modal) {
+                    // Find the label element containing our text
+                    const labels = [...modal.querySelectorAll('label, span.slds-form-element__label, legend')];
+                    const target = labels.find(l => l.textContent && l.textContent.trim().includes(labelText));
+                    if (target) {
+                        target.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    } else {
+                        // Label not found yet — scroll modal down to reveal more fields
+                        modal.scrollTop = modal.scrollHeight;
+                    }
+                }
+            }""", label)
+            await asyncio.sleep(0.5)
+        except Exception as scroll_err:
+            logger.debug(f"  Modal scroll for '{label}' failed: {scroll_err}")
+
+        # Step 2: Try Lightning component selectors (CSS-based)
+        strategies = [
+            # Lightning date picker (label is outside the input, inside parent)
+            (f"lightning-input-field:has-text('{label}') input", "input-field"),
+            (f"lightning-datepicker:has-text('{label}') input", "datepicker"),
+            (f"lightning-input:has-text('{label}') input", "input"),
+            (f"lightning-combobox:has-text('{label}') input", "combobox"),
+            # Aria / name fallbacks
+            (f"input[aria-label='{label}']", "aria-label"),
+            (f"input[name='{label}']", "name-attr"),
+        ]
+
+        for selector, comp_type in strategies:
+            try:
+                locator = page.locator(selector)
+                if await locator.count() == 0:
+                    continue
+                el = locator.first
+                await el.scroll_into_view_if_needed(timeout=5000)
+                await el.click(timeout=5000)
+                # For date pickers: select all and type, then Tab to commit
+                if comp_type in ("datepicker", "input-field"):
+                    # Lightning date fields need click+type approach
+                    await el.press("Control+A")
+                    await el.type(value or "", delay=50)
+                    await page.keyboard.press("Tab")
+                else:
+                    await el.fill(value or "", timeout=10000)
+                    await page.keyboard.press("Tab")
+                logger.info(f"  → _fill_salesforce_field: filled '{label}' via {comp_type} ({selector})")
+                return True
+            except Exception as e:
+                logger.debug(f"  _fill_salesforce_field: {comp_type} failed for '{label}': {e}")
+                continue
+
+        # Step 3: JavaScript-based discovery (handles shadow DOM and complex structures)
+        # Find the input by traversing the DOM from the label text
+        try:
+            js_found = await page.evaluate("""(args) => {
+                const [labelText, fillValue] = args;
+                const modal = document.querySelector('.slds-modal__content, records-record-edit-form') || document.body;
+                
+                // Find all elements containing our label text
+                const allElements = [...modal.querySelectorAll('*')];
+                let targetInput = null;
+                
+                for (const el of allElements) {
+                    // Check if this element's DIRECT text content includes our label
+                    if (el.textContent && el.textContent.trim().includes(labelText)) {
+                        // Look for the closest form element container
+                        const formEl = el.closest('lightning-input-field, lightning-datepicker, lightning-input, .slds-form-element');
+                        if (formEl) {
+                            targetInput = formEl.querySelector('input:not([type=hidden]), textarea');
+                            if (targetInput) break;
+                        }
+                    }
+                }
+                
+                if (!targetInput) return false;
+                
+                // Scroll it into view
+                targetInput.scrollIntoView({ behavior: 'instant', block: 'center' });
+                
+                // Set value via native setter to trigger Lightning data binding
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeInputValueSetter.call(targetInput, fillValue);
+                targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+                targetInput.dispatchEvent(new Event('change', { bubbles: true }));
+                targetInput.dispatchEvent(new Event('blur', { bubbles: true }));
+                
+                return true;
+            }""", [label, value or ""])
+
+            if js_found:
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.3)
+                logger.info(f"  → _fill_salesforce_field: filled '{label}' via JS DOM traversal")
+                return True
+        except Exception as js_err:
+            logger.debug(f"  _fill_salesforce_field: JS traversal failed for '{label}': {js_err}")
+
+        return False
 
     @staticmethod
     async def _resolve_locator(page, target, locator_type, logger):
@@ -144,6 +347,31 @@ class PlaywrightService:
 
                 # If all fail, return the original to show standard error trace
                 logger.warning(f"  ⚠ All role fallbacks failed. Returning original role locator to wait/fail naturally.")
+                
+                # Last resort: try common Salesforce-specific selectors for action buttons
+                sf_selectors = [
+                    f"a[title='{name}']",
+                    f"button[title='{name}']",
+                    f"lightning-button:has-text('{name}')",
+                    f"lightning-button-menu:has-text('{name}')",
+                    f"div[title='{name}']",
+                    f"one-app-nav-bar-item-root:has-text('{name}')",
+                    f"runtime_platform_actions-action-renderer:has-text('{name}')",
+                ]
+                for sf_sel in sf_selectors:
+                    try:
+                        sf_loc = page.locator(sf_sel)
+                        if await sf_loc.count() > 0:
+                            vis_sf = await PlaywrightService._first_visible(sf_loc, logger, f"SF selector: {sf_sel}")
+                            try:
+                                if await vis_sf.is_visible():
+                                    logger.info(f"  → Resolved via SF selector: {sf_sel}")
+                                    return vis_sf
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
+                
                 return page.get_by_role(role, name=name, exact=False).first
 
             else:
@@ -163,6 +391,25 @@ class PlaywrightService:
                     logger.info(f"  ℹ API name detected: '{target}' → also trying label '{clean}'")
 
             for label_target in labels_to_try:
+                # Strategy 0: Lightning component selectors (highest priority for SF fields)
+                # These target the actual <input> inside Lightning Web Components
+                # where get_by_label fails because the label is outside the input.
+                lightning_selectors = [
+                    (f"lightning-input-field:has-text('{label_target}') input", "lightning-input-field"),
+                    (f"lightning-datepicker:has-text('{label_target}') input", "lightning-datepicker"),
+                    (f"lightning-input:has-text('{label_target}') input", "lightning-input"),
+                    (f"lightning-combobox:has-text('{label_target}') input", "lightning-combobox"),
+                    (f"input[aria-label='{label_target}']", "aria-label"),
+                ]
+                for sel, comp_type in lightning_selectors:
+                    try:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0:
+                            logger.info(f"  → Resolved via {comp_type} for '{label_target}' (count={await loc.count()})")
+                            return loc.first
+                    except Exception:
+                        continue
+
                 # Strategy 1: Scope to visible Salesforce modal, then find input by label
                 modal_scopes = [
                     "div.modal-body",
@@ -242,6 +489,15 @@ class PlaywrightService:
                                 return result
                         except Exception:
                             pass
+                except Exception:
+                    pass
+
+                # Strategy 4b: Try name= attribute directly (very common in lightning-input)
+                try:
+                    by_name = page.locator(f"input[name='{label_target}'], textarea[name='{label_target}']")
+                    if await by_name.count() > 0:
+                        logger.info(f"  → Quick win: found via input[name='{label_target}']")
+                        return by_name.first
                 except Exception:
                     pass
 
@@ -453,6 +709,8 @@ class PlaywrightService:
                     context = await browser.new_context()
                     await context.tracing.start(screenshots=True, snapshots=True, sources=True)
                     page = await context.new_page()
+                    page.set_default_timeout(30000)
+                    page.set_default_navigation_timeout(45000)
 
                     try:
                         await page.goto(frontdoor_url, wait_until="domcontentloaded", timeout=30000)
@@ -513,6 +771,8 @@ class PlaywrightService:
                     context = await browser.new_context()
                     await context.tracing.start(screenshots=True, snapshots=True, sources=True)
                     page = await context.new_page()
+                    page.set_default_timeout(30000)
+                    page.set_default_navigation_timeout(45000)
                     try:
                         await page.goto(login_target, wait_until="domcontentloaded", timeout=30000)
                         print(f"[SESSION] On login page: {page.url}")
@@ -565,11 +825,14 @@ class PlaywrightService:
                     print(f"[SESSION] Loading existing session for {project_id}")
                     try:
                         context = await browser.new_context(storage_state=session_path)
+                        # Global timeouts set after page creation below
                     except Exception as e:
                         print(f"[SESSION] Failed to load session: {e}")
                         context = await browser.new_context()
                     await context.tracing.start(screenshots=True, snapshots=True, sources=True)
                     page = await context.new_page()
+                    page.set_default_timeout(30000)
+                    page.set_default_navigation_timeout(45000)
                 # ═══════════════════════════════════════════════════
                 # CASE 3: No session, not connected → normal (login test)
                 # ═══════════════════════════════════════════════════
@@ -580,6 +843,8 @@ class PlaywrightService:
                     context = await browser.new_context()
                     await context.tracing.start(screenshots=True, snapshots=True, sources=True)
                     page = await context.new_page()
+                    page.set_default_timeout(30000)
+                    page.set_default_navigation_timeout(45000)
 
                 # Screenshot directory
                 screenshot_base_dir = "static/test-runs"
@@ -643,6 +908,21 @@ class PlaywrightService:
                 # Execute Test Steps
                 # ═══════════════════════════════════════════════════
                 try:
+                    sf_field_map = {}  # Dynamic field map, populated after modal opens
+                    sf_metadata_map = {}  # MCP metadata map
+
+                    # Load MCP metadata if project is connected
+                    if project_id and (mcp_connected or project_category == "salesforce"):
+                        try:
+                            from uuid import UUID as _UUID
+                            sf_metadata_map = await SalesforceLightningEngine.load_field_metadata(
+                                _UUID(project_id) if isinstance(project_id, str) else project_id
+                            )
+                            if sf_metadata_map:
+                                logger.info(f"  ℹ Loaded {len(sf_metadata_map)} field metadata entries")
+                        except Exception as e:
+                            logger.warning(f"  ⚠ Failed to load MCP metadata: {e}")
+
                     for index, step in enumerate(steps):
                         step_start = datetime.utcnow()
                         if hasattr(step, "action"):
@@ -679,89 +959,312 @@ class PlaywrightService:
                                     if nav_path
                                     else base_url
                                 )
-                                # Salesforce SPA may abort navigation (client-side routing)
-                                # ERR_ABORTED means the page loaded but SPA router took over
-                                try:
-                                    await page.goto(full_target, wait_until="domcontentloaded", timeout=30000)
-                                except Exception as nav_err:
-                                    if "ERR_ABORTED" in str(nav_err):
-                                        logger.info(f"  ℹ Navigation absorbed by Salesforce SPA router (ERR_ABORTED), continuing")
+
+                                # Extract expected URL fragment for verification
+                                expected_fragment = nav_path.strip("/").lower() if nav_path else ""
+
+                                # Navigate with retry — Salesforce SPA may not complete first attempt
+                                for nav_attempt in range(3):
+                                    try:
+                                        await page.goto(full_target, wait_until="domcontentloaded", timeout=45000)
+                                    except Exception as nav_err:
+                                        if "ERR_ABORTED" in str(nav_err):
+                                            logger.info(f"  ℹ Navigation absorbed by Salesforce SPA router")
+                                        else:
+                                            raise
+
+                                    # Wait for page to settle
+                                    await SalesforceLightningEngine.wait_for_page_ready(page)
+
+                                    # Verify URL contains expected path
+                                    current_url = page.url.lower()
+                                    if expected_fragment and expected_fragment not in current_url:
+                                        logger.warning(
+                                            f"  ⚠ Nav attempt {nav_attempt + 1}: URL mismatch — "
+                                            f"expected '{expected_fragment}' in '{page.url}'"
+                                        )
+                                        if nav_attempt < 2:
+                                            await asyncio.sleep(3)
+                                            continue
+                                        else:
+                                            logger.warning(f"  ⚠ Navigation may not have reached target after 3 attempts")
                                     else:
-                                        raise
-                                # Smart wait: let Salesforce Lightning SPA render
-                                try:
-                                    await page.wait_for_load_state("load", timeout=10000)
-                                except Exception:
-                                    pass
-                                import asyncio as _aio
-                                await _aio.sleep(4)  # Salesforce SPA needs time to initialize Lightning components
+                                        logger.info(f"  ✅ Navigation confirmed: {page.url}")
+                                        break
+
+                                # Extra wait for Salesforce list view to fully render
+                                if "list" in (nav_path or "").lower() or "/o/" in (nav_path or ""):
+                                    try:
+                                        await page.locator(
+                                            "force-list-view-manager-header, .forceListViewManager, "
+                                            ".slds-page-header, lst-list-view-manager-header, "
+                                            "lightning-list-view-header"
+                                        ).first.wait_for(state="visible", timeout=15000)
+                                        logger.info(f"  ✅ List view rendered")
+                                    except Exception:
+                                        await asyncio.sleep(3)
 
                             elif action == "click":
-                                locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
+                                # Wait for page DOM readiness
                                 try:
-                                    await locator.wait_for(state="visible", timeout=15000)
-                                except Exception:
-                                    # Retry: Salesforce Lightning components may render late
-                                    import asyncio as _aio
-                                    logger.info(f"  ℹ Element not visible yet, waiting 3s and retrying...")
-                                    await _aio.sleep(3)
-                                    locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
-                                    await locator.wait_for(state="visible", timeout=15000)
-                                await locator.click(timeout=15000)
-
-                                # Smart post-click waits for Salesforce
-                                import asyncio as _aio
-                                target_lower = (target or "").lower()
-                                if "new" in target_lower or "edit" in target_lower:
-                                    # After clicking New/Edit, wait for Salesforce modal to open
-                                    try:
-                                        modal = page.locator("div.modal-body, div.slds-modal__content, section.slds-modal, records-record-edit-form")
-                                        await modal.first.wait_for(state="visible", timeout=10000)
-                                        logger.info("  ℹ Salesforce modal detected, ready for form input")
-                                    except Exception:
-                                        await _aio.sleep(2)  # Fallback wait if modal not detected
-                                elif "save" in target_lower:
-                                    # After clicking Save, wait for toast or page transition
-                                    await _aio.sleep(2)
-                                    try:
-                                        # Wait for toast to appear
-                                        toast = page.locator(".toastMessage, .forceToastMessage, .slds-notify__content, div[data-key='success'], div[data-key='error']")
-                                        await toast.first.wait_for(state="visible", timeout=5000)
-                                        logger.info("  ℹ Salesforce toast notification detected")
-                                    except Exception:
-                                        pass  # Toast may have already dismissed or action doesn't show toast
-                                elif "delete" in target_lower or "confirm" in target_lower:
-                                    await _aio.sleep(1)
-
-                            elif action in ["fill", "input", "type"]:
-                                import asyncio as _aio
-                                await _aio.sleep(0.3)
-                                locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
-
-                                # Ensure element exists in DOM
-                                await locator.wait_for(state="attached", timeout=15000)
-
-                                # Scroll into view (important for Salesforce modals)
-                                try:
-                                    await locator.scroll_into_view_if_needed(timeout=5000)
+                                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
                                 except Exception:
                                     pass
 
-                                await locator.wait_for(state="visible", timeout=15000)
+                                target_lower = (target or "").lower()
 
-                                # Fill safely for Salesforce inputs
-                                try:
-                                    await locator.fill(value or "", timeout=15000)
-                                except Exception:
-                                    # Fallback: simulate real keyboard input (works with Lightning date pickers)
-                                    logger.info(f"  ℹ fill() failed, using keyboard typing fallback")
-                                    await locator.click(timeout=5000)
-                                    await locator.press("Control+A")
-                                    await locator.type(value or "", delay=50)
+                                # For SF action buttons, wait for list view to render first
+                                if any(kw in target_lower for kw in ["new", "edit", "delete", "clone", "import"]):
+                                    logger.info("  ℹ SF action button — waiting for list view")
+                                    try:
+                                        await page.locator(
+                                            "force-list-view-manager-header, .forceListViewManager, "
+                                            ".slds-page-header, lst-list-view-manager-header"
+                                        ).first.wait_for(state="visible", timeout=25000)
+                                        await asyncio.sleep(2)
+                                    except Exception:
+                                        await asyncio.sleep(5)
 
-                                # Tab out to close any datepicker/dropdown
-                                await page.keyboard.press("Tab")
-                                await _aio.sleep(0.3)
+                                # ─── Smart Click with fast-fail ───
+                                # First attempt
+                                click_succeeded = False
+                                last_click_err = None
+                                for click_attempt in range(2):  # max 2 attempts (not 3)
+                                    try:
+                                        loc = await SalesforceLightningEngine.resolve_locator(
+                                            page, target, locator_type
+                                        )
+                                        await SalesforceLightningEngine.safe_click(page, loc)
+                                        click_succeeded = True
+                                        break
+                                    except Exception as click_err:
+                                        last_click_err = click_err
+                                        err_msg = str(click_err)
+
+                                        # ─── Fast-fail: if element is not in DOM, don't retry ───
+                                        if ("not found in DOM" in err_msg
+                                            or "not exist on the current page" in err_msg
+                                            or "page fully loaded" in err_msg):
+                                            logger.warning(
+                                                f"  ⚠ Element '{target}' not found in DOM — "
+                                                f"skipping further retries (fast-fail)"
+                                            )
+                                            break
+
+                                        if click_attempt < 1:  # only retry once
+                                            logger.info(f"  ℹ Click attempt {click_attempt+1} failed, retrying in 3s...")
+                                            await asyncio.sleep(3)
+
+                                            # Before retrying, check if element exists now
+                                            try:
+                                                probe_loc = await SalesforceLightningEngine.resolve_locator(
+                                                    page, target, locator_type
+                                                )
+                                                probe_count = await probe_loc.count() if hasattr(probe_loc, 'count') else 0
+                                                if probe_count == 0:
+                                                    logger.warning(
+                                                        f"  ⚠ Element '{target}' still not on page — aborting retry"
+                                                    )
+                                                    break
+                                            except Exception:
+                                                pass
+
+                                if not click_succeeded:
+                                    raise last_click_err
+
+                                # Post-click: modal awareness + field map scanning
+                                if any(kw in target_lower for kw in ["new", "edit", "create", "clone", "quick"]):
+                                    modal_found = await SalesforceLightningEngine.wait_for_modal(page)
+
+                                    # Modal verification loop — retry click if modal didn't open
+                                    if not modal_found:
+                                        for retry_attempt in range(2):
+                                            logger.info(
+                                                f"  ℹ Modal not found — retry attempt {retry_attempt + 1}/2"
+                                            )
+                                            await asyncio.sleep(3)
+
+                                            # Re-resolve locator
+                                            try:
+                                                loc = await SalesforceLightningEngine.resolve_locator(
+                                                    page, target, locator_type
+                                                )
+                                            except Exception:
+                                                continue
+
+                                            # Try force click, then JS click
+                                            try:
+                                                logger.info("  ℹ Retry: force click")
+                                                await loc.click(force=True, timeout=10000)
+                                            except Exception:
+                                                try:
+                                                    logger.info("  ℹ Retry: JS click")
+                                                    element = await loc.element_handle(timeout=10000)
+                                                    if element:
+                                                        await page.evaluate("(el) => el.click()", element)
+                                                except Exception as js_err:
+                                                    logger.debug(f"  JS click retry failed: {js_err}")
+                                                    continue
+
+                                            modal_found = await SalesforceLightningEngine.wait_for_modal(page)
+                                            if modal_found:
+                                                logger.info("  ℹ Modal detected after retry click")
+                                                break
+
+                                        # Last resort: check for full-page form (not modal)
+                                        if not modal_found:
+                                            logger.info("  ℹ Checking for full-page record form")
+                                            try:
+                                                await page.locator(
+                                                    "records-record-edit-form, lightning-record-edit-form, "
+                                                    ".slds-form, force-record-layout-section"
+                                                ).first.wait_for(state="visible", timeout=10000)
+                                                logger.info("  ℹ Full-page record form detected")
+                                            except Exception:
+                                                await asyncio.sleep(3)
+
+                                    sf_field_map = await SalesforceLightningEngine.scan_field_map(page)
+                                elif "save" in target_lower:
+                                    # ─── Component 3: Pre-save required field check ───
+                                    try:
+                                        filled_fields = set()
+                                        for prev_log in logs:
+                                            t = prev_log.get("target", "")
+                                            if t and prev_log.get("status") == "success":
+                                                filled_fields.add(t.lower())
+                                        missing_required = []
+                                        for meta_label, meta_info in sf_metadata_map.items():
+                                            if meta_info.get("required"):
+                                                if not any(meta_label.lower() in f or f in meta_label.lower() for f in filled_fields):
+                                                    missing_required.append(meta_label)
+                                        if missing_required:
+                                            print(f"[PRE-SAVE] ⚠ Required fields not filled: {missing_required}")
+                                            logger.info(f"  ⚠ Pre-save warning: missing required fields: {missing_required}")
+                                    except Exception as ps_err:
+                                        print(f"[PRE-SAVE] Check error: {ps_err}")
+
+                                    await asyncio.sleep(2)
+                                    try:
+                                        toast = page.locator(
+                                            ".toastMessage, .forceToastMessage, "
+                                            ".slds-notify__content, div[data-key='success'], div[data-key='error']"
+                                        )
+                                        await toast.first.wait_for(state="visible", timeout=8000)
+                                        logger.info("  ℹ Toast notification detected")
+                                    except Exception:
+                                        pass
+                                elif "delete" in target_lower or "confirm" in target_lower:
+                                    await asyncio.sleep(1)
+
+                            elif action in ["fill", "input", "type"]:
+                                # Check if metadata says this is a picklist
+                                meta_info = sf_metadata_map.get(target)
+                                if not meta_info and sf_metadata_map:
+                                    for ml, mi in sf_metadata_map.items():
+                                        if target.lower() in ml.lower() or ml.lower() in target.lower():
+                                            meta_info = mi
+                                            break
+                                print(f"[STEP] TYPE action for '{target}' = '{value}', meta_type={meta_info.get('type') if meta_info else 'none'}")
+                                if meta_info and meta_info.get("type") in ("picklist", "multipicklist", "combobox"):
+                                    logger.info(f"  ℹ Metadata redirect: TYPE '{target}' → SELECT (picklist)")
+                                    await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                    success = await SalesforceLightningEngine._fill_picklist(
+                                        page, target, value
+                                    )
+                                    if not success:
+                                        raise Exception(
+                                            f"Could not select '{value}' in picklist field '{target}' — all strategies exhausted"
+                                        )
+                                elif meta_info and meta_info.get("type") == "reference":
+                                    logger.info(f"  ℹ Metadata redirect: TYPE '{target}' → LOOKUP_SELECT (reference)")
+                                    await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                    success = await SalesforceLightningEngine._fill_lookup(
+                                        page, target, value
+                                    )
+                                    if not success:
+                                        raise Exception(
+                                            f"Could not find/select '{value}' in lookup field '{target}' — all strategies exhausted"
+                                        )
+                                elif meta_info and meta_info.get("type") in ("date", "datetime"):
+                                    print(f"[STEP] Metadata redirect: TYPE '{target}' → DATE fill")
+                                    await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                    success = await SalesforceLightningEngine._fill_date(
+                                        page, target, value
+                                    )
+                                    if not success:
+                                        # Fallback to fill_field which has JS probe
+                                        await SalesforceLightningEngine.fill_field(
+                                            page, target, value, sf_field_map, sf_metadata_map
+                                        )
+                                else:
+                                    # Standard text field fill with proper Lightning commit
+                                    await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+
+                                    # Find the input by label
+                                    input_loc = None
+                                    for sel in [
+                                        f"lightning-input:has-text('{target}') input",
+                                        f"lightning-textarea:has-text('{target}') textarea",
+                                        f"input[placeholder*='{target}']",
+                                    ]:
+                                        try:
+                                            loc = page.locator(sel)
+                                            if await loc.count() > 0 and await loc.first.is_visible():
+                                                input_loc = loc.first
+                                                break
+                                        except Exception:
+                                            continue
+
+                                    if not input_loc:
+                                        # Fallback: get_by_label
+                                        try:
+                                            loc = page.get_by_label(target, exact=False)
+                                            if await loc.count() > 0:
+                                                input_loc = loc.first
+                                        except Exception:
+                                            pass
+
+                                    if input_loc:
+                                        # Click, select all, type value, then Tab to commit
+                                        await input_loc.click(timeout=5000)
+                                        await asyncio.sleep(0.3)
+                                        await input_loc.press("Control+a")
+                                        await asyncio.sleep(0.1)
+                                        await page.keyboard.type(value, delay=80)
+                                        await asyncio.sleep(0.3)
+                                        await page.keyboard.press("Tab")
+                                        await asyncio.sleep(0.5)
+                                        print(f"[STEP] ✅ Text field '{target}' filled with '{value}' + Tab commit")
+                                    else:
+                                        # Last resort: try fill_field
+                                        await SalesforceLightningEngine.fill_field(
+                                            page, target, value, sf_field_map, sf_metadata_map
+                                        )
+                                        print(f"[STEP] ⚠ fill_field fallback used for '{target}'")
+
+                            elif action == "select":
+                                # Direct picklist fill
+                                await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                success = await SalesforceLightningEngine._fill_picklist(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"Could not select '{value}' in picklist field '{target}' — all strategies exhausted. "
+                                        f"Check if '{value}' is a valid option for this field."
+                                    )
+
+                            elif action in ("lookup", "lookup_select"):
+                                # Direct lookup fill with record selection
+                                await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                success = await SalesforceLightningEngine._fill_lookup(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"LOOKUP_SELECT failed: could not find/select '{value}' in lookup field '{target}'. "
+                                        f"Ensure the record exists in the related object."
+                                    )
 
                             elif action == "assert_text":
                                 # Determine expected text: use value if set, otherwise target IS the text to find
@@ -775,16 +1278,8 @@ class PlaywrightService:
 
                                 found_text = None
 
-                                # Strategy 1: Try the specified locator (for CSS or text-based targets)
-                                try:
-                                    locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
-                                    await locator.wait_for(state="visible", timeout=5000 if is_toast else 15000)
-                                    found_text = await locator.text_content()
-                                except Exception:
-                                    pass
-
-                                # Strategy 2: Try known Salesforce toast selectors
-                                if found_text is None and is_toast:
+                                # Strategy 1: Wait and retry for toast (they appear briefly)
+                                if is_toast:
                                     toast_selectors = [
                                         ".toastMessage",
                                         ".forceToastMessage",
@@ -795,15 +1290,40 @@ class PlaywrightService:
                                         ".slds-notify_toast",
                                         ".slds-notify--toast",
                                     ]
-                                    for ts in toast_selectors:
-                                        try:
-                                            tl = page.locator(ts)
-                                            if await tl.count() > 0 and await tl.first.is_visible():
-                                                found_text = await tl.first.text_content()
-                                                logger.info(f"  ℹ Toast found via fallback selector: '{ts}'")
+                                    combined_toast = ", ".join(toast_selectors)
+
+                                    # Wait up to 10s for any toast to appear
+                                    try:
+                                        toast_loc = page.locator(combined_toast)
+                                        await toast_loc.first.wait_for(state="visible", timeout=10000)
+                                        found_text = await toast_loc.first.text_content()
+                                        logger.info(f"  ℹ Toast detected: '{(found_text or '')[:60]}'")
+                                    except Exception:
+                                        # Retry: poll for toast every 1s for 5 more seconds
+                                        for retry in range(5):
+                                            await asyncio.sleep(1)
+                                            for ts in toast_selectors:
+                                                try:
+                                                    tl = page.locator(ts)
+                                                    if await tl.count() > 0:
+                                                        txt = await tl.first.text_content()
+                                                        if txt:
+                                                            found_text = txt
+                                                            logger.info(f"  ℹ Toast found on retry {retry+1}: '{ts}'")
+                                                            break
+                                                except Exception:
+                                                    continue
+                                            if found_text:
                                                 break
-                                        except Exception:
-                                            continue
+
+                                # Strategy 2: Try the specified locator
+                                if found_text is None:
+                                    try:
+                                        locator = await PlaywrightService._resolve_locator(page, target, locator_type, logger)
+                                        await locator.wait_for(state="visible", timeout=5000 if is_toast else 15000)
+                                        found_text = await locator.text_content()
+                                    except Exception:
+                                        pass
 
                                 # Strategy 3: Try get_by_text directly for the expected text
                                 if found_text is None:
@@ -822,6 +1342,82 @@ class PlaywrightService:
                                         if expected_text in (page_text or ""):
                                             logger.info(f"  ℹ Assert text found in page body")
                                             found_text = page_text
+                                    except Exception:
+                                        pass
+
+                                # Strategy 5: Check for Salesforce validation errors BEFORE fallback success
+                                has_validation_errors = False
+                                validation_error_text = ""
+                                if is_toast and found_text is None:
+                                    try:
+                                        error_selectors = [
+                                            ".slds-form-element__help",
+                                            ".slds-notify--error",
+                                            "div[data-key='error']",
+                                            ".forceFormPageError",
+                                            ".slds-has-error",
+                                            "ul.errorsList",
+                                            ".pageLevelErrors",
+                                            ".slds-page-header--object-home .error",
+                                        ]
+                                        for es in error_selectors:
+                                            err_loc = page.locator(es)
+                                            err_count = await err_loc.count()
+                                            if err_count > 0:
+                                                has_validation_errors = True
+                                                try:
+                                                    validation_error_text = await err_loc.first.text_content()
+                                                except Exception:
+                                                    validation_error_text = f"{err_count} validation error(s) found"
+                                                logger.info(f"  ⚠ Validation errors detected via '{es}': {validation_error_text[:100]}")
+                                                break
+
+                                        # Also check for error toast
+                                        error_toast = page.locator("div[data-key='error'], .slds-notify--error, .toastMessage")
+                                        if await error_toast.count() > 0:
+                                            has_validation_errors = True
+                                            try:
+                                                validation_error_text = await error_toast.first.text_content()
+                                            except Exception:
+                                                pass
+
+                                        # Check for "Review the following fields" popup
+                                        review_popup = page.get_by_text("Review the following", exact=False)
+                                        if await review_popup.count() > 0:
+                                            has_validation_errors = True
+                                            try:
+                                                validation_error_text = await review_popup.first.text_content()
+                                            except Exception:
+                                                validation_error_text = "Review the following fields"
+                                            logger.info(f"  ⚠ Validation popup detected: {validation_error_text[:100]}")
+
+                                        # Check if modal is still open (means save failed)
+                                        modal_still_open = await page.locator(
+                                            ".slds-modal__container, div[role='dialog']"
+                                        ).count() > 0
+                                        if modal_still_open:
+                                            has_validation_errors = True
+                                            if not validation_error_text:
+                                                validation_error_text = "Record creation modal still open — save likely failed"
+                                            logger.info(f"  ⚠ Modal still open after Save — record NOT created")
+
+                                    except Exception as e:
+                                        logger.debug(f"  Validation check error: {e}")
+
+                                # If validation errors found, FAIL the assertion
+                                if has_validation_errors:
+                                    raise Exception(
+                                        f"Assertion failed: record was NOT created. "
+                                        f"Salesforce validation error: {validation_error_text[:200]}"
+                                    )
+
+                                # Strategy 6: URL-based success (ONLY if no validation errors)
+                                if found_text is None and is_toast and not has_validation_errors:
+                                    try:
+                                        current_url = page.url
+                                        if "/lightning/r/" in current_url and "/view" in current_url:
+                                            logger.info(f"  ℹ URL indicates record was created: {current_url}")
+                                            found_text = "was created"
                                     except Exception:
                                         pass
 
@@ -850,6 +1446,59 @@ class PlaywrightService:
                             step_log["status"] = "failed"
                             step_log["error"] = str(e)
                             overall_result = "failed"
+
+                            # ─── Component 2: Enhanced error diagnostics ───
+                            diagnostics = {
+                                "step": step_order,
+                                "action": action,
+                                "field": target,
+                                "value": value,
+                            }
+                            meta_info = sf_metadata_map.get(target, {}) if sf_metadata_map else {}
+                            field_type = meta_info.get("type", "unknown")
+                            diagnostics["field_type"] = field_type
+
+                            if action in ("lookup", "lookup_select"):
+                                refs = meta_info.get("referenceTo", [])
+                                diagnostics["reason"] = (
+                                    f"Lookup value '{value}' was typed but could not be selected from '{target}' "
+                                    f"(related object: {refs[0] if refs else 'unknown'})"
+                                )
+                                diagnostics["suggested_fix"] = (
+                                    f"Ensure the record '{value}' exists in the related object. "
+                                    f"Check that the record name matches exactly."
+                                )
+                            elif action == "select":
+                                pv = meta_info.get("picklistValues", [])
+                                valid = [v.get("label", v.get("value", "")) for v in pv if v.get("active")][:10]
+                                diagnostics["reason"] = (
+                                    f"Could not select '{value}' in picklist field '{target}'"
+                                )
+                                diagnostics["suggested_fix"] = (
+                                    f"Valid values are: {valid}. Ensure the value matches exactly."
+                                ) if valid else "Check Salesforce for valid picklist values."
+                            elif action in ("fill", "input", "type") and field_type in ("date", "datetime"):
+                                diagnostics["reason"] = (
+                                    f"Date value '{value}' could not be entered into field '{target}'"
+                                )
+                                diagnostics["suggested_fix"] = (
+                                    "Use MM/DD/YYYY format. Ensure the date field is visible and editable."
+                                )
+                            elif action == "assert_text":
+                                diagnostics["reason"] = str(e)
+                                diagnostics["suggested_fix"] = (
+                                    "Check if a Salesforce validation error blocked the save. "
+                                    "Review required fields and validation rules."
+                                )
+                            else:
+                                diagnostics["reason"] = str(e)
+                                diagnostics["suggested_fix"] = (
+                                    f"Verify the element '{target}' exists and is visible on the page."
+                                )
+
+                            step_log["diagnostics"] = diagnostics
+                            print(f"[DIAG] Step {step_order} failed: {diagnostics.get('reason', '')[:100]}")
+                            print(f"[DIAG] Suggested fix: {diagnostics.get('suggested_fix', '')[:100]}")
 
                             filename = "error.png"
                             save_path = os.path.join(run_screenshot_dir, filename)

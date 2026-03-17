@@ -16,5 +16,8 @@ from .domain_model import DomainModel
 from .vector_embedding import VectorEmbedding
 from .rag_query_log import RagQueryLog
 
+# Execution Learning (Self-Learning RAG)
+from .execution_learning import ExecutionLearning
+
 # Project Integration (Phase 1)
 from .project_integration import ProjectIntegration
