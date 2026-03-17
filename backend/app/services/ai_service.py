@@ -430,6 +430,12 @@ SUPPORTED ACTIONS
 - CHECKBOX — target = field label, value = "true" or "false" (for checkbox/boolean/toggle fields ONLY)
 - UPLOAD — target = field label, value = file path (for file upload fields ONLY)
 - TAB — target = tab name (for switching between record detail tabs: Details, Related, Activity)
+- INLINE_EDIT — target = field label, value = new value, locator_type = field type hint (for editing fields directly on record detail page without opening modal)
+- QUICK_ACTION — target = action name (for clicking quick action buttons like 'Log a Call', 'New Task', 'Send Email')
+- LIST_ROW_ACTION — target = record name in list, value = action name (for clicking row dropdown actions like Edit, Delete, Clone in list view)
+- PATH_STAGE — target = stage name (for updating the record stage via the Path component, e.g., 'Closed Won')
+- DISMISS_TOAST — (for dismissing a toast notification when it blocks further interaction)
+- ADDRESS — target = field label, value = "Street, City, State, Zip, Country" (for compound address fields)
 - ASSERT_TEXT — target = locator expression, value = expected text
 - WAIT — value = seconds as string
 
@@ -515,6 +521,25 @@ File Upload:
 
 Tab Navigation:
   Switch Tab:           action="TAB", target="Related", locator_type="role"
+
+Inline Edit (record detail page, NO modal):
+  Text field:           action="INLINE_EDIT", target="Account Name", value="Acme Corp", locator_type="text"
+  Picklist:             action="INLINE_EDIT", target="Stage", value="Closed Won", locator_type="picklist"
+  Lookup:               action="INLINE_EDIT", target="Owner", value="John Doe", locator_type="lookup"
+
+Quick Actions:
+  Log a Call:           action="QUICK_ACTION", target="Log a Call", locator_type="role"
+  New Task:             action="QUICK_ACTION", target="New Task", locator_type="role"
+
+List View Row Actions:
+  Edit from list:       action="LIST_ROW_ACTION", target="Acme Corp", value="Edit", locator_type="role"
+  Delete from list:     action="LIST_ROW_ACTION", target="Acme Corp", value="Delete", locator_type="role"
+
+Path Stage:
+  Update stage:         action="PATH_STAGE", target="Closed Won", locator_type="role"
+
+Address:
+  Billing Address:      action="ADDRESS", target="Billing Address", value="123 Main St, Springfield, IL, 62701, USA", locator_type="label"
 
 -------------------------
 CRUD INTENT RULES (NO WAIT STEPS — runner handles waits automatically)

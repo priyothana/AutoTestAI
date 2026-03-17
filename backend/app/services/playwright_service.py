@@ -1153,6 +1153,9 @@ class PlaywrightService:
                                     # E2: Wait for spinner to clear after save
                                     await SalesforceLightningEngine.wait_for_spinner_gone(page)
 
+                                    # E3: Auto-handle Duplicate Rule popup (save_anyway by default)
+                                    await SalesforceLightningEngine.handle_duplicate_popup(page, "save_anyway")
+
                                     await asyncio.sleep(2)
                                     try:
                                         toast = page.locator(
@@ -1354,6 +1357,79 @@ class PlaywrightService:
                                                 raise Exception(f"Tab '{tab_name}' not found")
                                     except Exception as tab_err:
                                         raise Exception(f"Tab switch to '{tab_name}' failed: {tab_err}")
+
+                            elif action == "inline_edit":
+                                # B1: Inline edit on record detail page
+                                # target = field label, value = new value
+                                # locator_type can indicate field_type: 'picklist','lookup','date','checkbox'
+                                field_type_hint = locator_type if locator_type in (
+                                    "picklist", "lookup", "date", "checkbox", "multipicklist"
+                                ) else "text"
+                                success = await SalesforceLightningEngine.inline_edit(
+                                    page, target, value,
+                                    field_type=field_type_hint,
+                                    metadata_map=sf_metadata_map or {}
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"Inline edit failed for '{target}' — field not found or not editable"
+                                    )
+
+                            elif action == "quick_action":
+                                # B4: Quick Action from record action bar / overflow menu
+                                # target = action name (e.g. 'Log a Call', 'New Task')
+                                action_name_qa = target or value or ""
+                                success = await SalesforceLightningEngine.click_quick_action(
+                                    page, action_name_qa
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"Quick Action '{action_name_qa}' not found or not clickable"
+                                    )
+                                # If a modal opened, scan field map
+                                modal_found = await SalesforceLightningEngine.wait_for_modal(page)
+                                if modal_found:
+                                    sf_field_map = await SalesforceLightningEngine.scan_field_map(page)
+                                    await SalesforceLightningEngine.handle_record_type_modal(page)
+                                    await SalesforceLightningEngine.wait_for_spinner_gone(page)
+
+                            elif action == "list_row_action":
+                                # B5: Row-level action in list view
+                                # target = record name to find the row
+                                # value = action name (e.g. 'Edit', 'Delete', 'Clone')
+                                success = await SalesforceLightningEngine.click_list_view_row_action(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"List view row action '{value}' on '{target}' failed"
+                                    )
+
+                            elif action == "path_stage":
+                                # B9: Path component stage update
+                                # target = stage name (e.g. 'Closed Won', 'Prospecting')
+                                stage_name_arg = target or value or ""
+                                success = await SalesforceLightningEngine.click_path_stage(
+                                    page, stage_name_arg
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"Path stage '{stage_name_arg}' not found on the page"
+                                    )
+
+                            elif action == "dismiss_toast":
+                                # B8: Dismiss toast notification
+                                await SalesforceLightningEngine.dismiss_toast(page)
+                                # Not raising on False — toast may already be gone, that's OK
+
+                            elif action == "address":
+                                # A5: Compound address field
+                                # target = field label, value = comma-separated address string
+                                success = await SalesforceLightningEngine._fill_address(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(f"Address fill failed for '{target}'")
 
                             elif action == "assert_text":
                                 # Determine expected text: use value if set, otherwise target IS the text to find
