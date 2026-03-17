@@ -2927,3 +2927,832 @@ class SalesforceLightningEngine:
         except Exception:
             # Spinner may have disappeared during our check
             pass
+
+    # ─────────────────────────────────────────────
+    # B1: Inline Edit Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def inline_edit(page, label, value, field_type="text", metadata_map=None):
+        """Perform an inline edit on a Salesforce record detail page.
+
+        Salesforce inline editing:
+        - Hover over the field value to reveal the pencil icon
+        - Click the pencil icon (or double-click the field value)
+        - The field becomes editable inline
+        - Fill the value
+        - Click the checkmark (save inline) or the page Save button
+
+        Args:
+            page: Playwright page
+            label: Field label text
+            value: New value to set
+            field_type: 'text', 'picklist', 'lookup', 'date', 'checkbox'
+            metadata_map: Optional MCP metadata for field type detection
+        """
+        logger.info(f"  ✏ Inline Edit: '{label}' → '{value}'")
+
+        # ─── Step 1: Auto-detect field type from metadata if not specified ───
+        if metadata_map and field_type == "text":
+            meta = metadata_map.get(label)
+            if not meta:
+                for ml, mi in metadata_map.items():
+                    if label.lower() in ml.lower() or ml.lower() in label.lower():
+                        meta = mi
+                        break
+            if meta:
+                sf_type = meta.get("type", "")
+                if sf_type in ("picklist", "combobox"):
+                    field_type = "picklist"
+                elif sf_type == "reference":
+                    field_type = "lookup"
+                elif sf_type in ("date", "datetime"):
+                    field_type = "date"
+                elif sf_type == "boolean":
+                    field_type = "checkbox"
+                elif sf_type == "multipicklist":
+                    field_type = "multipicklist"
+
+        # ─── Step 2: Find the field on the detail page ───
+        field_containers = [
+            f"records-record-layout-item:has-text('{label}')",
+            f"force-record-layout-item:has-text('{label}')",
+            f"records-output-field:has-text('{label}')",
+            f".slds-form-element:has-text('{label}')",
+            f"[data-field-label='{label}']",
+        ]
+
+        field_container = None
+        for fc_sel in field_containers:
+            try:
+                loc = page.locator(fc_sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    field_container = loc.first
+                    logger.info(f"  → Found field container for '{label}' via: {fc_sel}")
+                    break
+            except Exception:
+                continue
+
+        if not field_container:
+            logger.warning(f"  ⚠ Inline edit: field container not found for '{label}'")
+            return False
+
+        # ─── Step 3: Hover to show pencil icon, then click it ───
+        try:
+            await field_container.scroll_into_view_if_needed(timeout=5000)
+            await field_container.hover(timeout=5000)
+            await asyncio.sleep(0.5)
+
+            # Try clicking the pencil/edit button
+            pencil_selectors = [
+                "button.slds-button_icon[title*='Edit']",
+                "button[data-target-selection-name*='edit']",
+                "a.inlineEditTrigger",
+                ".slds-cell-edit button",
+                "button.slds-button_icon-edit",
+                "[title='Edit']",
+            ]
+            pencil_found = False
+            for ps in pencil_selectors:
+                try:
+                    pencil = field_container.locator(ps)
+                    if await pencil.count() > 0 and await pencil.first.is_visible():
+                        await pencil.first.click(timeout=5000)
+                        pencil_found = True
+                        logger.info(f"  → Clicked pencil icon via: {ps}")
+                        await asyncio.sleep(0.5)
+                        break
+                except Exception:
+                    continue
+
+            if not pencil_found:
+                # Try double-clicking the field value (triggers inline edit in some orgs)
+                try:
+                    value_el = field_container.locator(
+                        "span.slds-form-element__static, .slds-form-element__static"
+                    )
+                    if await value_el.count() > 0:
+                        await value_el.first.dblclick(timeout=5000)
+                        logger.info(f"  → Double-clicked field value to trigger inline edit")
+                        await asyncio.sleep(0.5)
+                    else:
+                        logger.warning(f"  ⚠ Could not find pencil or value element for '{label}'")
+                        return False
+                except Exception as e:
+                    logger.warning(f"  ⚠ Double-click failed: {e}")
+                    return False
+        except Exception as e:
+            logger.warning(f"  ⚠ Inline edit hover/pencil failed for '{label}': {e}")
+            return False
+
+        # ─── Step 4: Fill the now-editable field ───
+        await asyncio.sleep(0.5)
+        filled = False
+
+        if field_type == "picklist":
+            filled = await SalesforceLightningEngine._fill_picklist(page, label, value)
+        elif field_type == "multipicklist":
+            filled = await SalesforceLightningEngine._fill_multi_picklist(page, label, value)
+        elif field_type == "lookup":
+            filled = await SalesforceLightningEngine._fill_lookup(page, label, value)
+        elif field_type == "date":
+            filled = await SalesforceLightningEngine._fill_date(page, label, value)
+        elif field_type == "checkbox":
+            filled = await SalesforceLightningEngine._fill_checkbox(page, label, value)
+        else:
+            # Text field inline edit
+            text_selectors = [
+                f"records-record-layout-item:has-text('{label}') input",
+                f"records-record-layout-item:has-text('{label}') textarea",
+                f"force-record-layout-item:has-text('{label}') input",
+                f".slds-form-element:has-text('{label}') input",
+            ]
+            for ts in text_selectors:
+                try:
+                    inp = page.locator(ts)
+                    if await inp.count() > 0 and await inp.first.is_visible():
+                        await inp.first.click(timeout=3000)
+                        await asyncio.sleep(0.2)
+                        await inp.first.press("Control+a")
+                        await page.keyboard.type(value or "", delay=50)
+                        filled = True
+                        logger.info(f"  → Typed '{value}' into inline text field")
+                        break
+                except Exception:
+                    continue
+
+        if not filled:
+            logger.warning(f"  ⚠ Could not fill inline edit for '{label}'")
+            return False
+
+        # ─── Step 5: Confirm/save the inline edit ───
+        await asyncio.sleep(0.3)
+        confirm_selectors = [
+            "button[title='Save'][class*='slds']",
+            "button.slds-button_save",
+            ".inlineEditSaveCol button",
+            "button[title='Save edit']",
+            "button[aria-label='Save']",
+        ]
+        for cs in confirm_selectors:
+            try:
+                confirm_btn = page.locator(cs)
+                if await confirm_btn.count() > 0 and await confirm_btn.first.is_visible():
+                    await confirm_btn.first.click(timeout=5000)
+                    await asyncio.sleep(1)
+                    logger.info(f"  ✅ Inline edit saved for '{label}'")
+                    return True
+            except Exception:
+                continue
+
+        # If no inline save button, press Tab/Enter to commit
+        try:
+            await page.keyboard.press("Tab")
+            await asyncio.sleep(0.3)
+            logger.info(f"  → Committed inline edit via Tab")
+            return True
+        except Exception:
+            pass
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # B4: Quick Action Menu Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def click_quick_action(page, action_name):
+        """Click a Quick Action from the Salesforce record action menu.
+
+        Quick Actions appear in:
+        - The highlights panel action bar (direct buttons like Log a Call, New Task)
+        - The overflow dropdown (▾ button) for additional actions
+        - Global actions button bar
+
+        Strategy:
+        1. Check if the action is directly visible as a button
+        2. If not, open the overflow/more-actions dropdown
+        3. Click the action from the dropdown
+        """
+        logger.info(f"  ⚡ Quick Action: '{action_name}'")
+
+        # Strategy 1: Direct button in the action bar
+        direct_selectors = [
+            f"button:has-text('{action_name}')",
+            f"a[title='{action_name}']",
+            f"force-quick-action-bubble:has-text('{action_name}')",
+            f"lightning-action-bar button:has-text('{action_name}')",
+            f"[title='{action_name}']",
+        ]
+        for ds in direct_selectors:
+            try:
+                loc = page.locator(ds)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=5000)
+                    await asyncio.sleep(1)
+                    logger.info(f"  → Clicked quick action directly: '{action_name}'")
+                    return True
+            except Exception:
+                continue
+
+        # Strategy 2: Open overflow/more-actions dropdown
+        overflow_selectors = [
+            "button[title='More Actions']",
+            "button[aria-label='More Actions']",
+            ".slds-button_icon-more",
+            "button[title='More actions']",
+            "a.more-desktop",
+            "li.oneActionsRibbon__overflowButton button",
+        ]
+        for os_sel in overflow_selectors:
+            try:
+                overflow = page.locator(os_sel)
+                if await overflow.count() > 0 and await overflow.first.is_visible():
+                    await overflow.first.click(timeout=5000)
+                    await asyncio.sleep(0.7)
+                    logger.info(f"  → Opened overflow menu via: {os_sel}")
+
+                    # Now find the action in the dropdown
+                    action_in_dropdown = [
+                        f"[role='menuitem']:has-text('{action_name}')",
+                        f"a:has-text('{action_name}')",
+                        f"lightning-menu-item:has-text('{action_name}')",
+                    ]
+                    for adi in action_in_dropdown:
+                        try:
+                            item = page.locator(adi)
+                            if await item.count() > 0 and await item.first.is_visible():
+                                await item.first.click(timeout=5000)
+                                await asyncio.sleep(1)
+                                logger.info(f"  ✅ Clicked '{action_name}' from overflow dropdown")
+                                return True
+                        except Exception:
+                            continue
+
+                    # Esc to close if not found
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                    break
+            except Exception:
+                continue
+
+        logger.warning(f"  ⚠ Quick action '{action_name}' not found")
+        return False
+
+    # ─────────────────────────────────────────────
+    # B5: List View Row Action Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def click_list_view_row_action(page, record_name, action_name):
+        """Click a row-level action in a Salesforce list view.
+
+        Each row in a list view has a dropdown arrow (▾) with actions like:
+        Edit, Delete, Change Owner, Clone, etc.
+
+        Args:
+            page: Playwright page
+            record_name: The visible name/text of the record (to identify the row)
+            action_name: The action to click (e.g., 'Edit', 'Delete', 'Clone')
+        """
+        logger.info(f"  📋 List View Row Action: '{action_name}' on '{record_name}'")
+
+        # ─── Step 1: Find the row containing the record ───
+        row_selectors = [
+            f"tr:has-text('{record_name}')",
+            f"[role='row']:has-text('{record_name}')",
+            f"tbody tr:has(a:has-text('{record_name}'))",
+        ]
+        row = None
+        for rs in row_selectors:
+            try:
+                loc = page.locator(rs)
+                if await loc.count() > 0:
+                    # Pick the most specific visible row
+                    for i in range(min(await loc.count(), 5)):
+                        candidate = loc.nth(i)
+                        if await candidate.is_visible():
+                            row = candidate
+                            logger.info(f"  → Found row for '{record_name}' via: {rs}")
+                            break
+                    if row:
+                        break
+            except Exception:
+                continue
+
+        if not row:
+            logger.warning(f"  ⚠ Row not found for '{record_name}'")
+            return False
+
+        # ─── Step 2: Click the row dropdown button ───
+        dropdown_selectors = [
+            "button[aria-haspopup='menu']",
+            "lightning-button-menu button",
+            "button[title*='Show Actions']",
+            "button[aria-label*='Show Actions']",
+            ".slds-button_icon-border-filled",
+        ]
+        dropdown_found = False
+        for dds in dropdown_selectors:
+            try:
+                dropdown_btn = row.locator(dds)
+                if await dropdown_btn.count() > 0:
+                    await dropdown_btn.first.scroll_into_view_if_needed(timeout=3000)
+                    await dropdown_btn.first.click(timeout=5000)
+                    await asyncio.sleep(0.7)
+                    dropdown_found = True
+                    logger.info(f"  → Opened row dropdown via: {dds}")
+                    break
+            except Exception:
+                continue
+
+        if not dropdown_found:
+            logger.warning(f"  ⚠ Row dropdown button not found for '{record_name}'")
+            return False
+
+        # ─── Step 3: Click the action ───
+        action_selectors = [
+            f"[role='menuitem']:has-text('{action_name}')",
+            f"lightning-menu-item:has-text('{action_name}')",
+            f"a:has-text('{action_name}')",
+            f"span:has-text('{action_name}')",
+        ]
+        for acs in action_selectors:
+            try:
+                action_item = page.locator(acs)
+                if await action_item.count() > 0 and await action_item.first.is_visible():
+                    await action_item.first.click(timeout=5000)
+                    await asyncio.sleep(1)
+                    logger.info(f"  ✅ Clicked '{action_name}' from row dropdown")
+                    return True
+            except Exception:
+                continue
+
+        # Close dropdown if action not found
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        logger.warning(f"  ⚠ Action '{action_name}' not found in row dropdown")
+        return False
+
+    # ─────────────────────────────────────────────
+    # B8: Toast Dismissal Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def dismiss_toast(page, timeout=5000):
+        """Dismiss a Salesforce toast notification.
+
+        Some workflows require the toast to be dismissed before the
+        next interaction (it can block elements underneath it).
+
+        Clicks the toast's close button if found.
+        Returns True if a toast was dismissed, False if no toast.
+        """
+        toast_close_selectors = [
+            ".toastClose",
+            "button.slds-notify__close",
+            ".slds-notify_toast button[title='Close']",
+            ".slds-notify_container button[title='Close']",
+            "button[title='Close'][class*='toast']",
+            ".slds-notification-list button[title='Close']",
+        ]
+        for tcs in toast_close_selectors:
+            try:
+                close_btn = page.locator(tcs)
+                if await close_btn.count() > 0 and await close_btn.first.is_visible():
+                    await close_btn.first.click(timeout=timeout)
+                    await asyncio.sleep(0.5)
+                    logger.info("  → Toast dismissed")
+                    return True
+            except Exception:
+                continue
+
+        # Alternative: wait for toast to auto-dismiss
+        try:
+            toast = page.locator(
+                ".toastMessage, .forceToastMessage, .slds-notify_toast"
+            )
+            if await toast.count() > 0:
+                # Wait for it to disappear naturally (max 5s)
+                await toast.first.wait_for(state="hidden", timeout=5000)
+                logger.info("  → Toast auto-dismissed")
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # B9: Path / Kanban Stage Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def click_path_stage(page, stage_name):
+        """Update a record stage via the Salesforce Path component.
+
+        The Path component renders as a horizontal progress indicator
+        (lightning-path, force-path-element, opportunity-path, lead-path).
+        Clicking a stage moves the record to that stage.
+
+        Args:
+            page: Playwright page
+            stage_name: Name of the stage to click (e.g., 'Closed Won', 'Qualified')
+        """
+        logger.info(f"  🛤 Path stage: '{stage_name}'")
+
+        # Strategy 1: Direct path item click
+        path_selectors = [
+            f"lightning-path-coaching a:has-text('{stage_name}')",
+            f"a.slds-path__link:has-text('{stage_name}')",
+            f"li.slds-path__item:has-text('{stage_name}')",
+            f"[data-value='{stage_name}']",
+            f"button:has-text('{stage_name}')",
+            f"a[title='{stage_name}']",
+        ]
+        for ps in path_selectors:
+            try:
+                loc = page.locator(ps)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.scroll_into_view_if_needed(timeout=3000)
+                    await loc.first.click(timeout=5000)
+                    await asyncio.sleep(1)
+                    logger.info(f"  → Clicked path stage: '{stage_name}'")
+
+                    # Look for "Mark Stage as Complete" or "Select Closed Stage" button
+                    confirm_btns = [
+                        "button:has-text('Mark Stage as Complete')",
+                        "button:has-text('Select Closed Stage')",
+                        "button:has-text('Mark as Current Stage')",
+                        "button:has-text('Mark Stage as Current')",
+                        "button:has-text('Save')",
+                    ]
+                    for cb in confirm_btns:
+                        try:
+                            btn = page.locator(cb)
+                            if await btn.count() > 0 and await btn.first.is_visible():
+                                await btn.first.click(timeout=5000)
+                                await asyncio.sleep(1)
+                                logger.info(f"  → Confirmed stage via: {cb}")
+                                break
+                        except Exception:
+                            continue
+
+                    # Wait for spinner
+                    await SalesforceLightningEngine.wait_for_spinner_gone(page)
+                    return True
+            except Exception:
+                continue
+
+        # Strategy 2: Try Kanban card drag-by-picklist update
+        try:
+            # Some records use a picklist for stage rather than the path
+            success = await SalesforceLightningEngine._fill_picklist(page, "Stage", stage_name)
+            if success:
+                logger.info(f"  → Stage '{stage_name}' set via picklist fallback")
+                return True
+        except Exception:
+            pass
+
+        logger.warning(f"  ⚠ Path stage '{stage_name}' not found")
+        return False
+
+    # ─────────────────────────────────────────────
+    # E3: Duplicate Rule Popup Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def handle_duplicate_popup(page, action="save_anyway"):
+        """Handle the Salesforce Duplicate Rule popup.
+
+        When saving a record, SF Duplicate Rules may show a modal:
+        'Potential Duplicates Found' with options:
+        - Save Anyway / Continue Saving (proceed)
+        - Cancel (abort)
+        - View Duplicates (navigate to dupe record)
+
+        Args:
+            page: Playwright page
+            action: 'save_anyway' (default), 'cancel', or 'view_duplicates'
+        Returns:
+            True if duplicate popup was detected and handled,
+            False if no duplicate popup appeared.
+        """
+        logger.info(f"  🔁 Checking for Duplicate Rule popup (action={action})...")
+
+        # Detect duplicate popup
+        dupe_indicators = [
+            "h2:has-text('Potential Duplicate')",
+            "h2:has-text('Duplicate')",
+            ".slds-modal h2:has-text('duplicate')",
+            "duplicaterecordsets-duplicate-record-set-list",
+            "records-form-footer:has-text('Save Anyway')",
+            "button:has-text('Save Anyway')",
+        ]
+        popup_found = False
+        for di in dupe_indicators:
+            try:
+                loc = page.locator(di)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    popup_found = True
+                    logger.info(f"  → Duplicate popup detected via: {di}")
+                    break
+            except Exception:
+                continue
+
+        if not popup_found:
+            return False
+
+        await asyncio.sleep(0.5)
+
+        if action == "save_anyway":
+            save_anyway_selectors = [
+                "button:has-text('Save Anyway')",
+                "button:has-text('Continue Saving')",
+                "button:has-text('Ignore and Save')",
+                ".slds-modal button.slds-button_brand",
+            ]
+            for sas in save_anyway_selectors:
+                try:
+                    btn = page.locator(sas)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click(timeout=5000)
+                        await asyncio.sleep(1)
+                        logger.info("  → Clicked 'Save Anyway' on duplicate popup")
+                        await SalesforceLightningEngine.wait_for_spinner_gone(page)
+                        return True
+                except Exception:
+                    continue
+
+        elif action == "cancel":
+            cancel_selectors = [
+                "button:has-text('Cancel')",
+                ".slds-modal button:has-text('Cancel')",
+            ]
+            for cs in cancel_selectors:
+                try:
+                    btn = page.locator(cs)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click(timeout=5000)
+                        await asyncio.sleep(0.5)
+                        logger.info("  → Cancelled duplicate popup")
+                        return True
+                except Exception:
+                    continue
+
+        elif action == "view_duplicates":
+            view_selectors = [
+                "button:has-text('View Duplicates')",
+                "a:has-text('View Duplicates')",
+            ]
+            for vs in view_selectors:
+                try:
+                    btn = page.locator(vs)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click(timeout=5000)
+                        await asyncio.sleep(2)
+                        logger.info("  → Navigated to duplicate records")
+                        return True
+                except Exception:
+                    continue
+
+        logger.warning(f"  ⚠ Duplicate popup found but could not perform '{action}'")
+        return False
+
+    # ─────────────────────────────────────────────
+    # E7: Dynamic Forms / Conditional Visibility Check
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def check_field_visible_dynamic(page, label, timeout=5000):
+        """Check if a field is currently visible on a page with Dynamic Forms.
+
+        With Salesforce Dynamic Forms, fields are shown/hidden based on conditions.
+        Call this before attempting to fill a field — if it returns False,
+        skip the field fill gracefully rather than raising an error.
+
+        Returns:
+            True if the field is visible and fillable
+            False if the field is hidden (skip gracefully)
+        """
+        visibility_selectors = [
+            f"lightning-input-field:has-text('{label}')",
+            f"lightning-input:has-text('{label}')",
+            f"lightning-textarea:has-text('{label}')",
+            f"lightning-combobox:has-text('{label}')",
+            f".slds-form-element:has-text('{label}')",
+        ]
+        for sel in visibility_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() == 0:
+                    continue
+                el = loc.first
+                is_vis = await el.is_visible()
+                if is_vis:
+                    logger.info(f"  → Field '{label}' is visible (Dynamic Forms)")
+                    return True
+                else:
+                    logger.info(f"  → Field '{label}' is HIDDEN (Dynamic Forms — condition not met)")
+                    return False
+            except Exception:
+                continue
+        # Field not found at all
+        logger.info(f"  → Field '{label}' not found on page (Dynamic Forms)")
+        return False
+
+    @staticmethod
+    async def fill_field_if_visible(page, label, value, field_map=None, metadata_map=None):
+        """Fill a field only if it's visible (Dynamic Forms safe variant).
+
+        Use this instead of fill_field() on pages with Dynamic Forms
+        so that hidden fields are silently skipped rather than failing.
+
+        Returns:
+            'filled' — field was visible and filled
+            'hidden' — field was not visible, skipped
+            'failed' — field was visible but fill failed
+        """
+        is_visible = await SalesforceLightningEngine.check_field_visible_dynamic(page, label)
+        if not is_visible:
+            logger.info(f"  ℹ Skipping hidden field '{label}' (Dynamic Forms)")
+            return "hidden"
+        try:
+            await SalesforceLightningEngine.fill_field(page, label, value, field_map, metadata_map)
+            return "filled"
+        except Exception as e:
+            logger.warning(f"  ⚠ fill_field_if_visible: fill failed for '{label}': {e}")
+            return "failed"
+
+    # ─────────────────────────────────────────────
+    # A5: Compound Address Field Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def _fill_address(page, label, value):
+        """Fill a Salesforce compound address field (lightning-input-address).
+
+        Compound address fields render sub-fields:
+        - Street (textarea)
+        - City (input)
+        - State/Province (picklist or input)
+        - Zip/Postal Code (input)
+        - Country (picklist or input)
+
+        Value format options:
+        - Plain string → fills Street only
+        - Dict: {'street': ..., 'city': ..., 'state': ..., 'zip': ..., 'country': ...}
+        - Comma-separated: "123 Main St, Springfield, IL, 62701, USA"
+
+        Args:
+            page: Playwright page
+            label: Field label (e.g., "Billing Address", "Mailing Address")
+            value: Address string or dict
+        """
+        logger.info(f"  🏠 Address field: '{label}' → '{value}'")
+
+        # Parse value into components
+        address = {}
+        if isinstance(value, dict):
+            address = value
+        elif isinstance(value, str) and "," in value:
+            parts = [p.strip() for p in value.split(",")]
+            if len(parts) >= 1:
+                address["street"] = parts[0]
+            if len(parts) >= 2:
+                address["city"] = parts[1]
+            if len(parts) >= 3:
+                address["state"] = parts[2]
+            if len(parts) >= 4:
+                address["zip"] = parts[3]
+            if len(parts) >= 5:
+                address["country"] = parts[4]
+        else:
+            address["street"] = value  # Treat as street only
+
+        # ─── Find the address component container ───
+        addr_container_selectors = [
+            f"lightning-input-address:has-text('{label}')",
+            f"lightning-input-field:has-text('{label}') lightning-input-address",
+            f".slds-form-element:has-text('{label}') lightning-input-address",
+            f"[data-field-label='{label}']",
+        ]
+        container = None
+        for asel in addr_container_selectors:
+            try:
+                loc = page.locator(asel)
+                if await loc.count() > 0:
+                    container = loc.first
+                    logger.info(f"  → Found address container via: {asel}")
+                    break
+            except Exception:
+                continue
+
+        if not container:
+            # Try to fill as generic text (some addresses are simple textarea)
+            logger.info(f"  → No compound address component found, trying generic fill")
+            return await SalesforceLightningEngine._fill_generic(page, label, address.get("street", value))
+
+        filled_any = False
+
+        # ─── Fill Street ───
+        if address.get("street"):
+            for sel in ["textarea[name='street']", "textarea[placeholder*='treet']", "textarea"]:
+                try:
+                    inp = container.locator(sel)
+                    if await inp.count() > 0 and await inp.first.is_visible():
+                        await inp.first.click(timeout=3000)
+                        await inp.first.fill(address["street"])
+                        filled_any = True
+                        logger.info(f"  → Street filled: '{address['street']}'")
+                        break
+                except Exception:
+                    continue
+
+        # ─── Fill City ───
+        if address.get("city"):
+            for sel in ["input[name='city']", "input[placeholder*='ity']"]:
+                try:
+                    inp = container.locator(sel)
+                    if await inp.count() > 0 and await inp.first.is_visible():
+                        await inp.first.click(timeout=3000)
+                        await inp.first.fill(address["city"])
+                        filled_any = True
+                        logger.info(f"  → City filled: '{address['city']}'")
+                        break
+                except Exception:
+                    continue
+
+        # ─── Fill State (try picklist first, then text) ───
+        if address.get("state"):
+            state_filled = False
+            for sel in ["select[name='province']", "lightning-combobox[name='province']"]:
+                try:
+                    inp = container.locator(sel)
+                    if await inp.count() > 0:
+                        await inp.first.select_option(label=address["state"])
+                        state_filled = True
+                        filled_any = True
+                        logger.info(f"  → State filled (select): '{address['state']}'")
+                        break
+                except Exception:
+                    continue
+            if not state_filled:
+                for sel in ["input[name='province']", "input[placeholder*='tate']"]:
+                    try:
+                        inp = container.locator(sel)
+                        if await inp.count() > 0 and await inp.first.is_visible():
+                            await inp.first.fill(address["state"])
+                            filled_any = True
+                            logger.info(f"  → State filled (text): '{address['state']}'")
+                            break
+                    except Exception:
+                        continue
+
+        # ─── Fill Zip ───
+        if address.get("zip"):
+            for sel in ["input[name='postalCode']", "input[placeholder*='ip']", "input[name='postal_code']"]:
+                try:
+                    inp = container.locator(sel)
+                    if await inp.count() > 0 and await inp.first.is_visible():
+                        await inp.first.fill(address["zip"])
+                        filled_any = True
+                        logger.info(f"  → Zip filled: '{address['zip']}'")
+                        break
+                except Exception:
+                    continue
+
+        # ─── Fill Country ───
+        if address.get("country"):
+            country_filled = False
+            for sel in ["select[name='country']", "lightning-combobox[name='country']"]:
+                try:
+                    inp = container.locator(sel)
+                    if await inp.count() > 0:
+                        await inp.first.select_option(label=address["country"])
+                        country_filled = True
+                        filled_any = True
+                        logger.info(f"  → Country filled (select): '{address['country']}'")
+                        break
+                except Exception:
+                    continue
+            if not country_filled:
+                for sel in ["input[name='country']", "input[placeholder*='ountry']"]:
+                    try:
+                        inp = container.locator(sel)
+                        if await inp.count() > 0 and await inp.first.is_visible():
+                            await inp.first.fill(address["country"])
+                            filled_any = True
+                            logger.info(f"  → Country filled (text): '{address['country']}'")
+                            break
+                    except Exception:
+                        continue
+
+        if filled_any:
+            await page.keyboard.press("Tab")
+            await asyncio.sleep(0.3)
+            logger.info(f"  ✅ Address field '{label}' filled")
+
+        return filled_any
