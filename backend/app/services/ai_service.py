@@ -71,6 +71,11 @@ Each step must use ONLY one of the following actions:
 - TYPE
 - ASSERT_TEXT
 - WAIT
+- SELECT
+- LOOKUP
+- CHECKBOX
+- MULTI_SELECT
+- UPLOAD
 
 -------------------------
 STEP FORMAT
@@ -265,6 +270,10 @@ SUPPORTED ACTIONS
 - TYPE
 - ASSERT_TEXT
 - WAIT
+- SELECT
+- LOOKUP
+- CHECKBOX
+- MULTI_SELECT
 
 -------------------------
 STEP FORMAT
@@ -416,7 +425,11 @@ SUPPORTED ACTIONS
 - CLICK — target = locator expression (prefer getByRole)
 - TYPE — target = locator expression (prefer getByLabel), value = text to type (for text, email, phone, currency, number, date fields ONLY)
 - SELECT — target = field label, value = picklist option to select (for picklist/combobox fields ONLY)
+- MULTI_SELECT — target = field label, value = semicolon-separated options (for multi-select picklist fields ONLY)
 - LOOKUP — target = field label, value = search text (for lookup/reference fields ONLY)
+- CHECKBOX — target = field label, value = "true" or "false" (for checkbox/boolean/toggle fields ONLY)
+- UPLOAD — target = field label, value = file path (for file upload fields ONLY)
+- TAB — target = tab name (for switching between record detail tabs: Details, Related, Activity)
 - ASSERT_TEXT — target = locator expression, value = expected text
 - WAIT — value = seconds as string
 
@@ -490,6 +503,19 @@ Structural (CSS only):
   Tab:                  locator_type="role", target="role=tab, name=Details"
   Required Error:       locator_type="css", target=".slds-form-element__help"
 
+Checkbox/Toggle:
+  Checkbox:             action="CHECKBOX", target="Active", value="true", locator_type="label"
+  Toggle:               action="CHECKBOX", target="Do Not Call", value="false", locator_type="label"
+
+Multi-Select Picklist:
+  Multi-Select:         action="MULTI_SELECT", target="Industries", value="Technology;Finance;Healthcare", locator_type="label"
+
+File Upload:
+  Upload:               action="UPLOAD", target="Attachment", value="/path/to/file.pdf", locator_type="label"
+
+Tab Navigation:
+  Switch Tab:           action="TAB", target="Related", locator_type="role"
+
 -------------------------
 CRUD INTENT RULES (NO WAIT STEPS — runner handles waits automatically)
 -------------------------
@@ -557,6 +583,34 @@ DELETE: If test says "delete {Object}":
 3. CLICK → confirm deletion button
 4. ASSERT_TEXT → deletion confirmation
 
+CLONE: If test says "clone {Object}":
+1. NAVIGATE to the source record view page
+2. CLICK → target: "role=button, name=Clone", locator_type: "role"
+3. Any Record Type modal will be handled automatically by the runner
+4. Modify any fields that differ from the original
+5. CLICK → target: "role=button, name=Save", locator_type: "role"
+6. ASSERT_TEXT → target: "was created", locator_type: "text"
+
+RELATED LIST CREATE: If test says "create {ChildObject} from {ParentRecord}":
+1. NAVIGATE to the parent record view page (e.g. /lightning/r/Account/{RecordId}/view)
+2. TAB → target: "Related", locator_type: "role"  (switch to Related tab)
+3. CLICK → target: "role=button, name=New" in the related list section
+4. Fill in child record fields per CRUD CREATE rules above
+5. CLICK → target: "role=button, name=Save", locator_type: "role"
+6. ASSERT_TEXT → target: "was created", locator_type: "text"
+
+INLINE EDIT: If test says "inline edit {Field} on {Record}":
+1. NAVIGATE to the record view page
+2. CLICK → the pencil/edit icon next to the field (target: field label area)
+3. TYPE/SELECT → the new value (field becomes editable inline)
+4. CLICK → target: "role=button, name=Save", locator_type: "role"
+5. ASSERT_TEXT → verify the new value is shown
+
+RECORD TYPE SELECTION:
+- If an object has multiple record types, clicking "New" may open a Record Type picker
+- The runner handles this automatically — you do NOT need to generate a step for it
+- If the user specifies a record type, mention it in the test description/preconditions
+
 -------------------------
 FIELD VALUE RULES (CRITICAL — field type determines the action)
 -------------------------
@@ -566,10 +620,12 @@ FIELD VALUE RULES (CRITICAL — field type determines the action)
 - Currency → action: TYPE, value: "1000"
 - Number → action: TYPE, value: "100"
 - Date → action: TYPE, value: "01/01/2025"
-- Checkbox → action: CLICK (use getByRole or getByLabel)
+- Checkbox → action: CHECKBOX, value: "true" or "false"
 - Picklist → action: SELECT, value: Use the EXACT value from the user's prompt. If user doesn't specify, pick a valid value from metadata picklist values
+- Multi-Select Picklist → action: MULTI_SELECT, value: semicolon-separated values (e.g. "Val1;Val2")
 - Lookup/Reference → action: LOOKUP_SELECT, value: search text for the related record
 - Required fields → MUST be populated (check metadata for nillable=false)
+- Time → action: TYPE, value: "2:00 PM" or "14:00"
 
 CRITICAL VALUE RULE:
 When the user explicitly mentions a value in their prompt (e.g., "set status to Converted", "change type to Partner"),
@@ -578,10 +634,17 @@ User-specified values ALWAYS take priority over metadata defaults.
 
 ACTION MAPPING BY FIELD TYPE (DO NOT USE TYPE FOR PICKLISTS):
 - string, textarea, email, phone, url, currency, int, double, percent → TYPE
-- picklist, multipicklist, combobox → SELECT
+- picklist, combobox → SELECT
+- multipicklist → MULTI_SELECT (value = semicolon-separated, e.g. "Value1;Value2;Value3")
 - reference, lookup → LOOKUP_SELECT
 - date, datetime → TYPE (with date format)
-- boolean → CLICK
+- boolean → CHECKBOX (value = "true" or "false")
+- time → TYPE (with time format e.g. "2:00 PM")
+
+DEPENDENT PICKLIST RULE (CRITICAL):
+- If picklist B's options depend on picklist A's selection, picklist A MUST come FIRST
+- Example: If "Sub-Type" depends on "Type", generate SELECT for "Type" BEFORE "Sub-Type"
+- Look in metadata for controlling field relationships
 
 -------------------------
 VALIDATION RULE HANDLING

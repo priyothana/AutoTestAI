@@ -36,12 +36,14 @@ FIELD_TYPE_ACTION_MAP = {
     "percent": "TYPE",
     "date": "TYPE",
     "datetime": "TYPE",
+    "time": "TYPE",
     "picklist": "SELECT",
-    "multipicklist": "SELECT",
+    "multipicklist": "MULTI_SELECT",
     "combobox": "SELECT",
     "reference": "LOOKUP_SELECT",
     "lookup": "LOOKUP_SELECT",
-    "boolean": "CLICK",
+    "boolean": "CHECKBOX",
+    "richtext": "TYPE",
 }
 
 

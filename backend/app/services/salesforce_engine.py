@@ -187,14 +187,24 @@ class SalesforceLightningEngine:
                     if (!labelText) return;
 
                     // Detect field type from child components
-                    if (field.querySelector('lightning-datepicker')) {
+                    if (field.querySelector('input[type="checkbox"], lightning-primitive-input-toggle')) {
+                        map[labelText] = 'checkbox';
+                    } else if (field.querySelector('lightning-datepicker')) {
                         map[labelText] = 'date';
+                    } else if (field.querySelector('lightning-timepicker')) {
+                        map[labelText] = 'time';
+                    } else if (field.querySelector('lightning-dual-listbox')) {
+                        map[labelText] = 'multipicklist';
                     } else if (field.querySelector('lightning-combobox')) {
                         map[labelText] = 'picklist';
                     } else if (field.querySelector('lightning-lookup, lightning-grouped-combobox, input[role="combobox"]')) {
                         map[labelText] = 'lookup';
+                    } else if (field.querySelector('lightning-input-rich-text, [contenteditable="true"]')) {
+                        map[labelText] = 'richtext';
                     } else if (field.querySelector('lightning-textarea, textarea')) {
                         map[labelText] = 'textarea';
+                    } else if (field.querySelector('input[type="file"], lightning-file-upload')) {
+                        map[labelText] = 'file';
                     } else {
                         map[labelText] = 'text';
                     }
@@ -202,7 +212,9 @@ class SalesforceLightningEngine:
 
                 // Scan standalone lightning-input, lightning-combobox, lightning-datepicker
                 ['lightning-input', 'lightning-combobox', 'lightning-datepicker',
-                 'lightning-textarea', 'lightning-lookup'].forEach(tag => {
+                 'lightning-timepicker', 'lightning-textarea', 'lightning-lookup',
+                 'lightning-dual-listbox', 'lightning-input-rich-text',
+                 'lightning-file-upload'].forEach(tag => {
                     modal.querySelectorAll(tag).forEach(el => {
                         const label = el.querySelector('label, .slds-form-element__label');
                         if (!label) return;
@@ -210,9 +222,13 @@ class SalesforceLightningEngine:
                         if (!labelText || map[labelText]) return;
 
                         if (tag === 'lightning-datepicker') map[labelText] = 'date';
+                        else if (tag === 'lightning-timepicker') map[labelText] = 'time';
                         else if (tag === 'lightning-combobox') map[labelText] = 'picklist';
                         else if (tag === 'lightning-lookup') map[labelText] = 'lookup';
                         else if (tag === 'lightning-textarea') map[labelText] = 'textarea';
+                        else if (tag === 'lightning-dual-listbox') map[labelText] = 'multipicklist';
+                        else if (tag === 'lightning-input-rich-text') map[labelText] = 'richtext';
+                        else if (tag === 'lightning-file-upload') map[labelText] = 'file';
                         else map[labelText] = 'text';
                     });
                 });
@@ -224,14 +240,24 @@ class SalesforceLightningEngine:
                     const labelText = label.textContent.trim();
                     if (!labelText || map[labelText]) return;
 
-                    if (el.querySelector('input[type="date"], lightning-datepicker')) {
+                    if (el.querySelector('input[type="checkbox"], lightning-primitive-input-toggle')) {
+                        map[labelText] = 'checkbox';
+                    } else if (el.querySelector('input[type="date"], lightning-datepicker')) {
                         map[labelText] = 'date';
+                    } else if (el.querySelector('lightning-timepicker')) {
+                        map[labelText] = 'time';
+                    } else if (el.querySelector('lightning-dual-listbox')) {
+                        map[labelText] = 'multipicklist';
                     } else if (el.querySelector('select, lightning-combobox, [role="listbox"]')) {
                         map[labelText] = 'picklist';
                     } else if (el.querySelector('input[role="combobox"]')) {
                         map[labelText] = 'lookup';
+                    } else if (el.querySelector('lightning-input-rich-text, [contenteditable="true"]')) {
+                        map[labelText] = 'richtext';
                     } else if (el.querySelector('textarea')) {
                         map[labelText] = 'textarea';
+                    } else if (el.querySelector('input[type="file"], lightning-file-upload')) {
+                        map[labelText] = 'file';
                     } else {
                         map[labelText] = 'text';
                     }
@@ -895,12 +921,13 @@ class SalesforceLightningEngine:
                 # Map Salesforce API types to engine types
                 type_mapping = {
                     "picklist": "picklist",
-                    "multipicklist": "picklist",
+                    "multipicklist": "multipicklist",
                     "combobox": "picklist",
                     "reference": "lookup",
                     "date": "date",
                     "datetime": "date",
                     "boolean": "checkbox",
+                    "time": "time",
                     "textarea": "text",
                     "string": "text",
                     "email": "text",
@@ -1041,7 +1068,23 @@ class SalesforceLightningEngine:
         await SalesforceLightningEngine.scroll_modal_to_field(page, label)
 
         # Step 2: Try type-specific strategies
-        if field_type == "date":
+        if field_type == "checkbox":
+            success = await SalesforceLightningEngine._fill_checkbox(page, label, value)
+            if success:
+                return
+        elif field_type == "multipicklist":
+            success = await SalesforceLightningEngine._fill_multi_picklist(page, label, value)
+            if success:
+                return
+        elif field_type == "richtext":
+            success = await SalesforceLightningEngine._fill_rich_text(page, label, value)
+            if success:
+                return
+        elif field_type == "time":
+            success = await SalesforceLightningEngine._fill_time(page, label, value)
+            if success:
+                return
+        elif field_type == "date":
             success = await SalesforceLightningEngine._fill_date(page, label, value)
             if success:
                 return
@@ -2268,3 +2311,619 @@ class SalesforceLightningEngine:
         except Exception as e:
             logger.debug(f"  JS DOM traversal failed for '{label}': {e}")
         return False
+
+    # ─────────────────────────────────────────────
+    # A1: Checkbox / Toggle Field Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def _fill_checkbox(page, label, value):
+        """Fill a Lightning checkbox or toggle field.
+
+        Salesforce checkboxes render as:
+        - lightning-input-field > input[type=checkbox]
+        - lightning-input[type=toggle]
+        - lightning-primitive-input-toggle
+        - Standard <input type="checkbox">
+
+        Strategy: Find the checkbox, check its current state, toggle if needed.
+        Value: 'true'/'yes'/'1'/'checked' → check it; otherwise → uncheck it.
+        """
+        logger.info(f"  ☑ Checkbox: '{label}' → '{value}'")
+        target_checked = value.lower().strip() in ("true", "yes", "1", "checked", "on")
+
+        # Strategy 1: Lightning component selectors
+        checkbox_selectors = [
+            f"lightning-input-field:has-text('{label}') input[type='checkbox']",
+            f"lightning-input:has-text('{label}') input[type='checkbox']",
+            f".slds-form-element:has-text('{label}') input[type='checkbox']",
+            f"lightning-input:has-text('{label}') span.slds-checkbox_faux",
+            f"lightning-input:has-text('{label}') label.slds-checkbox__label",
+            f"input[aria-label='{label}'][type='checkbox']",
+        ]
+        for sel in checkbox_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() == 0:
+                    continue
+                el = loc.first
+                await el.scroll_into_view_if_needed(timeout=5000)
+
+                # For actual input[type=checkbox], check the current state
+                tag = await el.evaluate("el => el.tagName.toLowerCase()")
+                if tag == "input":
+                    is_checked = await el.is_checked()
+                    if is_checked != target_checked:
+                        # Click on the visual checkbox (span.slds-checkbox_faux or label)
+                        # because clicking the hidden input may not work in Lightning
+                        parent = page.locator(
+                            f"lightning-input-field:has-text('{label}'), "
+                            f"lightning-input:has-text('{label}'), "
+                            f".slds-form-element:has-text('{label}')"
+                        )
+                        if await parent.count() > 0:
+                            faux = parent.first.locator(
+                                "span.slds-checkbox_faux, label.slds-checkbox__label, "
+                                "span.slds-checkbox_on, span.slds-checkbox--faux"
+                            )
+                            if await faux.count() > 0:
+                                await faux.first.click(timeout=5000)
+                            else:
+                                await el.click(timeout=5000)
+                        else:
+                            await el.click(timeout=5000)
+                        await asyncio.sleep(0.3)
+                        logger.info(f"  → Checkbox '{label}' toggled to {target_checked}")
+                    else:
+                        logger.info(f"  → Checkbox '{label}' already {target_checked}, skipping")
+                else:
+                    # For non-input elements (faux checkbox, label), just click
+                    await el.click(timeout=5000)
+                    await asyncio.sleep(0.3)
+                    logger.info(f"  → Checkbox '{label}' clicked via {sel}")
+                return True
+            except Exception as e:
+                logger.debug(f"  Checkbox strategy {sel} failed: {e}")
+                continue
+
+        # Strategy 2: Toggle switch components
+        toggle_selectors = [
+            f"lightning-input-field:has-text('{label}') lightning-primitive-input-toggle",
+            f"lightning-input:has-text('{label}') button[role='switch']",
+            f".slds-form-element:has-text('{label}') button[role='switch']",
+        ]
+        for sel in toggle_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    el = loc.first
+                    # Check current state via aria-checked
+                    is_checked_str = await el.get_attribute("aria-checked") or "false"
+                    is_checked = is_checked_str.lower() == "true"
+                    if is_checked != target_checked:
+                        await el.click(timeout=5000)
+                        await asyncio.sleep(0.3)
+                        logger.info(f"  → Toggle '{label}' switched to {target_checked}")
+                    else:
+                        logger.info(f"  → Toggle '{label}' already {target_checked}")
+                    return True
+            except Exception as e:
+                logger.debug(f"  Toggle strategy {sel} failed: {e}")
+                continue
+
+        # Strategy 3: JS fallback
+        try:
+            toggled = await page.evaluate("""(args) => {
+                const [labelText, shouldCheck] = args;
+                const root = document.querySelector(
+                    '.slds-modal__content, records-record-edit-form'
+                ) || document.body;
+                const labels = root.querySelectorAll(
+                    'label, span.slds-form-element__label, legend'
+                );
+                for (const lbl of labels) {
+                    if (!lbl.textContent || !lbl.textContent.trim().includes(labelText)) continue;
+                    const container = lbl.closest(
+                        'lightning-input-field, lightning-input, .slds-form-element'
+                    );
+                    if (!container) continue;
+                    const cb = container.querySelector('input[type="checkbox"]');
+                    if (cb) {
+                        if (cb.checked !== shouldCheck) {
+                            cb.click();
+                        }
+                        return true;
+                    }
+                    const toggle = container.querySelector('button[role="switch"]');
+                    if (toggle) {
+                        const isOn = toggle.getAttribute('aria-checked') === 'true';
+                        if (isOn !== shouldCheck) {
+                            toggle.click();
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            }""", [label, target_checked])
+            if toggled:
+                await asyncio.sleep(0.3)
+                logger.info(f"  → Checkbox '{label}' toggled via JS")
+                return True
+        except Exception as e:
+            logger.debug(f"  Checkbox JS fallback failed: {e}")
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # A2: Multi-Select Picklist Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def _fill_multi_picklist(page, label, value):
+        """Fill a Lightning Multi-Select Picklist (Dual Listbox).
+
+        Salesforce multi-select picklists render as lightning-dual-listbox
+        with two list columns: Available Options and Selected Options.
+
+        Strategy:
+        1. Find the dual-listbox component by label
+        2. For each value to select, click it in the Available list
+        3. Click the 'move to selected' arrow button
+
+        Value format: semicolon-separated (e.g., "Value1;Value2;Value3")
+        """
+        logger.info(f"  ☰ Multi-Select Picklist: '{label}' → '{value}'")
+        values = [v.strip() for v in (value or "").split(";") if v.strip()]
+        if not values:
+            return False
+
+        # Strategy 1: Lightning dual-listbox component
+        dual_listbox_selectors = [
+            f"lightning-dual-listbox:has-text('{label}')",
+            f"lightning-input-field:has-text('{label}') lightning-dual-listbox",
+            f".slds-form-element:has-text('{label}') lightning-dual-listbox",
+            f".slds-dueling-list:has-text('{label}')",
+        ]
+
+        for dl_sel in dual_listbox_selectors:
+            try:
+                container = page.locator(dl_sel)
+                if await container.count() == 0:
+                    continue
+
+                container = container.first
+                logger.info(f"  → Found dual-listbox via: {dl_sel}")
+
+                selected_count = 0
+                for val in values:
+                    # Find the option in the Available list
+                    option_selectors = [
+                        f"[role='option']:has-text('{val}')",
+                        f".slds-listbox__item:has-text('{val}')",
+                        f"span[title='{val}']",
+                    ]
+                    for opt_sel in option_selectors:
+                        try:
+                            option = container.locator(opt_sel)
+                            if await option.count() > 0:
+                                await option.first.click(timeout=5000)
+                                selected_count += 1
+                                logger.info(f"  → Selected '{val}' in dual-listbox")
+                                await asyncio.sleep(0.3)
+                                break
+                        except Exception:
+                            continue
+
+                # Click the "Move to Selected" arrow button
+                if selected_count > 0:
+                    move_right_selectors = [
+                        "button[title='Move selection to Chosen']",
+                        "button.slds-button:has(lightning-primitive-icon)",
+                        "button[aria-label*='Move']",
+                        "button[aria-label*='right']",
+                    ]
+                    for mr_sel in move_right_selectors:
+                        try:
+                            move_btn = container.locator(mr_sel)
+                            if await move_btn.count() > 0:
+                                await move_btn.first.click(timeout=5000)
+                                await asyncio.sleep(0.5)
+                                logger.info(f"  → Moved {selected_count} items to Selected")
+                                return True
+                        except Exception:
+                            continue
+
+                    # Alternative: some dual listboxes auto-move on double-click
+                    logger.info(f"  → {selected_count} items selected but no move button found")
+                    return True
+            except Exception as e:
+                logger.debug(f"  Dual-listbox {dl_sel} error: {e}")
+                continue
+
+        # Strategy 2: Multi-select combobox (non-dual-listbox)
+        # Some SF fields use a combobox that allows multiple selections via checkboxes
+        try:
+            combo_selectors = [
+                f"lightning-input-field:has-text('{label}') button",
+                f".slds-form-element:has-text('{label}') button[aria-haspopup='listbox']",
+            ]
+            for cs in combo_selectors:
+                trigger = page.locator(cs)
+                if await trigger.count() == 0:
+                    continue
+
+                # Click to open the dropdown
+                await trigger.first.click(timeout=5000)
+                await asyncio.sleep(1)
+
+                # Select each value
+                for val in values:
+                    option = page.locator(
+                        f"[role='option']:has-text('{val}'), "
+                        f"lightning-base-combobox-item:has-text('{val}')"
+                    )
+                    if await option.count() > 0:
+                        await option.first.click(timeout=5000)
+                        await asyncio.sleep(0.3)
+                        logger.info(f"  → Multi-select: clicked '{val}'")
+
+                # Close dropdown
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.3)
+                logger.info(f"  → Multi-select picklist '{label}' completed")
+                return True
+        except Exception as e:
+            logger.debug(f"  Multi-select combobox fallback failed: {e}")
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # A3: Rich Text / HTML Editor Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def _fill_rich_text(page, label, value):
+        """Fill a Lightning Rich Text editor field.
+
+        Salesforce rich text fields use lightning-input-rich-text which wraps
+        a contenteditable div or an iframe-based editor.
+
+        Strategy:
+        1. Find the editor container by label
+        2. Click on the contenteditable area
+        3. Type the value
+        """
+        logger.info(f"  📝 Rich Text: '{label}' → '{value}'")
+
+        # Strategy 1: Lightning contenteditable div
+        richtext_selectors = [
+            f"lightning-input-rich-text:has-text('{label}') div[contenteditable='true']",
+            f"lightning-input-field:has-text('{label}') div[contenteditable='true']",
+            f".slds-form-element:has-text('{label}') div[contenteditable='true']",
+            f"lightning-input-rich-text:has-text('{label}') .ql-editor",
+            f".slds-rich-text-area__content[contenteditable='true']",
+        ]
+        for sel in richtext_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() == 0:
+                    continue
+                el = loc.first
+                await el.scroll_into_view_if_needed(timeout=5000)
+                await el.click(timeout=5000)
+                await asyncio.sleep(0.3)
+
+                # Clear existing content
+                await page.keyboard.press("Control+a")
+                await asyncio.sleep(0.1)
+
+                # Type the value
+                await page.keyboard.type(value or "", delay=30)
+                await asyncio.sleep(0.3)
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.3)
+                logger.info(f"  → Rich text '{label}' filled via {sel}")
+                return True
+            except Exception as e:
+                logger.debug(f"  Rich text strategy {sel} failed: {e}")
+                continue
+
+        # Strategy 2: iframe-based editor (some orgs use CKEditor)
+        try:
+            editor_container = page.locator(
+                f"lightning-input-rich-text:has-text('{label}'), "
+                f"lightning-input-field:has-text('{label}')"
+            )
+            if await editor_container.count() > 0:
+                iframe = editor_container.first.locator("iframe")
+                if await iframe.count() > 0:
+                    frame = iframe.first.content_frame
+                    if frame:
+                        body = frame.locator("body")
+                        await body.click(timeout=5000)
+                        await asyncio.sleep(0.3)
+                        await frame.locator("body").fill(value or "")
+                        logger.info(f"  → Rich text '{label}' filled via iframe editor")
+                        return True
+        except Exception as e:
+            logger.debug(f"  Rich text iframe fallback failed: {e}")
+
+        # Strategy 3: JS fallback — set innerHTML on contenteditable
+        try:
+            filled = await page.evaluate("""(args) => {
+                const [labelText, fillValue] = args;
+                const root = document.querySelector(
+                    '.slds-modal__content, records-record-edit-form'
+                ) || document.body;
+                const labels = root.querySelectorAll(
+                    'label, span.slds-form-element__label, legend'
+                );
+                for (const lbl of labels) {
+                    if (!lbl.textContent || !lbl.textContent.trim().includes(labelText)) continue;
+                    const container = lbl.closest(
+                        'lightning-input-rich-text, lightning-input-field, .slds-form-element'
+                    );
+                    if (!container) continue;
+                    const editor = container.querySelector(
+                        '[contenteditable="true"], .ql-editor'
+                    );
+                    if (editor) {
+                        editor.innerHTML = '<p>' + fillValue + '</p>';
+                        editor.dispatchEvent(new Event('input', { bubbles: true }));
+                        editor.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    }
+                }
+                return false;
+            }""", [label, value or ""])
+            if filled:
+                logger.info(f"  → Rich text '{label}' filled via JS innerHTML")
+                return True
+        except Exception as e:
+            logger.debug(f"  Rich text JS fallback failed: {e}")
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # A6: Time Field Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def _fill_time(page, label, value):
+        """Fill a Lightning time field.
+
+        Salesforce time fields use lightning-timepicker which renders
+        an input with a combobox-style dropdown of time slots.
+
+        Strategy: Click → clear → type time → Tab to commit.
+        Value format: "HH:MM AM/PM" or "HH:MM" (24hr)
+        """
+        logger.info(f"  🕐 Time field: '{label}' → '{value}'")
+
+        selectors = [
+            f"lightning-timepicker:has-text('{label}') input",
+            f"lightning-input-field:has-text('{label}') lightning-timepicker input",
+            f"lightning-input:has-text('{label}') input[type='text']",
+            f"input[aria-label='{label}']",
+            f".slds-form-element:has-text('{label}') input[type='text']",
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() == 0:
+                    continue
+                el = loc.first
+                await el.scroll_into_view_if_needed(timeout=5000)
+                await el.click(timeout=5000)
+                await asyncio.sleep(0.3)
+
+                # Select all and type
+                await el.click(click_count=3, timeout=3000)
+                await asyncio.sleep(0.2)
+                await page.keyboard.type(value or "", delay=50)
+                await asyncio.sleep(0.3)
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.5)
+
+                # Dismiss any dropdown
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+
+                logger.info(f"  → Time field '{label}' filled via {sel}")
+                return True
+            except Exception as e:
+                logger.debug(f"  Time strategy {sel} failed: {e}")
+                continue
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # A4: File Upload Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def _fill_file_upload(page, label, file_path):
+        """Handle Salesforce file upload fields.
+
+        Salesforce file uploads use:
+        - lightning-file-upload component
+        - Standard <input type="file"> (hidden, triggered by button)
+
+        Strategy: Find the file input, use set_input_files().
+        """
+        logger.info(f"  📁 File upload: '{label}' → '{file_path}'")
+
+        file_selectors = [
+            f"lightning-file-upload:has-text('{label}') input[type='file']",
+            f"lightning-input-field:has-text('{label}') input[type='file']",
+            f".slds-form-element:has-text('{label}') input[type='file']",
+            f"input[type='file'][aria-label*='{label}']",
+            f"input[type='file'][name*='{label}']",
+        ]
+        for sel in file_selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() == 0:
+                    continue
+                # set_input_files works even on hidden file inputs
+                await loc.first.set_input_files(file_path)
+                await asyncio.sleep(2)  # Wait for upload
+                logger.info(f"  → File uploaded for '{label}' via {sel}")
+                return True
+            except Exception as e:
+                logger.debug(f"  File upload {sel} failed: {e}")
+                continue
+
+        # Strategy 2: JS — find hidden file input near the label
+        try:
+            input_found = await page.evaluate("""(labelText) => {
+                const root = document.querySelector(
+                    '.slds-modal__content, records-record-edit-form'
+                ) || document.body;
+                const labels = root.querySelectorAll(
+                    'label, span.slds-form-element__label, legend, .slds-file-selector__button'
+                );
+                for (const lbl of labels) {
+                    if (!lbl.textContent || !lbl.textContent.trim().includes(labelText)) continue;
+                    const container = lbl.closest(
+                        'lightning-file-upload, lightning-input-field, .slds-form-element'
+                    );
+                    if (!container) continue;
+                    const input = container.querySelector('input[type="file"]');
+                    if (input) {
+                        input.style.display = 'block';
+                        input.style.opacity = '1';
+                        return true;
+                    }
+                }
+                return false;
+            }""", label)
+            if input_found:
+                # Now the file input should be visible
+                visible_input = page.locator(f"input[type='file']:visible")
+                if await visible_input.count() > 0:
+                    await visible_input.first.set_input_files(file_path)
+                    await asyncio.sleep(2)
+                    logger.info(f"  → File uploaded for '{label}' via JS reveal + set_input_files")
+                    return True
+        except Exception as e:
+            logger.debug(f"  File upload JS fallback failed: {e}")
+
+        return False
+
+    # ─────────────────────────────────────────────
+    # B10: Record Type Selector Handler
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def handle_record_type_modal(page, record_type_name=None):
+        """Handle the Record Type selection modal that appears before the new record form.
+
+        When a Salesforce object has multiple record types, clicking "New" opens
+        a modal asking the user to select a Record Type before showing the form.
+
+        Args:
+            page: Playwright page
+            record_type_name: Optional specific record type to select.
+                            If None, selects the first/default option.
+
+        Returns:
+            True if a record type modal was handled, False if not detected.
+        """
+        logger.info("  🏷 Checking for Record Type selection modal...")
+
+        # Detect the Record Type modal
+        rt_modal_indicators = [
+            "h2:has-text('Select a record type')",
+            "h2:has-text('New ')",
+            ".slds-modal h2:has-text('record type')",
+            "div.changeRecordTypeOptionRightColumn",
+            ".slds-radio_button-group",
+            "records-recordtype-picking",
+        ]
+
+        modal_found = False
+        for indicator in rt_modal_indicators:
+            try:
+                loc = page.locator(indicator)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    modal_found = True
+                    logger.info(f"  → Record Type modal detected via: {indicator}")
+                    break
+            except Exception:
+                continue
+
+        if not modal_found:
+            return False
+
+        await asyncio.sleep(0.5)
+
+        # If a specific record type was requested, select it
+        if record_type_name:
+            rt_option_selectors = [
+                f"label:has-text('{record_type_name}')",
+                f"span.slds-radio__label:has-text('{record_type_name}')",
+                f"[role='radio']:has-text('{record_type_name}')",
+                f"input[type='radio'][value='{record_type_name}']",
+            ]
+            for rt_sel in rt_option_selectors:
+                try:
+                    opt = page.locator(rt_sel)
+                    if await opt.count() > 0:
+                        await opt.first.click(timeout=5000)
+                        logger.info(f"  → Selected Record Type: '{record_type_name}'")
+                        await asyncio.sleep(0.3)
+                        break
+                except Exception:
+                    continue
+
+        # Click "Next" or "Continue" button to proceed
+        next_buttons = [
+            "button:has-text('Next')",
+            "button:has-text('Continue')",
+            ".slds-modal button.slds-button--brand",
+            ".slds-modal button.slds-button_brand",
+        ]
+        for nb_sel in next_buttons:
+            try:
+                btn = page.locator(nb_sel)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click(timeout=5000)
+                    logger.info(f"  → Clicked 'Next' on Record Type modal")
+                    await asyncio.sleep(1)
+                    return True
+            except Exception:
+                continue
+
+        logger.warning("  ⚠ Record Type modal detected but could not proceed")
+        return False
+
+    # ─────────────────────────────────────────────
+    # E2: Spinner Wait Utility
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def wait_for_spinner_gone(page, timeout=15000):
+        """Wait for all Salesforce Lightning spinners to disappear.
+
+        Common after Save, navigation, or modal actions.
+        """
+        spinner_selectors = (
+            "lightning-spinner, .slds-spinner, "
+            ".slds-spinner_container:not(.slds-hide), "
+            "div.slds-spinner_container:not([class*='slds-hide'])"
+        )
+        try:
+            spinner = page.locator(spinner_selectors)
+            # Only wait if a spinner is currently visible
+            if await spinner.count() > 0:
+                logger.info("  ℹ Spinner detected, waiting for it to clear...")
+                await spinner.first.wait_for(state="hidden", timeout=timeout)
+                logger.info("  ℹ Spinner cleared")
+                await asyncio.sleep(0.3)
+        except Exception:
+            # Spinner may have disappeared during our check
+            pass

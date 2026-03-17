@@ -1124,6 +1124,13 @@ class PlaywrightService:
                                                 await asyncio.sleep(3)
 
                                     sf_field_map = await SalesforceLightningEngine.scan_field_map(page)
+
+                                    # B10: Handle Record Type selection modal (appears before new record form)
+                                    await SalesforceLightningEngine.handle_record_type_modal(page)
+
+                                    # E2: Wait for spinner to clear after modal opens
+                                    await SalesforceLightningEngine.wait_for_spinner_gone(page)
+
                                 elif "save" in target_lower:
                                     # ─── Component 3: Pre-save required field check ───
                                     try:
@@ -1142,6 +1149,9 @@ class PlaywrightService:
                                             logger.info(f"  ⚠ Pre-save warning: missing required fields: {missing_required}")
                                     except Exception as ps_err:
                                         print(f"[PRE-SAVE] Check error: {ps_err}")
+
+                                    # E2: Wait for spinner to clear after save
+                                    await SalesforceLightningEngine.wait_for_spinner_gone(page)
 
                                     await asyncio.sleep(2)
                                     try:
@@ -1165,7 +1175,22 @@ class PlaywrightService:
                                             meta_info = mi
                                             break
                                 print(f"[STEP] TYPE action for '{target}' = '{value}', meta_type={meta_info.get('type') if meta_info else 'none'}")
-                                if meta_info and meta_info.get("type") in ("picklist", "multipicklist", "combobox"):
+                                if meta_info and meta_info.get("type") == "multipicklist":
+                                    logger.info(f"  ℹ Metadata redirect: TYPE '{target}' → MULTI_SELECT")
+                                    await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                    success = await SalesforceLightningEngine._fill_multi_picklist(
+                                        page, target, value
+                                    )
+                                    if not success:
+                                        # Fallback to single picklist
+                                        success = await SalesforceLightningEngine._fill_picklist(
+                                            page, target, value
+                                        )
+                                    if not success:
+                                        raise Exception(
+                                            f"Could not select '{value}' in multi-select field '{target}' — all strategies exhausted"
+                                        )
+                                elif meta_info and meta_info.get("type") in ("picklist", "combobox"):
                                     logger.info(f"  ℹ Metadata redirect: TYPE '{target}' → SELECT (picklist)")
                                     await SalesforceLightningEngine.scroll_modal_to_field(page, target)
                                     success = await SalesforceLightningEngine._fill_picklist(
@@ -1174,6 +1199,16 @@ class PlaywrightService:
                                     if not success:
                                         raise Exception(
                                             f"Could not select '{value}' in picklist field '{target}' — all strategies exhausted"
+                                        )
+                                elif meta_info and meta_info.get("type") == "boolean":
+                                    logger.info(f"  ℹ Metadata redirect: TYPE '{target}' → CHECKBOX")
+                                    await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                    success = await SalesforceLightningEngine._fill_checkbox(
+                                        page, target, value
+                                    )
+                                    if not success:
+                                        raise Exception(
+                                            f"Could not toggle checkbox '{target}' — all strategies exhausted"
                                         )
                                 elif meta_info and meta_info.get("type") == "reference":
                                     logger.info(f"  ℹ Metadata redirect: TYPE '{target}' → LOOKUP_SELECT (reference)")
@@ -1265,6 +1300,60 @@ class PlaywrightService:
                                         f"LOOKUP_SELECT failed: could not find/select '{value}' in lookup field '{target}'. "
                                         f"Ensure the record exists in the related object."
                                     )
+
+                            elif action == "checkbox":
+                                # A1: Checkbox/toggle field
+                                await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                success = await SalesforceLightningEngine._fill_checkbox(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"Could not toggle checkbox '{target}' — all strategies exhausted"
+                                    )
+
+                            elif action == "multi_select":
+                                # A2: Multi-select picklist
+                                await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                success = await SalesforceLightningEngine._fill_multi_picklist(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"Could not select values '{value}' in multi-select field '{target}' — all strategies exhausted"
+                                    )
+
+                            elif action == "upload":
+                                # A4: File upload
+                                success = await SalesforceLightningEngine._fill_file_upload(
+                                    page, target, value
+                                )
+                                if not success:
+                                    raise Exception(
+                                        f"File upload failed for '{target}' with path '{value}'"
+                                    )
+
+                            elif action == "tab":
+                                # B3: Tab switching on record detail page
+                                tab_name = target or value or ""
+                                if tab_name:
+                                    try:
+                                        tab_loc = page.get_by_role("tab", name=tab_name, exact=False)
+                                        if await tab_loc.count() > 0:
+                                            await tab_loc.first.click(timeout=5000)
+                                            await asyncio.sleep(1)
+                                            logger.info(f"  → Switched to tab: '{tab_name}'")
+                                        else:
+                                            # Fallback: try text-based click
+                                            text_loc = page.get_by_text(tab_name, exact=False)
+                                            if await text_loc.count() > 0:
+                                                await text_loc.first.click(timeout=5000)
+                                                await asyncio.sleep(1)
+                                                logger.info(f"  → Clicked tab text: '{tab_name}'")
+                                            else:
+                                                raise Exception(f"Tab '{tab_name}' not found")
+                                    except Exception as tab_err:
+                                        raise Exception(f"Tab switch to '{tab_name}' failed: {tab_err}")
 
                             elif action == "assert_text":
                                 # Determine expected text: use value if set, otherwise target IS the text to find
