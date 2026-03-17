@@ -414,7 +414,9 @@ SUPPORTED ACTIONS
 -------------------------
 - NAVIGATE — value = relative URL path
 - CLICK — target = locator expression (prefer getByRole)
-- TYPE — target = locator expression (prefer getByLabel), value = text to type
+- TYPE — target = locator expression (prefer getByLabel), value = text to type (for text, email, phone, currency, number, date fields ONLY)
+- SELECT — target = field label, value = picklist option to select (for picklist/combobox fields ONLY)
+- LOOKUP — target = field label, value = search text (for lookup/reference fields ONLY)
 - ASSERT_TEXT — target = locator expression, value = expected text
 - WAIT — value = seconds as string
 
@@ -465,15 +467,22 @@ Buttons:
   Delete Button:        locator_type="role", target="role=button, name=Delete"
   Cancel Button:        locator_type="role", target="role=button, name=Cancel"
 
-Form Fields (use field LABEL from metadata):
-  Text Input:           locator_type="label", target="Account Name"
-  Textarea:             locator_type="label", target="Description"
-  Phone:                locator_type="label", target="Phone"
-  Email:                locator_type="label", target="Email"
+Form Fields — TEXT/NUMBER/DATE (use field LABEL from metadata):
+  Text Input:           action="TYPE", locator_type="label", target="Account Name"
+  Textarea:             action="TYPE", locator_type="label", target="Description"
+  Phone:                action="TYPE", locator_type="label", target="Phone"
+  Email:                action="TYPE", locator_type="label", target="Email"
+  Date:                 action="TYPE", locator_type="label", target="Invoice Date", value="01/01/2025"
+  Currency:             action="TYPE", locator_type="label", target="Amount", value="1000"
 
-Picklist/Combobox:
-  Open Combobox:        locator_type="label", target="Industry"
-  Select Option:        locator_type="css", target="[role='option'][data-value='Technology']"
+Picklist/Combobox — MUST USE SELECT ACTION:
+  Picklist:             action="SELECT", target="Industry", value="Technology", locator_type="label"
+  Picklist:             action="SELECT", target="Tax Type", value="GST", locator_type="label"
+  Status:               action="SELECT", target="Status", value="Active", locator_type="label"
+
+Lookup/Reference — MUST USE LOOKUP ACTION:
+  Lookup:               action="LOOKUP", target="Account", value="Test Corp", locator_type="label"
+  Lookup:               action="LOOKUP", target="Opportunity", value="My Deal", locator_type="label"
 
 Structural (CSS only):
   Toast Message:        locator_type="css", target=".slds-notify_toast"
@@ -493,18 +502,32 @@ IMPORTANT: Do NOT generate WAIT steps. The Playwright runner automatically:
 
 REQUIRED FIELD ANALYSIS (do this BEFORE generating steps):
 Before generating CREATE/UPDATE steps, you MUST:
-1. Scan the metadata for ALL fields where nillable=false or required=true
-2. Also check for fields marked as required in page layouts
-3. Generate a TYPE step for EACH required field — not just the ones the user mentions
-4. If the user mentions a specific value for a field, use that value
-5. For other required fields, generate reasonable test values matching the field type
+1. Parse the user's prompt and extract EVERY field-value pair they mention
+2. Scan the metadata for ALL fields where nillable=false or required=true
+3. Combine both lists — generate steps for EVERY field from both sources
+4. CRITICAL: Every field the user explicitly mentions in their prompt MUST have a corresponding step. 
+   Do NOT skip any user-mentioned field. If the user says "Bill To as Sample Account 25", there MUST be a LOOKUP step for Bill To.
+5. If the user mentions a specific value for a field, use that EXACT value
+6. For required fields NOT mentioned by the user, generate reasonable test values matching the field type
+7. Match user field names to the closest metadata label. Example: user says "Service Provided Till" → check metadata for exact label (it may be "Service Provided Till" not "Service Provided To")
+
+FIELD NAME MATCHING:
+- Always use the EXACT field label from metadata, not your interpretation
+- If user says "Bill To" and metadata has "Bill To" → use "Bill To"
+- If user says "Signed By" and metadata has "Signed By" → use "Signed By"
+- If there's no exact match, find the closest metadata field label
 
 CREATE: If test says "create {Object}":
 1. NAVIGATE → value: "/lightning/o/{ObjectApiName}/list"
 2. CLICK → target: "role=button, name=New", locator_type: "role"
-3. TYPE → generate ONE step for EVERY required/mandatory field from the metadata
+3. For EVERY user-mentioned field AND every required field from metadata, generate the correct action:
+   - If field type = string/text/email/phone/currency/number/textarea → action: "TYPE"
+   - If field type = picklist → action: "SELECT"
+   - If field type = reference/lookup → action: "LOOKUP"
+   - If field type = date/datetime → action: "TYPE" with date format
+   - If field type = boolean/checkbox → action: "CLICK"
    Each step: target: "{FieldLabel}", value: "{TestValue}", locator_type: "label"
-   IMPORTANT: You MUST include ALL required fields, not just fields the user mentioned
+   IMPORTANT: You MUST include ALL user-mentioned fields AND all required metadata fields. Missing ANY user-mentioned field is a failure.
 4. CLICK → target: "role=button, name=Save", locator_type: "role"
 5. ASSERT_TEXT → target: "was created", locator_type: "text"
 
@@ -514,11 +537,19 @@ READ: If test says "view/read {Object}":
 3. ASSERT_TEXT → verify key field values
 
 UPDATE/EDIT: If test says "edit/update {Object}":
-1. NAVIGATE to record
-2. CLICK → target: "role=button, name=Edit", locator_type: "role"
-3. TYPE → modified field values using locator_type: "label"
-4. CLICK → target: "role=button, name=Save", locator_type: "role"
-5. ASSERT_TEXT → target: "was saved", locator_type: "text"
+1. NAVIGATE → value: "/lightning/o/{ObjectApiName}/list"
+2. CLICK → the record link (target: "role=link, name={RecordName}", locator_type: "role")
+3. CLICK → target: "role=button, name=Edit", locator_type: "role"
+4. For each field the user wants to change:
+   - Extract the EXACT field name AND value from the user's prompt
+   - Use the correct action based on field type (TYPE, SELECT, LOOKUP_SELECT)
+   - CRITICAL: Use the EXACT value the user specified, NOT a different value from metadata
+5. CLICK → target: "role=button, name=Save", locator_type: "role"
+6. ASSERT_TEXT → target: "was saved", locator_type: "text"
+
+EXAMPLE: "Update the status of Lead 'Rio Rio' to 'Converted'"
+→ Extract: Record="Rio Rio", Field="Lead Status" or "Status", Value="Converted"
+→ Step 4 should be: SELECT | Status | Converted (NOT "Qualified" or any other value)
 
 DELETE: If test says "delete {Object}":
 1. NAVIGATE to record
@@ -527,18 +558,30 @@ DELETE: If test says "delete {Object}":
 4. ASSERT_TEXT → deletion confirmation
 
 -------------------------
-FIELD VALUE RULES
+FIELD VALUE RULES (CRITICAL — field type determines the action)
 -------------------------
-- Text → "Sample Text"
-- Email → "test@example.com"
-- Phone → "9876543210"
-- Currency → "1000"
-- Number → "100"
-- Date → "01/01/2025"
-- Checkbox → CLICK the checkbox (use getByRole or getByLabel)
-- Picklist → MUST use a value from metadata picklist values
-- Lookup → TYPE search text into getByLabel, then CLICK result option
+- Text → action: TYPE, value: "Sample Text"
+- Email → action: TYPE, value: "test@example.com"
+- Phone → action: TYPE, value: "9876543210"
+- Currency → action: TYPE, value: "1000"
+- Number → action: TYPE, value: "100"
+- Date → action: TYPE, value: "01/01/2025"
+- Checkbox → action: CLICK (use getByRole or getByLabel)
+- Picklist → action: SELECT, value: Use the EXACT value from the user's prompt. If user doesn't specify, pick a valid value from metadata picklist values
+- Lookup/Reference → action: LOOKUP_SELECT, value: search text for the related record
 - Required fields → MUST be populated (check metadata for nillable=false)
+
+CRITICAL VALUE RULE:
+When the user explicitly mentions a value in their prompt (e.g., "set status to Converted", "change type to Partner"),
+you MUST use that EXACT value in the generated step. NEVER substitute a different value.
+User-specified values ALWAYS take priority over metadata defaults.
+
+ACTION MAPPING BY FIELD TYPE (DO NOT USE TYPE FOR PICKLISTS):
+- string, textarea, email, phone, url, currency, int, double, percent → TYPE
+- picklist, multipicklist, combobox → SELECT
+- reference, lookup → LOOKUP_SELECT
+- date, datetime → TYPE (with date format)
+- boolean → CLICK
 
 -------------------------
 VALIDATION RULE HANDLING
@@ -581,18 +624,32 @@ JSON structure (replace placeholders with actual metadata values):
     {
       "id": "3",
       "action": "TYPE",
-      "target": "{FieldLabel from metadata}",
-      "value": "{Appropriate test value}",
+      "target": "{TextFieldLabel}",
+      "value": "{text value}",
       "locator_type": "label"
     },
     {
       "id": "4",
+      "action": "SELECT",
+      "target": "{PicklistFieldLabel}",
+      "value": "{picklist value from metadata}",
+      "locator_type": "label"
+    },
+    {
+      "id": "5",
+      "action": "LOOKUP",
+      "target": "{LookupFieldLabel}",
+      "value": "{search text}",
+      "locator_type": "label"
+    },
+    {
+      "id": "6",
       "action": "CLICK",
       "target": "role=button, name=Save",
       "locator_type": "role"
     },
     {
-      "id": "5",
+      "id": "7",
       "action": "ASSERT_TEXT",
       "target": "was created",
       "locator_type": "text"
@@ -600,6 +657,22 @@ JSON structure (replace placeholders with actual metadata values):
   ],
   "expected_outcome": "Clear expected result"
 }
+
+-------------------------
+FIELD COVERAGE VERIFICATION (do this BEFORE outputting JSON)
+-------------------------
+Before outputting the JSON, you MUST perform this self-check:
+
+1. List every field-value pair the user mentioned in their prompt
+2. List every [REQUIRED] and [MUST INCLUDE] field from the metadata above
+3. For each field in both lists, verify there is a corresponding step in your output
+4. If ANY field is missing a step → ADD the step before outputting
+5. If a user-mentioned field cannot be matched to any metadata field → still generate a step using your best guess of the action type, and add a note in the description: "Field '{name}' not found in metadata"
+
+Example self-check:
+  User mentioned: Opportunity, Bill To, Order, Tax Type, Entity, Bank Detail, Signed By, Service Provided From, Service Provided Till, Pay To
+  Required fields: Entity, Tax Type, Bank Detail, Opportunity
+  Generated steps must cover ALL of the above — missing any is a failure.
 
 IMPORTANT: Output ONLY valid JSON. No explanations, no comments, no markdown.
 ALWAYS use getByRole for buttons and getByLabel for form fields. CSS is FALLBACK ONLY.

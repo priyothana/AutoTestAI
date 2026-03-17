@@ -12,6 +12,7 @@ class VectorEmbedding(Base):
     project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=False)
     source_type = Column(String, nullable=False)  # object, flow, lwc, validation
     source_id = Column(UUID(as_uuid=True), nullable=False)
+    chunk_type = Column(String, default="metadata", nullable=False)  # metadata, success_pattern, failure_correction, field_behavior
     embedding_vector = Column(JSONB, nullable=False)  # stored as JSON float array
     text_chunk = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

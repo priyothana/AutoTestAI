@@ -13,4 +13,5 @@ class RagQueryLog(Base):
     test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id"), nullable=True)
     query_text = Column(Text, nullable=False)
     retrieved_chunks = Column(JSONB, default=[])
+    chunk_sources = Column(JSONB, nullable=True)  # e.g. {"metadata": 3, "success_pattern": 1, "failure_correction": 1}
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

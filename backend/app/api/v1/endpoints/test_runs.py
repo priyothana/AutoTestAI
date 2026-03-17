@@ -336,6 +336,16 @@ async def run_playwright_test(
 
                     await session.commit()
                     logger.info(f"DB UPDATED for run {run_id}: status={final_status}, screenshot={test_run.screenshot_path}")
+
+                    # --- Self-Learning: store execution patterns for RAG ---
+                    try:
+                        from app.services.execution_learning_service import ExecutionLearningService
+                        await ExecutionLearningService.process_execution_result(
+                            session, UUID(run_id), result_data
+                        )
+                        logger.info(f"[LEARNING] Execution learning processed for run {run_id}")
+                    except Exception as learn_err:
+                        logger.warning(f"[LEARNING] Execution learning failed (non-critical): {learn_err}")
                 else:
                     logger.error(f"Could not find test run {run_id} in DB for background update")
         except Exception as db_err:
