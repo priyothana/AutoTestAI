@@ -636,6 +636,31 @@ RECORD TYPE SELECTION:
 - The runner handles this automatically — you do NOT need to generate a step for it
 - If the user specifies a record type, mention it in the test description/preconditions
 
+PDF / REPORT GENERATION:
+When the user says "Generate PDF", "View PDF", "Preview PDF", or "Print Invoice":
+1. NAVIGATE → to the record page
+2. CLICK → the "Generate PDF", "Generate Invoice PDF", or equivalent button
+3. ASSERT_TEXT → verify the PDF preview appeared. Use SPECIFIC selectors:
+   - target: "css=.previewOuterContainer, canvas, iframe[src*='pdf'], .pdfViewer"
+   - locator_type: "css"
+   - value: leave empty (the element existing = success)
+   - DO NOT assert just "Invoice" — that word appears in breadcrumbs and will falsely pass
+4. CLICK → "Save to Files" or "Download" button IF requested
+5. To verify the PDF attached in Files (Related tab):
+   - TAB → target: "Related", locator_type: "role"
+   - ASSERT_TEXT → target: "Files", locator_type: "text" (verify Files section appears)
+   - ASSERT_TEXT → target: "css=records-related-list-container:has-text('Files') a", value: ".pdf", locator_type: "css"
+     (OR use: target: "pdf" with get_by_text if filename has .pdf)
+
+ASSERT_TEXT SPECIFICITY RULE (CRITICAL):
+- NEVER use generic page-title words (e.g. "Invoice", "Account", "Contact") as the expected text
+- These words appear in breadcrumbs and navigation — they will ALWAYS match even if the action failed
+- Instead target the RESULT of the action:
+  - PDF generated → assert CSS selector of the PDF preview element
+  - Record created → assert toast "was created"
+  - Field updated → assert the new value visible in the detail section
+  - File attached → assert the file name in the Related → Files list
+
 -------------------------
 FIELD VALUE RULES (CRITICAL — field type determines the action)
 -------------------------

@@ -308,6 +308,11 @@ class SalesforceMCPService:
                         "nillable": f.get("nillable"),
                         "createable": f.get("createable"),
                         "updateable": f.get("updateable"),
+                        # For lookup/reference fields — tells us which object to query for real records
+                        "referenceTo": f.get("referenceTo", []),
+                        "picklistValues": [
+                            v["value"] for v in (f.get("picklistValues") or []) if v.get("active")
+                        ] if f.get("type") in ("picklist", "multipicklist") else [],
                     }
                     for f in desc.get("fields", [])
                 ],
