@@ -17,6 +17,7 @@ class TestRunResponse(TestRunBase):
     logs: List[Any] = []
     screenshot_path: Optional[str] = None
     test_case_name: Optional[str] = None
+    ai_suggestions: Optional[Any] = None
     created_at: datetime
     
     class Config:
