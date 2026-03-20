@@ -674,6 +674,8 @@ FIELD VALUE RULES (CRITICAL — field type determines the action)
 - Picklist → action: SELECT, value: Use the EXACT value from the user's prompt. If user doesn't specify, pick a valid value from metadata picklist values
 - Multi-Select Picklist → action: MULTI_SELECT, value: semicolon-separated values (e.g. "Val1;Val2")
 - Lookup/Reference → action: LOOKUP_SELECT, value: search text for the related record
+  CRITICAL: If ValidRecords are listed for a lookup field, you MUST use one of those values.
+  NEVER invent a lookup value. ValidRecords are REAL records queried from the Salesforce org.
 - Required fields → MUST be populated (check metadata for nillable=false)
 - Time → action: TYPE, value: "2:00 PM" or "14:00"
 
