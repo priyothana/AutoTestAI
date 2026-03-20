@@ -82,6 +82,9 @@ For ASSERT TEXT on element:
 
 4. For LOOKUP fields (Pay To, Entity): use action="fill" with locator_type="label".
    Add wait 1000ms AFTER each lookup fill to allow dropdown autocomplete to dismiss.
+   CRITICAL: If the metadata says "USE ONE OF THESE REAL ORG VALUES" for a lookup field,
+   you MUST use one of those exact values. NEVER invent or guess lookup values.
+   Using a non-existent record name will cause the test to fail.
 
 5. For PICKLIST fields: use action="fill" with the exact picklist value from MCP metadata.
 
@@ -267,22 +270,66 @@ class TestHealingService:
                     continue
 
                 label = field.get("label", field.get("name", ""))
+                api_name = field.get("name", "")
                 # Use first referenced object type (most lookups have one)
                 ref_object = ref_to[0] if ref_to else None
                 if not ref_object:
                     continue
 
-                # Cache per-object queries
-                if ref_object not in queried_objects:
-                    try:
-                        # Determine the name field — most objects have 'Name', some have different
-                        name_field = "Name"
-                        if ref_object == "RecordType":
-                            name_field = "Name"
-                        elif ref_object == "User":
-                            name_field = "Name"
+                # Check for mandatory lookup filter
+                filtered_info = field.get("filteredLookupInfo") or {}
+                has_mandatory_filter = (
+                    isinstance(filtered_info, dict)
+                    and filtered_info.get("optionalFilter") is False
+                )
 
-                        soql = f"SELECT Id, {name_field} FROM {ref_object} WHERE {name_field} != null LIMIT 5"
+                # Build cache key: include filter status since same object
+                # may need different queries for filtered vs unfiltered fields
+                cache_key = f"{ref_object}__filtered" if has_mandatory_filter else ref_object
+
+                if cache_key not in queried_objects:
+                    try:
+                        NAME_FIELD_MAP = {
+                            "Order": "OrderNumber",
+                            "Case": "CaseNumber",
+                            "Solution": "SolutionName",
+                            "Task": "Subject",
+                            "Event": "Subject",
+                            "ContentDocument": "Title",
+                            "Document": "Name",
+                        }
+                        name_field = NAME_FIELD_MAP.get(ref_object, "Name")
+
+                        # For filtered lookups, try to get filter criteria via Tooling API
+                        filter_where = ""
+                        if has_mandatory_filter and api_name:
+                            try:
+                                from simple_salesforce import Salesforce as _SF
+                                sf_client = _SF(
+                                    username=username, password=password,
+                                    security_token=security_token, domain=domain,
+                                )
+                                # Query LookupFilter for this specific field
+                                obj_api = api_name.split(".")[0] if "." in api_name else ""
+                                tooling_soql = (
+                                    f"SELECT Id, DeveloperName, SourceFieldDefinition.QualifiedApiName, "
+                                    f"LookupObjectFieldDefinition.QualifiedApiName "
+                                    f"FROM LookupFilter "
+                                    f"WHERE SourceFieldDefinition.QualifiedApiName = '{api_name}' "
+                                    f"OR SourceFieldDefinition.DurableId LIKE '%{api_name}%' "
+                                    f"LIMIT 5"
+                                )
+                                tooling_result = sf_client.tooling.query(tooling_soql)
+                                print(f"[HEALING] Tooling LookupFilter for {api_name}: {tooling_result.get('records', [])}")
+                            except Exception as te:
+                                print(f"[HEALING] Tooling API query failed for {api_name}: {te}")
+
+                        # Use higher LIMIT for filtered fields to increase chances of finding valid records
+                        limit = 20 if has_mandatory_filter else 5
+                        soql = f"SELECT Id, {name_field} FROM {ref_object} WHERE {name_field} != null ORDER BY {name_field} LIMIT {limit}"
+                        if filter_where:
+                            soql = f"SELECT Id, {name_field} FROM {ref_object} WHERE {name_field} != null AND {filter_where} LIMIT {limit}"
+
                         result = SalesforceMCPService.query(
                             username=username,
                             password=password,
@@ -290,19 +337,21 @@ class TestHealingService:
                             domain=domain,
                             soql=soql,
                         )
-                        # query() returns {"total_size": N, "done": True, "records": [...]}
                         records = result.get("records", []) if isinstance(result, dict) else (result or [])
                         names = [
                             r.get(name_field, "") for r in records
                             if r.get(name_field)
                         ]
-                        queried_objects[ref_object] = names
-                        logger.info(f"[HEALING] Lookup '{label}' → {ref_object}: found {len(names)} records: {names}")
+                        queried_objects[cache_key] = names
+                        filter_tag = " [HAS MANDATORY FILTER]" if has_mandatory_filter else ""
+                        print(f"[HEALING] Lookup '{label}' → {ref_object}{filter_tag}: found {len(names)} records: {names}")
+                        logger.info(f"[HEALING] Lookup '{label}' → {ref_object}{filter_tag}: found {len(names)} records: {names}")
                     except Exception as qe:
+                        print(f"[HEALING] Could not query {ref_object} for lookup '{label}': {qe}")
                         logger.warning(f"[HEALING] Could not query {ref_object} for lookup '{label}': {qe}")
-                        queried_objects[ref_object] = []
+                        queried_objects[cache_key] = []
 
-                names = queried_objects.get(ref_object, [])
+                names = queried_objects.get(cache_key, [])
                 if names:
                     lookup_options[label] = names
 
@@ -340,13 +389,23 @@ class TestHealingService:
                     real_names = (lookup_options or {}).get(label, [])
                     ref_to = f.get("referenceTo") or []
                     ref_str = f" → refs: {', '.join(ref_to)}" if ref_to else ""
+                    # Check for mandatory lookup filter
+                    filtered_info = f.get("filteredLookupInfo") or {}
+                    has_filter = (
+                        isinstance(filtered_info, dict)
+                        and filtered_info.get("optionalFilter") is False
+                    )
+                    filter_warning = ""
+                    if has_filter:
+                        filter_warning = " ⚠ THIS FIELD HAS A MANDATORY LOOKUP FILTER — not all records listed may be valid. Try each value in order until one is accepted."
                     if real_names:
                         lines.append(
                             f"  - {label} ({api}) [lookup, {req}]{ref_str}"
                             f" | USE ONE OF THESE REAL ORG VALUES: {', '.join(repr(n) for n in real_names)}"
+                            f"{filter_warning}"
                         )
                     else:
-                        lines.append(f"  - {label} ({api}) [lookup, {req}]{ref_str} | query org for real value")
+                        lines.append(f"  - {label} ({api}) [lookup, {req}]{ref_str} | query org for real value{filter_warning}")
 
                 else:
                     lines.append(f"  - {label} ({api}) [{ftype}, {req}]")
@@ -496,6 +555,7 @@ Output ONLY the JSON object with 'analysis' and 'corrected_steps'. No markdown."
                 return None
 
             logger.info(f"[HEALING] App error detected at step #{error_info['step_order']}: {error_info['error_message'][:100]}")
+            print(f"[HEALING] App error detected at step #{error_info['step_order']}")
 
             # Step 2: infer object
             object_name = TestHealingService.infer_object_name(logs, steps)
@@ -509,12 +569,14 @@ Output ONLY the JSON object with 'analysis' and 'corrected_steps'. No markdown."
                     object_name, project_id, db_session
                 )
                 logger.info(f"[HEALING] MCP metadata fetched: {bool(mcp_metadata)}")
+                print(f"[HEALING] MCP metadata fetched: {bool(mcp_metadata)}, fields: {len((mcp_metadata or {}).get('fields', []))}")
 
                 # Step 3b: query real record names for each lookup field
                 if mcp_metadata:
                     lookup_options = await TestHealingService.fetch_lookup_values(
                         mcp_metadata, project_id, db_session
                     )
+                    print(f"[HEALING] Lookup options for fields: {list(lookup_options.keys())} = {lookup_options}")
                     logger.info(f"[HEALING] Lookup options for fields: {list(lookup_options.keys())}")
 
             # Step 4: generate suggestions via Claude

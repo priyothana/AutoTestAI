@@ -1610,161 +1610,418 @@ class SalesforceLightningEngine:
         print(f"[LOOKUP] 🔍 Starting lookup for '{label}' = '{value}'")
 
         # ─── Step 1: Find the lookup input ───
+        # IMPORTANT: Must find input inside a lightning-lookup/lightning-grouped-combobox,
+        # NOT a picklist input that happens to share the same label text.
         input_loc = None
 
-        # Priority 1: get_by_label (most precise — uses Salesforce's label association)
-        try:
-            loc = page.get_by_label(label, exact=False)
-            if await loc.count() > 0:
-                # Verify it's a combobox/input
-                tag = await loc.first.evaluate("el => el.tagName.toLowerCase()")
-                if tag == 'input':
-                    input_loc = loc.first
-                    print(f"[LOOKUP] → Input found via get_by_label for '{label}'")
-        except Exception:
-            pass
+        # Priority 1: Lookup-specific CSS selectors (most precise — scoped to lookup components)
+        lookup_input_selectors = [
+            # lightning-lookup component hierarchy
+            f"lightning-lookup:has-text('{label}') input[role='combobox']",
+            f"lightning-lookup:has-text('{label}') input",
+            # lightning-grouped-combobox (Salesforce uses this for lookups)
+            f"lightning-grouped-combobox:has-text('{label}') input[role='combobox']",
+            f"lightning-grouped-combobox:has-text('{label}') input",
+            # lightning-input-field containing a lookup (has combobox role)
+            f"lightning-input-field:has-text('{label}') input[role='combobox']",
+            # slds-form-element scoped to combobox (excludes picklist selects)
+            f".slds-form-element:has-text('{label}') input[role='combobox']",
+        ]
 
-        # Priority 2: CSS selectors with :has-text()
+        for sel in lookup_input_selectors:
+            try:
+                loc = page.locator(sel)
+                cnt = await loc.count()
+                if cnt > 0:
+                    # Pick the first visible one
+                    for i in range(min(cnt, 3)):
+                        candidate = loc.nth(i)
+                        if await candidate.is_visible():
+                            input_loc = candidate
+                            print(f"[LOOKUP] → Input found via CSS: {sel}")
+                            break
+                if input_loc:
+                    break
+            except Exception:
+                continue
+
+        # Priority 2: get_by_label with parent validation — verify it's inside a lookup component
         if not input_loc:
-            input_selectors = [
-                f"lightning-input-field:has-text('{label}') input[role='combobox']",
-                f"lightning-grouped-combobox:has-text('{label}') input",
-                f"lightning-lookup:has-text('{label}') input",
-                f".slds-form-element:has-text('{label}') input[role='combobox']",
-                f"lightning-input-field:has-text('{label}') input",
-            ]
+            try:
+                loc = page.get_by_label(label, exact=False)
+                cnt = await loc.count()
+                for i in range(min(cnt, 5)):
+                    candidate = loc.nth(i)
+                    try:
+                        tag = await candidate.evaluate("el => el.tagName.toLowerCase()")
+                        if tag != 'input':
+                            continue
+                        # Validate it's inside a lightning-lookup or lightning-grouped-combobox
+                        is_lookup = await candidate.evaluate("""el => {
+                            let p = el.parentElement;
+                            while (p) {
+                                const tag = p.tagName.toLowerCase();
+                                if (tag === 'lightning-lookup' || tag === 'lightning-grouped-combobox') return true;
+                                if (tag === 'lightning-picklist' || tag === 'select') return false;
+                                p = p.parentElement;
+                            }
+                            return false;
+                        }""")
+                        if is_lookup:
+                            input_loc = candidate
+                            print(f"[LOOKUP] → Input found via get_by_label (parent-validated) for '{label}'")
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
-            for sel in input_selectors:
-                try:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0:
-                        input_loc = loc.first
-                        print(f"[LOOKUP] → Input found via CSS: {sel}")
-                        break
-                except Exception:
-                    continue
+        # Priority 3: JS parent-walk — find any visible combobox input near label text
+        if not input_loc:
+            try:
+                handle = await page.evaluate_handle("""(lbl) => {
+                    // Find all label elements containing the text
+                    const allLabels = Array.from(document.querySelectorAll('label, span.slds-form-element__label'));
+                    for (const labelEl of allLabels) {
+                        if (!labelEl.textContent.trim().toLowerCase().includes(lbl.toLowerCase())) continue;
+                        // Walk up to find a sibling/descendant combobox input inside a lookup element
+                        let parent = labelEl.parentElement;
+                        for (let depth = 0; depth < 8 && parent; depth++) {
+                            const tag = parent.tagName.toLowerCase();
+                            if (tag === 'lightning-lookup' || tag === 'lightning-grouped-combobox' || tag === 'lightning-input-field') {
+                                const inp = parent.querySelector('input[role="combobox"], input[type="text"]');
+                                if (inp && inp.offsetParent !== null) return inp;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    return null;
+                }""", label)
+                el = handle.as_element()
+                if el:
+                    input_loc = page.locator("xpath=//input[@role='combobox']").first  # placeholder
+                    # Use JS click/type directly since we have the element handle
+                    print(f"[LOOKUP] → Input found via JS parent-walk for '{label}'")
+                    # Use JS-based interaction instead
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    await asyncio.sleep(0.4)
+                    await el.evaluate("inp => { inp.value = ''; }")
+                    search_str = value[:3] if len(value) > 3 else value
+                    await el.type(search_str, delay=80)
+                    logger.info(f"  → Typed '{search_str}' (JS path) into lookup '{label}'")
+                    # Check dropdown the same way
+                    await asyncio.sleep(2)
+                    # JS-click the option
+                    picked = await page.evaluate("""(args) => {
+                        const [val] = args;
+                        const vLow = val.toLowerCase();
+                        const opts = document.querySelectorAll('[role="listbox"] [role="option"], lightning-base-combobox-item, .slds-listbox__option');
+                        for (const o of opts) {
+                            if (o.offsetParent === null) continue;
+                            const t = (o.textContent || '').toLowerCase();
+                            if (t.includes(vLow.substring(0, 3))) { o.click(); return o.textContent.trim(); }
+                        }
+                        return null;
+                    }""", [value])
+                    if picked:
+                        logger.info(f"  ✅ Lookup '{label}' → JS path clicked: '{picked}'")
+                        await asyncio.sleep(1)
+                        return True
+                    # Fallback: advanced search
+                    input_loc = None  # Will fall through to advanced search below
+            except Exception as _e:
+                print(f"[LOOKUP] JS parent-walk error: {_e}")
 
         if not input_loc:
             logger.warning(f"  ⚠ No lookup input found for '{label}'")
             return False
 
+
         try:
             # ─── Step 2: Type the search value ───
+            # Salesforce LWC lookup components require real InputEvent dispatches
+            # with composed:true to cross Shadow DOM. Simple typing methods often
+            # fail to trigger the autocomplete AJAX.
             await input_loc.scroll_into_view_if_needed(timeout=5000)
             await input_loc.click(timeout=5000)
             await asyncio.sleep(0.5)
 
-            # Clear any existing value first
+            # Clear existing value
             await input_loc.fill("", timeout=3000)
             await asyncio.sleep(0.3)
-            await input_loc.fill(value or "", timeout=5000)
-            logger.info(f"  → Typed '{value}' into lookup input")
 
-            # ─── Step 3: Check for suggestion dropdown with RETRIES ───
-            suggestion_selectors = [
-                f"lightning-base-combobox-formatted-text:has-text('{value}')",
-                f"[role='option']:has-text('{value}')",
-                f"lightning-base-combobox-item:has-text('{value}')",
-                f".slds-listbox__option:has-text('{value}')",
-                f"[data-value='{value}']",
+            # Strategy A: Use JS to set value + dispatch InputEvent with composed:true
+            # This is the React/LWC-compatible method
+            search_str = value[:3] if len(value) > 3 else value
+            js_typed = await input_loc.evaluate("""(inp, searchStr) => {
+                // Focus the input
+                inp.focus();
+                // Use the native setter to bypass any LWC property override
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                // Clear first
+                nativeSetter.call(inp, '');
+                inp.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, composed: true, inputType: 'deleteContentBackward'
+                }));
+                // Type char by char with events
+                let typed = '';
+                for (const ch of searchStr) {
+                    typed += ch;
+                    nativeSetter.call(inp, typed);
+                    inp.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, composed: true, data: ch, inputType: 'insertText'
+                    }));
+                    inp.dispatchEvent(new KeyboardEvent('keydown', {
+                        bubbles: true, composed: true, key: ch, code: 'Key' + ch.toUpperCase()
+                    }));
+                    inp.dispatchEvent(new KeyboardEvent('keyup', {
+                        bubbles: true, composed: true, key: ch, code: 'Key' + ch.toUpperCase()
+                    }));
+                }
+                // Also fire change event
+                inp.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                return inp.value;
+            }""", search_str)
+            print(f"[LOOKUP] → JS nativeInputValueSetter typed '{js_typed}' into lookup '{label}'")
+
+            # Wait for Salesforce AJAX autocomplete
+            await asyncio.sleep(2.5)
+
+            # ─── DEBUG: Dump ALL visible options on the page ───
+            debug_opts = await page.evaluate("""() => {
+                const results = [];
+                const listboxes = document.querySelectorAll('[role="listbox"]');
+                for (const lb of listboxes) {
+                    const opts = lb.querySelectorAll('[role="option"]');
+                    const visibleOpts = [];
+                    for (const o of opts) {
+                        if (o.offsetParent !== null) {
+                            visibleOpts.push((o.textContent || '').trim().substring(0, 60));
+                        }
+                    }
+                    if (visibleOpts.length > 0) {
+                        let parentTag = 'unknown';
+                        let p = lb.parentElement;
+                        for (let i = 0; i < 10 && p; i++) {
+                            const t = p.tagName.toLowerCase();
+                            if (t.startsWith('lightning-') || t.startsWith('c-')) { parentTag = t; break; }
+                            p = p.parentElement;
+                        }
+                        results.push({parent: parentTag, count: visibleOpts.length, options: visibleOpts.slice(0, 8)});
+                    }
+                }
+                return results;
+            }""")
+            print(f"[LOOKUP] DEBUG visible listboxes after JS type: {debug_opts}")
+
+            # Check input value
+            try:
+                input_val = await input_loc.input_value(timeout=2000)
+                print(f"[LOOKUP] DEBUG input value: '{input_val}'")
+            except Exception:
+                pass
+
+            # ─── Step 3: Check dropdown options and click Search if needed ───
+            # Playwright locators pierce Shadow DOM; JS evaluate does NOT.
+            # So we use Playwright locators to find options, then JS click to bypass interception.
+
+            # First, click the input to open/refresh the dropdown
+            try:
+                await input_loc.click(timeout=3000)
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            # Use Playwright locators (which pierce Shadow DOM) to find options
+            # in the lookup component
+            scoped_option_selectors = [
+                f"lightning-lookup:has-text('{label}') [role='option']",
+                f"lightning-grouped-combobox:has-text('{label}') [role='option']",
+                f"lightning-input-field:has-text('{label}') [role='option']",
             ]
 
-            # Retry loop: suggestions may take 2-6s to appear (server-side search)
-            for attempt in range(4):
-                await asyncio.sleep(1.5)  # Wait between attempts
-                logger.info(f"  → Checking suggestions (attempt {attempt + 1}/4)...")
-
-                # Try Playwright selectors first
-                for ss in suggestion_selectors:
-                    try:
-                        suggestion = page.locator(ss)
-                        count = await suggestion.count()
-                        if count > 0:
-                            # Find a VISIBLE suggestion (skip hidden ones from other lookups)
-                            for i in range(min(count, 5)):
-                                s = suggestion.nth(i)
-                                if await s.is_visible():
-                                    await s.click(timeout=5000)
-                                    logger.info(f"  ✅ Lookup '{label}' → clicked suggestion (attempt {attempt + 1})")
-                                    await asyncio.sleep(1)
-
-                                    # Smart verification: check if selection was accepted
-                                    if await SalesforceLightningEngine._verify_lookup_selection(
-                                        page, label, value, input_loc
-                                    ):
-                                        return True
-                                    # If not verified, continue to next selector
-                    except Exception:
-                        continue
-
-                # Try JS-based suggestion click (catches Shadow DOM cases)
+            found_options = []
+            option_locator = None
+            for sel in scoped_option_selectors:
                 try:
-                    clicked = await page.evaluate("""(args) => {
-                        const [val] = args;
-                        const valLower = val.toLowerCase();
-                        // Search all visible listbox options
-                        const options = document.querySelectorAll(
-                            '[role="option"], lightning-base-combobox-item, .slds-listbox__option'
-                        );
-                        for (const opt of options) {
-                            if (opt.offsetParent === null) continue; // skip hidden
-                            const text = opt.textContent?.trim()?.toLowerCase() || '';
-                            if (text.includes(valLower)) {
-                                opt.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                opt.click();
-                                return true;
-                            }
-                            // Also check title attribute on spans
-                            const span = opt.querySelector('span[title], lightning-base-combobox-formatted-text');
-                            if (span) {
-                                const spanText = (span.getAttribute('title') || span.textContent || '').toLowerCase();
-                                if (spanText.includes(valLower)) {
-                                    opt.click();
-                                    return true;
-                                }
-                            }
-                        }
-                        return false;
-                    }""", [value])
-                    if clicked:
-                        logger.info(f"  ✅ Lookup '{label}' → JS click (attempt {attempt + 1})")
-                        await asyncio.sleep(1)
-                        if await SalesforceLightningEngine._verify_lookup_selection(
-                            page, label, value, input_loc
-                        ):
-                            return True
+                    loc = page.locator(sel)
+                    count = await loc.count()
+                    if count > 0:
+                        option_locator = loc
+                        for i in range(min(count, 10)):
+                            try:
+                                text = (await loc.nth(i).text_content(timeout=2000) or "").strip()
+                                found_options.append(text)
+                            except Exception:
+                                found_options.append("")
+                        print(f"[LOOKUP] Found {count} options via Playwright: {sel}")
+                        print(f"[LOOKUP] Option texts: {[t[:50] for t in found_options]}")
+                        break
+                except Exception:
+                    continue
+
+            if not found_options:
+                # Also try global visible options
+                try:
+                    all_opts = page.locator("[role='option']:visible")
+                    count = await all_opts.count()
+                    if count > 0:
+                        for i in range(min(count, 10)):
+                            text = (await all_opts.nth(i).text_content(timeout=2000) or "").strip()
+                            found_options.append(text)
+                        option_locator = all_opts
+                        print(f"[LOOKUP] Found {count} global visible options: {[t[:50] for t in found_options]}")
                 except Exception:
                     pass
 
-                # On retry, ONLY clear and re-type if input still shows the typed text
-                if attempt < 3:
+            # Check if any option is a direct match for our value
+            val_lower = value.lower()
+            for i, text in enumerate(found_options):
+                text_lower = text.lower()
+                # Skip meta-options
+                if any(skip in text_lower for skip in ['search', 'new ', 'add', 'show more', 'draft', 'finalized', 'sent', 'paid']):
+                    continue
+                if val_lower in text_lower or text_lower in val_lower:
                     try:
-                        # Check if input still has the typed value (meaning nothing was selected)
-                        try:
-                            current_val = await input_loc.input_value(timeout=2000)
-                        except Exception:
-                            current_val = ""
+                        # Use JS click to bypass interception
+                        await option_locator.nth(i).evaluate("el => el.click()")
+                        print(f"[LOOKUP] ✅ Direct match clicked via JS: '{text}'")
+                        await asyncio.sleep(1.0)
+                        return True
+                    except Exception as e:
+                        print(f"[LOOKUP] ⚠ Failed to click match: {e}")
 
-                        if current_val and value.lower() in current_val.lower():
-                            logger.info(f"  ℹ Input still shows typed text, re-typing...")
-                            await input_loc.click(timeout=3000)
-                            await input_loc.fill("", timeout=3000)
+            # No direct match — find and click "Search..." / "Show more results"
+            print(f"[LOOKUP] No direct match, looking for Search option...")
+            for i, text in enumerate(found_options):
+                text_lower = text.lower()
+                if 'search' in text_lower or 'show more' in text_lower:
+                    try:
+                        # JS click to bypass click interception/timeout
+                        await option_locator.nth(i).evaluate("el => el.click()")
+                        print(f"[LOOKUP] → JS-clicked Search option: '{text[:50]}'")
+                        await asyncio.sleep(3.0)
+
+                        # A search modal should now be open
+                        dialog_count = await page.locator("div[role='dialog']").count()
+                        print(f"[LOOKUP] Dialog count after Search click: {dialog_count}")
+
+                        # Find search input in the newest dialog
+                        search_modal_input = None
+                        modal_input_selectors = [
+                            "div[role='dialog'] input[type='search']",
+                            "div[role='dialog'] input[placeholder*='Search']",
+                            "div[role='dialog'] input.slds-input",
+                            "div[role='dialog'] input[role='combobox']",
+                            "div[role='dialog'] input[type='text']",
+                            "section[role='dialog'] input",
+                        ]
+                        for msel in modal_input_selectors:
+                            try:
+                                loc = page.locator(msel)
+                                if await loc.count() > 0:
+                                    for idx in range(await loc.count()):
+                                        candidate = loc.nth(idx)
+                                        if await candidate.is_visible():
+                                            search_modal_input = candidate
+                                            print(f"[LOOKUP] → Found search modal input: {msel}")
+                                            break
+                                if search_modal_input:
+                                    break
+                            except Exception:
+                                continue
+
+                        if search_modal_input:
+                            # Wait for modal to finish initial load/search
+                            await asyncio.sleep(1.5)
+
+                            # Clear the pre-filled search text (from dropdown typing)
+                            await search_modal_input.click(timeout=3000)
                             await asyncio.sleep(0.3)
-                            await input_loc.fill(value or "", timeout=5000)
-                        else:
-                            # Value changed — selection may have worked
-                            logger.info(f"  ✅ Lookup '{label}' → input value changed, assuming selection succeeded")
-                            return True
-                    except Exception:
-                        pass
+                            await search_modal_input.fill("", timeout=3000)
+                            await asyncio.sleep(0.5)
 
-            print(f"[LOOKUP] ℹ No dropdown suggestions for '{value}' after 4 attempts, trying advanced search...")
-            logger.info(f"  ℹ No dropdown suggestions for '{value}' after 4 attempts, trying advanced search...")
+                            # Type the full value
+                            await search_modal_input.fill(value, timeout=5000)
+                            print(f"[LOOKUP] → Filled search modal with: '{value}'")
+                            await asyncio.sleep(0.5)
+
+                            # Press Enter to trigger search
+                            await page.keyboard.press("Enter")
+                            print(f"[LOOKUP] → Pressed Enter in search modal")
+                            await asyncio.sleep(4.0)
+
+                            # Debug: dump what's visible in the modal
+                            try:
+                                modal_html = await page.evaluate("""() => {
+                                    const dialogs = document.querySelectorAll('div[role="dialog"]');
+                                    const last = dialogs[dialogs.length - 1];
+                                    if (!last) return 'no dialog';
+                                    // Get all links and text in the dialog
+                                    const links = last.querySelectorAll('a');
+                                    const texts = [];
+                                    for (const l of links) {
+                                        if (l.offsetParent !== null) {
+                                            texts.push(l.textContent.trim().substring(0, 60));
+                                        }
+                                    }
+                                    // Also check table rows
+                                    const rows = last.querySelectorAll('tr, [role="row"]');
+                                    for (const r of rows) {
+                                        if (r.offsetParent !== null) {
+                                            texts.push('ROW:' + r.textContent.trim().substring(0, 60));
+                                        }
+                                    }
+                                    // Check for "no results" message
+                                    const bodyText = last.textContent || '';
+                                    if (bodyText.includes('No results')) {
+                                        texts.push('NO_RESULTS: ' + bodyText.substring(bodyText.indexOf('No results'), bodyText.indexOf('No results') + 40));
+                                    }
+                                    return texts.slice(0, 10);
+                                }""")
+                                print(f"[LOOKUP] DEBUG search modal contents: {modal_html}")
+                            except Exception:
+                                pass
+
+                            # Look for result in modal
+                            result_selectors = [
+                                f"div[role='dialog'] a:has-text('{value}')",
+                                f"div[role='dialog'] th a:has-text('{value[:10]}')",
+                                f"div[role='dialog'] tr:has-text('{value}')",
+                                f"div[role='dialog'] .slds-truncate:has-text('{value}')",
+                                f"section[role='dialog'] a:has-text('{value}')",
+                                # Partial match
+                                f"div[role='dialog'] a:has-text('{value.split()[0]}')",
+                            ]
+                            for rsel in result_selectors:
+                                try:
+                                    result_loc = page.locator(rsel).first
+                                    if await result_loc.is_visible():
+                                        await result_loc.click(timeout=5000)
+                                        print(f"[LOOKUP] ✅ Selected from search modal: {rsel}")
+                                        await asyncio.sleep(1.5)
+                                        return True
+                                except Exception:
+                                    continue
+
+                            print(f"[LOOKUP] ⚠ No matching result in search modal")
+                        else:
+                            print(f"[LOOKUP] ⚠ No search input found in modal")
+                    except Exception as e:
+                        print(f"[LOOKUP] ⚠ Error clicking Search option: {e}")
+                    break
+
+            print(f"[LOOKUP] Falling through to advanced search fallback...")
+
 
             # ─── Step 4: Advanced Search Fallback ───
             adv_result = await SalesforceLightningEngine._lookup_advanced_search(
                 page, label, value, input_loc
             )
+
             if adv_result:
                 # Verify pill after advanced search too
                 if await SalesforceLightningEngine._verify_lookup_pill(page, label, value):
@@ -1976,7 +2233,8 @@ class SalesforceLightningEngine:
                                     opt_text.startswith("search") or "show more results" in opt_text or
                                     "add" in opt_text[:4]):
                                 continue
-                            await opt.click(timeout=5000)
+                            # Use JS click to bypass interception/timeout
+                            await opt.evaluate("el => el.click()")
                             print(f"[LOOKUP-ADV] ✅ Selected from dropdown: '{opt_texts[oi][:40]}'")
                             return True
 
@@ -1986,8 +2244,9 @@ class SalesforceLightningEngine:
                     if await opt.is_visible():
                         opt_text = opt_texts[oi].lower() if oi < len(opt_texts) else ""
                         if 'search' in opt_text and 'new' not in opt_text:
-                            await opt.click(timeout=5000)
-                            print(f"[LOOKUP-ADV] → Clicked 'Search...' option")
+                            # Use JS click to bypass interception/timeout
+                            await opt.evaluate("el => el.click()")
+                            print(f"[LOOKUP-ADV] → Clicked 'Search...' option via JS")
                             await asyncio.sleep(3)
                             # Check for NEW dialog
                             new_count = await page.locator("div[role='dialog']").count()

@@ -238,15 +238,122 @@ async def generate_test_steps_endpoint(
                     if target_obj:
                         print(f"[TEST-GEN] Object filter: target='{target_clean}', matched={exact_matches}")
 
+
+                    # ─── Fetch REAL lookup values from the org ───
+                    # Query MetadataRaw directly — MetadataNormalized may not have all objects
+                    lookup_values = {}
+                    SKIP_FIELD_NAMES = {
+                        'createdbyid', 'lastmodifiedbyid', 'ownerid',
+                        'recordtypeid', 'parentid',
+                    }
+                    try:
+                        from app.models.metadata_raw import MetadataRaw
+                        from app.services.salesforce_mcp_service import SalesforceMCPService
+                        from app.services.integration_service import IntegrationService
+                        from app.models.project_integration import ProjectIntegration
+
+                        # Get all field metadata for this project
+                        raw_result = await db.execute(
+                            select(MetadataRaw).where(
+                                MetadataRaw.project_id == UUID(project_id),
+                                MetadataRaw.metadata_type == "field",
+                            )
+                        )
+                        raw_fields = raw_result.scalars().all()
+
+                        # Find reference fields and their targets
+                        ref_fields = []
+                        for rf in raw_fields:
+                            raw = rf.raw_json or {}
+                            ftype = (raw.get("type") or "").lower()
+                            fname = (raw.get("name") or "").lower()
+                            if ftype == "reference" and fname not in SKIP_FIELD_NAMES:
+                                ref_to = raw.get("referenceTo", [])
+                                label = raw.get("label", raw.get("name", ""))
+                                if ref_to and label:
+                                    ref_fields.append({
+                                        "label": label,
+                                        "referenceTo": ref_to[0],
+                                        "api_name": rf.api_name,
+                                    })
+
+                        if ref_fields:
+                            print(f"[TEST-GEN] Found {len(ref_fields)} reference fields: "
+                                  f"{[(r['label'], r['referenceTo']) for r in ref_fields[:10]]}")
+
+                            # Get Salesforce credentials
+                            int_result = await db.execute(
+                                select(ProjectIntegration).where(
+                                    ProjectIntegration.project_id == UUID(project_id)
+                                )
+                            )
+                            int_record = int_result.scalars().first()
+                            if int_record and int_record.category == "salesforce":
+                                decrypted = await IntegrationService.get_decrypted_tokens(int_record)
+                                username = decrypted.get("username")
+                                password = decrypted.get("password")
+                                security_token = decrypted.get("security_token")
+                                domain = "test" if (int_record.salesforce_login_url or "").find("test.salesforce.com") >= 0 else "login"
+
+                                if username and password and security_token:
+                                    queried_objects = {}
+                                    for rf in ref_fields:
+                                        ref_obj = rf["referenceTo"]
+                                        if ref_obj in queried_objects:
+                                            if queried_objects[ref_obj]:
+                                                lookup_values[rf["label"]] = queried_objects[ref_obj]
+                                            continue
+                                        try:
+                                            NAME_FIELD_MAP = {
+                                                "Order": "OrderNumber",
+                                                "Case": "CaseNumber",
+                                                "Solution": "SolutionName",
+                                                "Task": "Subject",
+                                                "Event": "Subject",
+                                                "ContentDocument": "Title",
+                                            }
+                                            name_field = NAME_FIELD_MAP.get(ref_obj, "Name")
+                                            soql = f"SELECT Id, {name_field} FROM {ref_obj} WHERE {name_field} != null LIMIT 5"
+                                            result = SalesforceMCPService.query(
+                                                username=username, password=password,
+                                                security_token=security_token,
+                                                domain=domain, soql=soql,
+                                            )
+                                            records = result.get("records", []) if isinstance(result, dict) else []
+                                            names = [r.get(name_field, "") for r in records if r.get(name_field)]
+                                            queried_objects[ref_obj] = names
+                                            if names:
+                                                lookup_values[rf["label"]] = names
+                                                print(f"[TEST-GEN] Lookup '{rf['label']}' → {ref_obj}: {names}")
+                                        except Exception as qe:
+                                            print(f"[TEST-GEN] ⚠ Query {ref_obj} for '{rf['label']}': {qe}")
+                                            queried_objects[ref_obj] = []
+
+                        if lookup_values:
+                            print(f"[TEST-GEN] 🔍 All lookup values: {list(lookup_values.keys())}")
+                    except Exception as lv_err:
+                        print(f"[TEST-GEN] ⚠ Could not fetch lookup values: {lv_err}")
+
+                    # Add LOOKUP VALUE RULES if we have real values
+                    if lookup_values:
+                        field_summary_lines.append("=== LOOKUP VALUE RULES (CRITICAL) ===")
+                        field_summary_lines.append(
+                            "For LOOKUP/REFERENCE fields, you MUST use one of the ValidRecords "
+                            "listed below. NEVER invent a lookup value. These are REAL records from the org."
+                        )
+                        for field_label, record_names in lookup_values.items():
+                            field_summary_lines.append(
+                                f"  Field=\"{field_label}\" → ValidRecords={record_names}"
+                            )
+                        field_summary_lines.append("=== END LOOKUP VALUE RULES ===")
+                        field_summary_lines.append("")
+
+                    # Now build per-object field details
                     for record in meta_records:
                         structured = record.structured_json or {}
                         obj_name = structured.get("object", record.object_name)
-
-                        # Only include allowed objects
                         if allowed_objects is not None and obj_name not in allowed_objects:
                             continue
-                        print(f"[TEST-GEN] Including metadata for object: {obj_name} (fields: {len(structured.get('fields', []))})")
-
 
                         fields = structured.get("fields", [])
                         if not fields:
@@ -254,6 +361,7 @@ async def generate_test_steps_endpoint(
 
                         field_summary_lines.append(f"--- Object: {obj_name} (Label: {structured.get('label', obj_name)}) ---")
                         field_summary_lines.append("")
+
 
                         required_fields = [f for f in fields if f.get("required")]
                         optional_fields = [f for f in fields if not f.get("required")]
@@ -288,7 +396,10 @@ async def generate_test_steps_endpoint(
                                     line += f" | Action=SELECT | Values={values[:10]}"
                                 elif ftype == "reference":
                                     refs = f.get("referenceTo", [])
+                                    valid_recs = lookup_values.get(label, [])
                                     line += f" | Action=LOOKUP_SELECT | ReferenceTo={refs}"
+                                    if valid_recs:
+                                        line += f" | ValidRecords={valid_recs}"
                                 elif ftype in ("date", "datetime"):
                                     line += f" | Action=TYPE | Format=MM/DD/YYYY"
                                 elif ftype == "boolean":
@@ -321,7 +432,10 @@ async def generate_test_steps_endpoint(
                                         line += f" | Action=SELECT | Values={values[:10]}"
                                     elif ftype == "reference":
                                         refs = f.get("referenceTo", [])
+                                        valid_recs = lookup_values.get(label, [])
                                         line += f" | Action=LOOKUP_SELECT | ReferenceTo={refs}"
+                                        if valid_recs:
+                                            line += f" | ValidRecords={valid_recs}"
                                     elif ftype in ("date", "datetime"):
                                         line += f" | Action=TYPE | Format=MM/DD/YYYY"
                                     else:
@@ -340,7 +454,10 @@ async def generate_test_steps_endpoint(
                                         values = [pv.get("label", pv.get("value", "")) for pv in f.get("picklistValues", []) if pv.get("active")]
                                         line += f" | Action=SELECT | Values={values[:10]}"
                                     elif ftype == "reference":
+                                        valid_recs = lookup_values.get(label, [])
                                         line += f" | Action=LOOKUP_SELECT"
+                                        if valid_recs:
+                                            line += f" | ValidRecords={valid_recs}"
                                     elif ftype in ("date", "datetime"):
                                         line += f" | Action=TYPE | Format=MM/DD/YYYY"
                                     else:
