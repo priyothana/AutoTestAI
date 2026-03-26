@@ -378,6 +378,7 @@ class HealChatRequest(_BaseModel):
     """Request body for the /heal conversational endpoint."""
     message: str
     chat_history: _Optional[_List[dict]] = []
+    current_corrected_steps: _Optional[_List[dict]] = None
 
 @router.post("/{id}/heal")
 async def heal_test_run(
@@ -417,6 +418,7 @@ async def heal_test_run(
             steps=test_case.steps or [],
             project_id=project_id,
             db_session=db,
+            current_corrected_steps=body.current_corrected_steps,
         )
         return response
     except Exception as e:

@@ -982,7 +982,67 @@ class PlaywrightService:
                         except Exception as e:
                             logger.warning(f"  ⚠ Failed to load MCP metadata: {e}")
 
-                    for index, step in enumerate(steps):
+                    # Install persistent error-modal auto-dismisser
+                    await SalesforceLightningEngine.install_error_modal_watcher(page)
+
+                    # ─── Runtime step reordering for dependent picklists ───
+                    # If metadata has controllerName info, ensure controlling field
+                    # steps always run BEFORE dependent field steps.
+                    execution_steps = steps  # default: use original steps
+                    if sf_metadata_map:
+                        try:
+                            steps_list = list(steps)  # Make mutable copy
+                            reordered = False
+                            for i, step_i in enumerate(steps_list):
+                                s_action = (step_i.get("action", "") if isinstance(step_i, dict)
+                                            else getattr(step_i, "action", "")).lower().strip()
+                                s_target = (step_i.get("target", "") if isinstance(step_i, dict)
+                                            else getattr(step_i, "target", ""))
+                                if s_action not in ("select", "fill", "type", "input"):
+                                    continue
+                                # Check if this target has a controlling field
+                                meta = sf_metadata_map.get(s_target, {})
+                                if not meta:
+                                    for ml, mi in sf_metadata_map.items():
+                                        if s_target.lower() == ml.lower():
+                                            meta = mi
+                                            break
+                                ctrl_api = meta.get("controllerName", "")
+                                if not ctrl_api:
+                                    continue
+                                # Resolve controlling field API name to label
+                                ctrl_label = ""
+                                for ml, mi in sf_metadata_map.items():
+                                    api = mi.get("api_name", "")
+                                    if api and (api == ctrl_api or
+                                               api.replace("__c", "") == ctrl_api.replace("__c", "")):
+                                        ctrl_label = ml
+                                        break
+                                if not ctrl_label:
+                                    ctrl_label = ctrl_api
+                                # Find the controlling field's step
+                                ctrl_idx = None
+                                for j, step_j in enumerate(steps_list):
+                                    j_target = (step_j.get("target", "") if isinstance(step_j, dict)
+                                                else getattr(step_j, "target", ""))
+                                    if j_target.lower() == ctrl_label.lower():
+                                        ctrl_idx = j
+                                        break
+                                # If dependent step comes BEFORE controller step, move it after
+                                if ctrl_idx is not None and i < ctrl_idx:
+                                    dep_step = steps_list.pop(i)
+                                    # Insert after controller step (which shifted left by 1)
+                                    steps_list.insert(ctrl_idx, dep_step)
+                                    print(f"[STEP-REORDER] Moved '{s_target}' (dependent) AFTER "
+                                          f"'{ctrl_label}' (controller): step {i+1} → {ctrl_idx+1}")
+                                    reordered = True
+                            if reordered:
+                                execution_steps = steps_list
+                                print(f"[STEP-REORDER] ✅ Steps reordered for dependent picklist dependencies")
+                        except Exception as reorder_err:
+                            print(f"[STEP-REORDER] ⚠ Reorder failed (non-fatal): {reorder_err}")
+
+                    for index, step in enumerate(execution_steps):
                         step_start = datetime.utcnow()
                         if hasattr(step, "action"):
                             action = step.action.lower().strip()
@@ -998,6 +1058,11 @@ class PlaywrightService:
                         locator_type = locator_type.lower().strip()
 
                         logger.info(f"Executing step {index+1}: {action} on {target} (locator_type={locator_type})")
+
+                        # Dismiss any Salesforce app-error modal that may be blocking the page
+                        # (backup for cases where the MutationObserver watcher missed it)
+                        await SalesforceLightningEngine.dismiss_error_modal(page)
+
                         step_order = index + 1
                         step_log = {
                             "step_order": step_order,
@@ -1301,6 +1366,20 @@ class PlaywrightService:
                                     await asyncio.sleep(1)
 
                             elif action in ["fill", "input", "type"]:
+                                # Wait for the target field to appear on the page
+                                # (after clicking Edit/New, the form modal may take time to render)
+                                try:
+                                    await page.wait_for_selector(
+                                        f"label:has-text('{target}'), "
+                                        f"span.slds-form-element__label:has-text('{target}'), "
+                                        f".test-id__field-label:has-text('{target}')",
+                                        state="visible",
+                                        timeout=15000,
+                                    )
+                                    print(f"[STEP] ✅ Field label '{target}' found on page")
+                                except Exception:
+                                    print(f"[STEP] ⚠ Field label '{target}' not found after 15s — continuing")
+
                                 # Check if metadata says this is a picklist
                                 meta_info = sf_metadata_map.get(target)
                                 if not meta_info and sf_metadata_map:
@@ -1385,16 +1464,82 @@ class PlaywrightService:
                                             continue
 
                                     if not input_loc:
-                                        # Fallback: get_by_label
+                                        # Fallback: find input INSIDE the modal, filtering non-form elements
                                         try:
-                                            loc = page.get_by_label(target, exact=False)
-                                            if await loc.count() > 0:
-                                                input_loc = loc.first
+                                            # First try modal-scoped search
+                                            modal_selectors = [
+                                                ".slds-modal__content",
+                                                "section.slds-modal",
+                                                "[role='dialog']",
+                                            ]
+                                            scope = None
+                                            for ms in modal_selectors:
+                                                try:
+                                                    m = page.locator(ms)
+                                                    if await m.count() > 0 and await m.first.is_visible():
+                                                        scope = m.first
+                                                        break
+                                                except Exception:
+                                                    continue
+
+                                            search_ctx = scope if scope else page
+                                            loc = search_ctx.get_by_label(target, exact=False)
+                                            cnt = await loc.count()
+                                            for i in range(min(cnt, 8)):
+                                                candidate = loc.nth(i)
+                                                try:
+                                                    info = await candidate.evaluate("""el => ({
+                                                        tag: el.tagName.toLowerCase(),
+                                                        type: (el.type || '').toLowerCase(),
+                                                        cls: el.className || '',
+                                                    })""")
+                                                    tag = info.get("tag", "")
+                                                    inp_type = info.get("type", "")
+                                                    cls = info.get("cls", "")
+                                                    # Skip non-form elements
+                                                    if tag not in ('input', 'textarea', 'select'):
+                                                        continue
+                                                    # Skip column resizers, hidden inputs, assistive-text
+                                                    if inp_type in ('range', 'hidden', 'checkbox', 'radio'):
+                                                        continue
+                                                    if 'slds-assistive-text' in cls:
+                                                        continue
+                                                    if await candidate.is_visible():
+                                                        input_loc = candidate
+                                                        print(f"[STEP] Found input for '{target}' via modal-scoped get_by_label (tag={tag}, type={inp_type})")
+                                                        break
+                                                except Exception:
+                                                    continue
                                         except Exception:
                                             pass
 
-                                    if input_loc:
-                                        # Click, select all, type value, then Tab to commit
+                                    # Strategy: Try lookup FIRST — but ONLY if the field type
+                                    # is unknown or could be a reference.  Skip for email,
+                                    # phone, url, textarea etc. where lookup causes errors.
+                                    NON_LOOKUP_TYPES = (
+                                        "string", "email", "phone", "url",
+                                        "textarea", "percent", "currency",
+                                        "int", "double", "encryptedstring",
+                                        "base64", "id",
+                                    )
+                                    meta_type = (meta_info.get("type", "") if meta_info else "").lower()
+                                    should_try_lookup = meta_type not in NON_LOOKUP_TYPES
+
+                                    if should_try_lookup:
+                                        print(f"[STEP] Trying _fill_lookup first for '{target}' (meta_type={meta_type})")
+                                        await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                        success = await SalesforceLightningEngine._fill_lookup(
+                                            page, target, value
+                                        )
+                                        if success:
+                                            print(f"[STEP] ✅ '{target}' filled via _fill_lookup")
+                                    else:
+                                        print(f"[STEP] Skipping lookup for '{target}' (meta_type={meta_type}) — using direct text fill")
+                                        success = False
+
+                                    if not success and input_loc:
+                                        # Not a lookup — use generic text fill
+                                        print(f"[STEP] _fill_lookup returned False, using text fill for '{target}'")
                                         await input_loc.click(timeout=5000)
                                         await asyncio.sleep(0.3)
                                         await input_loc.press("Control+a")
@@ -1414,14 +1559,42 @@ class PlaywrightService:
                             elif action == "select":
                                 # Direct picklist fill
                                 await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+
+                                # Check for dependent picklist — if the controlling field
+                                # hasn't been set yet, provide a clear diagnostic
+                                dep_controller_label = ""
+                                if sf_metadata_map:
+                                    meta = sf_metadata_map.get(target, {})
+                                    if not meta:
+                                        for ml, mi in sf_metadata_map.items():
+                                            if target.lower() in ml.lower() or ml.lower() in target.lower():
+                                                meta = mi
+                                                break
+                                    ctrl_api = meta.get("controllerName", "")
+                                    if ctrl_api:
+                                        # Resolve API name to label
+                                        for ml, mi in sf_metadata_map.items():
+                                            if mi.get("api_name", "").replace("__c", "") == ctrl_api.replace("__c", ""):
+                                                dep_controller_label = ml
+                                                break
+                                        if not dep_controller_label:
+                                            dep_controller_label = ctrl_api
+                                        print(f"[PICKLIST-DEP] '{target}' is dependent on controlling field '{dep_controller_label}'")
+
                                 success = await SalesforceLightningEngine._fill_picklist(
                                     page, target, value
                                 )
                                 if not success:
-                                    raise Exception(
+                                    err_msg = (
                                         f"Could not select '{value}' in picklist field '{target}' — all strategies exhausted. "
                                         f"Check if '{value}' is a valid option for this field."
                                     )
+                                    if dep_controller_label:
+                                        err_msg += (
+                                            f" This is a DEPENDENT PICKLIST controlled by '{dep_controller_label}' — "
+                                            f"ensure '{dep_controller_label}' is selected BEFORE '{target}'."
+                                        )
+                                    raise Exception(err_msg)
 
                             elif action in ("lookup", "lookup_select"):
                                 # Direct lookup fill with record selection
@@ -1966,9 +2139,44 @@ class PlaywrightService:
                             logger.info(f"  ✅ STEP {step_order} SUCCESS: {action}")
 
                         except Exception as e:
+                            error_msg = str(e).lower()
                             logger.info(f"  ❌ STEP {step_order} FAILED: {action} - {e}")
+
+                            # If failed due to app-error modal blocking, try dismiss + ALWAYS retry
+                            if "subtree intercepts pointer events" in error_msg:
+                                print(f"[RETRY] Step {step_order} blocked by modal — dismissing and retrying")
+                                # Try to dismiss (may already be gone)
+                                await SalesforceLightningEngine.dismiss_error_modal(page)
+                                # Wait for page to stabilize
+                                await asyncio.sleep(1.5)
+                                try:
+                                    if action in ["fill", "input", "type"]:
+                                        await SalesforceLightningEngine.scroll_modal_to_field(page, target)
+                                        await SalesforceLightningEngine._fill_generic(
+                                            page, target, value
+                                        )
+                                        step_log["status"] = "success"
+                                        step_log["note"] = "Succeeded after modal dismiss retry"
+                                        print(f"[RETRY] ✅ Step {step_order} succeeded after modal retry")
+                                        continue
+                                    elif action == "click":
+                                        if "role=button" in (locator_type or ""):
+                                            name = target.split("name=")[-1].strip() if "name=" in target else target
+                                            btn = page.get_by_role("button", name=name)
+                                        else:
+                                            btn = page.locator(target)
+                                        await btn.first.click(timeout=5000)
+                                        step_log["status"] = "success"
+                                        step_log["note"] = "Succeeded after modal dismiss retry"
+                                        print(f"[RETRY] ✅ Step {step_order} succeeded after modal retry")
+                                        continue
+                                except Exception as retry_err:
+                                    print(f"[RETRY] ❌ Retry also failed: {retry_err}")
+                                    step_log["error"] = f"Original: {e} | Retry: {retry_err}"
+
                             step_log["status"] = "failed"
-                            step_log["error"] = str(e)
+                            if "error" not in step_log:
+                                step_log["error"] = str(e)
                             overall_result = "failed"
 
                             # ─── Component 2: Enhanced error diagnostics ───

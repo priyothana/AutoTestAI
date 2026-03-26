@@ -201,9 +201,31 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
         setIsRunning(true)
         setLastRunResult(null)
-        const runToastId = toast.loading("Starting execution flow...")
+        const runToastId = toast.loading("Saving & starting execution...")
 
         try {
+            // ── Auto-save current steps before running ──────────────────
+            // This ensures any UI changes (including accepted AI Healing
+            // steps) are persisted before execution starts.
+            if (!isInternalNew && currentId) {
+                const saveRes = await fetch(`http://localhost:8000/api/v1/tests/${currentId}`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        name: testName,
+                        description,
+                        project_id: selectedProjectId,
+                        steps,
+                        priority,
+                    }),
+                })
+                if (!saveRes.ok) {
+                    throw new Error("Failed to auto-save test steps before running")
+                }
+            }
+
+            toast.loading("Running test...", { id: runToastId })
+
             const response = await fetch("http://localhost:8000/api/v1/test-runs", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },

@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useRef, useEffect } from "react"
-import { Bot, ChevronDown, ChevronUp, CheckCircle, Send, Loader2, Wrench, Sparkles, ListChecks } from "lucide-react"
+import { Bot, ChevronDown, ChevronUp, CheckCircle, Send, Loader2, Wrench, Sparkles, ListChecks, Pencil } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { toast } from "sonner"
@@ -57,6 +57,20 @@ function actionColor(action: string) {
   return "text-sky-600 dark:text-sky-400"
 }
 
+// ─── Helper: check if a step was modified between two arrays ─────────────────
+function isStepModified(prev: CorrectedStep[], curr: CorrectedStep[], idx: number): boolean {
+  if (!prev || !prev.length || idx >= prev.length) return false
+  const p = prev[idx]
+  const c = curr[idx]
+  if (!p || !c) return false
+  return (
+    p.action !== c.action ||
+    p.target !== c.target ||
+    p.value !== c.value ||
+    (p.locator_type || "") !== (c.locator_type || "")
+  )
+}
+
 // ─── Component ─────────────────────────────────────────────────────────────
 
 export default function AiFixAssistant({
@@ -74,14 +88,9 @@ export default function AiFixAssistant({
   const [isChatting, setIsChatting] = useState(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [chatHistory])
-
   // ── Normalize legacy list format → {analysis, corrected_steps} ──────────
   let healResult: HealResult
   if (Array.isArray(suggestions)) {
-    // Old format: array of {type, step_order, new_step, reason}
     healResult = {
       analysis: "Required fields were missing. Suggested fill steps before the Save action.",
       corrected_steps: (suggestions as any[]).map((hint: any, idx: number) => ({
@@ -96,16 +105,33 @@ export default function AiFixAssistant({
     healResult = suggestions as HealResult
   }
 
-  const correctedSteps: CorrectedStep[] = healResult?.corrected_steps || []
-  const analysis = healResult?.analysis || ""
-  const hasSteps = correctedSteps.length > 0
+  // ── Live corrected steps — mutable state that updates from chat ──────────
+  const [liveCorrectedSteps, setLiveCorrectedSteps] = useState<CorrectedStep[]>(
+    healResult?.corrected_steps || []
+  )
+  const [prevStepsSnapshot, setPrevStepsSnapshot] = useState<CorrectedStep[]>([])
+  const [liveAnalysis, setLiveAnalysis] = useState<string>(healResult?.analysis || "")
 
-  // ── Apply: replace all steps with corrected_steps ────────────────────────
+  // Sync when initial suggestions change (e.g. new test run loaded)
+  useEffect(() => {
+    const initial = healResult?.corrected_steps || []
+    setLiveCorrectedSteps(initial)
+    setLiveAnalysis(healResult?.analysis || "")
+    setPrevStepsSnapshot([])
+  }, [suggestions])
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [chatHistory])
+
+  const hasSteps = liveCorrectedSteps.length > 0
+
+  // ── Apply: replace all steps with liveCorrectedSteps ──────────────────────
   const handleAcceptFixes = async () => {
     if (!hasSteps) return
     setIsApplying(true)
     try {
-      const updatedSteps: TestStep[] = correctedSteps.map((cs, idx) => ({
+      const updatedSteps: TestStep[] = liveCorrectedSteps.map((cs, idx) => ({
         id: `heal-${Date.now()}-${idx}`,
         action: (cs.action || "").toUpperCase(),
         target: cs.target || "",
@@ -113,7 +139,6 @@ export default function AiFixAssistant({
         locator_type: cs.locator_type || "",
       }))
       onApplyFixes(updatedSteps)
-      // Pass updatedSteps directly so the parent doesn't read stale closure reads
       await onSave(updatedSteps)
       setApplied(true)
       toast.success("Test steps updated with AI-fixed flow! Review above, then click Run Test.")
@@ -125,7 +150,7 @@ export default function AiFixAssistant({
     }
   }
 
-  // ── Chat ──────────────────────────────────────────────────────────────────
+  // ── Chat — sends current_corrected_steps for edit mode ────────────────────
   const handleSendChat = async () => {
     if (!chatInput.trim() || isChatting) return
     const userMsg = chatInput.trim()
@@ -140,11 +165,25 @@ export default function AiFixAssistant({
         body: JSON.stringify({
           message: userMsg,
           chat_history: updatedHistory.slice(-6).map((m) => ({ role: m.role, content: m.content })),
+          current_corrected_steps: liveCorrectedSteps.length > 0 ? liveCorrectedSteps : null,
         }),
       })
       if (!res.ok) throw new Error("Chat request failed")
       const data = await res.json()
-      setChatHistory((prev) => [...prev, { role: "assistant", content: data.reply || "No response." }])
+
+      // If the response contains corrected_steps, update the live steps
+      if (data.corrected_steps && Array.isArray(data.corrected_steps) && data.corrected_steps.length > 0) {
+        setPrevStepsSnapshot([...liveCorrectedSteps])  // snapshot before change
+        setLiveCorrectedSteps(data.corrected_steps)
+        setLiveAnalysis(data.reply || liveAnalysis)
+        setApplied(false)  // reset applied state since steps changed
+        setChatHistory((prev) => [
+          ...prev,
+          { role: "assistant", content: data.reply || "✅ Steps updated." },
+        ])
+      } else {
+        setChatHistory((prev) => [...prev, { role: "assistant", content: data.reply || "No response." }])
+      }
     } catch {
       setChatHistory((prev) => [...prev, { role: "assistant", content: "Sorry, couldn't process that. Try again." }])
     } finally {
@@ -170,7 +209,7 @@ export default function AiFixAssistant({
               AI Fix Assistant
               {hasSteps && (
                 <Badge className="text-[10px] px-1.5 h-4 bg-sky-200 text-sky-800 hover:bg-sky-200 dark:bg-sky-800 dark:text-sky-100">
-                  {correctedSteps.length} steps corrected
+                  {liveCorrectedSteps.length} steps corrected
                 </Badge>
               )}
             </p>
@@ -193,10 +232,10 @@ export default function AiFixAssistant({
         <div className="border-t border-sky-200/70 dark:border-sky-800/50">
 
           {/* ── Analysis banner ─────────────────────────────────────────── */}
-          {analysis && (
+          {liveAnalysis && (
             <div className="mx-5 mt-4 px-3 py-2 rounded-lg bg-sky-100/60 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800">
               <p className="text-[11px] text-sky-700 dark:text-sky-300 leading-relaxed">
-                <span className="font-semibold">What changed: </span>{analysis}
+                <span className="font-semibold">What changed: </span>{liveAnalysis}
               </p>
             </div>
           )}
@@ -206,18 +245,21 @@ export default function AiFixAssistant({
             <div className="px-5 py-4">
               <p className="text-xs font-medium text-sky-700 dark:text-sky-300 mb-2.5 flex items-center gap-1.5">
                 <ListChecks className="h-3.5 w-3.5" />
-                Complete corrected test flow ({correctedSteps.length} steps)
+                Complete corrected test flow ({liveCorrectedSteps.length} steps)
               </p>
               <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
-                {correctedSteps.map((cs, idx) => {
+                {liveCorrectedSteps.map((cs, idx) => {
                   const isNew = !steps.some(
                     (s) => s.action.toUpperCase() === cs.action.toUpperCase() && s.target === cs.target
                   )
+                  const isModified = isStepModified(prevStepsSnapshot, liveCorrectedSteps, idx)
                   return (
                     <div
                       key={idx}
-                      className={`flex items-start gap-2.5 px-3 py-2 rounded-lg border text-[11px] ${
-                        isNew
+                      className={`flex items-start gap-2.5 px-3 py-2 rounded-lg border text-[11px] transition-all duration-300 ${
+                        isModified
+                          ? "bg-amber-50/70 dark:bg-amber-950/20 border-amber-300 dark:border-amber-700 ring-1 ring-amber-200 dark:ring-amber-800"
+                          : isNew
                           ? "bg-emerald-50/70 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800"
                           : "bg-white/50 dark:bg-black/15 border-sky-100 dark:border-sky-900/30"
                       }`}
@@ -235,14 +277,19 @@ export default function AiFixAssistant({
                           </span>
                         )}
                         {cs.value && (
-                          <span className="text-gray-500 dark:text-gray-400 ml-1">= "{cs.value}"</span>
+                          <span className="text-gray-500 dark:text-gray-400 ml-1">= &quot;{cs.value}&quot;</span>
                         )}
                       </div>
-                      {isNew && (
+                      {isModified ? (
+                        <Badge className="text-[9px] px-1 h-4 bg-amber-100 text-amber-700 hover:bg-amber-100 dark:bg-amber-900/50 dark:text-amber-300 shrink-0">
+                          <Pencil className="h-2.5 w-2.5 mr-0.5" />
+                          EDITED
+                        </Badge>
+                      ) : isNew ? (
                         <Badge className="text-[9px] px-1 h-4 bg-emerald-100 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-900/50 dark:text-emerald-300 shrink-0">
                           NEW
                         </Badge>
-                      )}
+                      ) : null}
                     </div>
                   )
                 })}
@@ -281,14 +328,14 @@ export default function AiFixAssistant({
             </div>
           )}
 
-          {/* ── Chat section ─────────────────────────────────────────────── */}
+          {/* ── Chat section — interactive step editor ────────────────────── */}
           <div className="border-t border-sky-200/70 dark:border-sky-800/50 px-5 py-4">
             <p className="text-xs font-medium text-sky-700 dark:text-sky-300 mb-3 flex items-center gap-1.5">
               <Bot className="h-3.5 w-3.5" />
-              Ask a follow-up question about the fix
+              Edit steps or ask a question
             </p>
             {chatHistory.length > 0 && (
-              <div className="space-y-2 mb-3 max-h-40 overflow-y-auto pr-1">
+              <div className="space-y-2 mb-3 max-h-48 overflow-y-auto pr-1">
                 {chatHistory.map((msg, idx) => (
                   <div key={idx} className={`flex gap-2 ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
                     <div
@@ -315,7 +362,7 @@ export default function AiFixAssistant({
             <div className="flex gap-2">
               <input
                 className="flex-1 h-9 px-3 rounded-lg text-xs border border-sky-200 dark:border-sky-700 bg-white/60 dark:bg-black/20 focus:outline-none focus:ring-2 focus:ring-sky-400 placeholder-sky-300/60 dark:placeholder-sky-600/60 text-gray-700 dark:text-gray-300"
-                placeholder="e.g. What value should I use for Pay To?"
+                placeholder='e.g. "Update step 14 as Order = 00000471" or ask a question'
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendChat() } }}
