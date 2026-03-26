@@ -73,6 +73,7 @@ class MetadataNormalizer:
                     "label": data.get("label", field_name),
                     "type": data.get("type", "string"),
                     "required": not data.get("nillable", True) and not data.get("defaultedOnCreate", False),
+                    "createable": data.get("createable", True),
                     "length": data.get("length"),
                     "picklistValues": [
                         {"label": pv.get("label"), "value": pv.get("value"), "active": pv.get("active")}
@@ -81,7 +82,22 @@ class MetadataNormalizer:
                     "referenceTo": data.get("referenceTo", []),
                     "unique": data.get("unique", False),
                     "externalId": data.get("externalId", False),
+                    "controllerName": data.get("controllerName", ""),
+                    "dependentPicklist": data.get("dependentPicklist", False),
+                    "filteredLookupInfo": data.get("filteredLookupInfo") or None,
+                    "relationshipName": data.get("relationshipName", ""),
                 }
+
+                # For reference/lookup fields, the API label (e.g. "Account ID")
+                # differs from the Salesforce UI label (e.g. "Account Name").
+                # Store a ui_label for step targeting.
+                if data.get("type") == "reference":
+                    raw_label = field_info["label"]
+                    if raw_label.endswith(" ID"):
+                        field_info["ui_label"] = raw_label[:-3] + " Name"
+                    else:
+                        field_info["ui_label"] = raw_label
+
                 fields_map.setdefault(obj_name, []).append(field_info)
 
             elif raw.metadata_type == "validation_rule":

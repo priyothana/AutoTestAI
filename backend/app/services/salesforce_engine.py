@@ -68,6 +68,10 @@ class SalesforceLightningEngine:
                             "api_name": field.get("api", ""),
                             "required": field.get("required", False),
                             "reference_to": field.get("referenceTo", []),
+                            "controllerName": field.get("controllerName", ""),
+                            "dependentPicklist": field.get("dependentPicklist", False),
+                            "filteredLookupInfo": field.get("filteredLookupInfo") or None,
+                            "relationshipName": field.get("relationshipName", ""),
                         }
 
             SalesforceLightningEngine._metadata_cache[project_id] = field_metadata
@@ -682,6 +686,42 @@ class SalesforceLightningEngine:
         if is_action_button:
             logger.info(f"  ℹ Smart Button Engine: resolving '{name}'")
 
+            # ── Special handling for Save: prefer EXACT match to avoid
+            #    clicking "Save & New" instead of "Save" ──
+            if name.lower() == "save":
+                # Try modal footer Save button first (most common for record creation)
+                modal_save_selectors = [
+                    ".modal-footer button[title='Save']:not([title*='New'])",
+                    ".modal-footer button.slds-button_brand:last-child",
+                    "button[name='SaveEdit']",
+                    "button[name='save']",
+                ]
+                for mss in modal_save_selectors:
+                    try:
+                        loc = page.locator(mss)
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            btn_text = (await loc.first.text_content() or "").strip()
+                            # Skip if this is "Save & New" 
+                            if "new" not in btn_text.lower():
+                                logger.info(f"  → Smart Button: Save matched via '{mss}' (text='{btn_text}')")
+                                return loc.first
+                    except Exception:
+                        continue
+
+                # Try get_by_role with exact=True
+                try:
+                    exact_loc = page.get_by_role("button", name="Save", exact=True)
+                    if await exact_loc.count() > 0:
+                        for i in range(await exact_loc.count()):
+                            try:
+                                if await exact_loc.nth(i).is_visible():
+                                    logger.info(f"  → Smart Button: Save matched via exact role")
+                                    return exact_loc.nth(i)
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+
             # Build a comprehensive combined selector for toolbar actions
             # Includes both button and a (anchor) elements
             combined_toolbar = (
@@ -699,8 +739,6 @@ class SalesforceLightningEngine:
                 f".slds-page-header a[title='{name}'], "
                 f"one-record-home-flexipage2 button[title='{name}'], "
                 f"one-record-home-flexipage2 a[title='{name}'], "
-                f"lightning-button:has-text('{name}'), "
-                f"lightning-button-menu:has-text('{name}'), "
                 f"runtime_platform_actions-action-renderer a[title='{name}'], "
                 f"runtime_platform_actions-action-renderer button[title='{name}']"
             )
@@ -730,6 +768,16 @@ class SalesforceLightningEngine:
                 )
                 count = await visible_loc.count()
                 if count > 0:
+                    # Filter out "Save & New" for Save button
+                    if name.lower() == "save":
+                        for i in range(count):
+                            try:
+                                txt = (await visible_loc.nth(i).text_content() or "").strip()
+                                if txt.lower() == "save":
+                                    logger.info(f"  → Smart Button: exact visible match for Save")
+                                    return visible_loc.nth(i)
+                            except Exception:
+                                continue
                     logger.info(f"  → Smart Button: visible element match ({count} found)")
                     return visible_loc.first
             except Exception:
@@ -756,8 +804,9 @@ class SalesforceLightningEngine:
         # ─── Generic role resolution (non-action buttons or fallback) ───
         best_match = None
 
-        # Try the exact role
-        loc = page.get_by_role(role, name=name, exact=False)
+        # Try the exact role (use exact=True to avoid partial matches
+        # like "Save" matching "Save & New")
+        loc = page.get_by_role(role, name=name, exact=True)
         if await loc.count() > 0:
             for i in range(await loc.count()):
                 try:
@@ -1064,6 +1113,23 @@ class SalesforceLightningEngine:
         logger.info(f"  ℹ Filling '{label}' (detected type: {field_type}) with value '{value}'")
         print(f"[FIELD] Filling '{label}' → detected type: {field_type}, value: '{value}'")
 
+        # Step 0: Wait for the edit form to load (field label must be visible)
+        # After clicking Edit, the modal may take several seconds to render.
+        # We wait for the target field label to appear on the page.
+        try:
+            print(f"[FIELD] Waiting for '{label}' label to appear on page...")
+            await page.wait_for_selector(
+                f"label:has-text('{label}'), span.slds-form-element__label:has-text('{label}'), "
+                f".test-id__field-label:has-text('{label}')",
+                state="visible",
+                timeout=15000,
+            )
+            print(f"[FIELD] ✅ '{label}' label appeared on page")
+        except Exception:
+            # Label not found in 15s — maybe it's behind a scroll or different name
+            # Continue with strategies anyway, they have their own error handling
+            print(f"[FIELD] ⚠ '{label}' label not found after 15s wait — continuing with fill strategies")
+
         # Step 1: Scroll modal to bring field into view
         await SalesforceLightningEngine.scroll_modal_to_field(page, label)
 
@@ -1247,6 +1313,7 @@ class SalesforceLightningEngine:
         Strategy 2: Playwright get_by_label → combobox
         Strategy 3: Find all visible --None-- buttons, match to label
         Strategy 4: JS fallback for edge cases"""
+        print(f"[PICKLIST] 🔍 Starting picklist fill: '{label}' = '{value}'")
 
         async def _try_click_and_select(trigger_loc, strategy_name):
             """Click a trigger locator, wait for dropdown, select option, VERIFY."""
@@ -1368,21 +1435,96 @@ class SalesforceLightningEngine:
         except Exception:
             pass
 
+        # Shared trigger selectors used by all picklist strategies
+        trigger_selectors = [
+            "button",
+            "[role='combobox']",
+            "input[role='combobox']",
+            "div[role='combobox']",
+        ]
+
+        # ─── Strategy 0: Modal-scoped selectors (PRIORITY for edit forms) ───
+        # When editing a record, the form opens in section[role='dialog'].
+        # Selectors MUST be scoped to the modal first, otherwise they match
+        # read-only fields behind the modal on the record detail page.
+        print(f"[PICKLIST] S0: Trying modal-scoped selectors for '{label}'")
+        try:
+            debug = await page.evaluate("""(labelText) => {
+                const modals = document.querySelectorAll("section[role='dialog'], div.modal-body, .slds-modal__content, records-record-edit-form");
+                const modalInfo = Array.from(modals).map(m => m.tagName + (m.getAttribute('role') || '') + ':' + m.children.length + 'ch');
+                
+                // Find all labels matching our field
+                const allLabels = document.querySelectorAll('label, span.slds-form-element__label');
+                const matchedLabels = [];
+                const allLabelTexts = [];
+                for (const l of allLabels) {
+                    const txt = l.textContent?.trim();
+                    if (txt) allLabelTexts.push(txt.substring(0, 30));
+                    if (txt && txt.toLowerCase().includes(labelText.toLowerCase())) {
+                        const container = l.closest('.slds-form-element, lightning-input-field, lightning-combobox');
+                        const inModal = !!l.closest("section[role='dialog'], .slds-modal__content");
+                        matchedLabels.push({
+                            text: txt,
+                            inModal,
+                            containerTag: container?.tagName || 'none',
+                            hasButton: !!container?.querySelector('button'),
+                            hasCombobox: !!container?.querySelector("[role='combobox']"),
+                            hasSelect: !!container?.querySelector('select'),
+                            visible: l.offsetParent !== null,
+                        });
+                    }
+                }
+                return { modals: modalInfo, matchedLabels, labelCount: allLabelTexts.length, first20: allLabelTexts.slice(0, 20) };
+            }""", label)
+            print(f"[PICKLIST] S0 DEBUG: modals={debug.get('modals')}, matched={debug.get('matchedLabels')}")
+            print(f"[PICKLIST] S0 DEBUG: {debug.get('labelCount')} labels on page, first20={debug.get('first20')}")
+        except Exception as e:
+            print(f"[PICKLIST] S0 DEBUG failed: {e}")
+        modal_scopes = [
+            "section[role='dialog']",
+            "div.modal-body",
+            ".slds-modal__content",
+            "records-record-edit-form",
+        ]
+        modal_container_suffixes = [
+            f" .slds-form-element:has-text('{label}')",
+            f" lightning-input-field:has-text('{label}')",
+            f" lightning-grouped-combobox:has-text('{label}')",
+            f" lightning-combobox:has-text('{label}')",
+            f" lightning-picklist:has-text('{label}')",
+        ]
+        for scope in modal_scopes:
+            for suffix in modal_container_suffixes:
+                sel = scope + suffix
+                try:
+                    containers = page.locator(sel)
+                    count = await containers.count()
+                    if count == 0:
+                        continue
+                    logger.info(f"  ℹ Picklist S0: found {count} containers via {sel}")
+                    for ci in range(min(count, 3)):
+                        container = containers.nth(ci)
+                        for trigger_sel in trigger_selectors:
+                            btn = container.locator(trigger_sel)
+                            btn_count = await btn.count()
+                            if btn_count > 0:
+                                logger.info(f"  ℹ Picklist S0: trigger {trigger_sel} in container {ci}")
+                                if await _try_click_and_select(btn.first, f"S0:{sel}>{trigger_sel}"):
+                                    return True
+                except Exception as e:
+                    logger.debug(f"  Picklist S0 {sel} error: {e}")
+                    continue
+
         # ─── Strategy 1: Playwright container:has-text → find button trigger ───
         # Playwright's :has-text() pierces Shadow DOM, so this works even when
         # the label is outside the lightning-combobox component
+        print(f"[PICKLIST] S1: Trying container:has-text for '{label}'")
         container_selectors = [
             f".slds-form-element:has-text('{label}')",
             f"lightning-input-field:has-text('{label}')",
             f"lightning-grouped-combobox:has-text('{label}')",
             f"lightning-combobox:has-text('{label}')",
             f"lightning-picklist:has-text('{label}')",
-        ]
-        trigger_selectors = [
-            "button",
-            "[role='combobox']",
-            "input[role='combobox']",
-            "div[role='combobox']",
         ]
 
         for container_sel in container_selectors:
@@ -1409,6 +1551,7 @@ class SalesforceLightningEngine:
                 continue
 
         # ─── Strategy 2: Playwright get_by_label → combobox interaction ───
+        print(f"[PICKLIST] S2: Trying get_by_label for '{label}'")
         try:
             combobox = page.get_by_label(label, exact=False)
             count = await combobox.count()
@@ -1422,6 +1565,7 @@ class SalesforceLightningEngine:
             logger.debug(f"  Picklist S2 error: {e}")
 
         # ─── Strategy 3: Find all --None-- buttons and match to label ───
+        print(f"[PICKLIST] S3: Trying --None-- buttons for '{label}'")
         try:
             none_buttons = page.locator("button:has-text('--None--')")
             none_count = await none_buttons.count()
@@ -1458,6 +1602,7 @@ class SalesforceLightningEngine:
             logger.debug(f"  Picklist S3 error: {e}")
 
         # ─── Strategy 4: JS fallback — find label, walk DOM, click trigger ───
+        print(f"[PICKLIST] S4: Trying JS fallback for '{label}'")
         try:
             trigger_info = await page.evaluate("""(labelText) => {
                 const root = document.querySelector(
@@ -1614,36 +1759,62 @@ class SalesforceLightningEngine:
         # NOT a picklist input that happens to share the same label text.
         input_loc = None
 
-        # Priority 1: Lookup-specific CSS selectors (most precise — scoped to lookup components)
-        lookup_input_selectors = [
-            # lightning-lookup component hierarchy
-            f"lightning-lookup:has-text('{label}') input[role='combobox']",
-            f"lightning-lookup:has-text('{label}') input",
-            # lightning-grouped-combobox (Salesforce uses this for lookups)
-            f"lightning-grouped-combobox:has-text('{label}') input[role='combobox']",
-            f"lightning-grouped-combobox:has-text('{label}') input",
-            # lightning-input-field containing a lookup (has combobox role)
-            f"lightning-input-field:has-text('{label}') input[role='combobox']",
-            # slds-form-element scoped to combobox (excludes picklist selects)
-            f".slds-form-element:has-text('{label}') input[role='combobox']",
+        # Priority 0: Modal-scoped — after clicking Edit, Salesforce opens a dialog overlay
+        modal_selectors = [
+            f"section[role='dialog'] lightning-input-field:has-text('{label}') input[role='combobox']",
+            f"section[role='dialog'] lightning-lookup:has-text('{label}') input[role='combobox']",
+            f"section[role='dialog'] lightning-grouped-combobox:has-text('{label}') input[role='combobox']",
+            f"section[role='dialog'] .slds-form-element:has-text('{label}') input[role='combobox']",
+            f"div.modal-body lightning-input-field:has-text('{label}') input[role='combobox']",
+            f"div.modal-body lightning-lookup:has-text('{label}') input[role='combobox']",
         ]
-
-        for sel in lookup_input_selectors:
+        for sel in modal_selectors:
             try:
                 loc = page.locator(sel)
                 cnt = await loc.count()
                 if cnt > 0:
-                    # Pick the first visible one
                     for i in range(min(cnt, 3)):
                         candidate = loc.nth(i)
                         if await candidate.is_visible():
                             input_loc = candidate
-                            print(f"[LOOKUP] → Input found via CSS: {sel}")
+                            print(f"[LOOKUP] → Input found via modal-scoped CSS: {sel}")
                             break
                 if input_loc:
                     break
             except Exception:
                 continue
+
+        # Priority 1: Lookup-specific CSS selectors (most precise — scoped to lookup components)
+        if not input_loc:
+            lookup_input_selectors = [
+                # lightning-lookup component hierarchy
+                f"lightning-lookup:has-text('{label}') input[role='combobox']",
+                f"lightning-lookup:has-text('{label}') input",
+                # lightning-grouped-combobox (Salesforce uses this for lookups)
+                f"lightning-grouped-combobox:has-text('{label}') input[role='combobox']",
+                f"lightning-grouped-combobox:has-text('{label}') input",
+                # lightning-input-field containing a lookup (has combobox role)
+                f"lightning-input-field:has-text('{label}') input[role='combobox']",
+                # slds-form-element scoped to combobox (excludes picklist selects)
+                f".slds-form-element:has-text('{label}') input[role='combobox']",
+            ]
+
+            for sel in lookup_input_selectors:
+                try:
+                    loc = page.locator(sel)
+                    cnt = await loc.count()
+                    if cnt > 0:
+                        # Pick the first visible one
+                        for i in range(min(cnt, 3)):
+                            candidate = loc.nth(i)
+                            if await candidate.is_visible():
+                                input_loc = candidate
+                                print(f"[LOOKUP] → Input found via CSS: {sel}")
+                                break
+                    if input_loc:
+                        break
+                except Exception:
+                    continue
 
         # Priority 2: get_by_label with parent validation — verify it's inside a lookup component
         if not input_loc:
@@ -1877,6 +2048,49 @@ class SalesforceLightningEngine:
                 except Exception:
                     pass
 
+            # ─── Retry: if no dropdown options found, the lookup may have filter criteria ───
+            # Clear input and click to show "Recently Viewed" (filtered) records,
+            # or try single-char searches to discover valid filtered records.
+            if not found_options:
+                print(f"[LOOKUP] ⚠ No dropdown options found for '{value}' — retrying with broader search (possible filter criteria)")
+                retry_searches = [""]  # Empty = show recently viewed
+                # Try first char of common words that might match filtered records
+                retry_searches.extend(list("abcdefghijklmnopqrstuvwxyz0123456789"[:10]))
+                for retry_term in retry_searches:
+                    try:
+                        await input_loc.fill("", timeout=3000)
+                        await asyncio.sleep(0.3)
+                        if retry_term:
+                            await input_loc.type(retry_term, delay=80)
+                        else:
+                            await input_loc.click(timeout=3000)
+                        await asyncio.sleep(2.0)
+
+                        # Check for options
+                        for sel in scoped_option_selectors:
+                            try:
+                                loc = page.locator(sel)
+                                count = await loc.count()
+                                if count > 0:
+                                    option_locator = loc
+                                    for idx in range(min(count, 10)):
+                                        try:
+                                            text = (await loc.nth(idx).text_content(timeout=2000) or "").strip()
+                                            found_options.append(text)
+                                        except Exception:
+                                            pass
+                                    print(f"[LOOKUP] Retry '{retry_term}' found {count} options: {[t[:50] for t in found_options]}")
+                                    break
+                            except Exception:
+                                continue
+                        if found_options:
+                            break
+                    except Exception:
+                        continue
+                if not found_options:
+                    print(f"[LOOKUP] ⚠ No options found after retries")
+
+
             # Check if any option is a direct match for our value
             val_lower = value.lower()
             for i, text in enumerate(found_options):
@@ -1894,125 +2108,62 @@ class SalesforceLightningEngine:
                     except Exception as e:
                         print(f"[LOOKUP] ⚠ Failed to click match: {e}")
 
-            # No direct match — find and click "Search..." / "Show more results"
-            print(f"[LOOKUP] No direct match, looking for Search option...")
+            # No direct match — try to click the first real record option
+            # instead of going to Advanced Search. This handles lookup fields
+            # with filter criteria where the SOQL value differs from UI options.
+            print(f"[LOOKUP] No direct match for '{value}', trying first valid dropdown option...")
+            SKIP_KW = ['search', 'new ', 'add', 'show more', 'recently viewed',
+                        'no results', 'create new', 'draft', 'finalized', 'sent', 'paid']
+            first_record_clicked = False
             for i, text in enumerate(found_options):
-                text_lower = text.lower()
-                if 'search' in text_lower or 'show more' in text_lower:
-                    try:
-                        # JS click to bypass click interception/timeout
-                        await option_locator.nth(i).evaluate("el => el.click()")
-                        print(f"[LOOKUP] → JS-clicked Search option: '{text[:50]}'")
-                        await asyncio.sleep(3.0)
+                text_lower = text.lower().strip()
+                if not text_lower or any(skip in text_lower for skip in SKIP_KW):
+                    continue
+                # This looks like a real record — click it
+                try:
+                    await option_locator.nth(i).evaluate("el => el.click()")
+                    print(f"[LOOKUP] ✅ Fallback: selected '{text[:50]}' "
+                          f"(original value '{value}' not in filtered results)")
+                    await asyncio.sleep(1.0)
+                    return True
+                except Exception as e:
+                    print(f"[LOOKUP] ⚠ Fallback click failed for '{text[:50]}': {e}")
+                    first_record_clicked = True
 
-                        # A search modal should now be open
-                        dialog_count = await page.locator("div[role='dialog']").count()
-                        print(f"[LOOKUP] Dialog count after Search click: {dialog_count}")
+            # Only go to Search/Advanced if no real record was found in dropdown
+            if not first_record_clicked:
+                print(f"[LOOKUP] No valid record options in dropdown, trying Search...")
+                for i, text in enumerate(found_options):
+                    text_lower = text.lower()
+                    if 'search' in text_lower or 'show more' in text_lower:
+                        popup_page = None
+                        try:
+                            async with page.expect_popup(timeout=2000) as popup_info:
+                                await option_locator.nth(i).evaluate("el => el.click()")
+                                print(f"[LOOKUP] → JS-clicked Search option: '{text[:50]}'")
+                            popup_page = await popup_info.value
+                            print(f"[LOOKUP] → Captured popup window: {popup_page.url[:80]}")
+                        except Exception:
+                            print(f"[LOOKUP] → No popup (Lightning dialog expected)")
 
-                        # Find search input in the newest dialog
-                        search_modal_input = None
-                        modal_input_selectors = [
-                            "div[role='dialog'] input[type='search']",
-                            "div[role='dialog'] input[placeholder*='Search']",
-                            "div[role='dialog'] input.slds-input",
-                            "div[role='dialog'] input[role='combobox']",
-                            "div[role='dialog'] input[type='text']",
-                            "section[role='dialog'] input",
-                        ]
-                        for msel in modal_input_selectors:
+                        if popup_page:
+                            result = await SalesforceLightningEngine._search_in_popup(
+                                popup_page, label, value
+                            )
+                            if result:
+                                return True
                             try:
-                                loc = page.locator(msel)
-                                if await loc.count() > 0:
-                                    for idx in range(await loc.count()):
-                                        candidate = loc.nth(idx)
-                                        if await candidate.is_visible():
-                                            search_modal_input = candidate
-                                            print(f"[LOOKUP] → Found search modal input: {msel}")
-                                            break
-                                if search_modal_input:
-                                    break
-                            except Exception:
-                                continue
-
-                        if search_modal_input:
-                            # Wait for modal to finish initial load/search
-                            await asyncio.sleep(1.5)
-
-                            # Clear the pre-filled search text (from dropdown typing)
-                            await search_modal_input.click(timeout=3000)
-                            await asyncio.sleep(0.3)
-                            await search_modal_input.fill("", timeout=3000)
-                            await asyncio.sleep(0.5)
-
-                            # Type the full value
-                            await search_modal_input.fill(value, timeout=5000)
-                            print(f"[LOOKUP] → Filled search modal with: '{value}'")
-                            await asyncio.sleep(0.5)
-
-                            # Press Enter to trigger search
-                            await page.keyboard.press("Enter")
-                            print(f"[LOOKUP] → Pressed Enter in search modal")
-                            await asyncio.sleep(4.0)
-
-                            # Debug: dump what's visible in the modal
-                            try:
-                                modal_html = await page.evaluate("""() => {
-                                    const dialogs = document.querySelectorAll('div[role="dialog"]');
-                                    const last = dialogs[dialogs.length - 1];
-                                    if (!last) return 'no dialog';
-                                    // Get all links and text in the dialog
-                                    const links = last.querySelectorAll('a');
-                                    const texts = [];
-                                    for (const l of links) {
-                                        if (l.offsetParent !== null) {
-                                            texts.push(l.textContent.trim().substring(0, 60));
-                                        }
-                                    }
-                                    // Also check table rows
-                                    const rows = last.querySelectorAll('tr, [role="row"]');
-                                    for (const r of rows) {
-                                        if (r.offsetParent !== null) {
-                                            texts.push('ROW:' + r.textContent.trim().substring(0, 60));
-                                        }
-                                    }
-                                    // Check for "no results" message
-                                    const bodyText = last.textContent || '';
-                                    if (bodyText.includes('No results')) {
-                                        texts.push('NO_RESULTS: ' + bodyText.substring(bodyText.indexOf('No results'), bodyText.indexOf('No results') + 40));
-                                    }
-                                    return texts.slice(0, 10);
-                                }""")
-                                print(f"[LOOKUP] DEBUG search modal contents: {modal_html}")
+                                await popup_page.close()
                             except Exception:
                                 pass
-
-                            # Look for result in modal
-                            result_selectors = [
-                                f"div[role='dialog'] a:has-text('{value}')",
-                                f"div[role='dialog'] th a:has-text('{value[:10]}')",
-                                f"div[role='dialog'] tr:has-text('{value}')",
-                                f"div[role='dialog'] .slds-truncate:has-text('{value}')",
-                                f"section[role='dialog'] a:has-text('{value}')",
-                                # Partial match
-                                f"div[role='dialog'] a:has-text('{value.split()[0]}')",
-                            ]
-                            for rsel in result_selectors:
-                                try:
-                                    result_loc = page.locator(rsel).first
-                                    if await result_loc.is_visible():
-                                        await result_loc.click(timeout=5000)
-                                        print(f"[LOOKUP] ✅ Selected from search modal: {rsel}")
-                                        await asyncio.sleep(1.5)
-                                        return True
-                                except Exception:
-                                    continue
-
-                            print(f"[LOOKUP] ⚠ No matching result in search modal")
                         else:
-                            print(f"[LOOKUP] ⚠ No search input found in modal")
-                    except Exception as e:
-                        print(f"[LOOKUP] ⚠ Error clicking Search option: {e}")
-                    break
+                            await asyncio.sleep(4)
+                            result = await SalesforceLightningEngine._search_in_advanced_dialog(
+                                page, label, value
+                            )
+                            if result:
+                                return True
+                        break
 
             print(f"[LOOKUP] Falling through to advanced search fallback...")
 
@@ -2033,6 +2184,33 @@ class SalesforceLightningEngine:
         except Exception as e:
             logger.warning(f"  ⚠ Lookup failed for '{label}': {e}")
             return False
+        finally:
+            # Always dismiss any error dialogs that appeared during lookup
+            # (e.g., 'We hit a snag' panels) to prevent blocking subsequent steps
+            try:
+                await page.evaluate("""() => {
+                    // Dismiss uiPanel error dialogs ('We hit a snag')
+                    document.querySelectorAll('.uiPanel').forEach(panel => {
+                        const h = panel.querySelector('h2, [class*=\"title\"]');
+                        const t = (h?.textContent || '').toLowerCase();
+                        if (t.includes('snag') || t.includes('error')) {
+                            const btn = panel.querySelector('button.slds-modal__close') ||
+                                panel.querySelector("button[title='Close']") ||
+                                panel.querySelector("button[title='OK']") ||
+                                panel.querySelector('button');
+                            if (btn) btn.click();
+                        }
+                    });
+                    // Dismiss uiModal--app-error
+                    document.querySelectorAll('.uiModal--app-error').forEach(modal => {
+                        const btn = modal.querySelector('.modal-footer button') ||
+                            modal.querySelector('button.slds-modal__close');
+                        if (btn) btn.click();
+                    });
+                }""")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
     @staticmethod
     async def _verify_lookup_selection(page, label, value, input_loc):
         """Smart verification that a lookup selection was accepted.
@@ -2186,6 +2364,72 @@ class SalesforceLightningEngine:
                         print(f"[LOOKUP-ADV] → Re-found input via get_by_label")
                 except Exception as e:
                     print(f"[LOOKUP-ADV] ⚠ Could not re-focus input: {e}")
+                    # The input is blocked — likely by an Advanced Search modal/popup.
+                    # Check ALL dialogs and browser pages for the value.
+
+                    # Strategy A: Check all dialogs on the page
+                    try:
+                        all_dialogs = page.locator("div[role='dialog']")
+                        dialog_count = await all_dialogs.count()
+                        print(f"[LOOKUP-ADV] → Checking {dialog_count} dialogs for '{value}'")
+                        for di in range(dialog_count):
+                            try:
+                                dialog = all_dialogs.nth(di)
+                                if not await dialog.is_visible():
+                                    continue
+                                # First try clicking a result directly
+                                found = await SalesforceLightningEngine._click_modal_result(
+                                    dialog, value
+                                )
+                                if found:
+                                    return True
+                                # Then try searching within it
+                                found2 = await SalesforceLightningEngine._search_in_modal(
+                                    page, dialog, label, value
+                                )
+                                if found2:
+                                    return True
+                            except Exception:
+                                continue
+                    except Exception as de:
+                        print(f"[LOOKUP-ADV] ⚠ Dialog check error: {de}")
+
+                    # Strategy B: Check for popup windows (Classic VF lookup window)
+                    try:
+                        context = page.context
+                        all_pages = context.pages
+                        if len(all_pages) > 1:
+                            print(f"[LOOKUP-ADV] → Found {len(all_pages)} browser pages, checking popups")
+                            for popup_page in all_pages:
+                                if popup_page == page:
+                                    continue
+                                try:
+                                    popup_url = popup_page.url or ""
+                                    popup_text = await popup_page.evaluate(
+                                        "document.body ? document.body.innerText : ''"
+                                    ) or ""
+                                    if value in popup_text:
+                                        print(f"[LOOKUP-ADV] → Found '{value}' in popup: {popup_url[:80]}")
+                                        # Try clicking the record link in the popup
+                                        for psel in [
+                                            f"a:has-text('{value}')",
+                                            f"th a:has-text('{value}')",
+                                            f"td a:has-text('{value}')",
+                                        ]:
+                                            try:
+                                                ploc = popup_page.locator(psel)
+                                                if await ploc.count() > 0 and await ploc.first.is_visible():
+                                                    await ploc.first.click(timeout=5000)
+                                                    print(f"[LOOKUP-ADV] ✅ Clicked '{value}' in popup via {psel}")
+                                                    await asyncio.sleep(2)
+                                                    return True
+                                            except Exception:
+                                                continue
+                                except Exception:
+                                    continue
+                    except Exception as pe:
+                        print(f"[LOOKUP-ADV] ⚠ Popup check error: {pe}")
+
                     continue
 
             # ─── Clear and type the search term ───
@@ -2244,35 +2488,141 @@ class SalesforceLightningEngine:
                     if await opt.is_visible():
                         opt_text = opt_texts[oi].lower() if oi < len(opt_texts) else ""
                         if 'search' in opt_text and 'new' not in opt_text:
-                            # Use JS click to bypass interception/timeout
-                            await opt.evaluate("el => el.click()")
-                            print(f"[LOOKUP-ADV] → Clicked 'Search...' option via JS")
-                            await asyncio.sleep(3)
-                            # Check for NEW dialog
-                            new_count = await page.locator("div[role='dialog']").count()
-                            if new_count > existing_dialog_count:
-                                print(f"[LOOKUP-ADV] → NEW search modal opened ({new_count})")
-                                search_modal = page.locator("div[role='dialog']").nth(new_count - 1)
-                                result = await SalesforceLightningEngine._search_in_modal(page, search_modal, label, value)
-                                if result:
-                                    return True
-                                # Modal search failed — close the modal before continuing
+                            # Capture popup BEFORE clicking Search
+                            popup_page = None
+                            try:
+                                async with page.expect_popup(timeout=10000) as popup_info:
+                                    await opt.evaluate("el => el.click()")
+                                    print(f"[LOOKUP-ADV] → Clicked 'Search...' option via JS")
+                                popup_page = await popup_info.value
+                                print(f"[LOOKUP-ADV] → Captured popup window: {popup_page.url[:80]}")
+                            except Exception as popup_err:
+                                print(f"[LOOKUP-ADV] → No popup captured (may be dialog): {popup_err}")
+                                await asyncio.sleep(3)
+
+                            if popup_page:
+                                # ─── Search within the popup window ───
                                 try:
-                                    cancel_btn = search_modal.locator("button:has-text('Cancel')")
-                                    if await cancel_btn.count() > 0:
-                                        await cancel_btn.first.click(timeout=3000)
-                                        print(f"[LOOKUP-ADV] → Closed search modal via Cancel")
-                                    else:
-                                        await page.keyboard.press("Escape")
-                                    await asyncio.sleep(1)
-                                except Exception:
+                                    await popup_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                                    await asyncio.sleep(2)
+
+                                    # Find search input in popup
+                                    search_input = None
+                                    for psi in [
+                                        "input[type='search']", "input[type='text']",
+                                        "input.slds-input", "input[name='str']",
+                                        "#searchFrame input", "input[id='lksrch']",
+                                    ]:
+                                        try:
+                                            inp = popup_page.locator(psi)
+                                            if await inp.count() > 0 and await inp.first.is_visible():
+                                                search_input = inp.first
+                                                break
+                                        except Exception:
+                                            continue
+
+                                    # Also check frames inside popup
+                                    if not search_input:
+                                        for frame in popup_page.frames:
+                                            for psi in ["input[id='lksrch']", "input[type='text']", "input[name='str']"]:
+                                                try:
+                                                    inp = frame.locator(psi)
+                                                    if await inp.count() > 0 and await inp.first.is_visible():
+                                                        search_input = inp.first
+                                                        print(f"[LOOKUP-ADV] → Found search input in popup frame: {psi}")
+                                                        break
+                                                except Exception:
+                                                    continue
+                                            if search_input:
+                                                break
+
+                                    if search_input:
+                                        await search_input.fill(value, timeout=5000)
+                                        print(f"[LOOKUP-ADV] → Typed '{value}' in popup search")
+                                        await asyncio.sleep(0.5)
+
+                                        # Click Go/Search button
+                                        btn_clicked = False
+                                        for bsel in ["input[name='go']", "button:has-text('Go')", "button:has-text('Search')", "input[type='submit']"]:
+                                            try:
+                                                # Check popup and its frames
+                                                for frame in [popup_page] + popup_page.frames:
+                                                    btn = frame.locator(bsel)
+                                                    if await btn.count() > 0 and await btn.first.is_visible():
+                                                        await btn.first.click(timeout=5000)
+                                                        print(f"[LOOKUP-ADV] → Clicked search button: {bsel}")
+                                                        btn_clicked = True
+                                                        break
+                                                if btn_clicked:
+                                                    break
+                                            except Exception:
+                                                continue
+
+                                        if not btn_clicked:
+                                            await search_input.press("Enter")
+                                            print(f"[LOOKUP-ADV] → Pressed Enter")
+
+                                        await asyncio.sleep(4)
+
+                                    # Click matching result in popup (check all frames)
+                                    for frame in [popup_page] + popup_page.frames:
+                                        try:
+                                            frame_text = await frame.evaluate(
+                                                "document.body ? document.body.innerText : ''"
+                                            ) or ""
+                                            if value not in frame_text:
+                                                continue
+                                            for rsel in [
+                                                f"a:has-text('{value}')",
+                                                f"th a:has-text('{value}')",
+                                                f"td a:has-text('{value}')",
+                                            ]:
+                                                try:
+                                                    rloc = frame.locator(rsel)
+                                                    if await rloc.count() > 0 and await rloc.first.is_visible():
+                                                        await rloc.first.click(timeout=5000)
+                                                        print(f"[LOOKUP-ADV] ✅ Selected '{value}' from popup via {rsel}")
+                                                        await asyncio.sleep(2)
+                                                        return True
+                                                except Exception:
+                                                    continue
+                                        except Exception:
+                                            continue
+
+                                    print(f"[LOOKUP-ADV] ⚠ Could not find '{value}' in popup results")
                                     try:
-                                        await page.keyboard.press("Escape")
-                                        await asyncio.sleep(1)
+                                        await popup_page.close()
                                     except Exception:
                                         pass
-                                # Don't continue outer loop — modal search already tried shorter terms
-                                return False
+                                except Exception as pe:
+                                    print(f"[LOOKUP-ADV] ⚠ Popup search error: {pe}")
+                                    try:
+                                        await popup_page.close()
+                                    except Exception:
+                                        pass
+                            else:
+                                # Fallback: check for NEW dialog (Lightning-style search)
+                                new_count = await page.locator("div[role='dialog']").count()
+                                if new_count > existing_dialog_count:
+                                    print(f"[LOOKUP-ADV] → NEW search modal opened ({new_count})")
+                                    search_modal = page.locator("div[role='dialog']").nth(new_count - 1)
+                                    result = await SalesforceLightningEngine._search_in_modal(page, search_modal, label, value)
+                                    if result:
+                                        return True
+                                    try:
+                                        cancel_btn = search_modal.locator("button:has-text('Cancel')")
+                                        if await cancel_btn.count() > 0:
+                                            await cancel_btn.first.click(timeout=3000)
+                                        else:
+                                            await page.keyboard.press("Escape")
+                                        await asyncio.sleep(1)
+                                    except Exception:
+                                        try:
+                                            await page.keyboard.press("Escape")
+                                            await asyncio.sleep(1)
+                                        except Exception:
+                                            pass
+                                    return False
                             break
 
             except Exception as e:
@@ -2410,7 +2760,8 @@ class SalesforceLightningEngine:
 
     @staticmethod
     async def _click_modal_result(modal, value):
-        """Try to find and click a matching result in a search modal."""
+        """Try to find and click a matching result in a search modal.
+        Handles both Lightning (direct DOM) and Classic (VF iframe) results."""
         result_selectors = [
             f"a:has-text('{value}')",
             f"th a:has-text('{value}')",
@@ -2422,6 +2773,7 @@ class SalesforceLightningEngine:
             f"[role='row']:has-text('{value}')",
         ]
 
+        # Strategy 1: Search in outer modal (Lightning style)
         for rs in result_selectors:
             try:
                 result = modal.locator(rs)
@@ -2448,9 +2800,491 @@ class SalesforceLightningEngine:
                             return True
             except Exception:
                 continue
-        
+
+        # Strategy 2: Search inside iframes (Classic VF search modal)
+        # Salesforce Advanced Search uses a Visualforce page in an iframe
+        try:
+            # Get the page from the modal
+            page = modal.page
+            for frame in page.frames:
+                try:
+                    frame_url = frame.url or ""
+                    # Only check Salesforce lookup/search frames
+                    if not any(kw in frame_url.lower() for kw in [
+                        "lookup", "search", "lkid", "_ui/common",
+                        "visualforce", "apex"
+                    ]) and frame != page.main_frame:
+                        # Also check zero-URL iframes (embedded VF)
+                        if frame_url and "salesforce" not in frame_url.lower():
+                            continue
+
+                    frame_text = await frame.evaluate(
+                        "document.body ? document.body.innerText : ''"
+                    ) or ""
+                    if value not in frame_text:
+                        continue
+
+                    print(f"[LOOKUP-MODAL] Found '{value}' in iframe: {frame_url[:80]}")
+
+                    # Try clicking the link containing the value
+                    iframe_selectors = [
+                        f"a:has-text('{value}')",
+                        f"th a:has-text('{value}')",
+                        f"td a:has-text('{value}')",
+                        f"a[title*='{value}']",
+                    ]
+                    for isel in iframe_selectors:
+                        try:
+                            result = frame.locator(isel)
+                            count = await result.count()
+                            if count > 0:
+                                for i in range(min(count, 5)):
+                                    if await result.nth(i).is_visible():
+                                        await result.nth(i).click(timeout=5000)
+                                        print(f"[LOOKUP-MODAL] ✅ Clicked iframe result: {isel} (item {i})")
+                                        await asyncio.sleep(1)
+                                        return True
+                        except Exception:
+                            continue
+
+                except Exception as frame_err:
+                    print(f"[LOOKUP-MODAL] Frame check error: {frame_err}")
+                    continue
+        except Exception as iframe_err:
+            print(f"[LOOKUP-MODAL] Iframe strategy error: {iframe_err}")
+
         return False
 
+
+    @staticmethod
+    async def _search_in_advanced_dialog(page, label, value):
+        """Handle Lightning Advanced Search dialog for lookup fields.
+        
+        Finds the correct Advanced Search dialog (not the record creation form),
+        types the full value in its search input, clicks Search, then selects
+        the matching record via radio button + Select button."""
+        print(f"[LOOKUP-DIALOG] 🔎 Looking for Advanced Search dialog for '{label}'")
+
+        # Wait for dialog to fully render
+        await asyncio.sleep(2)
+
+        # Find the Advanced Search dialog — check both div and section
+        all_dialogs = page.locator("[role='dialog']")
+        dialog_count = await all_dialogs.count()
+        print(f"[LOOKUP-DIALOG] Found {dialog_count} dialogs on page")
+
+        adv_dialog = None
+        
+        # Strategy 1: Look for heading containing "Advanced Search" or "Search"
+        for di in range(dialog_count - 1, -1, -1):  # Check newest dialogs first
+            try:
+                dialog = all_dialogs.nth(di)
+                if not await dialog.is_visible():
+                    continue
+                
+                # Check heading elements
+                for heading_sel in [
+                    "h1", "h2", "h2 span", "header",
+                    "[class*='title']", "[class*='heading']",
+                    ".slds-modal__title", ".slds-text-heading",
+                ]:
+                    try:
+                        heading = dialog.locator(heading_sel)
+                        if await heading.count() > 0:
+                            h_text = (await heading.first.text_content(timeout=2000) or "").strip().lower()
+                            if "advanced search" in h_text or "search" in h_text:
+                                adv_dialog = dialog
+                                print(f"[LOOKUP-DIALOG] → Found via heading '{h_text}' (selector: {heading_sel})")
+                                break
+                    except Exception:
+                        continue
+                if adv_dialog:
+                    break
+                
+                # Check if dialog has a Search button + results table pattern
+                try:
+                    has_search_btn = await dialog.locator("button:has-text('Search')").count() > 0
+                    has_table = await dialog.locator("table, [role='grid'], [role='row']").count() > 0
+                    has_cancel_select = await dialog.locator("button:has-text('Cancel')").count() > 0
+                    if has_search_btn and (has_table or has_cancel_select):
+                        adv_dialog = dialog
+                        print(f"[LOOKUP-DIALOG] → Found via Search button + table/cancel pattern")
+                        break
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+        # Strategy 2: Check text content as fallback
+        if not adv_dialog:
+            for di in range(dialog_count - 1, -1, -1):
+                try:
+                    dialog = all_dialogs.nth(di)
+                    if not await dialog.is_visible():
+                        continue
+                    dialog_text = (await dialog.text_content(timeout=3000) or "").lower()
+                    if ("advanced search" in dialog_text
+                            or "results found for" in dialog_text
+                            or f"search {label.lower()}" in dialog_text):
+                        adv_dialog = dialog
+                        print(f"[LOOKUP-DIALOG] → Found via text content match")
+                        break
+                except Exception:
+                    continue
+
+        # Strategy 3: Pick the LAST dialog that has input[type=search/text] + button:Search
+        if not adv_dialog:
+            for di in range(dialog_count - 1, -1, -1):
+                try:
+                    dialog = all_dialogs.nth(di)
+                    if not await dialog.is_visible():
+                        continue
+                    # Check if this dialog has a standalone search input
+                    # (not a combobox/lookup input)
+                    has_search = False
+                    for si in ["input[type='search']", "input[type='text']"]:
+                        inp = dialog.locator(si)
+                        if await inp.count() > 0 and await inp.first.is_visible():
+                            has_search = True
+                            break
+                    has_btn = await dialog.locator("button:has-text('Search')").count() > 0
+                    if has_search and has_btn:
+                        adv_dialog = dialog
+                        print(f"[LOOKUP-DIALOG] → Found via search input + Search button (index {di})")
+                        break
+                except Exception:
+                    continue
+
+        if not adv_dialog:
+            print(f"[LOOKUP-DIALOG] ⚠ No Advanced Search dialog found")
+            return False
+
+        # Step 1: Find the search input within THIS dialog
+        search_input = None
+        for si_sel in [
+            "input[type='search']",
+            "input[type='text']",
+            "input.slds-input",
+        ]:
+            try:
+                inp = adv_dialog.locator(si_sel)
+                if await inp.count() > 0 and await inp.first.is_visible():
+                    search_input = inp.first
+                    print(f"[LOOKUP-DIALOG] → Found search input: {si_sel}")
+                    break
+            except Exception:
+                continue
+
+        if not search_input:
+            print(f"[LOOKUP-DIALOG] ⚠ No search input in Advanced Search dialog")
+            # Try to select from existing results anyway
+            return await SalesforceLightningEngine._select_from_adv_results(
+                page, adv_dialog, value
+            )
+
+        # Step 2: Clear and type the FULL value
+        try:
+            await search_input.click(timeout=3000)
+            await asyncio.sleep(0.3)
+            await search_input.fill("", timeout=3000)
+            await asyncio.sleep(0.3)
+            await search_input.fill(value, timeout=5000)
+            print(f"[LOOKUP-DIALOG] → Typed '{value}' in search input")
+        except Exception as e:
+            print(f"[LOOKUP-DIALOG] ⚠ Could not type in search: {e}")
+            # Try existing results anyway
+            return await SalesforceLightningEngine._select_from_adv_results(
+                page, adv_dialog, value
+            )
+
+        # Step 3: Click the Search button
+        try:
+            search_btn = adv_dialog.locator("button:has-text('Search')")
+            if await search_btn.count() > 0 and await search_btn.first.is_visible():
+                await search_btn.first.click(timeout=5000)
+                print(f"[LOOKUP-DIALOG] → Clicked Search button")
+            else:
+                await search_input.press("Enter")
+                print(f"[LOOKUP-DIALOG] → Pressed Enter")
+        except Exception:
+            try:
+                await search_input.press("Enter")
+            except Exception:
+                pass
+
+        # Wait for results to load
+        await asyncio.sleep(4)
+
+        # Step 4: Select the matching record
+        return await SalesforceLightningEngine._select_from_adv_results(
+            page, adv_dialog, value
+        )
+
+    @staticmethod
+    async def _select_from_adv_results(page, dialog, value):
+        """Select a record from Advanced Search results.
+        
+        CRITICAL: In Salesforce Lightning, radio inputs are CSS-hidden.
+        Clicking the hidden input doesn't trigger Lightning's framework.
+        Must click the VISIBLE elements: the radio cell, label, or faux span.
+        """
+        print(f"[LOOKUP-DIALOG] Selecting '{value}' from results...")
+
+        # Find rows containing the value
+        rows = dialog.locator(f"tr:has-text('{value}')")
+        row_count = await rows.count()
+        print(f"[LOOKUP-DIALOG] → Found {row_count} rows matching '{value}'")
+
+        if row_count == 0:
+            # Fallback: exact value not found — this typically happens when the
+            # lookup has filter criteria (e.g. Order filtered by Entity).
+            # The SOQL query at generation time didn't apply these filters.
+            # Try to select the FIRST available record from the table instead.
+            print(f"[LOOKUP-DIALOG] ⚠ No rows matching '{value}' — trying first available record (filter criteria may apply)")
+            all_rows = dialog.locator("table tbody tr")
+            all_count = await all_rows.count()
+            if all_count > 0:
+                print(f"[LOOKUP-DIALOG] → Found {all_count} total rows, selecting first available")
+                row = all_rows.first
+                row_count = 1  # Proceed with selection logic below
+            else:
+                print(f"[LOOKUP-DIALOG] ⚠ No rows at all in results table")
+                return False
+
+        radio_selected = False
+        if row_count > 0 and await rows.count() > 0:
+            row = rows.first  # Use first matching row
+
+        # Strategy 1: Use Playwright getByRole('radio') — safest accessibility approach
+        # NEVER click td/a/link elements — they navigate away from the form!
+        try:
+            radio_loc = dialog.get_by_role("radio")
+            rc = await radio_loc.count()
+            print(f"[LOOKUP-DIALOG] → Found {rc} radio(s) by role in dialog")
+            if rc > 0:
+                await radio_loc.first.click(timeout=3000)
+                print(f"[LOOKUP-DIALOG] → Clicked radio by role")
+                radio_selected = True
+                await asyncio.sleep(1)
+        except Exception as e:
+            print(f"[LOOKUP-DIALOG] → getByRole failed: {e}")
+
+        # Strategy 2: Force-click the hidden input[type='radio'] in matching row
+        if not radio_selected:
+            try:
+                radio = row.locator("input[type='radio']")
+                if await radio.count() > 0:
+                    await radio.first.click(force=True, timeout=3000)
+                    print(f"[LOOKUP-DIALOG] → Force-clicked input[type='radio']")
+                    radio_selected = True
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[LOOKUP-DIALOG] → force radio click failed: {e}")
+
+        # Strategy 3: Click the visible radio faux span (circular indicator)
+        if not radio_selected:
+            try:
+                faux = row.locator("span.slds-radio_faux, span.slds-radio--faux")
+                if await faux.count() > 0:
+                    await faux.first.click(timeout=3000)
+                    print(f"[LOOKUP-DIALOG] → Clicked slds-radio_faux")
+                    radio_selected = True
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[LOOKUP-DIALOG] → faux click failed: {e}")
+
+        # Strategy 4: Click the label wrapping the radio (NOT data links)
+        if not radio_selected:
+            try:
+                label = row.locator("label.slds-radio__label, label[for]")
+                if await label.count() > 0:
+                    await label.first.click(force=True, timeout=3000)
+                    print(f"[LOOKUP-DIALOG] → Clicked radio label")
+                    radio_selected = True
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[LOOKUP-DIALOG] → label click failed: {e}")
+
+        # Strategy 5: JS — find radio input in the search dialog and click it
+        if not radio_selected:
+            try:
+                radio_selected = await page.evaluate("""(val) => {
+                    const dialogs = document.querySelectorAll('[role="dialog"]');
+                    for (const dlg of dialogs) {
+                        const h = dlg.querySelector('h1, h2');
+                        if (!h || !h.textContent.toLowerCase().includes('search')) continue;
+                        const rows = dlg.querySelectorAll('tr');
+                        for (const row of rows) {
+                            if (!row.textContent.includes(val)) continue;
+                            // ONLY click radio input, never td/a/link
+                            const radio = row.querySelector('input[type="radio"]');
+                            if (radio) { radio.click(); return true; }
+                            // Try clicking the label
+                            const lbl = row.querySelector('label');
+                            if (lbl) { lbl.click(); return true; }
+                        }
+                    }
+                    return false;
+                }""", value)
+                if radio_selected:
+                    print(f"[LOOKUP-DIALOG] → JS clicked radio/label")
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[LOOKUP-DIALOG] → JS failed: {e}")
+
+        if not radio_selected:
+            print(f"[LOOKUP-DIALOG] ⚠ Could not select radio for '{value}'")
+            try:
+                await dialog.locator("button:has-text('Cancel')").first.click(timeout=3000)
+            except Exception:
+                pass
+            return False
+
+        # Wait for Select button to become ENABLED after radio selection
+        await asyncio.sleep(2)
+
+        # Click Select button — try multiple scopes
+        select_clicked = False
+
+        # Try 1: Dialog-scoped
+        try:
+            sel = dialog.locator("button:has-text('Select')")
+            if await sel.count() > 0 and await sel.first.is_visible():
+                await sel.first.click(timeout=5000)
+                print(f"[LOOKUP-DIALOG] ✅ Select clicked (dialog scope)")
+                select_clicked = True
+        except Exception:
+            pass
+
+        # Try 2: Page-level selectors
+        if not select_clicked:
+            for s in [
+                ".slds-modal button:has-text('Select')",
+                "[role='dialog'] button:has-text('Select')",
+                "footer button:has-text('Select')",
+            ]:
+                try:
+                    btn = page.locator(s)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click(timeout=3000)
+                        print(f"[LOOKUP-DIALOG] ✅ Select clicked ({s})")
+                        select_clicked = True
+                        break
+                except Exception:
+                    continue
+
+        # Try 3: JS click any visible "Select" button
+        if not select_clicked:
+            try:
+                select_clicked = await page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.trim() === 'Select' && 
+                            b.offsetParent !== null && !b.disabled) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    // Also try disabled Select buttons (enable and click)
+                    for (const b of btns) {
+                        if (b.textContent.trim() === 'Select' && b.disabled) {
+                            b.disabled = false;
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if select_clicked:
+                    print(f"[LOOKUP-DIALOG] ✅ JS-clicked Select")
+            except Exception:
+                pass
+
+        if select_clicked:
+            await asyncio.sleep(2)
+            return True
+
+        print(f"[LOOKUP-DIALOG] ⚠ Select button still disabled/not found")
+        return False
+
+    @staticmethod
+    async def _search_in_popup(popup_page, label, value):
+        """Handle Classic VF popup window for lookup fields."""
+        print(f"[LOOKUP-POPUP] 🔎 Searching in popup for '{label}' = '{value}'")
+        try:
+            await popup_page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await asyncio.sleep(3)
+
+            # Find search input (check all frames)
+            search_input = None
+            all_frames = [popup_page] + popup_page.frames
+            for frame in all_frames:
+                for psi in [
+                    "input[id='lksrch']", "input[name='str']",
+                    "input[type='search']", "input[type='text']",
+                    "input.slds-input",
+                ]:
+                    try:
+                        inp = frame.locator(psi)
+                        if await inp.count() > 0 and await inp.first.is_visible():
+                            search_input = inp.first
+                            print(f"[LOOKUP-POPUP] → Found search input: {psi}")
+                            break
+                    except Exception:
+                        continue
+                if search_input:
+                    break
+
+            if search_input:
+                await search_input.fill(value, timeout=5000)
+                print(f"[LOOKUP-POPUP] → Typed '{value}'")
+                await asyncio.sleep(0.5)
+
+                # Click Go/Search button
+                btn_clicked = False
+                for bsel in ["input[name='go']", "input[type='submit']",
+                             "button:has-text('Go')", "button:has-text('Search')"]:
+                    try:
+                        for frame in all_frames:
+                            btn = frame.locator(bsel)
+                            if await btn.count() > 0 and await btn.first.is_visible():
+                                await btn.first.click(timeout=5000)
+                                print(f"[LOOKUP-POPUP] → Clicked: {bsel}")
+                                btn_clicked = True
+                                break
+                        if btn_clicked:
+                            break
+                    except Exception:
+                        continue
+                if not btn_clicked:
+                    await search_input.press("Enter")
+                await asyncio.sleep(5)
+
+            # Click matching result
+            for frame in all_frames:
+                try:
+                    frame_text = await frame.evaluate(
+                        "document.body ? document.body.innerText : ''"
+                    ) or ""
+                    if value not in frame_text:
+                        continue
+                    for rsel in [f"a:has-text('{value}')", f"th a:has-text('{value}')",
+                                 f"td a:has-text('{value}')"]:
+                        try:
+                            rloc = frame.locator(rsel)
+                            if await rloc.count() > 0 and await rloc.first.is_visible():
+                                await rloc.first.click(timeout=5000)
+                                print(f"[LOOKUP-POPUP] ✅ Selected '{value}' via {rsel}")
+                                await asyncio.sleep(2)
+                                return True
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            print(f"[LOOKUP-POPUP] ⚠ Could not find '{value}' in popup")
+        except Exception as e:
+            print(f"[LOOKUP-POPUP] ⚠ Error: {e}")
+        return False
 
 
     @staticmethod
@@ -3159,6 +3993,206 @@ class SalesforceLightningEngine:
 
         logger.warning("  ⚠ Record Type modal detected but could not proceed")
         return False
+
+    # ─────────────────────────────────────────────
+    # App-Error Modal Dismissal
+    # ─────────────────────────────────────────────
+    # E1a: Persistent Error-Modal Auto-Dismisser
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def install_error_modal_watcher(page):
+        """Inject a MutationObserver that auto-dismisses Salesforce app-error
+        modals AND 'We hit a snag' error panels the instant they appear.
+
+        Handles two types of error overlays:
+        1. 'Sorry to interrupt' modal (class: uiModal--app-error)
+        2. 'We hit a snag' panel (class: uiPanel, heading contains 'snag')
+
+        Both block ALL pointer events and can prevent form interactions.
+        """
+        try:
+            await page.evaluate("""() => {
+                // Prevent double-installation
+                if (window.__sfErrorModalWatcher) return;
+                window.__sfErrorModalWatcher = true;
+
+                function dismissNode(node) {
+                    if (!(node instanceof HTMLElement)) return;
+                    // Type 1: uiModal--app-error
+                    const appErrorModal = node.classList?.contains('uiModal--app-error')
+                        ? node
+                        : node.querySelector?.('.uiModal--app-error');
+                    if (appErrorModal) {
+                        console.log('[SF-WATCHER] App-error modal detected');
+                        setTimeout(() => {
+                            const btn =
+                                appErrorModal.querySelector('.modal-footer button') ||
+                                appErrorModal.querySelector('button.slds-modal__close') ||
+                                appErrorModal.querySelector("button[title='Close this window']");
+                            if (btn) { btn.click(); console.log('[SF-WATCHER] ✅ App-error dismissed'); }
+                            else { setTimeout(() => {
+                                const b = appErrorModal.querySelector('.modal-footer button') || appErrorModal.querySelector('button.slds-modal__close');
+                                if (b) { b.click(); console.log('[SF-WATCHER] ✅ App-error dismissed (retry)'); }
+                            }, 500); }
+                        }, 200);
+                        return;
+                    }
+                    // Type 2: 'We hit a snag' panel (uiPanel with error heading)
+                    const panels = node.classList?.contains('uiPanel')
+                        ? [node]
+                        : Array.from(node.querySelectorAll?.('.uiPanel') || []);
+                    for (const panel of panels) {
+                        const heading = panel.querySelector?.('h2, .panel-header, [class*="title"]');
+                        const text = (heading?.textContent || '').toLowerCase();
+                        if (text.includes('snag') || text.includes('error')) {
+                            console.log('[SF-WATCHER] Error panel detected: ' + text);
+                            setTimeout(() => {
+                                const closeBtn = panel.querySelector('button.slds-modal__close') ||
+                                    panel.querySelector("button[title='Close']") ||
+                                    panel.querySelector("button[title='OK']") ||
+                                    panel.querySelector('.forceModalActionContainer button') ||
+                                    panel.querySelector('button');
+                                if (closeBtn) { closeBtn.click(); console.log('[SF-WATCHER] ✅ Error panel dismissed'); }
+                            }, 200);
+                        }
+                    }
+                }
+
+                const observer = new MutationObserver((mutations) => {
+                    for (const mutation of mutations) {
+                        for (const node of mutation.addedNodes) {
+                            dismissNode(node);
+                        }
+                    }
+                });
+
+                observer.observe(document.body, {
+                    childList: true,
+                    subtree: true,
+                });
+                console.log('[SF-WATCHER] Error modal watcher installed');
+            }""")
+            print("[SF-WATCHER] MutationObserver installed for auto-dismissing error modals")
+        except Exception as e:
+            print(f"[SF-WATCHER] Failed to install watcher: {e}")
+
+    # ─────────────────────────────────────────────
+    # E1b: Reactive Error-Modal Dismissal
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    async def dismiss_error_modal(page):
+        """Detect and dismiss Salesforce app-error modal overlays.
+
+        These modals appear when a server-side error occurs and block ALL
+        pointer events on the page.  They have class 'uiModal--app-error'
+        and typically contain an OK button in the footer.
+
+        Returns True if a modal was dismissed, False if none found.
+        """
+        import asyncio
+
+        try:
+            # Wait a short moment for modal to render if it's in transition
+            error_modal = page.locator("div.uiModal--app-error")
+            print("[DISMISS] Checking for app-error modal...")
+            try:
+                await error_modal.first.wait_for(state="visible", timeout=1000)
+            except Exception:
+                # No modal found within 1s — that's fine
+                print("[DISMISS] No modal found within 1s")
+                return False
+
+            count = await error_modal.count()
+            print(f"[DISMISS] Found {count} app-error modal(s)")
+            if count == 0:
+                return False
+
+            print("[DISMISS] ⚠ App-error modal detected — attempting to dismiss")
+
+            # Log the error text for debugging
+            try:
+                error_text = await error_modal.first.locator(
+                    ".modal-body, .slds-modal__content"
+                ).first.text_content(timeout=2000)
+                logger.warning(f"  ⚠ Modal text: {(error_text or '')[:200]}")
+            except Exception:
+                pass
+
+            # Strategy 1: Try multiple button selectors scoped to the modal
+            print("[DISMISS] Strategy 1: Trying scoped button selectors")
+            close_selectors = [
+                "button:has-text('OK')",
+                ".modal-footer button",
+                "button.slds-modal__close",
+                "button[title='Close this window']",
+                "button:has-text('Close')",
+            ]
+            for sel in close_selectors:
+                try:
+                    btn = error_modal.first.locator(sel)
+                    btn_count = await btn.count()
+                    print(f"[DISMISS]   Selector '{sel}': count={btn_count}")
+                    if btn_count > 0 and await btn.first.is_visible():
+                        await btn.first.click(force=True, timeout=3000)
+                        await asyncio.sleep(0.5)
+                        print(f"[DISMISS] ✅ Dismissed via scoped '{sel}'")
+                        return True
+                except Exception as ex:
+                    print(f"[DISMISS]   Selector '{sel}' failed: {ex}")
+                    continue
+
+            # Strategy 2: Try page-level selectors (unscoped)
+            print("[DISMISS] Strategy 2: Trying page-level selectors")
+            page_level_selectors = [
+                "div.uiModal--app-error button:has-text('OK')",
+                "div.uiModal--app-error .modal-footer button",
+            ]
+            for sel in page_level_selectors:
+                try:
+                    btn = page.locator(sel)
+                    btn_count = await btn.count()
+                    print(f"[DISMISS]   Page selector '{sel}': count={btn_count}")
+                    if btn_count > 0:
+                        await btn.first.click(force=True, timeout=3000)
+                        await asyncio.sleep(0.5)
+                        print(f"[DISMISS] ✅ Dismissed via page-level '{sel}'")
+                        return True
+                except Exception as ex:
+                    print(f"[DISMISS]   Page selector '{sel}' failed: {ex}")
+                    continue
+
+            # Strategy 3: JavaScript click on the OK button
+            print("[DISMISS] Strategy 3: Trying JavaScript DOM click")
+            try:
+                dismissed = await page.evaluate("""() => {
+                    const modal = document.querySelector('div.uiModal--app-error');
+                    if (!modal) return false;
+                    const btns = modal.querySelectorAll('.modal-footer button, button.slds-modal__close');
+                    for (const btn of btns) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }""")
+                print(f"[DISMISS]   JS result: {dismissed}")
+                if dismissed:
+                    await asyncio.sleep(0.5)
+                    print("[DISMISS] ✅ Dismissed via JavaScript")
+                    return True
+            except Exception as ex:
+                print(f"[DISMISS]   JS failed: {ex}")
+
+            # Strategy 4: Press Escape
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+            logger.info("  → App-error modal dismissed via Escape")
+            return True
+
+        except Exception as e:
+            logger.debug(f"  dismiss_error_modal check failed: {e}")
+            return False
 
     # ─────────────────────────────────────────────
     # E2: Spinner Wait Utility
