@@ -88,7 +88,7 @@ export default function ExecutionPage() {
         e.stopPropagation();
         setDeletingId(id);
         try {
-            const response = await safeFetch(`http://localhost:8000/api/v1/test-runs/${id}`, {
+            const response = await safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${id}`, {
                 method: 'DELETE',
             });
 
@@ -120,7 +120,7 @@ export default function ExecutionPage() {
     const fetchRuns = async (showLoading = false) => {
         if (showLoading) setIsLoading(true)
         try {
-            const response = await safeFetch("http://localhost:8000/api/v1/test-runs")
+            const response = await safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs`)
             if (!response) {
                 // Network error - silently fail, keep existing data
                 return
@@ -303,10 +303,10 @@ export default function ExecutionPage() {
                                                             {run.screenshot_path ? (
                                                                 <div className="rounded-md border bg-gray-50 dark:bg-black overflow-hidden group relative max-w-[300px]">
                                                                     <img
-                                                                        src={`http://localhost:8000${run.screenshot_path}`}
+                                                                        src={`${process.env.NEXT_PUBLIC_API_URL}${run.screenshot_path}`}
                                                                         alt="Execution Screenshot"
                                                                         className="w-full h-auto object-contain cursor-zoom-in"
-                                                                        onClick={() => window.open(`http://localhost:8000${run.screenshot_path}`, '_blank')}
+                                                                        onClick={() => window.open(`${process.env.NEXT_PUBLIC_API_URL}${run.screenshot_path}`, '_blank')}
                                                                     />
                                                                     <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[10px] p-1 text-center opacity-0 group-hover:opacity-100 transition-opacity">
                                                                         Click to enlarge

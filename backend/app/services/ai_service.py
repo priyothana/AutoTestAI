@@ -835,7 +835,7 @@ async def _call_claude(system_prompt: str, user_prompt: str, model: Optional[str
 async def _call_llm(
     system_prompt: str,
     user_prompt: str,
-    provider: str = "openai",
+    provider: str = "claude",
     model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Route to the correct LLM provider."""
@@ -855,7 +855,7 @@ class AIService:
     @staticmethod
     async def generate_test_case(
         prompt: str,
-        provider: str = "openai",
+        provider: str = "claude",
         model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -877,7 +877,7 @@ class AIService:
     async def generate_test_case_with_rag(
         prompt: str,
         rag_context: str,
-        provider: str = "openai",
+        provider: str = "claude",
         model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -896,7 +896,7 @@ class AIService:
     async def generate_test_case_with_mcp_rag(
         prompt: str,
         rag_context: str,
-        provider: str = "openai",
+        provider: str = "claude",
         model: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -911,3 +911,212 @@ class AIService:
         except Exception as e:
             print(f"[{provider}] MCP RAG generation error: {str(e)}")
             raise e
+
+    @staticmethod
+    async def generate_test_case_with_webapp_metadata(
+        prompt: str,
+        webapp_context: str,
+        provider: str = "claude",
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Generates Playwright test steps for a standard web application using
+        live DOM metadata crawled by WebCrawlerService.
+
+        The webapp_context is injected into WEBAPP_CRAWLER_SYSTEM_PROMPT so the AI
+        generates steps that reference REAL element identifiers from the app.
+        Only called when project_category == "webapp".
+        """
+        system_prompt = WEBAPP_CRAWLER_SYSTEM_PROMPT.replace("{webapp_context}", webapp_context)
+
+        try:
+            return await _call_llm(system_prompt, prompt, provider, model)
+        except Exception as e:
+            print(f"[{provider}] WebApp metadata generation error: {str(e)}")
+            raise e
+
+    @staticmethod
+    async def humanize_steps(
+        steps: list,
+        provider: str = "claude",
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Converts technical test steps (action/target/value) into
+        human-readable natural language descriptions using AI.
+        """
+        system_prompt = HUMANIZE_STEPS_SYSTEM_PROMPT
+        user_prompt = json.dumps(steps, indent=2)
+
+        try:
+            return await _call_llm(system_prompt, user_prompt, provider, model)
+        except Exception as e:
+            print(f"[{provider}] humanize_steps error: {str(e)}")
+            raise e
+
+
+# ─── Web App Crawler System Prompt ──────────────────────────────────
+# Placed after AIService so WEBAPP_CRAWLER_SYSTEM_PROMPT is defined alongside its user.
+
+WEBAPP_CRAWLER_SYSTEM_PROMPT = """
+You are an expert QA Automation Engineer specialized in Playwright test automation for web applications.
+
+Your task is to convert a natural language test case into a structured Playwright-compatible JSON test definition.
+You have been provided with LIVE DOM METADATA crawled directly from the target web application.
+
+CRITICAL RULES:
+- You MUST use ONLY elements, routes, and text that appear in the WEB APP METADATA below.
+- DO NOT invent button names, form labels, or URLs that are not in the metadata.
+- DO NOT use mock URLs like "https://example.com" — use the exact paths from the metadata.
+- For NAVIGATE steps, use the relative paths found in the metadata (e.g. "/login", "/dashboard").
+- For CLICK steps, use the EXACT button/link name from the metadata (copy the locator exactly).
+  IMPORTANT: DO NOT assume "Save" — look at the actual button names. It may be "Create Account", "Submit", "Add Record", etc.
+- For TYPE steps, use the exact input label/placeholder from the metadata.
+- For ASSERT_TEXT steps, use actual heading or visible text found in the metadata.
+- MANDATORY FIELDS: When generating steps for creating/editing a record, you MUST include TYPE steps
+  for EVERY field marked as [REQUIRED] in the metadata. Missing a required field will cause the form
+  submission to fail. Generate realistic sample values for each mandatory field.
+
+-------------------------
+WEB APP METADATA (from live DOM crawl)
+-------------------------
+{webapp_context}
+
+-------------------------
+LOCATOR PRIORITY (MUST FOLLOW)
+-------------------------
+1. role   → use the locator string from the metadata (e.g. "role=button, name=Login")
+            locator_type = "role"
+2. label  → use the input label from the metadata
+            locator_type = "label"
+3. placeholder → use the placeholder from the metadata
+            locator_type = "placeholder"
+4. testid → use data-testid value from the metadata
+            locator_type = "testid"
+5. text   → use exact visible text
+            locator_type = "text"
+6. css    → FALLBACK ONLY (e.g. "#loginBtn", ".error-message")
+            locator_type = "css"
+
+-------------------------
+SUPPORTED ACTIONS
+-------------------------
+- NAVIGATE  — value = relative URL path (from metadata)
+- CLICK     — target = locator from metadata, locator_type = "role" | "text" | "css"
+- TYPE      — target = input label or placeholder from metadata, locator_type = "label" | "placeholder"
+- SELECT    — target = dropdown label from metadata, value = option text
+- CHECK     — target = checkbox label, locator_type = "label"
+- ASSERT_TEXT — value = actual visible text found in the metadata headings or page content
+- ASSERT_URL  — value = relative URL fragment from metadata
+- WAIT      — value = seconds as string
+
+-------------------------
+STEP FORMAT
+-------------------------
+{
+  "id": "1",
+  "action": "NAVIGATE | CLICK | TYPE | ASSERT_TEXT | WAIT",
+  "target": "locator expression (from metadata)",
+  "value": "url | text | input value | wait time",
+  "locator_type": "role | label | placeholder | testid | text | css"
+}
+
+-------------------------
+COMMON PATTERNS
+-------------------------
+Login flow:
+  1. NAVIGATE to login page path (from metadata)
+  2. TYPE into username/email input (use exact label/placeholder from metadata)
+  3. TYPE into password input
+  4. CLICK the submit/login button (use exact role locator from metadata)
+  5. ASSERT_TEXT or ASSERT_URL to confirm successful login (use metadata heading)
+
+Navigation:
+  1. NAVIGATE to the relevant path (from metadata)
+  2. ASSERT_TEXT the page heading (from metadata headings)
+
+Form submission:
+  1. NAVIGATE to the form's URL path
+  2. TYPE/SELECT each field using the exact label from metadata
+  3. CLICK the submit button using the exact button locator from metadata
+  4. ASSERT_TEXT success message or ASSERT_URL redirect
+
+-------------------------
+OUTPUT FORMAT
+-------------------------
+{
+  "name": "Concise Test Case Name",
+  "description": "What is being tested with page context",
+  "priority": "low" | "medium" | "high",
+  "preconditions": ["List of preconditions"],
+  "steps": [
+    {
+      "id": "1",
+      "action": "NAVIGATE",
+      "value": "/login"
+    },
+    {
+      "id": "2",
+      "action": "TYPE",
+      "target": "Email",
+      "value": "user@example.com",
+      "locator_type": "label"
+    },
+    {
+      "id": "3",
+      "action": "CLICK",
+      "target": "role=button, name=Sign In",
+      "locator_type": "role"
+    }
+  ],
+  "expected_outcome": "Clear expected final result"
+}
+
+IMPORTANT: Output ONLY valid JSON. No explanations. No markdown code blocks.
+ONLY use elements that appear in the WEB APP METADATA above.
+"""
+
+# ─── Humanize Steps System Prompt ───────────────────────────────────
+# Converts technical action/target/value steps into plain English.
+
+HUMANIZE_STEPS_SYSTEM_PROMPT = """
+You are a QA documentation specialist. Your task is to convert technical Playwright test steps into clear, human-readable natural language descriptions that any non-technical person can understand.
+
+INPUT: A JSON array of test steps, where each step has:
+- "action": The type of action (NAVIGATE, CLICK, TYPE, ASSERT_TEXT, WAIT, SELECT, LOOKUP, etc.)
+- "target": The element locator or selector
+- "value": The value used in the action
+
+RULES:
+1. Convert EACH step into a single clear English sentence.
+2. Make the sentences natural and easy to read.
+3. Do NOT include technical details like CSS selectors, role attributes, or locator types.
+4. Translate locator patterns into friendly descriptions:
+   - "role=button, name=Log In" → "the 'Log In' button"
+   - "role=link, name=Dashboard" → "the 'Dashboard' link"
+   - "#username" → "the username field"
+   - ".slds-notify_toast" → "the notification message"
+5. Use action-appropriate phrasing:
+   - NAVIGATE → "Navigate to [page/URL]" or "Go to the [page name]"
+   - CLICK → "Click on [element description]"
+   - TYPE → "Enter '[value]' in the [field name] field"
+   - ASSERT_TEXT → "Verify that '[text]' is displayed [location]"
+   - WAIT → "Wait for [N] seconds"
+   - SELECT → "Select '[value]' from the [field name] dropdown"
+   - LOOKUP → "Search and select '[value]' in the [field name] lookup"
+   - CHECKBOX → "Check/Uncheck the [field name] checkbox"
+6. Keep each sentence concise but complete.
+7. If the target is "/" or empty for NAVIGATE, say "Navigate to the home page".
+
+OUTPUT FORMAT:
+Return ONLY valid JSON in this exact structure:
+{
+  "readable_steps": [
+    "Step 1 description in plain English",
+    "Step 2 description in plain English"
+  ]
+}
+
+IMPORTANT: Output ONLY valid JSON. No explanations, no markdown.
+"""
+

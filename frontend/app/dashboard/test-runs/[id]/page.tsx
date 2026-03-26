@@ -55,7 +55,7 @@ export default function TestRunDetailsPage({ params }: { params: Promise<{ id: s
 
     const fetchRun = async () => {
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/test-runs/${id}`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${id}`)
             if (response.ok) {
                 const data = await response.json()
                 setRun(data)
@@ -156,7 +156,7 @@ export default function TestRunDetailsPage({ params }: { params: Promise<{ id: s
                                         {log.screenshot && (
                                             <div className="mt-2">
                                                 <img
-                                                    src={`http://localhost:8000/${log.screenshot}`}
+                                                    src={`${process.env.NEXT_PUBLIC_API_URL}/${log.screenshot}`}
                                                     alt="Failure Screenshot"
                                                     className="rounded border shadow-sm max-w-sm"
                                                 />

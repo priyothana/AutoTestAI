@@ -54,7 +54,7 @@ export default function SignupPage() {
 
     async function onSubmit(values: z.infer<typeof formSchema>) {
         try {
-            const response = await fetch("http://localhost:8000/api/v1/users/signup", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/users/signup`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",

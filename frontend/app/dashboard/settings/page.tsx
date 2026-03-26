@@ -43,7 +43,7 @@ export default function SettingsPage() {
     const fetchSettings = async () => {
         setIsLoading(true)
         try {
-            const response = await fetch("http://localhost:8000/api/v1/settings/")
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/settings/`)
             if (response.ok) {
                 const data = await response.json()
                 setSettings({
@@ -85,7 +85,7 @@ export default function SettingsPage() {
                 variables: parsedVariables
             }
 
-            const response = await fetch("http://localhost:8000/api/v1/settings/", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/settings/`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)

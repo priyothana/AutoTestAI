@@ -49,7 +49,7 @@ class RAGGenerateRequest(BaseModel):
     prompt: str
     test_case_id: Optional[UUID] = None
     top_k: int = 5  # number of relevant chunks to retrieve
-    provider: str = "openai"    # "openai" or "claude"
+    provider: str = "claude"    # "openai" or "claude"
     model: Optional[str] = None  # specific model name override
 
 
@@ -62,4 +62,4 @@ class RAGGenerateResponse(BaseModel):
     expected_outcome: str
     rag_context_used: bool = False
     retrieved_chunks: List[str] = []
-    model_provider: str = "openai"
+    model_provider: str = "claude"

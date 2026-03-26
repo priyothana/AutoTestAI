@@ -47,9 +47,9 @@ export default function ReportsPage() {
             setIsLoading(true)
             try {
                 const [trendRes, projectRes, failedRes] = await Promise.all([
-                    safeFetch("http://localhost:8000/api/v1/analytics/reports/trend"),
-                    safeFetch("http://localhost:8000/api/v1/analytics/reports/projects"),
-                    safeFetch("http://localhost:8000/api/v1/analytics/reports/top-failed")
+                    safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/analytics/reports/trend`),
+                    safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/analytics/reports/projects`),
+                    safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/analytics/reports/top-failed`)
                 ])
 
                 if (trendRes?.ok) {

@@ -56,13 +56,25 @@ class EmbeddingService:
         for record in norm_result.scalars().all():
             if record.id in existing_source_ids:
                 continue
-            text = EmbeddingService._metadata_to_text(record)
-            if text:
-                chunks.append({
-                    "source_id": record.id,
-                    "source_type": record.entity_type,
-                    "text": text[:MAX_CHUNK_CHARS],
-                })
+
+            # Special handling: webapp_crawl records get per-page chunking
+            if record.entity_type == "webapp_crawl":
+                page_chunks = EmbeddingService._webapp_crawl_to_chunks(record)
+                for pc in page_chunks:
+                    chunks.append({
+                        "source_id": record.id,
+                        "source_type": "webapp_page",
+                        "text": pc[:MAX_CHUNK_CHARS],
+                        "chunk_type": "webapp_metadata",
+                    })
+            else:
+                text = EmbeddingService._metadata_to_text(record)
+                if text:
+                    chunks.append({
+                        "source_id": record.id,
+                        "source_type": record.entity_type,
+                        "text": text[:MAX_CHUNK_CHARS],
+                    })
 
         # --- Chunk domain models ---
         domain_result = await db.execute(
@@ -102,6 +114,7 @@ class EmbeddingService:
                         project_id=project_id,
                         source_type=chunk["source_type"],
                         source_id=chunk["source_id"],
+                        chunk_type=chunk.get("chunk_type", "metadata"),
                         embedding_vector=embedding_data.embedding,
                         text_chunk=chunk["text"],
                     )
@@ -175,6 +188,63 @@ class EmbeddingService:
             )
 
         return ""
+
+    @staticmethod
+    def _webapp_crawl_to_chunks(record: MetadataNormalized) -> list:
+        """Split a webapp_crawl record into per-page text chunks for vector embedding."""
+        data = record.structured_json or {}
+        pages = data.get("pages", [])
+        base_url = data.get("base_url", "")
+        chunks = []
+
+        for page_data in pages:
+            path = page_data.get("path", "/")
+            title = page_data.get("title", "")
+            headings = page_data.get("headings", [])
+            buttons = page_data.get("buttons", [])
+            inputs = page_data.get("inputs", [])
+            selects = page_data.get("selects", [])
+            testids = page_data.get("testids", [])
+
+            lines = [
+                f"WebApp Page: {path}",
+                f"Base URL: {base_url}",
+            ]
+            if title:
+                lines.append(f"Title: {title}")
+            if headings:
+                lines.append(f"Headings: {', '.join(headings[:5])}")
+
+            if buttons:
+                btn_names = [b.get("name", b.get("locator", "")) for b in buttons]
+                lines.append(f"Buttons: {', '.join(btn_names[:15])}")
+
+            # Separate required vs optional inputs
+            req_inputs = [i for i in inputs if i.get("required")]
+            opt_inputs = [i for i in inputs if not i.get("required")]
+            if req_inputs:
+                req_names = [i.get("name", i.get("locator", "")) for i in req_inputs]
+                lines.append(f"Required fields: {', '.join(req_names)}")
+            if opt_inputs:
+                opt_names = [i.get("name", i.get("locator", "")) for i in opt_inputs]
+                lines.append(f"Optional fields: {', '.join(opt_names[:15])}")
+
+            if selects:
+                sel_names = [s.get("name", s.get("locator", "")) for s in selects]
+                lines.append(f"Dropdowns: {', '.join(sel_names[:10])}")
+
+            if testids:
+                lines.append(f"Test IDs: {', '.join(testids[:10])}")
+
+            chunk_text = "\n".join(lines)
+            if chunk_text.strip():
+                chunks.append(chunk_text)
+
+        if not chunks:
+            # Fallback: create a single summary chunk
+            chunks.append(f"WebApp metadata for {base_url}: {len(pages)} pages crawled")
+
+        return chunks
 
     @staticmethod
     def _domain_to_text(record: DomainModel) -> str:

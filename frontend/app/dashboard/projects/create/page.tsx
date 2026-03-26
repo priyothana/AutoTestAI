@@ -58,7 +58,7 @@ export default function CreateProjectPage() {
     const [sfUsername, setSfUsername] = useState("")
     const [sfPassword, setSfPassword] = useState("")
     const [sfLoginUrl, setSfLoginUrl] = useState("https://login.salesforce.com")
-    const [sfRedirectUri, setSfRedirectUri] = useState("http://localhost:8000/api/v1/integrations/salesforce/callback")
+    const [sfRedirectUri, setSfRedirectUri] = useState(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/integrations/salesforce/callback`)
     const [showSfSecret, setShowSfSecret] = useState(false)
     const [showSfPassword, setShowSfPassword] = useState(false)
 
@@ -90,7 +90,7 @@ export default function CreateProjectPage() {
     const onSubmit = async (values: z.infer<typeof formSchema>) => {
         setIsCreating(true)
         try {
-            const response = await fetch("http://localhost:8000/api/v1/projects/", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -127,7 +127,7 @@ export default function CreateProjectPage() {
 
         setConnectLoading(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${createdProjectId}/connect`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/connect`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -161,7 +161,7 @@ export default function CreateProjectPage() {
         setConnectLoading(true)
         try {
             // Step 1: Save Connected App credentials
-            const saveRes = await fetch(`http://localhost:8000/api/v1/projects/${createdProjectId}/save-sf-credentials`, {
+            const saveRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/save-sf-credentials`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -179,7 +179,7 @@ export default function CreateProjectPage() {
             }
 
             // Step 2: Start OAuth flow
-            const oauthRes = await fetch(`http://localhost:8000/api/v1/projects/${createdProjectId}/connect`, {
+            const oauthRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/connect`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ category: "salesforce" }),
@@ -206,7 +206,7 @@ export default function CreateProjectPage() {
 
         setConnectLoading(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${createdProjectId}/connect`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/connect`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -237,7 +237,7 @@ export default function CreateProjectPage() {
         setJiraConnecting(true)
         try {
             // Step 1: Validate credentials
-            const connectRes = await fetch("http://localhost:8000/api/v1/jira/connect", {
+            const connectRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/connect`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
@@ -248,7 +248,7 @@ export default function CreateProjectPage() {
             }
 
             // Step 2: Fetch boards
-            const boardsRes = await fetch("http://localhost:8000/api/v1/jira/boards", {
+            const boardsRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/boards`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
@@ -280,7 +280,7 @@ export default function CreateProjectPage() {
         }
         setJiraSaving(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/jira/projects/${createdProjectId}/config`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/projects/${createdProjectId}/config`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({

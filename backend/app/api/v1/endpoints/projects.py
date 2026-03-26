@@ -13,22 +13,36 @@ router = APIRouter()
 @router.post("/", response_model=ProjectResponse, status_code=201)
 async def create_project(project: ProjectCreate, db: AsyncSession = Depends(get_db)):
     """Create a new project"""
-    # TODO: Get current user from token
-    # For now, we assume a default user or handle it in a real auth dependency
-    
     new_project = Project(
         name=project.name,
         description=project.description,
         type=project.type,
+        category=project.category or "webapp",
         base_url=project.base_url,
         status=project.status,
         tags=project.tags or [],
         members=[],
-        # owner_id=current_user.id 
     )
     db.add(new_project)
     await db.commit()
     await db.refresh(new_project)
+
+    # ── Auto-save webapp credentials (like Salesforce does) ──
+    if project.base_url and (project.login_username or project.login_password):
+        try:
+            from app.services.integration_service import IntegrationService
+            await IntegrationService.create_web_integration(
+                db=db,
+                project_id=new_project.id,
+                base_url=project.login_url or project.base_url,
+                username=project.login_username,
+                password=project.login_password,
+                login_strategy=project.login_strategy or "form",
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to save web credentials: {e}")
+
     return new_project
 
 @router.get("/", response_model=List[ProjectResponse])
