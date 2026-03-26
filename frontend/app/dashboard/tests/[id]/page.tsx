@@ -14,7 +14,9 @@ import {
     Loader2,
     FileText,
     ArrowDown,
-    Sparkles
+    Sparkles,
+    BookOpen,
+    Code2
 } from "lucide-react"
 import { format } from "date-fns"
 
@@ -72,7 +74,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [projects, setProjects] = useState<Project[]>([])
     const [selectedProjectId, setSelectedProjectId] = useState<string>("")
     const [priority, setPriority] = useState("medium")
-    const [selectedProvider, setSelectedProvider] = useState("openai")
+    const [selectedProvider, setSelectedProvider] = useState("claude")
 
     const [steps, setSteps] = useState<TestStep[]>([])
     const [testStatus, setTestStatus] = useState<string>("draft")
@@ -81,13 +83,18 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [testSource, setTestSource] = useState<'manual' | 'jira' | null>(null)
     const [jiraConfigured, setJiraConfigured] = useState<boolean | null>(null) // null = loading
 
+    // Readable view state
+    const [readableSteps, setReadableSteps] = useState<string[]>([])
+    const [isHumanizing, setIsHumanizing] = useState(false)
+    const [showReadableView, setShowReadableView] = useState(false)
+
     useEffect(() => {
         setHasMounted(true)
     }, [])
 
     const fetchProjects = async () => {
         try {
-            const response = await fetch("http://localhost:8000/api/v1/projects/")
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`)
             if (response.ok) {
                 const data = await response.json()
                 const projectsList = Array.isArray(data) ? data : (data.items || [])
@@ -100,7 +107,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const fetchTestCase = async () => {
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/tests/${currentId}`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${currentId}`)
             if (response.ok) {
                 const data = await response.json()
                 setTestName(data.name)
@@ -132,7 +139,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const checkJiraConfig = async (projectId: string) => {
         try {
-            const res = await fetch(`http://localhost:8000/api/v1/jira/projects/${projectId}/config`)
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/projects/${projectId}/config`)
             if (res.ok) {
                 const data = await res.json()
                 setJiraConfigured(data.configured === true)
@@ -152,7 +159,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
         setIsGenerating(true)
         try {
-            const response = await fetch("http://localhost:8000/api/v1/tests/generate-test-steps", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/generate-test-steps`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ prompt, provider: selectedProvider, project_id: selectedProjectId || undefined })
@@ -208,7 +215,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             // This ensures any UI changes (including accepted AI Healing
             // steps) are persisted before execution starts.
             if (!isInternalNew && currentId) {
-                const saveRes = await fetch(`http://localhost:8000/api/v1/tests/${currentId}`, {
+                const saveRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${currentId}`, {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -226,7 +233,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
             toast.loading("Running test...", { id: runToastId })
 
-            const response = await fetch("http://localhost:8000/api/v1/test-runs", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ test_case_id: currentId })
@@ -248,7 +255,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
             const interval = setInterval(async () => {
                 try {
-                    const pollRes = await fetch(`http://localhost:8000/api/v1/test-runs/${runData.id}`)
+                    const pollRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${runData.id}`)
                     if (pollRes.ok) {
                         const statusData = await pollRes.json()
                         const status = statusData.status?.toLowerCase()
@@ -326,7 +333,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         setIsSaving(true)
         try {
             const method = isInternalNew ? "POST" : "PUT"
-            const url = isInternalNew ? "http://localhost:8000/api/v1/tests" : `http://localhost:8000/api/v1/tests/${currentId}`
+            const url = isInternalNew ? `${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests` : `${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${currentId}`
 
             const response = await fetch(url, {
                 method,
@@ -370,6 +377,38 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const updateStep = (id: string, field: keyof TestStep, value: string) => {
         setSteps(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s))
+    }
+
+    const handleHumanizeSteps = async () => {
+        if (steps.length === 0) return
+
+        // Toggle off if already showing readable view
+        if (showReadableView) {
+            setShowReadableView(false)
+            return
+        }
+
+        setIsHumanizing(true)
+        try {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ steps, provider: selectedProvider })
+            })
+
+            if (!response.ok) {
+                throw new Error("Failed to convert steps")
+            }
+
+            const data = await response.json()
+            setReadableSteps(data.readable_steps || [])
+            setShowReadableView(true)
+        } catch (error: any) {
+            console.error("Humanize error:", error)
+            toast.error("Failed to generate readable steps")
+        } finally {
+            setIsHumanizing(false)
+        }
     }
 
     return (
@@ -439,11 +478,10 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     <button
                         type="button"
                         onClick={() => setTestSource('manual')}
-                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${
-                            testSource === 'manual'
+                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${testSource === 'manual'
                                 ? 'border-blue-500 bg-blue-50/80 dark:bg-blue-950/20 shadow-md ring-2 ring-blue-200 dark:ring-blue-800'
                                 : 'border-gray-200 dark:border-gray-800 hover:border-blue-300 dark:hover:border-blue-700 hover:bg-blue-50/40 dark:hover:bg-blue-950/10'
-                        }`}
+                            }`}
                     >
                         <div className="flex items-center gap-3 mb-2">
                             <div className={`p-2 rounded-lg ${testSource === 'manual' ? 'bg-blue-100 dark:bg-blue-900/40' : 'bg-gray-100 dark:bg-gray-800'}`}>
@@ -463,13 +501,12 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                             if (jiraConfigured) setTestSource('jira')
                         }}
                         disabled={!jiraConfigured}
-                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${
-                            !jiraConfigured
+                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${!jiraConfigured
                                 ? 'border-gray-200 dark:border-gray-800 opacity-60 cursor-not-allowed'
                                 : testSource === 'jira'
                                     ? 'border-purple-500 bg-purple-50/80 dark:bg-purple-950/20 shadow-md ring-2 ring-purple-200 dark:ring-purple-800'
                                     : 'border-gray-200 dark:border-gray-800 hover:border-purple-300 dark:hover:border-purple-700 hover:bg-purple-50/40 dark:hover:bg-purple-950/10'
-                        }`}
+                            }`}
                     >
                         <div className="flex items-center gap-3 mb-2">
                             <div className={`p-2 rounded-lg ${testSource === 'jira' ? 'bg-purple-100 dark:bg-purple-900/40' : 'bg-gray-100 dark:bg-gray-800'}`}>
@@ -656,85 +693,138 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     <CardHeader className="border-b">
                         <CardTitle className="text-base">Test Steps ({steps.length})</CardTitle>
                         <CardAction>
-                            <Button variant="ghost" size="sm" onClick={addStep} className="text-blue-600 hover:text-blue-700 hover:bg-blue-50">
-                                <Plus className="mr-2 h-4 w-4" />
-                                Add Step
-                            </Button>
+                            <div className="flex items-center gap-2">
+                                <Button
+                                    variant={showReadableView ? "default" : "ghost"}
+                                    size="sm"
+                                    onClick={handleHumanizeSteps}
+                                    disabled={steps.length === 0 || isHumanizing}
+                                    className={showReadableView
+                                        ? "bg-indigo-600 hover:bg-indigo-700 text-white"
+                                        : "text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50"}
+                                >
+                                    {isHumanizing ? (
+                                        <>
+                                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                            Converting...
+                                        </>
+                                    ) : showReadableView ? (
+                                        <>
+                                            <Code2 className="mr-2 h-4 w-4" />
+                                            Editor View
+                                        </>
+                                    ) : (
+                                        <>
+                                            <BookOpen className="mr-2 h-4 w-4" />
+                                            Readable View
+                                        </>
+                                    )}
+                                </Button>
+                                <Button variant="ghost" size="sm" onClick={addStep} className="text-blue-600 hover:text-blue-700 hover:bg-blue-50">
+                                    <Plus className="mr-2 h-4 w-4" />
+                                    Add Step
+                                </Button>
+                            </div>
                         </CardAction>
                     </CardHeader>
                     <CardContent className="pt-4">
-                        <div className="space-y-3">
-                            {steps.map((step, index) => (
-                                <Card key={step.id} className="group hover:border-blue-400 transition-all duration-200">
-                                    <CardContent className="p-4 flex items-start gap-4">
-                                        <div className="mt-2 text-muted-foreground cursor-grab active:cursor-grabbing">
-                                            <GripVertical className="h-4 w-4" />
-                                        </div>
-                                        <div className="flex-1 grid grid-cols-12 gap-3">
-                                            <div className="col-span-1 pt-2 font-mono text-sm text-muted-foreground">
-                                                #{index + 1}
-                                            </div>
-                                            <div className="col-span-3">
-                                                <Select
-                                                    value={step.action}
-                                                    onValueChange={(val) => updateStep(step.id, "action", val)}
-                                                >
-                                                    <SelectTrigger className="h-9">
-                                                        <SelectValue />
-                                                    </SelectTrigger>
-                                                    <SelectContent>
-                                                        <SelectItem value="NAVIGATE">Navigate</SelectItem>
-                                                        <SelectItem value="CLICK">Click</SelectItem>
-                                                        <SelectItem value="TYPE">Type</SelectItem>
-                                                        <SelectItem value="ASSERT_TEXT">Assert Text</SelectItem>
-                                                        <SelectItem value="WAIT">Wait</SelectItem>
-                                                    </SelectContent>
-                                                </Select>
-                                            </div>
-                                            <div className="col-span-4">
-                                                <Input
-                                                    placeholder="Target (e.g. #id)"
-                                                    value={step.target}
-                                                    onChange={(e) => updateStep(step.id, "target", e.target.value)}
-                                                    className="h-9 font-mono text-xs focus-visible:ring-blue-400"
-                                                />
-                                            </div>
-                                            <div className="col-span-4">
-                                                <Input
-                                                    placeholder="Value"
-                                                    value={step.value}
-                                                    onChange={(e) => updateStep(step.id, "value", e.target.value)}
-                                                    className="h-9 focus-visible:ring-blue-400"
-                                                />
-                                            </div>
-                                        </div>
-                                        <Button
-                                            variant="ghost"
-                                            size="icon"
-                                            className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-600 hover:bg-red-50"
-                                            onClick={() => removeStep(step.id)}
-                                        >
-                                            <Trash2 className="h-4 w-4" />
-                                        </Button>
-                                    </CardContent>
-                                </Card>
-                            ))}
-                        </div>
-
-                        {steps.length === 0 && (
-                            <div className="flex flex-col items-center justify-center p-12 border-2 border-dashed rounded-xl text-muted-foreground bg-gray-50/50">
-                                <div className="bg-white p-3 rounded-full shadow-sm mb-4">
-                                    <AlertCircle className="h-8 w-8 text-blue-400" />
+                        {showReadableView && readableSteps.length > 0 ? (
+                            /* ── Readable View ── */
+                            <div className="space-y-2">
+                                <div className="flex items-center gap-2 mb-3">
+                                    <BookOpen className="h-4 w-4 text-indigo-500" />
+                                    <span className="text-sm font-medium text-indigo-600 dark:text-indigo-400">AI-Generated Readable Steps</span>
                                 </div>
-                                <p className="font-medium text-gray-900">No steps defined</p>
-                                <p className="text-sm max-w-[280px] text-center mt-1">
-                                    Enter a test case above and use the AI Generator to create steps, or add a step manually.
-                                </p>
-                                <Button variant="outline" size="sm" onClick={addStep} className="mt-4">
-                                    <Plus className="mr-2 h-4 w-4" />
-                                    Manual Step
-                                </Button>
+                                <ol className="space-y-2">
+                                    {readableSteps.map((text, index) => (
+                                        <li key={index} className="flex items-start gap-3 p-3 rounded-lg bg-gradient-to-r from-indigo-50/60 to-blue-50/40 dark:from-indigo-950/20 dark:to-blue-950/15 border border-indigo-100 dark:border-indigo-900/50 transition-all duration-200 hover:shadow-sm">
+                                            <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-sm font-bold flex items-center justify-center">
+                                                {index + 1}
+                                            </span>
+                                            <span className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed pt-1">
+                                                {text}
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ol>
                             </div>
+                        ) : (
+                            /* ── Editor View (original, untouched) ── */
+                            <>
+                                <div className="space-y-3">
+                                    {steps.map((step, index) => (
+                                        <Card key={step.id} className="group hover:border-blue-400 transition-all duration-200">
+                                            <CardContent className="p-4 flex items-start gap-4">
+                                                <div className="mt-2 text-muted-foreground cursor-grab active:cursor-grabbing">
+                                                    <GripVertical className="h-4 w-4" />
+                                                </div>
+                                                <div className="flex-1 grid grid-cols-12 gap-3">
+                                                    <div className="col-span-1 pt-2 font-mono text-sm text-muted-foreground">
+                                                        #{index + 1}
+                                                    </div>
+                                                    <div className="col-span-3">
+                                                        <Select
+                                                            value={step.action}
+                                                            onValueChange={(val) => updateStep(step.id, "action", val)}
+                                                        >
+                                                            <SelectTrigger className="h-9">
+                                                                <SelectValue />
+                                                            </SelectTrigger>
+                                                            <SelectContent>
+                                                                <SelectItem value="NAVIGATE">Navigate</SelectItem>
+                                                                <SelectItem value="CLICK">Click</SelectItem>
+                                                                <SelectItem value="TYPE">Type</SelectItem>
+                                                                <SelectItem value="ASSERT_TEXT">Assert Text</SelectItem>
+                                                                <SelectItem value="WAIT">Wait</SelectItem>
+                                                            </SelectContent>
+                                                        </Select>
+                                                    </div>
+                                                    <div className="col-span-4">
+                                                        <Input
+                                                            placeholder="Target (e.g. #id)"
+                                                            value={step.target}
+                                                            onChange={(e) => updateStep(step.id, "target", e.target.value)}
+                                                            className="h-9 font-mono text-xs focus-visible:ring-blue-400"
+                                                        />
+                                                    </div>
+                                                    <div className="col-span-4">
+                                                        <Input
+                                                            placeholder="Value"
+                                                            value={step.value}
+                                                            onChange={(e) => updateStep(step.id, "value", e.target.value)}
+                                                            className="h-9 focus-visible:ring-blue-400"
+                                                        />
+                                                    </div>
+                                                </div>
+                                                <Button
+                                                    variant="ghost"
+                                                    size="icon"
+                                                    className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-600 hover:bg-red-50"
+                                                    onClick={() => removeStep(step.id)}
+                                                >
+                                                    <Trash2 className="h-4 w-4" />
+                                                </Button>
+                                            </CardContent>
+                                        </Card>
+                                    ))}
+                                </div>
+
+                                {steps.length === 0 && (
+                                    <div className="flex flex-col items-center justify-center p-12 border-2 border-dashed rounded-xl text-muted-foreground bg-gray-50/50">
+                                        <div className="bg-white p-3 rounded-full shadow-sm mb-4">
+                                            <AlertCircle className="h-8 w-8 text-blue-400" />
+                                        </div>
+                                        <p className="font-medium text-gray-900">No steps defined</p>
+                                        <p className="text-sm max-w-[280px] text-center mt-1">
+                                            Enter a test case above and use the AI Generator to create steps, or add a step manually.
+                                        </p>
+                                        <Button variant="outline" size="sm" onClick={addStep} className="mt-4">
+                                            <Plus className="mr-2 h-4 w-4" />
+                                            Manual Step
+                                        </Button>
+                                    </div>
+                                )}
+                            </>
                         )}
                     </CardContent>
                 </Card>
@@ -803,13 +893,13 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                 {lastRunResult.screenshot_path ? (
                                     <div className="rounded-lg border bg-white dark:bg-black overflow-hidden shadow-sm group relative">
                                         <img
-                                            src={`http://localhost:8000${lastRunResult.screenshot_path}`}
+                                            src={`${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path}`}
                                             alt="Test Run Screenshot"
                                             className="w-full h-auto object-contain max-h-[400px]"
                                         />
                                         <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                                             <Button variant="secondary" size="sm" asChild>
-                                                <a href={`http://localhost:8000${lastRunResult.screenshot_path}`} target="_blank" rel="noreferrer">
+                                                <a href={`${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path}`} target="_blank" rel="noreferrer">
                                                     View Full Size
                                                 </a>
                                             </Button>

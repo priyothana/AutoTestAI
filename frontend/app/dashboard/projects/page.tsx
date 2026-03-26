@@ -48,7 +48,7 @@ export default function ProjectsPage() {
             if (statusFilter !== "all") params.append("status", statusFilter)
             if (typeFilter !== "all") params.append("type", typeFilter)
 
-            const response = await fetch(`http://localhost:8000/api/v1/projects/?${params}`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/?${params}`)
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.detail || `Failed to fetch projects (${response.status})`);
@@ -64,7 +64,7 @@ export default function ProjectsPage() {
             await Promise.all(
                 projectsList.map(async (p: Project) => {
                     try {
-                        const intRes = await fetch(`http://localhost:8000/api/v1/projects/${p.id}/integration-status`)
+                        const intRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${p.id}/integration-status`)
                         if (intRes.ok) {
                             const intData = await intRes.json()
                             statuses[p.id] = intData.status || "disconnected"
@@ -91,7 +91,7 @@ export default function ProjectsPage() {
 
     const handleDelete = async (id: string) => {
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${id}`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}`, {
                 method: "DELETE"
             })
 

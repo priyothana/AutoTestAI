@@ -13,7 +13,11 @@ class ProjectBase(BaseModel):
     tags: Optional[List[str]] = []
 
 class ProjectCreate(ProjectBase):
-    pass
+    # Web App login credentials (optional – stored encrypted in ProjectIntegration)
+    login_url: Optional[str] = None
+    login_username: Optional[str] = None
+    login_password: Optional[str] = None
+    login_strategy: Optional[str] = "form"  # form / basic_auth / sso / none
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = None

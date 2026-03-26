@@ -73,7 +73,7 @@ export default function ExecutionDetailsPage({ params }: { params: Promise<{ id:
 
     const fetchRun = async () => {
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/test-runs/${id}`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${id}`)
             if (response.ok) {
                 const data = await response.json()
                 setRun(data)
@@ -151,7 +151,7 @@ export default function ExecutionDetailsPage({ params }: { params: Promise<{ id:
 
                     {run.status !== "running" && (
                         <Button variant="outline" size="sm" asChild>
-                            <a href={`http://localhost:8000/screenshots/trace-${run.id}.zip`} download>
+                            <a href={`${process.env.NEXT_PUBLIC_API_URL}/screenshots/trace-${run.id}.zip`} download>
                                 <ExternalLink className="mr-2 h-4 w-4" />
                                 Download Trace
                             </a>
@@ -218,7 +218,7 @@ export default function ExecutionDetailsPage({ params }: { params: Promise<{ id:
                                     <TableCell className="text-right">
                                         {log.screenshot_url && (
                                             <Button variant="outline" size="sm" asChild>
-                                                <a href={`http://localhost:8000${log.screenshot_url}`} target="_blank" rel="noreferrer">
+                                                <a href={`${process.env.NEXT_PUBLIC_API_URL}${log.screenshot_url}`} target="_blank" rel="noreferrer">
                                                     <ImageIcon className="mr-2 h-4 w-4" />
                                                     Screenshot
                                                 </a>

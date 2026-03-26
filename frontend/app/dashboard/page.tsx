@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Activity, CheckCircle2, Play, Users, AlertCircle, Sparkles, Save, Loader2, FileText, BarChart2 } from "lucide-react"
+import { Activity, CheckCircle2, Play, Users, AlertCircle, Sparkles, Save, Loader2, FileText, BarChart2, BookOpen, Code2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -16,7 +16,7 @@ export default function DashboardPage() {
     const [isLoading, setIsLoading] = useState(false)
     const [generatedTest, setGeneratedTest] = useState<any>(null)
     const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
-    const [selectedProvider, setSelectedProvider] = useState("openai")
+    const [selectedProvider, setSelectedProvider] = useState("claude")
 
     // Analytics State
     const [stats, setStats] = useState({ total_projects: 0, total_test_cases: 0, total_executions: 0, pass_rate: 0 })
@@ -24,6 +24,11 @@ export default function DashboardPage() {
     const [recentRuns, setRecentRuns] = useState<any[]>([])
     const [isLoadingData, setIsLoadingData] = useState(true)
     const [projects, setProjects] = useState<any[]>([])
+
+    // Readable view state for dashboard
+    const [dashReadableSteps, setDashReadableSteps] = useState<string[]>([])
+    const [isDashHumanizing, setIsDashHumanizing] = useState(false)
+    const [showDashReadable, setShowDashReadable] = useState(false)
 
     useEffect(() => {
         const safeFetch = async (url: string): Promise<Response | null> => {
@@ -42,9 +47,9 @@ export default function DashboardPage() {
             setIsLoadingData(true)
             try {
                 const [statsRes, distRes, runsRes] = await Promise.all([
-                    safeFetch("http://localhost:8000/api/v1/analytics/dashboard-stats"),
-                    safeFetch("http://localhost:8000/api/v1/analytics/execution-distribution"),
-                    safeFetch("http://localhost:8000/api/v1/test-runs/?limit=10")
+                    safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/analytics/dashboard-stats`),
+                    safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/analytics/execution-distribution`),
+                    safeFetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/?limit=10`)
                 ])
 
                 if (statsRes?.ok) setStats(await statsRes.json())
@@ -73,7 +78,7 @@ export default function DashboardPage() {
         // Fetch projects for save
         const fetchProjects = async () => {
             try {
-                const res = await fetch("http://localhost:8000/api/v1/projects/")
+                const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`)
                 if (res?.ok) setProjects(await res.json())
             } catch { }
         }
@@ -88,7 +93,7 @@ export default function DashboardPage() {
         setGeneratedTest(null)
 
         try {
-            const response = await fetch("http://localhost:8000/api/v1/tests/generate-test-steps", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/generate-test-steps`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -128,7 +133,7 @@ export default function DashboardPage() {
                 return
             }
 
-            const response = await fetch("http://localhost:8000/api/v1/tests", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -161,6 +166,28 @@ export default function DashboardPage() {
         }
     }
 
+    const handleDashHumanize = async () => {
+        if (!generatedTest?.steps?.length) return
+        if (showDashReadable) { setShowDashReadable(false); return }
+
+        setIsDashHumanizing(true)
+        try {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ steps: generatedTest.steps, provider: selectedProvider })
+            })
+            if (!response.ok) throw new Error("Failed")
+            const data = await response.json()
+            setDashReadableSteps(data.readable_steps || [])
+            setShowDashReadable(true)
+        } catch {
+            // silently fail
+        } finally {
+            setIsDashHumanizing(false)
+        }
+    }
+
     const handleRun = async () => {
         if (!generatedTest) return
 
@@ -177,7 +204,7 @@ export default function DashboardPage() {
                 ? { test_case_id: generatedTest.id, environment: "default" }
                 : { test_case: generatedTest, environment: "default" } // Fallback if API supports ad-hoc run
 
-            const response = await fetch("http://localhost:8000/api/v1/test-runs", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -303,16 +330,43 @@ export default function DashboardPage() {
                             )}
 
                             <div className="space-y-2">
-                                <p className="text-sm font-medium text-muted-foreground">Test Steps:</p>
-                                <ul className="list-decimal list-inside space-y-1 text-sm bg-muted/50 p-3 rounded-md">
-                                    {generatedTest.steps.map((step: any, index: number) => (
-                                        <li key={index}>
-                                            <span className="font-semibold">{step.action}</span>
-                                            {step.target && <span className="mx-1 text-muted-foreground">on {step.target}</span>}
-                                            {step.value && <span className="mx-1 text-blue-600">"{step.value}"</span>}
-                                        </li>
-                                    ))}
-                                </ul>
+                                <div className="flex items-center justify-between">
+                                    <p className="text-sm font-medium text-muted-foreground">Test Steps:</p>
+                                    <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        onClick={handleDashHumanize}
+                                        disabled={isDashHumanizing}
+                                        className={showDashReadable
+                                            ? "text-indigo-600 hover:text-indigo-700 h-7 text-xs"
+                                            : "text-indigo-600 hover:text-indigo-700 h-7 text-xs"}
+                                    >
+                                        {isDashHumanizing ? (
+                                            <><Loader2 className="mr-1 h-3 w-3 animate-spin" />Converting...</>
+                                        ) : showDashReadable ? (
+                                            <><Code2 className="mr-1 h-3 w-3" />Technical View</>
+                                        ) : (
+                                            <><BookOpen className="mr-1 h-3 w-3" />AI Readable</>
+                                        )}
+                                    </Button>
+                                </div>
+                                {showDashReadable && dashReadableSteps.length > 0 ? (
+                                    <ol className="list-decimal list-inside space-y-1 text-sm bg-indigo-50/50 dark:bg-indigo-950/20 p-3 rounded-md">
+                                        {dashReadableSteps.map((text, index) => (
+                                            <li key={index} className="text-gray-800 dark:text-gray-200">{text}</li>
+                                        ))}
+                                    </ol>
+                                ) : (
+                                    <ul className="list-decimal list-inside space-y-1 text-sm bg-muted/50 p-3 rounded-md">
+                                        {generatedTest.steps.map((step: any, index: number) => (
+                                            <li key={index}>
+                                                <span className="font-semibold">{step.action}</span>
+                                                {step.target && <span className="mx-1 text-muted-foreground">on {step.target}</span>}
+                                                {step.value && <span className="mx-1 text-blue-600">"{step.value}"</span>}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                )}
                             </div>
 
                             <div className="space-y-2">

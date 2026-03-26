@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Loader2 } from "lucide-react"
+import { Loader2, ChevronDown, ChevronRight, KeyRound } from "lucide-react"
 import { toast } from "sonner"
 
 interface CreateProjectModalProps {
@@ -18,13 +18,17 @@ interface CreateProjectModalProps {
 
 export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProjectModalProps) {
     const [isLoading, setIsLoading] = useState(false)
+    const [showCredentials, setShowCredentials] = useState(false)
     const [formData, setFormData] = useState({
         name: "",
         description: "",
         type: "WEB",
         base_url: "",
         status: "Active",
-        tags: ""
+        tags: "",
+        login_username: "",
+        login_password: "",
+        login_url: "",
     })
 
     const handleSubmit = async (e: React.FormEvent) => {
@@ -32,15 +36,29 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
         setIsLoading(true)
 
         try {
+            const payload: any = {
+                name: formData.name,
+                description: formData.description,
+                type: formData.type,
+                base_url: formData.base_url,
+                status: formData.status,
+                tags: formData.tags.split(",").map(t => t.trim()).filter(Boolean),
+            }
+
+            // Include login credentials if provided (Web projects)
+            if (formData.login_username || formData.login_password) {
+                payload.login_username = formData.login_username
+                payload.login_password = formData.login_password
+                payload.login_url = formData.login_url || formData.base_url
+                payload.login_strategy = "form"
+            }
+
             const response = await fetch("http://localhost:8000/api/v1/projects/", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({
-                    ...formData,
-                    tags: formData.tags.split(",").map(t => t.trim()).filter(Boolean)
-                }),
+                body: JSON.stringify(payload),
             })
 
             if (!response.ok) {
@@ -48,7 +66,7 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
                 throw new Error(error.detail || "Failed to create project")
             }
 
-            toast.success("Project created successfully!")
+            toast.success("Project created successfully! Credentials saved securely.")
             onOpenChange(false)
             onSuccess()
 
@@ -59,8 +77,12 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
                 type: "WEB",
                 base_url: "",
                 status: "Active",
-                tags: ""
+                tags: "",
+                login_username: "",
+                login_password: "",
+                login_url: "",
             })
+            setShowCredentials(false)
         } catch (error: any) {
             toast.error(error.message || "Failed to create project")
         } finally {
@@ -138,6 +160,70 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
                                 type="url"
                             />
                         </div>
+
+                        {/* ── Login Credentials (collapsible, Web only) ── */}
+                        {formData.type === "WEB" && (
+                            <div className="border rounded-lg overflow-hidden">
+                                <button
+                                    type="button"
+                                    className="flex items-center gap-2 w-full p-3 text-sm font-medium text-left hover:bg-muted/50 transition-colors"
+                                    onClick={() => setShowCredentials(!showCredentials)}
+                                >
+                                    <KeyRound className="h-4 w-4 text-muted-foreground" />
+                                    <span>Login Credentials</span>
+                                    <span className="text-xs text-muted-foreground ml-1">(optional – for auto-login)</span>
+                                    {showCredentials ? (
+                                        <ChevronDown className="h-4 w-4 ml-auto text-muted-foreground" />
+                                    ) : (
+                                        <ChevronRight className="h-4 w-4 ml-auto text-muted-foreground" />
+                                    )}
+                                </button>
+                                {showCredentials && (
+                                    <div className="grid gap-3 p-3 pt-0 border-t">
+                                        <p className="text-xs text-muted-foreground">
+                                            Provide credentials to auto-login before running tests. Stored encrypted.
+                                        </p>
+                                        <div className="grid gap-2">
+                                            <Label htmlFor="login_url" className="text-xs">Login URL</Label>
+                                            <Input
+                                                id="login_url"
+                                                value={formData.login_url}
+                                                onChange={(e) => setFormData({ ...formData, login_url: e.target.value })}
+                                                placeholder="https://example.com/login (defaults to Base URL)"
+                                                type="url"
+                                                className="h-8 text-sm"
+                                            />
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-3">
+                                            <div className="grid gap-2">
+                                                <Label htmlFor="login_username" className="text-xs">Username / Email</Label>
+                                                <Input
+                                                    id="login_username"
+                                                    value={formData.login_username}
+                                                    onChange={(e) => setFormData({ ...formData, login_username: e.target.value })}
+                                                    placeholder="admin@example.com"
+                                                    autoComplete="off"
+                                                    className="h-8 text-sm"
+                                                />
+                                            </div>
+                                            <div className="grid gap-2">
+                                                <Label htmlFor="login_password" className="text-xs">Password</Label>
+                                                <Input
+                                                    id="login_password"
+                                                    type="password"
+                                                    value={formData.login_password}
+                                                    onChange={(e) => setFormData({ ...formData, login_password: e.target.value })}
+                                                    placeholder="••••••••"
+                                                    autoComplete="new-password"
+                                                    className="h-8 text-sm"
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
                         <div className="grid gap-2">
                             <Label htmlFor="tags">Tags (comma-separated)</Label>
                             <Input

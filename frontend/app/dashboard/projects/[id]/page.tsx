@@ -121,7 +121,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const fetchJiraConfig = async () => {
         setJiraConfigLoading(true)
         try {
-            const res = await fetch(`http://localhost:8000/api/v1/jira/projects/${id}/config`)
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/projects/${id}/config`)
             if (res.ok) {
                 const data = await res.json()
                 if (data.configured) setJiraConfig(data)
@@ -134,12 +134,12 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         if (!jiraDomain || !jiraEmail || !jiraApiToken) { toast.error("Please fill in all Jira fields"); return }
         setJiraConnecting(true)
         try {
-            const connectRes = await fetch("http://localhost:8000/api/v1/jira/connect", {
+            const connectRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/connect`, {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
             })
             if (!connectRes.ok) { const err = await connectRes.json().catch(() => ({})); throw new Error(err.detail || "Connection failed") }
-            const boardsRes = await fetch("http://localhost:8000/api/v1/jira/boards", {
+            const boardsRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/boards`, {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
             })
@@ -158,7 +158,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         if (!selectedJiraBoard) { toast.error("Select a board first"); return }
         setJiraSaving(true)
         try {
-            const res = await fetch(`http://localhost:8000/api/v1/jira/projects/${id}/config`, {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/projects/${id}/config`, {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken, board_id: selectedJiraBoard, board_name: selectedJiraBoardName }),
             })
@@ -172,7 +172,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
 
     const fetchProject = async () => {
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${id}`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}`)
             if (!response.ok) throw new Error("Failed to fetch project")
             setProject(await response.json())
         } catch { toast.error("Failed to load project") }
@@ -182,7 +182,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const fetchIntegration = async () => {
         setIntegrationLoading(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${id}/integration-status`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/integration-status`)
             if (response.ok) setIntegration(await response.json())
         } catch (error) { console.error("Failed to fetch integration:", error) }
         finally { setIntegrationLoading(false) }
@@ -194,8 +194,8 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             // Use MCP sync endpoint if connected via MCP, otherwise use standard sync
             const isMcpConn = integration?.mcp_connected
             const url = isMcpConn
-                ? `http://localhost:8000/api/v1/mcp/projects/${id}/mcp/sync-metadata`
-                : `http://localhost:8000/api/v1/projects/${id}/sync-metadata`
+                ? `${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp/sync-metadata`
+                : `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/sync-metadata`
             const response = await fetch(url, { method: "POST" })
             const data = await response.json()
             if (data.status === "completed") {
@@ -212,7 +212,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         if (!confirm("Are you sure you want to disconnect this integration?")) return
         setDisconnecting(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/projects/${id}/disconnect`, { method: "DELETE" })
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/disconnect`, { method: "DELETE" })
             if (response.ok || response.status === 204) {
                 toast.success("Integration disconnected")
                 setIntegration({ category: null, status: "disconnected" })
@@ -225,7 +225,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         const cat = project?.category || "webapp"
         if (cat === "salesforce") {
             try {
-                const response = await fetch(`http://localhost:8000/api/v1/projects/${id}/connect`, {
+                const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/connect`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ category: "salesforce" }),
@@ -247,7 +247,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         }
         setMcpConnecting(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp-connect`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp-connect`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -276,7 +276,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         if (!soqlQuery.trim()) return
         setQueryLoading(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/query`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp/query`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ query: soqlQuery }),
@@ -298,7 +298,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         setCreateLoading(true)
         try {
             const parsedData = JSON.parse(createData)
-            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/records/${createObjectType}`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp/records/${createObjectType}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ data: parsedData }),
@@ -321,7 +321,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         setUpdateLoading(true)
         try {
             const parsedData = JSON.parse(updateData)
-            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/records/${updateObjectType}/${updateRecordId}`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp/records/${updateObjectType}/${updateRecordId}`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ data: parsedData }),
@@ -344,7 +344,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         if (!confirm(`Delete ${deleteObjectType} record ${deleteRecordId}?`)) return
         setDeleteLoading(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/records/${deleteObjectType}/${deleteRecordId}`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp/records/${deleteObjectType}/${deleteRecordId}`, {
                 method: "DELETE",
             })
             const data = await response.json()
@@ -362,7 +362,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const handleFetchLimits = async () => {
         setLimitsLoading(true)
         try {
-            const response = await fetch(`http://localhost:8000/api/v1/mcp/projects/${id}/mcp/limits`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${id}/mcp/limits`)
             const data = await response.json()
             if (response.ok) {
                 setOrgLimits(data.key_limits)

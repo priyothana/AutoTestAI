@@ -4,6 +4,7 @@ from sqlalchemy.future import select
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 import openai
+import os
 
 from app.db.session import get_db
 from app.models.test_case import TestCase
@@ -21,7 +22,7 @@ async def generate_test_steps_endpoint(
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required")
 
-    provider = prompt_data.get("provider", "openai")
+    provider = prompt_data.get("provider", "claude")
     model = prompt_data.get("model")
     project_id = prompt_data.get("project_id")
 
@@ -86,6 +87,256 @@ async def generate_test_steps_endpoint(
         except Exception as e:
             print(f"[TEST-GEN] Project detection error: {e}")
             pass  # Non-critical; fall back to normal generation
+
+    # ──────────────────────────────────────────────────────────────────
+    # WEBAPP CRAWLER PATH — only for project_category == "webapp"
+    # Crawls the live app to extract real DOM metadata, then uses it
+    # to ground the AI prompt in actual page elements.
+    # Zero impact on Salesforce: protected by strict category check.
+    # ──────────────────────────────────────────────────────────────────
+    if project_id:
+        try:
+            from app.models.project import Project as _Project
+            _pid = UUID(project_id)
+            _proj_res = await db.execute(select(_Project).where(_Project.id == _pid))
+            _project = _proj_res.scalars().first()
+
+            if _project and getattr(_project, "category", "") == "webapp":
+                effective_base_url = (
+                    getattr(_project, "base_url", None) or ""
+                ).rstrip("/")
+
+                if effective_base_url:
+                    print(
+                        f"[TEST-GEN] WebApp project {_pid} | base_url={effective_base_url} "
+                        f"→ triggering Playwright crawler"
+                    )
+                    try:
+                        from app.services.web_crawler_service import WebCrawlerService
+                        from app.models.metadata_normalized import MetadataNormalized
+                        from datetime import datetime
+
+                        # ── Check DB cache (entity_type='webapp_crawl') ──
+                        # Reuses the existing metadata_normalized table (no new columns).
+                        # Cache is keyed by project_id + object_name='webapp_crawl'.
+                        cached_result = await db.execute(
+                            select(MetadataNormalized).where(
+                                MetadataNormalized.project_id == _pid,
+                                MetadataNormalized.entity_type == "webapp_crawl",
+                            )
+                        )
+                        cached_row = cached_result.scalars().first()
+
+                        # Use cache if it exists and is less than 30 minutes old
+                        USE_CACHE = False
+                        if cached_row and cached_row.structured_json:
+                            age_seconds = (
+                                datetime.utcnow() - cached_row.created_at
+                            ).total_seconds()
+                            if age_seconds < 1800:  # 30-minute TTL
+                                USE_CACHE = True
+                                print(
+                                    f"[TEST-GEN] Using cached webapp metadata "
+                                    f"({int(age_seconds)}s old)"
+                                )
+
+                        if USE_CACHE:
+                            webapp_meta = WebCrawlerService.from_structured_json(
+                                cached_row.structured_json
+                            )
+                        else:
+                            # ── Resolve auth session path ──
+                            # Reuses storageState files saved by WebPlaywrightService.
+                            from app.services.playwright_core_service import SESSIONS_DIR
+                            session_path = os.path.join(
+                                SESSIONS_DIR, f"{project_id}_web.json"
+                            )
+                            auth_path = (
+                                session_path if os.path.exists(session_path) else None
+                            )
+
+                            # ── Run the crawler ──
+                            webapp_meta = await WebCrawlerService.crawl(
+                                base_url=effective_base_url,
+                                max_pages=8,
+                                auth_session_path=auth_path,
+                            )
+
+                            # ── Persist to DB cache (upsert) ──
+                            structured = WebCrawlerService.to_structured_json(webapp_meta)
+                            if cached_row:
+                                cached_row.structured_json = structured
+                                cached_row.created_at = datetime.utcnow()
+                            else:
+                                new_row = MetadataNormalized(
+                                    project_id=_pid,
+                                    object_name="webapp_crawl",
+                                    entity_type="webapp_crawl",
+                                    label=effective_base_url,
+                                    structured_json=structured,
+                                )
+                                db.add(new_row)
+                            await db.commit()
+                            print(
+                                f"[TEST-GEN] Crawl complete: {len(webapp_meta.pages)} pages cached"
+                            )
+
+                            # ── Generate vector embeddings from crawled pages ──
+                            # Per-page chunking → OpenAI embeddings → vector_embeddings table
+                            try:
+                                from app.services.embedding_service import EmbeddingService
+                                embed_count = await EmbeddingService.generate_embeddings(db, _pid)
+                                print(f"[TEST-GEN] Generated {embed_count} webapp vector embeddings")
+                            except Exception as embed_err:
+                                print(f"[TEST-GEN] Embedding generation (non-critical): {embed_err}")
+
+                        # ── Build context string + generate ──
+                        if webapp_meta.pages:
+                            # ── Targeted deep crawl for creation forms ──
+                            # If the prompt mentions creating/adding a record,
+                            # navigate INTO the form to extract mandatory fields
+                            import re as _re
+
+                            # Extract object name from prompts like:
+                            # "create new contact record", "add a new account",
+                            # "create contact", "new lead record"
+                            # "opportunity record creation", "create record for opportunity"
+                            _target_object = None
+                            _prompt_lower = prompt.lower()
+                            _create_match = _re.search(
+                                r'\b(?:create|add)\b\s+(?:a\s+)?(?:new\s+)?(\w+)(?:\s+(\w+))?',
+                                _prompt_lower
+                            )
+                            if not _create_match:
+                                # Pattern: "new contact record", "new opportunity"
+                                _create_match = _re.search(
+                                    r'\bnew\s+(\w+)(?:\s+(\w+))?',
+                                    _prompt_lower
+                                )
+
+                            # Skip generic/filler words
+                            _skip_words = {
+                                "record", "entry", "form", "item", "test", "case",
+                                "step", "the", "a", "an", "new", "with", "for",
+                            }
+
+                            if _create_match:
+                                _word1 = _create_match.group(1).strip()
+                                _word2 = (_create_match.group(2) or "").strip()
+                                # If first word is a filler (e.g. "create record opportunity"),
+                                # use the second word
+                                if _word1 in _skip_words and _word2 and _word2 not in _skip_words:
+                                    _target_object = _word2
+                                elif _word1 not in _skip_words:
+                                    _target_object = _word1
+                                # Also try scanning for known CRM objects in the prompt
+                                if not _target_object:
+                                    _known_objects = [
+                                        "opportunity", "contact", "account", "lead",
+                                        "campaign", "case", "report",
+                                    ]
+                                    for obj in _known_objects:
+                                        if obj in _prompt_lower:
+                                            _target_object = obj
+                                            break
+
+                            if _target_object and _target_object not in _skip_words:
+                                    print(f"[TEST-GEN] Detected creation intent for object: '{_target_object}'")
+                                    try:
+                                        from app.services.playwright_core_service import SESSIONS_DIR
+                                        from app.services.integration_service import IntegrationService
+                                        _session_path = os.path.join(
+                                            SESSIONS_DIR, f"{project_id}_web.json"
+                                        )
+                                        _auth = _session_path if os.path.exists(_session_path) else _session_path
+
+                                        # Decrypt credentials for auto-login
+                                        _creds = None
+                                        try:
+                                            _int_result = await db.execute(
+                                                select(MetadataNormalized).where(
+                                                    MetadataNormalized.project_id == _pid,
+                                                ).limit(1)
+                                            )
+                                            from app.models.project_integration import ProjectIntegration
+                                            _int_res = await db.execute(
+                                                select(ProjectIntegration).where(
+                                                    ProjectIntegration.project_id == _pid,
+                                                )
+                                            )
+                                            _int_rec = _int_res.scalars().first()
+                                            if _int_rec:
+                                                _dec = await IntegrationService.get_decrypted_tokens(_int_rec)
+                                                if _dec.get("username") and _dec.get("password"):
+                                                    _creds = {
+                                                        "username": _dec["username"],
+                                                        "password": _dec["password"],
+                                                    }
+                                        except Exception as cred_err:
+                                            print(f"[TEST-GEN] Credential fetch (non-critical): {cred_err}")
+
+                                        _form_page = await WebCrawlerService.crawl_creation_form(
+                                            base_url=effective_base_url,
+                                            object_name=_target_object,
+                                            auth_session_path=_auth,
+                                            credentials=_creds,
+                                        )
+                                        if _form_page and (_form_page.inputs or _form_page.buttons):
+                                            # Merge form page into webapp_meta
+                                            webapp_meta.pages.append(_form_page)
+                                            print(
+                                                f"[TEST-GEN] Deep crawl: added form page with "
+                                                f"{len(_form_page.inputs)} inputs, "
+                                                f"{len(_form_page.buttons)} buttons, "
+                                                f"{len([i for i in _form_page.inputs if i.required])} required"
+                                            )
+                                        else:
+                                            print("[TEST-GEN] Deep crawl: no form fields found")
+                                    except Exception as deep_err:
+                                        print(f"[TEST-GEN] Deep crawl (non-critical): {deep_err}")
+
+                            webapp_context = WebCrawlerService.build_context_string(
+                                webapp_meta
+                            )
+
+                            # ── Enrich with RAG context (execution learnings) ──
+                            # Retrieve relevant past test execution patterns via vector similarity
+                            try:
+                                from app.services.rag_service import RAGService
+                                rag_chunks = await RAGService.retrieve(
+                                    db, _pid, prompt, top_k=5
+                                )
+                                if rag_chunks:
+                                    rag_context = await RAGService.build_rag_context(
+                                        rag_chunks, categorize=True
+                                    )
+                                    webapp_context = webapp_context + "\n\n" + rag_context
+                                    print(f"[TEST-GEN] Enriched with {len(rag_chunks)} RAG chunks")
+                            except Exception as rag_err:
+                                print(f"[TEST-GEN] RAG enrichment (non-critical): {rag_err}")
+
+                            print(
+                                f"[TEST-GEN] Generating with webapp metadata "
+                                f"({len(webapp_meta.pages)} pages, "
+                                f"context_len={len(webapp_context)})"
+                            )
+                            test_case = await AIService.generate_test_case_with_webapp_metadata(
+                                prompt, webapp_context, provider=provider, model=model
+                            )
+                            return test_case
+                        else:
+                            print(
+                                "[TEST-GEN] Crawler returned 0 pages, "
+                                "falling back to standard generation"
+                            )
+
+                    except Exception as crawl_err:
+                        print(
+                            f"[TEST-GEN] WebApp crawler failed: {crawl_err} "
+                            f"— falling back to standard generation"
+                        )
+        except Exception as _e:
+            print(f"[TEST-GEN] WebApp path detection error: {_e}")
 
     # --- MCP RAG path: strict metadata-driven generation ---
     if use_mcp_rag:
@@ -909,21 +1160,54 @@ async def generate_test_steps_endpoint(
         except Exception as rag_err:
             print(f"[TEST-GEN] MCP RAG failed, falling back to standard: {rag_err}")
 
-    # --- Standard path ---
+    # --- Standard path (with automatic OpenAI → Claude fallback) ---
     effective_prompt = prompt + session_instruction
 
     try:
         test_case = await AIService.generate_test_case(effective_prompt, provider=provider, model=model)
         return test_case
+    except (openai.AuthenticationError, openai.APIConnectionError, openai.APIError) as openai_err:
+        # If OpenAI fails, automatically fall back to Claude
+        print(f"[TEST-GEN] OpenAI failed ({type(openai_err).__name__}: {openai_err}), falling back to Claude...")
+        try:
+            test_case = await AIService.generate_test_case(effective_prompt, provider="claude", model=None)
+            print(f"[TEST-GEN] ✅ Claude fallback succeeded")
+            return test_case
+        except Exception as claude_err:
+            print(f"[TEST-GEN] Claude fallback also failed: {claude_err}")
+            # Report the original OpenAI error + fallback failure
+            detail = f"OpenAI API error: {getattr(openai_err, 'message', str(openai_err))}. Claude fallback also failed: {str(claude_err)}"
+            raise HTTPException(status_code=502, detail=detail)
     except openai.RateLimitError:
         raise HTTPException(
             status_code=429, 
             detail="OpenAI API Quota Exceeded. Please check your billing details or API key credits."
         )
-    except openai.APIError as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI API returned an error: {e.message}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+from pydantic import BaseModel
+
+class HumanizeStepsRequest(BaseModel):
+    steps: list
+    provider: str = "claude"
+
+@router.post("/humanize-steps", response_model=Dict[str, Any])
+async def humanize_steps_endpoint(
+    payload: HumanizeStepsRequest,
+):
+    """Convert technical test steps into human-readable natural language."""
+    if not payload.steps:
+        raise HTTPException(status_code=400, detail="A non-empty 'steps' array is required")
+
+    try:
+        result = await AIService.humanize_steps(payload.steps, provider=payload.provider)
+        return result
+    except Exception as e:
+        print(f"[HUMANIZE] Error: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to humanize steps: {str(e)}")
 
 from app.models.project import Project
 

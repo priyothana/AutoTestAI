@@ -98,7 +98,7 @@ async def create_test_run(
                 break
 
     # Resolve project category and integration status
-    project_category = project.category if project else "webapp"
+    project_category = (project.category if project else None) or "webapp"
     integration_status = "disconnected"
     sf_access_token = None
     sf_instance_url = None
@@ -108,6 +108,12 @@ async def create_test_run(
     mcp_connected = False
     sf_session_id = None
     sf_security_token = None
+
+    # Web App credentials (decrypted from ProjectIntegration)
+    web_username = None
+    web_password = None
+    web_login_url = None
+    web_login_strategy = "form"
     try:
         int_result_for_status = await db.execute(
             select(ProjectIntegration).where(ProjectIntegration.project_id == test_case.project_id)
@@ -235,6 +241,24 @@ async def create_test_run(
         print(f"[ERROR] Session resolution failed: {e}")
         traceback.print_exc()
 
+    # ── Extract Web App credentials ──
+    if project_category == "webapp":
+        try:
+            int_result_web = await db.execute(
+                select(ProjectIntegration).where(ProjectIntegration.project_id == test_case.project_id)
+            )
+            web_int = int_result_web.scalars().first()
+            if web_int and web_int.category == "web_app" and web_int.status == "connected":
+                from app.services.integration_service import IntegrationService
+                web_dec = await IntegrationService.get_decrypted_tokens(web_int)
+                web_username = web_dec.get("username")
+                web_password = web_dec.get("password")
+                web_login_url = web_int.base_url or base_url
+                web_login_strategy = web_int.login_strategy or "form"
+                print(f"[WEBAPP] Credentials found: user={bool(web_username)}, login_url={web_login_url}")
+        except Exception as web_err:
+            print(f"[WEBAPP] Credential lookup failed: {web_err}")
+
     print(f"[RUN] category={project_category} status={integration_status} base_url={base_url} has_token={bool(sf_access_token)} instance={sf_instance_url} mcp={mcp_connected} has_session={bool(sf_session_id)}")
 
     # 4. Trigger Background Execution
@@ -256,6 +280,10 @@ async def create_test_run(
         mcp_connected,
         sf_session_id,
         sf_security_token,
+        web_username,
+        web_password,
+        web_login_url,
+        web_login_strategy,
     )
 
     return new_run
@@ -277,6 +305,10 @@ async def run_playwright_test(
     mcp_connected: bool = False,
     sf_session_id: str = None,
     sf_security_token: str = None,
+    web_username: str = None,
+    web_password: str = None,
+    web_login_url: str = None,
+    web_login_strategy: str = "form",
 ):
     from app.db.session import AsyncSessionLocal
     from sqlalchemy import update
@@ -288,15 +320,31 @@ async def run_playwright_test(
         "duration": 0
     }
     try:
-        # Actually perform the test
-        result_data = await PlaywrightService.execute_test_case(
-            run_id, base_url, steps, project_id,
-            use_session_reuse, is_login_test,
-            project_category, integration_status,
-            sf_access_token, sf_instance_url,
-            sf_username, sf_password, sf_login_url,
-            mcp_connected, sf_session_id, sf_security_token,
-        )
+        # Route to the appropriate service based on project category
+        # Default to webapp for any category that isn't "salesforce"
+        is_salesforce = (project_category or "").lower() == "salesforce"
+        print(f"[ROUTE] project_category='{project_category}' → {'salesforce' if is_salesforce else 'webapp'}")
+
+        if is_salesforce:
+            # Salesforce path – completely unchanged
+            result_data = await PlaywrightService.execute_test_case(
+                run_id, base_url, steps, project_id,
+                use_session_reuse, is_login_test,
+                project_category, integration_status,
+                sf_access_token, sf_instance_url,
+                sf_username, sf_password, sf_login_url,
+                mcp_connected, sf_session_id, sf_security_token,
+            )
+        else:
+            # Web App path
+            from app.services.web_playwright_service import WebPlaywrightService
+            result_data = await WebPlaywrightService.execute_test_case(
+                run_id, base_url, steps, project_id,
+                web_username=web_username,
+                web_password=web_password,
+                web_login_url=web_login_url,
+                web_login_strategy=web_login_strategy,
+            )
     except Exception as e:
         logger.error(f"CRITICAL ERROR in run_playwright_test wrapper for {run_id}: {e}", exc_info=True)
         result_data = {
