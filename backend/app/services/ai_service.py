@@ -474,6 +474,21 @@ Flow:           "/lightning/flow/{FlowApiName}"
 LWC Component:  "/lightning/cmp/{ComponentName}"
 Custom Tab:     "/lightning/n/{TabApiName}"
 
+⚠ CRITICAL: Custom objects ALWAYS use their API name with __c suffix.
+  "Invoice" → "Invoice__c"  →  /lightning/o/Invoice__c/list
+  "Order" → "Order"         →  /lightning/o/Order/list (standard object)
+  NEVER use simplified names like "/invoices/..." — these are NOT valid Salesforce URLs.
+
+NAVIGATE TO SPECIFIC RECORD BY NAME/NUMBER:
+When the user mentions a specific record by name or number (e.g., "Open DS-2023-24-0025 Invoice"):
+1. NAVIGATE → "/lightning/o/{ObjectApiName}/list"  (go to the list view)
+2. TYPE → target: "input[name='Invoice__c-search-input'], input[type='search'], .search-input", value: "{RecordName}", locator_type: "css"  (type the record name in the list view search)
+3. CLICK → press Enter or search button (target: "role=button, name=Search", locator_type: "role")
+4. WAIT → 2 seconds for results
+5. CLICK → target: "role=link, name={RecordName}" (click the record link in the results)
+
+Do NOT try to construct a direct URL like "/lightning/r/Invoice__c/DS-2023-24-0025/view" — the value "DS-2023-24-0025" is a record NAME, not a Salesforce record ID. Only 15/18-char alphanumeric IDs work in record URLs.
+
 ObjectApiName MUST match metadata exactly (e.g., "Account", "Custom_Object__c").
 
 -------------------------
@@ -571,14 +586,19 @@ FIELD NAME MATCHING:
 CREATE: If test says "create {Object}":
 1. NAVIGATE → value: "/lightning/o/{ObjectApiName}/list"
 2. CLICK → target: "role=button, name=New", locator_type: "role"
-3. For EVERY user-mentioned field AND every required field from metadata, generate the correct action:
+3. Generate fill steps ONLY for these categories of fields:
+   a) Fields marked [REQUIRED] in the metadata — these MUST have steps
+   b) Fields marked [RECOMMENDED] in the metadata — these SHOULD have steps (page layout required)
+   c) Fields the user explicitly mentions in their prompt with specific values
+   DO NOT generate steps for [OPTIONAL] fields unless the user explicitly mentions them.
+   For each field, use the correct action based on type:
    - If field type = string/text/email/phone/currency/number/textarea → action: "TYPE"
    - If field type = picklist → action: "SELECT"
    - If field type = reference/lookup → action: "LOOKUP"
    - If field type = date/datetime → action: "TYPE" with date format
    - If field type = boolean/checkbox → action: "CLICK"
    Each step: target: "{FieldLabel}", value: "{TestValue}", locator_type: "label"
-   IMPORTANT: You MUST include ALL user-mentioned fields AND all required metadata fields. Missing ANY user-mentioned field is a failure.
+   IMPORTANT: Missing a [REQUIRED] field = test WILL fail at save. Missing a user-mentioned field = test is wrong.
 4. CLICK → target: "role=button, name=Save", locator_type: "role"
 5. ASSERT_TEXT → target: "was created", locator_type: "text"
 
@@ -636,6 +656,30 @@ RECORD TYPE SELECTION:
 - The runner handles this automatically — you do NOT need to generate a step for it
 - If the user specifies a record type, mention it in the test description/preconditions
 
+PDF / REPORT GENERATION:
+When the user says "Generate PDF", "View PDF", "Preview PDF", or "Print Invoice":
+1. NAVIGATE → "/lightning/o/{ObjectApiName}/list"  (list view of the object)
+2. If a specific record is mentioned (e.g., "DS-2023-24-0025"):
+   a. TYPE → search for the record name in the list view search bar
+   b. CLICK → press Enter or search button
+   c. CLICK → the record link from search results
+3. CLICK → the "Generate PDF", "Generate Invoice PDF", or equivalent button
+4. WAIT → 5 (wait 5 seconds for the PDF to generate/load)
+5. If the user says "save" or "save to files":
+   a. CLICK → target: "role=button, name=Save" or "role=button, name=Save to Files", locator_type: "role"
+   DO NOT try to click or assert on CSS selectors like ".previewOuterContainer" or "canvas" — these do NOT exist on Salesforce pages.
+6. To verify the PDF is stored in Files (Related tab):
+   - CLICK → target: "role=tab, name=Related", locator_type: "role"  (switch to Related tab)
+
+ASSERT_TEXT SPECIFICITY RULE (CRITICAL):
+- NEVER use generic page-title words (e.g. "Invoice", "Account", "Contact") as the expected text
+- These words appear in breadcrumbs and navigation — they will ALWAYS match even if the action failed
+- Instead target the RESULT of the action:
+  - PDF generated → assert CSS selector of the PDF preview element
+  - Record created → assert toast "was created"
+  - Field updated → assert the new value visible in the detail section
+  - File attached → assert the file name in the Related → Files list
+
 -------------------------
 FIELD VALUE RULES (CRITICAL — field type determines the action)
 -------------------------
@@ -649,6 +693,8 @@ FIELD VALUE RULES (CRITICAL — field type determines the action)
 - Picklist → action: SELECT, value: Use the EXACT value from the user's prompt. If user doesn't specify, pick a valid value from metadata picklist values
 - Multi-Select Picklist → action: MULTI_SELECT, value: semicolon-separated values (e.g. "Val1;Val2")
 - Lookup/Reference → action: LOOKUP_SELECT, value: search text for the related record
+  CRITICAL: If ValidRecords are listed for a lookup field, you MUST use one of those values.
+  NEVER invent a lookup value. ValidRecords are REAL records queried from the Salesforce org.
 - Required fields → MUST be populated (check metadata for nillable=false)
 - Time → action: TYPE, value: "2:00 PM" or "14:00"
 
@@ -761,6 +807,18 @@ Example self-check:
   User mentioned: Opportunity, Bill To, Order, Tax Type, Entity, Bank Detail, Signed By, Service Provided From, Service Provided Till, Pay To
   Required fields: Entity, Tax Type, Bank Detail, Opportunity
   Generated steps must cover ALL of the above — missing any is a failure.
+
+POST-GENERATION SELF-CHECK (MANDATORY — NON-NEGOTIABLE):
+After generating all steps, count EVERY [REQUIRED] field in the metadata.
+For EACH required field, verify there is a TYPE/SELECT/LOOKUP/CHECKBOX step targeting it.
+If ANY required field is missing a step → ADD a step for it now using a sensible default value.
+A test that skips required fields WILL fail at save time — this is a CRITICAL defect.
+
+COMPOUND NAME FIELDS:
+- Salesforce Contact, Lead, etc. use compound Name field (First Name + Last Name)
+- NEVER generate a step for "Full Name" — it is not an input field
+- Instead generate separate steps for "First Name" and "Last Name"
+- Last Name is ALWAYS required for Contact and Lead
 
 IMPORTANT: Output ONLY valid JSON. No explanations, no comments, no markdown.
 ALWAYS use getByRole for buttons and getByLabel for form fields. CSS is FALLBACK ONLY.

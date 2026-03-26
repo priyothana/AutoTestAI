@@ -42,6 +42,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { toast } from "sonner"
 import JiraImportPanel from "@/components/projects/JiraImportPanel"
+import AiFixAssistant from "@/components/tests/AiFixAssistant"
 
 // Step Type
 type TestStep = {
@@ -207,9 +208,31 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
         setIsRunning(true)
         setLastRunResult(null)
-        const runToastId = toast.loading("Starting execution flow...")
+        const runToastId = toast.loading("Saving & starting execution...")
 
         try {
+            // ── Auto-save current steps before running ──────────────────
+            // This ensures any UI changes (including accepted AI Healing
+            // steps) are persisted before execution starts.
+            if (!isInternalNew && currentId) {
+                const saveRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${currentId}`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        name: testName,
+                        description,
+                        project_id: selectedProjectId,
+                        steps,
+                        priority,
+                    }),
+                })
+                if (!saveRes.ok) {
+                    throw new Error("Failed to auto-save test steps before running")
+                }
+            }
+
+            toast.loading("Running test...", { id: runToastId })
+
             const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -248,6 +271,30 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                             } else {
                                 toast.error(`Test ${status} – View details below`, { id: runToastId })
                                 setTestStatus("failed")
+
+                                // AI Fix Assistant runs async after the status update.
+                                // Poll every 4s (up to 10x = 40s) until ai_suggestions are stored.
+                                let healAttempts = 0
+                                const healPoll = setInterval(async () => {
+                                    healAttempts++
+                                    try {
+                                        const healRes = await fetch(`http://localhost:8000/api/v1/test-runs/${runData.id}`)
+                                        if (healRes.ok) {
+                                            const healData = await healRes.json()
+                                            const ai = healData.ai_suggestions
+                                            const hasHeal = ai?.corrected_steps?.length > 0 || (Array.isArray(ai) && ai.length > 0)
+                                            console.log(`[AI Heal] attempt ${healAttempts}: hasHeal=${hasHeal}`)
+                                            if (hasHeal) {
+                                                clearInterval(healPoll)
+                                                setLastRunResult(healData)
+                                                toast.info("💡 AI Fix Assistant has suggestions — scroll down!", { duration: 6000 })
+                                            } else if (healAttempts >= 10) {
+                                                clearInterval(healPoll)
+                                                console.log("[AI Heal] No suggestions after 10 attempts — giving up")
+                                            }
+                                        }
+                                    } catch (_) { /* non-critical */ }
+                                }, 4000)
                             }
                             fetchTestCase()
                         }
@@ -868,6 +915,42 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     </CardContent>
                 </Card>
             )}
+
+            {/* ── AI Fix Assistant ──────────────────────────────────────── */}
+            {lastRunResult &&
+              lastRunResult.status === "failed" &&
+              lastRunResult.ai_suggestions != null &&
+              (
+                // New format: {analysis, corrected_steps}
+                lastRunResult.ai_suggestions?.corrected_steps?.length > 0 ||
+                // Legacy format: plain array
+                (Array.isArray(lastRunResult.ai_suggestions) && lastRunResult.ai_suggestions.length > 0)
+              ) && (
+                <AiFixAssistant
+                  runId={lastRunResult.id}
+                  suggestions={lastRunResult.ai_suggestions}
+                  steps={steps}
+                  onApplyFixes={(updatedSteps) => setSteps(updatedSteps)}
+                  onSave={async (updatedSteps) => {
+                    // Save the fresh steps directly — avoids stale React state closure
+                    if (!testName || !selectedProjectId) return
+                    const url = isInternalNew
+                      ? "http://localhost:8000/api/v1/tests"
+                      : `http://localhost:8000/api/v1/tests/${currentId}`
+                    await fetch(url, {
+                      method: isInternalNew ? "POST" : "PUT",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        name: testName,
+                        description,
+                        project_id: selectedProjectId,
+                        steps: updatedSteps,
+                        priority,
+                      }),
+                    })
+                  }}
+                />
+              )}
         </div>
     )
 }

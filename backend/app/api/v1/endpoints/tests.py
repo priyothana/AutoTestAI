@@ -355,23 +355,77 @@ async def generate_test_steps_endpoint(
                 # Extract object name from user prompt to filter out unrelated metadata
                 import re as _re
                 prompt_lower = prompt.lower()
-                # Try to extract the object name from common prompt patterns
-                obj_match = _re.search(
-                    r'(?:create|new|edit|update|delete|view|test)\s+(?:(?:a|an|the)\s+)?(?:new\s+)?'
-                    r'(\w[\w\s]*?)(?:\s+record|\s+for|\s+with|\s+-|\s*$)',
-                    prompt_lower
-                )
-                target_obj = obj_match.group(1).strip() if obj_match else None
-                print(f"[TEST-GEN] Detected target object: '{target_obj}'")
+                # Strategy 1: Standard patterns
+                target_obj = None
+                meta_records = []  # Initialize — will be populated later in the metadata query
+                for pattern in [
+                    r'(?:create|new|edit|update|delete|view|open|test)\s+(?:(?:a|an|the)\s+)?(?:new\s+)?(\w[\w\s]*?)(?:\s+record|\s+for|\s+with|\s+-|\s*$)',
+                    r'(?:creat\w*|new)\s+(?:(?:a|an|the)\s+)?(?:new\s+)?(\w+)',  # handles typos like "craete"
+                    r'\b(\w+)\s+(?:creation|form|page|layout|list)\b',
+                ]:
+                    obj_match = _re.search(pattern, prompt_lower)
+                    if obj_match:
+                        candidate = obj_match.group(1).strip()
+                        if candidate and candidate not in ('a', 'an', 'the', 'new', 'test', 'record'):
+                            target_obj = candidate
+                            break
+
+                # Strategy 2: Match words in prompt against known metadata object names
+                if not target_obj and meta_records:
+                    obj_name_set = {}
+                    for record in meta_records:
+                        structured = record.structured_json or {}
+                        obj_name = structured.get("object", record.object_name)
+                        if obj_name:
+                            obj_name_set[obj_name.lower()] = obj_name
+                            label = structured.get("label", "").lower()
+                            if label:
+                                obj_name_set[label] = obj_name
+                    prompt_words = set(prompt_lower.split())
+                    for key, real_name in obj_name_set.items():
+                        if key in prompt_words or key in prompt_lower:
+                            target_obj = key
+                            print(f"[TEST-GEN] Object matched via metadata scan: '{key}' → '{real_name}'")
+                            break
+
+                print(f"[TEST-GEN] Detected target object: '{target_obj}' from prompt: '{prompt_lower[:80]}'")
+
 
                 if target_obj:
-                    # Filter chunks that mention the target object
-                    filtered = [c for c in retrieved_chunks if target_obj in c.lower()]
+                    # ── Strict chunk filtering: separate metadata from learning ──
+                    # Metadata chunks from other objects cause the LLM to generate
+                    # steps for fields that don't belong to the target object.
+                    # Keep: execution learning chunks (useful across objects)
+                    # Keep: metadata chunks ABOUT the target object only
+                    # Drop: metadata chunks about other objects
+                    learning_chunks = []
+                    target_meta_chunks = []
+                    for c in retrieved_chunks:
+                        c_lower = c.lower()
+                        # Execution learning chunks — always keep
+                        if (c_lower.startswith("field behavior rules") or
+                            c_lower.startswith("successful test execution") or
+                            c_lower.startswith("failure correction")):
+                            learning_chunks.append(c)
+                            continue
+                        # Metadata chunks — strict object matching
+                        # Check if the chunk is primarily ABOUT the target object
+                        # by looking at the first 100 chars (chunk header)
+                        chunk_header = c_lower[:150]
+                        if (target_obj in chunk_header or
+                            f"object: {target_obj}" in c_lower[:300] or
+                            f"fields for {target_obj}" in c_lower[:300]):
+                            target_meta_chunks.append(c)
+
+                    filtered = target_meta_chunks + learning_chunks
                     if filtered:
-                        print(f"[TEST-GEN] Filtered {len(retrieved_chunks)} chunks → {len(filtered)} chunks for object '{target_obj}'")
+                        print(f"[TEST-GEN] Strict filter: {len(retrieved_chunks)} chunks → "
+                              f"{len(target_meta_chunks)} metadata + {len(learning_chunks)} learning "
+                              f"for object '{target_obj}'")
                         retrieved_chunks = filtered
                     else:
-                        print(f"[TEST-GEN] No chunks matched '{target_obj}', using all {len(retrieved_chunks)} chunks")
+                        print(f"[TEST-GEN] No chunks matched strict filter for '{target_obj}', "
+                              f"using all {len(retrieved_chunks)} chunks")
 
                 rag_context = await RAGService.build_rag_context(retrieved_chunks)
 
@@ -451,10 +505,16 @@ async def generate_test_steps_endpoint(
 
                     field_summary_lines = [
                         "\n\n=== COMPLETE FIELD REFERENCE (Direct from Org Metadata) ===",
-                        "CRITICAL — You MUST generate a step for:",
-                        "  1. EVERY field listed in EXTRACTED FIELDS below",
-                        "  2. EVERY field marked [REQUIRED] below",
-                        "  3. EVERY field the user explicitly mentions in their prompt",
+                        "⚠ CRITICAL OVERRIDE: IGNORE any field information from the RAG context above.",
+                        "The RAG context may contain fields from MULTIPLE objects — DO NOT use them.",
+                        "Use ONLY the fields listed in THIS section. These are the ONLY valid fields.",
+                        "",
+                        "RULES:",
+                        "  1. Generate steps for ALL fields marked [REQUIRED] below",
+                        "  2. Generate steps for fields marked [RECOMMENDED] below (commonly required on page layout)",
+                        "  3. Generate steps for fields the user explicitly mentions in their prompt",
+                        "  4. DO NOT generate steps for [OPTIONAL] fields unless user mentions them",
+                        "  5. DO NOT generate steps for fields from other objects",
                         "IMPORTANT: Use the exact LABEL as the step target.",
                         "IMPORTANT: Use the correct ACTION by TYPE (picklist→SELECT, reference→LOOKUP, text/date→TYPE).",
                         "",
@@ -489,22 +549,174 @@ async def generate_test_steps_endpoint(
                     if target_obj:
                         print(f"[TEST-GEN] Object filter: target='{target_clean}', matched={exact_matches}")
 
+
+                    # ─── Fetch REAL lookup values from the org ───
+                    # Query MetadataRaw directly — MetadataNormalized may not have all objects
+                    lookup_values = {}
+                    SKIP_FIELD_NAMES = {
+                        'createdbyid', 'lastmodifiedbyid', 'ownerid',
+                        'recordtypeid', 'parentid',
+                    }
+                    try:
+                        from app.models.metadata_raw import MetadataRaw
+                        from app.services.salesforce_mcp_service import SalesforceMCPService
+                        from app.services.integration_service import IntegrationService
+                        from app.models.project_integration import ProjectIntegration
+
+                        # Get all field metadata for this project
+                        raw_result = await db.execute(
+                            select(MetadataRaw).where(
+                                MetadataRaw.project_id == UUID(project_id),
+                                MetadataRaw.metadata_type == "field",
+                            )
+                        )
+                        raw_fields = raw_result.scalars().all()
+
+                        # Find reference fields and their targets
+                        ref_fields = []
+                        for rf in raw_fields:
+                            raw = rf.raw_json or {}
+                            ftype = (raw.get("type") or "").lower()
+                            fname = (raw.get("name") or "").lower()
+                            if ftype == "reference" and fname not in SKIP_FIELD_NAMES:
+                                ref_to = raw.get("referenceTo", [])
+                                label = raw.get("label", raw.get("name", ""))
+                                if ref_to and label:
+                                    ref_fields.append({
+                                        "label": label,
+                                        "referenceTo": ref_to[0],
+                                        "api_name": rf.api_name,
+                                    })
+
+                        if ref_fields:
+                            print(f"[TEST-GEN] Found {len(ref_fields)} reference fields: "
+                                  f"{[(r['label'], r['referenceTo']) for r in ref_fields[:10]]}")
+
+                            # Get Salesforce credentials
+                            int_result = await db.execute(
+                                select(ProjectIntegration).where(
+                                    ProjectIntegration.project_id == UUID(project_id)
+                                )
+                            )
+                            int_record = int_result.scalars().first()
+                            if int_record and int_record.category == "salesforce":
+                                decrypted = await IntegrationService.get_decrypted_tokens(int_record)
+                                username = decrypted.get("username")
+                                password = decrypted.get("password")
+                                security_token = decrypted.get("security_token")
+                                domain = "test" if (int_record.salesforce_login_url or "").find("test.salesforce.com") >= 0 else "login"
+
+                                if username and password and security_token:
+                                    queried_objects = {}
+                                    
+                                    # ─── Query lookup filter criteria from Tooling API ───
+                                    lookup_filters = {}
+                                    primary_object = exact_matches[0] if exact_matches else None
+                                    print(f"[TEST-GEN] 🔍 primary_object for filters: {primary_object}")
+                                    if primary_object:
+                                        try:
+                                            lookup_filters = SalesforceMCPService.get_lookup_filters(
+                                                username=username, password=password,
+                                                security_token=security_token,
+                                                object_name=primary_object,
+                                                domain=domain,
+                                            )
+                                            if lookup_filters:
+                                                print(f"[TEST-GEN] 🔍 Lookup filters found: {lookup_filters}")
+                                            else:
+                                                print(f"[TEST-GEN] ⚠ No lookup filters returned for {primary_object}")
+                                        except Exception as lf_err:
+                                            print(f"[TEST-GEN] ⚠ Could not query lookup filters: {lf_err}")
+                                            import traceback
+                                            traceback.print_exc()
+                                    
+                                    for rf in ref_fields:
+                                        ref_obj = rf["referenceTo"]
+                                        field_api = rf.get("api_name", "")
+                                        
+                                        # Check if this field has a lookup filter
+                                        filter_where = lookup_filters.get(field_api, "")
+                                        
+                                        # Use filter-specific cache key to avoid mixing filtered/unfiltered results
+                                        cache_key = f"{ref_obj}|{filter_where}" if filter_where else ref_obj
+                                        
+                                        if cache_key in queried_objects:
+                                            if queried_objects[cache_key]:
+                                                lookup_values[rf["label"]] = queried_objects[cache_key]
+                                            continue
+                                        try:
+                                            NAME_FIELD_MAP = {
+                                                "Order": "OrderNumber",
+                                                "Case": "CaseNumber",
+                                                "Solution": "SolutionName",
+                                                "Task": "Subject",
+                                                "Event": "Subject",
+                                                "ContentDocument": "Title",
+                                            }
+                                            name_field = NAME_FIELD_MAP.get(ref_obj, "Name")
+                                            
+                                            # Apply lookup filter criteria if available
+                                            if filter_where:
+                                                soql = f"SELECT Id, {name_field} FROM {ref_obj} WHERE ({filter_where}) AND {name_field} != null LIMIT 5"
+                                                print(f"[TEST-GEN] Filtered SOQL for '{rf['label']}': {soql}")
+                                            else:
+                                                soql = f"SELECT Id, {name_field} FROM {ref_obj} WHERE {name_field} != null LIMIT 5"
+                                            
+                                            result = SalesforceMCPService.query(
+                                                username=username, password=password,
+                                                security_token=security_token,
+                                                domain=domain, soql=soql,
+                                            )
+                                            records = result.get("records", []) if isinstance(result, dict) else []
+                                            names = [r.get(name_field, "") for r in records if r.get(name_field)]
+                                            queried_objects[cache_key] = names
+                                            if names:
+                                                lookup_values[rf["label"]] = names
+                                                print(f"[TEST-GEN] Lookup '{rf['label']}' → {ref_obj}: {names}")
+                                        except Exception as qe:
+                                            print(f"[TEST-GEN] ⚠ Query {ref_obj} for '{rf['label']}': {qe}")
+                                            queried_objects[cache_key] = []
+
+                        if lookup_values:
+                            print(f"[TEST-GEN] 🔍 All lookup values: {list(lookup_values.keys())}")
+                    except Exception as lv_err:
+                        print(f"[TEST-GEN] ⚠ Could not fetch lookup values: {lv_err}")
+
+                    # Add LOOKUP VALUE RULES if we have real values
+                    if lookup_values:
+                        field_summary_lines.append("=== LOOKUP VALUE RULES (CRITICAL) ===")
+                        field_summary_lines.append(
+                            "For LOOKUP/REFERENCE fields, you MUST use one of the ValidRecords "
+                            "listed below. NEVER invent a lookup value. These are REAL records from the org."
+                        )
+                        for field_label, record_names in lookup_values.items():
+                            field_summary_lines.append(
+                                f"  Field=\"{field_label}\" → ValidRecords={record_names}"
+                            )
+                        field_summary_lines.append("=== END LOOKUP VALUE RULES ===")
+                        field_summary_lines.append("")
+
+                    # Now build per-object field details
                     for record in meta_records:
                         structured = record.structured_json or {}
                         obj_name = structured.get("object", record.object_name)
-
-                        # Only include allowed objects
                         if allowed_objects is not None and obj_name not in allowed_objects:
                             continue
-                        print(f"[TEST-GEN] Including metadata for object: {obj_name} (fields: {len(structured.get('fields', []))})")
-
 
                         fields = structured.get("fields", [])
                         if not fields:
                             continue
 
+                        # Filter out non-createable fields (formula, auto-number,
+                        # system audit fields like CreatedById, LastModifiedDate)
+                        # to reduce prompt noise and prevent LLM confusion
+                        fields = [f for f in fields if f.get("createable", True)]
+                        if not fields:
+                            continue
+
                         field_summary_lines.append(f"--- Object: {obj_name} (Label: {structured.get('label', obj_name)}) ---")
                         field_summary_lines.append("")
+
 
                         required_fields = [f for f in fields if f.get("required")]
                         optional_fields = [f for f in fields if not f.get("required")]
@@ -526,12 +738,19 @@ async def generate_test_steps_endpoint(
                         if required_fields:
                             field_summary_lines.append("REQUIRED FIELDS (you MUST generate a step for each):")
                             for f in required_fields:
-                                label = f.get("label", f.get("api", ""))
+                                raw_label = f.get("label", f.get("api", ""))
+                                # Transform reference field labels to UI format
+                                label = f.get("ui_label", raw_label)
+                                if label == raw_label and f.get("type") == "reference" and label.endswith(" ID"):
+                                    label = label[:-3] + " Name"
                                 api = f.get("api", "")
                                 ftype = f.get("type", "string")
-                                is_user_mentioned = label.lower() in prompt_lower
+                                is_user_mentioned = label.lower() in prompt_lower or raw_label.lower() in prompt_lower
                                 tag = "[REQUIRED+USER-MENTIONED]" if is_user_mentioned else "[REQUIRED]"
-                                line = f"  {tag} Label=\"{label}\" | API={api} | Type={ftype}"
+                                # Add dependency annotation if this is a dependent picklist
+                                dep_controller = f.get("controllerName", "")
+                                dep_tag = f" [DEPENDENT on: {dep_controller}]" if dep_controller else ""
+                                line = f"  {tag}{dep_tag} Label=\"{label}\" | API={api} | Type={ftype}"
 
                                 # Add action hint
                                 if ftype in ("picklist", "multipicklist", "combobox"):
@@ -539,13 +758,86 @@ async def generate_test_steps_endpoint(
                                     line += f" | Action=SELECT | Values={values[:10]}"
                                 elif ftype == "reference":
                                     refs = f.get("referenceTo", [])
-                                    line += f" | Action=LOOKUP_SELECT | ReferenceTo={refs}"
+                                    valid_recs = lookup_values.get(label, []) or lookup_values.get(raw_label, [])
+                                    filtered_info = f.get("filteredLookupInfo")
+                                    if filtered_info:
+                                        line += f" | Action=LOOKUP_SELECT [FILTERED LOOKUP] | ReferenceTo={refs}"
+                                        if valid_recs:
+                                            line += (f" | ValidRecords={valid_recs}"
+                                                     f" ⚠ HAS LOOKUP FILTER — ValidRecords may NOT be selectable."
+                                                     f" The lookup will auto-select a valid filtered record at runtime.")
+                                    else:
+                                        line += f" | Action=LOOKUP_SELECT | ReferenceTo={refs}"
+                                        if valid_recs:
+                                            line += f" | ValidRecords={valid_recs}"
                                 elif ftype in ("date", "datetime"):
                                     line += f" | Action=TYPE | Format=MM/DD/YYYY"
                                 elif ftype == "boolean":
                                     line += f" | Action=CLICK"
                                 else:
                                     line += f" | Action=TYPE"
+
+                                field_summary_lines.append(line)
+
+                        # Recommended fields: fields that are nillable=true (so not
+                        # "required" by API) but are commonly required on the
+                        # Salesforce page layout.  Two categories:
+                        # 1) Lookup/reference fields (e.g., Account Name on Contact)
+                        # 2) Email-type fields (almost always required on layouts)
+                        EXCLUDE_API_PATTERNS = (
+                            "ownerid", "createdbyid", "lastmodifiedbyid",
+                            "masterrecordid", "individualid",
+                        )
+                        recommended_lookup_fields = [
+                            f for f in optional_fields
+                            if f.get("type") == "reference"
+                            and f.get("createable", True)
+                            and f.get("referenceTo")
+                            and f.get("api", "").lower() not in EXCLUDE_API_PATTERNS
+                        ]
+                        recommended_email_fields = [
+                            f for f in optional_fields
+                            if f.get("type") == "email"
+                            and f.get("createable", True)
+                        ]
+                        recommended_fields = recommended_lookup_fields + recommended_email_fields
+                        print(f"[TEST-GEN] RECOMMENDED fields for {obj_name}: "
+                              f"{[(f.get('label'), f.get('type')) for f in recommended_fields]}")
+
+                        if recommended_fields:
+                            field_summary_lines.append("")
+                            field_summary_lines.append(
+                                "RECOMMENDED FIELDS (you MUST include these in CREATE steps — "
+                                "they are required on the Salesforce page layout):"
+                            )
+                            for f in recommended_fields[:6]:  # Limit to top 6
+                                raw_label = f.get("label", f.get("api", ""))
+                                ftype = f.get("type", "string")
+
+                                if ftype == "reference":
+                                    # Transform reference label: " ID" → " Name"
+                                    label = f.get("ui_label", raw_label)
+                                    if label == raw_label and label.endswith(" ID"):
+                                        label = label[:-3] + " Name"
+                                    refs = f.get("referenceTo", [])
+                                    valid_recs = lookup_values.get(label, [])
+                                    if not valid_recs:
+                                        valid_recs = lookup_values.get(raw_label, [])
+                                    if not valid_recs and refs:
+                                        for lk_label, lk_vals in lookup_values.items():
+                                            if refs[0].lower() in lk_label.lower():
+                                                valid_recs = lk_vals
+                                                break
+                                    line = f"  [RECOMMENDED] Label=\"{label}\" | Type={ftype}"
+                                    line += f" | Action=LOOKUP_SELECT | ReferenceTo={refs}"
+                                    if valid_recs:
+                                        line += f" | ValidRecords={valid_recs}"
+                                elif ftype == "email":
+                                    label = raw_label
+                                    line = f"  [RECOMMENDED] Label=\"{label}\" | Type={ftype} | Action=TYPE"
+                                else:
+                                    label = raw_label
+                                    line = f"  [RECOMMENDED] Label=\"{label}\" | Type={ftype} | Action=TYPE"
 
                                 field_summary_lines.append(line)
 
@@ -567,12 +859,19 @@ async def generate_test_steps_endpoint(
                                     label = f.get("label", f.get("api", ""))
                                     ftype = f.get("type", "string")
                                     line = f"  [MUST INCLUDE] Label=\"{label}\" | Type={ftype}"
+                                    # Add dependency annotation
+                                    dep_controller = f.get("controllerName", "")
+                                    if dep_controller:
+                                        line = f"  [MUST INCLUDE] [DEPENDENT on: {dep_controller}] Label=\"{label}\" | Type={ftype}"
                                     if ftype in ("picklist", "multipicklist", "combobox"):
                                         values = [pv.get("label", pv.get("value", "")) for pv in f.get("picklistValues", []) if pv.get("active")]
                                         line += f" | Action=SELECT | Values={values[:10]}"
                                     elif ftype == "reference":
                                         refs = f.get("referenceTo", [])
+                                        valid_recs = lookup_values.get(label, [])
                                         line += f" | Action=LOOKUP_SELECT | ReferenceTo={refs}"
+                                        if valid_recs:
+                                            line += f" | ValidRecords={valid_recs}"
                                     elif ftype in ("date", "datetime"):
                                         line += f" | Action=TYPE | Format=MM/DD/YYYY"
                                     else:
@@ -582,21 +881,44 @@ async def generate_test_steps_endpoint(
 
                             if truly_optional:
                                 field_summary_lines.append("")
-                                field_summary_lines.append("OTHER FIELDS (generate steps if user mentions them):")
-                                for f in truly_optional[:40]:  # Limit to avoid token overflow
-                                    label = f.get("label", f.get("api", ""))
-                                    ftype = f.get("type", "string")
-                                    line = f"  [OPTIONAL] Label=\"{label}\" | Type={ftype}"
-                                    if ftype in ("picklist", "multipicklist", "combobox"):
-                                        values = [pv.get("label", pv.get("value", "")) for pv in f.get("picklistValues", []) if pv.get("active")]
-                                        line += f" | Action=SELECT | Values={values[:10]}"
-                                    elif ftype == "reference":
-                                        line += f" | Action=LOOKUP_SELECT"
-                                    elif ftype in ("date", "datetime"):
-                                        line += f" | Action=TYPE | Format=MM/DD/YYYY"
-                                    else:
-                                        line += f" | Action=TYPE"
-                                    field_summary_lines.append(line)
+                                field_summary_lines.append(
+                                    f"OTHER FIELDS ({len(truly_optional)} optional fields exist on this object. "
+                                    "DO NOT generate steps for these unless the user explicitly mentions them "
+                                    "in their prompt. For simple CREATE prompts, ONLY fill REQUIRED fields.):"
+                                )
+                                # Only list field names for reference, no action details
+                                # This prevents the LLM from generating steps for them
+                                opt_names = [f.get("label", "") for f in truly_optional[:20] if f.get("label")]
+                                if opt_names:
+                                    field_summary_lines.append(f"  Available: {', '.join(opt_names)}")
+
+                        # ─── Add explicit DEPENDENT PICKLIST RELATIONSHIPS section ───
+                        dep_relationships = []
+                        for f in fields:
+                            ctrl = f.get("controllerName", "")
+                            if ctrl and f.get("dependentPicklist"):
+                                dep_label = f.get("label", f.get("api", ""))
+                                # Resolve controller API name to label
+                                ctrl_label = ctrl
+                                for cf in fields:
+                                    if cf.get("api", "") == ctrl:
+                                        ctrl_label = cf.get("label", ctrl)
+                                        break
+                                dep_relationships.append((ctrl_label, dep_label))
+
+                        if dep_relationships:
+                            field_summary_lines.append("")
+                            field_summary_lines.append("=== DEPENDENT PICKLIST RELATIONSHIPS (CRITICAL — STEP ORDERING) ===")
+                            field_summary_lines.append(
+                                "The following fields are DEPENDENT PICKLISTS. "
+                                "You MUST generate the controlling field's step BEFORE the dependent field's step. "
+                                "If the controlling field is not selected first, the dependent field will have NO options."
+                            )
+                            for ctrl_label, dep_label in dep_relationships:
+                                field_summary_lines.append(
+                                    f"  RULE: SELECT \"{ctrl_label}\" BEFORE SELECT \"{dep_label}\""
+                                )
+                            field_summary_lines.append("=== END DEPENDENT PICKLIST RELATIONSHIPS ===")
 
                         field_summary_lines.append("")
 
@@ -656,7 +978,120 @@ async def generate_test_steps_endpoint(
                                 steps.append(new_step)
 
                         injected_names = [f[0] for f in injected]
-                        print(f"[TEST-GEN] ✅ Auto-injected missing steps: {injected_names}")
+                        print(f"[TEST-GEN] ✅ Auto-injected missing user-mentioned steps: {injected_names}")
+
+                    # ─── Validate ALL required metadata fields have steps ───
+                    # This catches required fields the LLM missed even though
+                    # they were in the metadata (e.g. Account on Contact)
+                    # BUT: Only auto-inject for CREATE/NEW operations!
+                    # For VIEW/OPEN/EDIT/DELETE, we should NOT inject required fields.
+                    is_create_op = any(kw in prompt_lower for kw in [
+                        'create ', 'new ', 'add ', 'insert ',
+                    ])
+                    # Also check if the generated steps already contain a "New" click
+                    has_new_click = any(
+                        s.get("action", "").lower() == "click"
+                        and "new" in (s.get("target") or "").lower()
+                        for s in steps
+                    )
+                    is_create_op = is_create_op or has_new_click
+
+                    is_view_op = any(kw in prompt_lower for kw in [
+                        'open ', 'view ', 'read ', 'navigate ',
+                        'generate pdf', 'generate invoice', 'preview',
+                        'delete ', 'clone ', 'inline edit',
+                    ])
+
+                    if is_view_op and not is_create_op:
+                        print(f"[TEST-GEN] ℹ Skipping required field injection — "
+                              f"detected VIEW/OPEN operation, not CREATE")
+                    else:
+                        step_targets_after = {
+                            s.get("target", "").lower()
+                            for s in steps
+                            if s.get("target") and s.get("action", "").upper() in (
+                                "TYPE", "SELECT", "LOOKUP", "LOOKUP_SELECT",
+                                "CHECKBOX", "MULTI_SELECT", "FILL", "INPUT",
+                            )
+                        }
+                        required_injected = []
+                        for record in meta_records:
+                            structured_r = record.structured_json or {}
+                            obj_r = structured_r.get("object", record.object_name)
+                            if allowed_objects is not None and obj_r not in allowed_objects:
+                                continue
+                            for f in structured_r.get("fields", []):
+                                if not f.get("required") or not f.get("createable", True):
+                                    continue
+                                label = f.get("label", "")
+                                if not label:
+                                    continue
+                                # Check if any existing step targets this field
+                                has_step = any(
+                                    label.lower() in t or t in label.lower()
+                                    for t in step_targets_after
+                                )
+                                if has_step:
+                                    continue
+                                # Determine the correct action and a sensible default value
+                                ftype = f.get("type", "string")
+                                if ftype == "reference":
+                                    action_name = "LOOKUP"
+                                    valid_recs = lookup_values.get(label, [])
+                                    default_val = valid_recs[0] if valid_recs else "Test"
+                                elif ftype in ("picklist", "combobox"):
+                                    action_name = "SELECT"
+                                    pvals = [pv.get("label", pv.get("value", ""))
+                                             for pv in f.get("picklistValues", []) if pv.get("active")]
+                                    default_val = pvals[0] if pvals else "Other"
+                                elif ftype == "multipicklist":
+                                    action_name = "MULTI_SELECT"
+                                    pvals = [pv.get("label", pv.get("value", ""))
+                                             for pv in f.get("picklistValues", []) if pv.get("active")]
+                                    default_val = pvals[0] if pvals else "Other"
+                                elif ftype == "boolean":
+                                    action_name = "CHECKBOX"
+                                    default_val = "true"
+                                elif ftype in ("date", "datetime"):
+                                    action_name = "TYPE"
+                                    default_val = "01/01/2025"
+                                elif ftype == "email":
+                                    action_name = "TYPE"
+                                    default_val = "test@example.com"
+                                elif ftype == "phone":
+                                    action_name = "TYPE"
+                                    default_val = "9876543210"
+                                elif ftype in ("currency", "double", "int", "percent"):
+                                    action_name = "TYPE"
+                                    default_val = "100"
+                                else:
+                                    action_name = "TYPE"
+                                    default_val = f"Test {label}"
+
+                                new_step = {
+                                    "id": str(len(steps) + 1),
+                                    "action": action_name,
+                                    "target": label,
+                                    "value": default_val,
+                                    "locator_type": "label",
+                                }
+                                required_injected.append((label, new_step))
+                                step_targets_after.add(label.lower())
+
+                        if required_injected:
+                            save_idx = None
+                            for i, s in enumerate(steps):
+                                t = (s.get("target") or "").lower()
+                                if s.get("action", "").lower() == "click" and "save" in t:
+                                    save_idx = i
+                                    break
+                            for flabel, new_step in reversed(required_injected):
+                                if save_idx is not None:
+                                    steps.insert(save_idx, new_step)
+                                else:
+                                    steps.append(new_step)
+                            req_names = [f[0] for f in required_injected]
+                            print(f"[TEST-GEN] ✅ Auto-injected missing REQUIRED fields: {req_names}")
 
                     # ─── Defer early TYPE steps to after all LOOKUP/SELECT ───
                     # Salesforce Lightning re-renders the form during lookup/picklist

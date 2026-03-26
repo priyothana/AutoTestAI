@@ -15,6 +15,7 @@ class TestRun(Base):
     result = Column(String, nullable=True) # overall result
     duration = Column(Float, nullable=True) # in seconds
     screenshot_path = Column(String, nullable=True)
+    ai_suggestions = Column(JSON, nullable=True)  # healing suggestions from AI Fix Assistant
     created_at = Column(DateTime, default=datetime.utcnow)
     
     test_case = relationship("TestCase", back_populates="test_runs")

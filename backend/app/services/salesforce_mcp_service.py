@@ -308,6 +308,23 @@ class SalesforceMCPService:
                         "nillable": f.get("nillable"),
                         "createable": f.get("createable"),
                         "updateable": f.get("updateable"),
+                        "defaultedOnCreate": f.get("defaultedOnCreate"),
+                        # For lookup/reference fields — tells us which object to query for real records
+                        "referenceTo": f.get("referenceTo", []),
+                        # Dependent picklist support
+                        "controllerName": f.get("controllerName", ""),
+                        "dependentPicklist": f.get("dependentPicklist", False),
+                        "unique": f.get("unique", False),
+                        "externalId": f.get("externalId", False),
+                        # Lookup filter criteria support
+                        "filteredLookupInfo": f.get("filteredLookupInfo") or None,
+                        "relationshipName": f.get("relationshipName", ""),
+                        "picklistValues": [
+                            {"label": v.get("label", v.get("value", "")),
+                             "value": v.get("value", ""),
+                             "active": v.get("active", True)}
+                            for v in (f.get("picklistValues") or []) if v.get("active")
+                        ] if f.get("type") in ("picklist", "multipicklist") else [],
                     }
                     for f in desc.get("fields", [])
                 ],
@@ -317,6 +334,92 @@ class SalesforceMCPService:
         except SalesforceError as e:
             logger.error(f"[mcp] Describe object failed: {e}")
             raise ValueError(f"Failed to describe object: {str(e)}")
+
+    @staticmethod
+    def get_lookup_filters(
+        username: str,
+        password: str,
+        security_token: str,
+        object_name: str,
+        domain: str = "login",
+    ) -> Dict[str, str]:
+        """
+        Query the Tooling API for LookupFilter metadata on an object.
+        Returns a dict of { field_api_name: "WHERE clause fragment" }.
+        
+        Example: {"Pay_To__c": "Name = 'DATASIRPI PRIVATE LIMITED' OR Name = 'DataSirpi LLC-FZC'"}
+        """
+        sf = SalesforceMCPService._get_client(
+            username, password, security_token, domain
+        )
+        filters = {}
+        try:
+            # Query LookupFilter via Tooling API
+            tooling_soql = (
+                f"SELECT Id, SourceFieldDefinition.QualifiedApiName, Active, IsOptional "
+                f"FROM LookupFilter "
+                f"WHERE SourceObject = '{object_name}' AND Active = true"
+            )
+            result = sf.restful(f"tooling/query", params={"q": tooling_soql})
+            records = result.get("records", [])
+            
+            for rec in records:
+                field_def = rec.get("SourceFieldDefinition") or {}
+                field_api = field_def.get("QualifiedApiName", "")
+                if not field_api:
+                    continue
+                # Strip object prefix if present (e.g., "Invoice__c.Pay_To__c" → "Pay_To__c")
+                if "." in field_api:
+                    field_api = field_api.split(".")[-1]
+                
+                # Query FilterItems for this LookupFilter
+                filter_id = rec.get("Id")
+                try:
+                    items_soql = (
+                        f"SELECT Field, Operation, Value, ValueField "
+                        f"FROM LookupFilterItem "
+                        f"WHERE LookupFilterId = '{filter_id}'"
+                    )
+                    items_result = sf.restful(f"tooling/query", params={"q": items_soql})
+                    items = items_result.get("records", [])
+                    
+                    where_parts = []
+                    for item in items:
+                        field = item.get("Field", "")         # e.g., "Account.Name"
+                        operation = item.get("Operation", "")  # e.g., "equals"
+                        val = item.get("Value", "")            # e.g., "DATASIRPI PRIVATE LIMITED"
+                        
+                        # Convert field reference: "Account.Name" → "Name" (target object field)
+                        if "." in field:
+                            field = field.split(".")[-1]
+                        
+                        # Map operation to SOQL
+                        op_map = {
+                            "equals": "=", "notEqual": "!=",
+                            "contains": "LIKE", "startsWith": "LIKE",
+                            "lessThan": "<", "greaterThan": ">",
+                            "lessOrEqual": "<=", "greaterOrEqual": ">=",
+                        }
+                        sql_op = op_map.get(operation, "=")
+                        
+                        if val:
+                            if sql_op == "LIKE" and operation == "contains":
+                                where_parts.append(f"{field} LIKE '%{val}%'")
+                            elif sql_op == "LIKE" and operation == "startsWith":
+                                where_parts.append(f"{field} LIKE '{val}%'")
+                            else:
+                                where_parts.append(f"{field} {sql_op} '{val}'")
+                    
+                    if where_parts:
+                        filters[field_api] = " OR ".join(where_parts)
+                        print(f"[MCP-FILTER] {object_name}.{field_api}: {filters[field_api]}")
+                except Exception as ie:
+                    print(f"[MCP-FILTER] ⚠ Could not query filter items for {field_api}: {ie}")
+                    
+        except Exception as e:
+            print(f"[MCP-FILTER] ⚠ Tooling API query failed for {object_name}: {e}")
+        
+        return filters
 
     @staticmethod
     def search(

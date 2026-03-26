@@ -394,10 +394,84 @@ async def run_playwright_test(
                         logger.info(f"[LEARNING] Execution learning processed for run {run_id}")
                     except Exception as learn_err:
                         logger.warning(f"[LEARNING] Execution learning failed (non-critical): {learn_err}")
+
+                    # --- AI Fix Assistant: generate healing suggestions for failed runs ---
+                    if final_status == "failed":
+                        try:
+                            from app.services.test_healing_service import TestHealingService
+                            heal_result = await TestHealingService.generate_healing_suggestions(
+                                logs=result_data.get("logs", []),
+                                steps=steps,
+                                project_id=project_id or "",
+                                db_session=session,
+                            )
+                            if heal_result:
+                                test_run.ai_suggestions = heal_result  # stores {analysis, corrected_steps}
+                                await session.commit()
+                                n = len((heal_result or {}).get("corrected_steps", []))
+                                logger.info(f"[HEALING] Stored corrected_steps ({n} steps) for run {run_id}")
+                        except Exception as heal_err:
+                            logger.warning(f"[HEALING] Non-critical failure: {heal_err}")
                 else:
                     logger.error(f"Could not find test run {run_id} in DB for background update")
         except Exception as db_err:
             logger.error(f"FAILED to update database for test run {run_id}: {db_err}", exc_info=True)
+
+# ─── AI Fix Assistant endpoints ───────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+from typing import Optional as _Optional, List as _List
+
+class HealChatRequest(_BaseModel):
+    """Request body for the /heal conversational endpoint."""
+    message: str
+    chat_history: _Optional[_List[dict]] = []
+    current_corrected_steps: _Optional[_List[dict]] = None
+
+@router.post("/{id}/heal")
+async def heal_test_run(
+    id: UUID,
+    body: HealChatRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Conversational AI Fix Assistant endpoint.
+
+    Accepts a user chat message + history, returns LLM reply + updated suggestions.
+    Used by the AiFixAssistant frontend component for follow-up questions.
+    """
+    # Load the test run
+    result = await db.execute(select(TestRun).where(TestRun.id == id))
+    test_run = result.scalars().first()
+    if not test_run:
+        raise HTTPException(status_code=404, detail="Test run not found")
+
+    # Load the associated test case steps
+    tc_result = await db.execute(
+        select(TestCase).where(TestCase.id == test_run.test_case_id)
+    )
+    test_case = tc_result.scalars().first()
+    if not test_case:
+        raise HTTPException(status_code=404, detail="Test case not found")
+
+    # Determine project_id
+    project_id = str(test_case.project_id)
+
+    try:
+        from app.services.test_healing_service import TestHealingService
+        response = await TestHealingService.chat(
+            run_id=str(id),
+            user_message=body.message,
+            chat_history=body.chat_history or [],
+            logs=test_run.logs or [],
+            steps=test_case.steps or [],
+            project_id=project_id,
+            db_session=db,
+            current_corrected_steps=body.current_corrected_steps,
+        )
+        return response
+    except Exception as e:
+        logger.error(f"[HEAL] endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Healing service error: {str(e)}")
 
 @router.get("/{id}", response_model=TestRunResponse)
 async def get_test_run(id: UUID, db: AsyncSession = Depends(get_db)):
@@ -420,6 +494,7 @@ async def get_test_run(id: UUID, db: AsyncSession = Depends(get_db)):
         screenshot_path=test_run.screenshot_path,
         test_case_id=test_run.test_case_id,
         test_case_name=test_case_name,
+        ai_suggestions=test_run.ai_suggestions,
         created_at=test_run.created_at
     )
 
