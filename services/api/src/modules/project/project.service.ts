@@ -1,0 +1,628 @@
+/**
+ * Project Module — Service Layer
+ *
+ * Public interface for the project module.
+ * All other modules that need project/credential data MUST import from here.
+ * NEVER import project.routes.ts or project.schema.ts from another module.
+ *
+ * Port of Python: projects.py + integrations.py + jira.py
+ * Owns Prisma models: projects, users, integrations, project_integrations
+ */
+import prisma from '../../shared/db/prisma.js'
+import { fernetEncrypt, fernetDecrypt } from '../../shared/encryption/fernet.js'
+import { createModuleLogger } from '../../shared/logger/index.js'
+import type {
+  ProjectCreate,
+  ProjectUpdate,
+  SalesforceCredentials,
+  JiraConnect,
+  JiraProjectConfig,
+} from './project.schema.js'
+
+const log = createModuleLogger('project')
+
+// ─── Project CRUD ────────────────────────────────────────────────
+
+/**
+ * Create a new project. Optionally auto-creates a web_app integration
+ * when login credentials are provided at the same time.
+ */
+export async function createProject(data: ProjectCreate) {
+  const project = await prisma.projects.create({
+    data: {
+      name: data.name,
+      description: data.description ?? null,
+      type: data.type,
+      category: data.category ?? 'webapp',
+      base_url: data.base_url ?? null,
+      status: data.status ?? 'Active',
+      tags: data.tags ?? [],
+      members: [],
+    },
+  })
+
+  // Auto-save webapp credentials when provided inline with project creation
+  if (data.base_url && (data.login_username || data.login_password)) {
+    try {
+      await createWebIntegration(
+        project.id,
+        data.login_url ?? data.base_url,
+        data.login_username ?? null,
+        data.login_password ?? null,
+        data.login_strategy ?? 'form',
+      )
+    } catch (err) {
+      log.warn({ err }, 'Failed to save web credentials during project creation')
+    }
+  }
+
+  return project
+}
+
+/**
+ * List projects with optional pagination, search, and filters.
+ */
+export async function listProjects(params: {
+  skip?: number
+  limit?: number
+  search?: string
+  status?: string
+  type?: string
+}) {
+  const { skip = 0, limit = 10, search, status, type } = params
+
+  const where: any = {}
+
+  if (search) {
+    where.OR = [
+      { name: { contains: search, mode: 'insensitive' } },
+      { description: { contains: search, mode: 'insensitive' } },
+    ]
+  }
+  if (status) where.status = status
+  if (type) where.type = type
+
+  return prisma.projects.findMany({
+    where,
+    skip,
+    take: limit,
+    orderBy: { created_at: 'desc' },
+  })
+}
+
+/**
+ * Get a single project by ID. Throws 404 if not found.
+ */
+export async function getProject(projectId: string) {
+  const project = await prisma.projects.findUnique({
+    where: { id: projectId },
+  })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+  return project
+}
+
+/**
+ * Partial update a project. Throws 404 if not found.
+ * Only provided (non-undefined) fields are updated.
+ */
+export async function updateProject(projectId: string, data: ProjectUpdate) {
+  const existing = await prisma.projects.findUnique({
+    where: { id: projectId },
+  })
+  if (!existing) throw { statusCode: 404, message: 'Project not found' }
+
+  // Build sparse update — only update explicitly provided fields
+  const updateData: any = {}
+  if (data.name !== undefined && data.name !== null) updateData.name = data.name
+  if (data.description !== undefined) updateData.description = data.description
+  if (data.type !== undefined && data.type !== null) updateData.type = data.type
+  if (data.category !== undefined) updateData.category = data.category
+  if (data.base_url !== undefined) updateData.base_url = data.base_url
+  if (data.status !== undefined) updateData.status = data.status
+  if (data.tags !== undefined) updateData.tags = data.tags
+
+  return prisma.projects.update({
+    where: { id: projectId },
+    data: updateData,
+  })
+}
+
+/**
+ * Soft-delete a project by setting status to 'Archived'.
+ * Hard delete is not supported — preserves referential integrity for
+ * test_cases, executions, and integration records.
+ */
+export async function deleteProject(projectId: string) {
+  const existing = await prisma.projects.findUnique({
+    where: { id: projectId },
+  })
+  if (!existing) throw { statusCode: 404, message: 'Project not found' }
+
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: { status: 'Archived' },
+  })
+}
+
+// ─── Integration Management ──────────────────────────────────────
+
+/**
+ * Create or update a web_app integration for a project.
+ * Credentials are Fernet-encrypted before storage.
+ * Called by POST /api/v1/projects/:id/integrations (category=web_app).
+ */
+export async function createWebIntegration(
+  projectId: string,
+  baseUrl: string,
+  username: string | null,
+  password: string | null,
+  loginStrategy: string,
+) {
+  const encUsername = username ? fernetEncrypt(username) : null
+  const encPassword = password ? fernetEncrypt(password) : null
+
+  // Upsert: if an integration already exists for this project, update it
+  const existing = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+
+  if (existing) {
+    return prisma.project_integrations.update({
+      where: { id: existing.id },
+      data: {
+        category: 'web_app',
+        status: 'connected',
+        base_url: baseUrl,
+        username: encUsername,
+        password: encPassword,
+        login_strategy: loginStrategy,
+      },
+    })
+  }
+
+  return prisma.project_integrations.create({
+    data: {
+      project_id: projectId,
+      category: 'web_app',
+      status: 'connected',
+      base_url: baseUrl,
+      username: encUsername,
+      password: encPassword,
+      login_strategy: loginStrategy,
+    },
+  })
+}
+
+/**
+ * Create an API integration (API key or bearer token).
+ * Tokens are Fernet-encrypted before storage.
+ */
+export async function createApiIntegration(
+  projectId: string,
+  baseUrl: string | null,
+  apiKey: string | null,
+  bearerToken: string | null,
+) {
+  const authConfig: Record<string, string> = {}
+  if (apiKey) authConfig.api_key = fernetEncrypt(apiKey)
+  if (bearerToken) authConfig.bearer_token = fernetEncrypt(bearerToken)
+
+  return prisma.project_integrations.create({
+    data: {
+      project_id: projectId,
+      category: 'api',
+      status: 'connected',
+      base_url: baseUrl,
+      auth_config: authConfig,
+    },
+  })
+}
+
+/**
+ * Get all integrations for a project.
+ * Returns the full list so the frontend can render per-category status.
+ * Called by GET /api/v1/projects/:id/integrations.
+ */
+export async function getProjectIntegrations(projectId: string) {
+  // Verify the project exists first
+  const project = await prisma.projects.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+
+  return prisma.project_integrations.findMany({
+    where: { project_id: projectId },
+    orderBy: { created_at: 'desc' },
+  })
+}
+
+/**
+ * Save a new integration config (generic upsert).
+ * Called by POST /api/v1/projects/:id/integrations.
+ * Routes to the correct integration type based on category.
+ */
+export async function createIntegration(
+  projectId: string,
+  body: {
+    category: string
+    base_url?: string
+    username?: string
+    password?: string
+    login_strategy?: string
+    api_key?: string
+    bearer_token?: string
+    client_id?: string
+    client_secret?: string
+  },
+) {
+  const category = body.category.toLowerCase()
+
+  if (category === 'web_app') {
+    if (!body.base_url) throw { statusCode: 400, message: 'base_url is required for web_app' }
+    return createWebIntegration(
+      projectId,
+      body.base_url,
+      body.username ?? null,
+      body.password ?? null,
+      body.login_strategy ?? 'form',
+    )
+  }
+
+  if (category === 'api') {
+    return createApiIntegration(
+      projectId,
+      body.base_url ?? null,
+      body.api_key ?? null,
+      body.bearer_token ?? null,
+    )
+  }
+
+  if (category === 'salesforce') {
+    // Salesforce OAuth is initiated via save-sf-credentials + OAuth flow
+    throw {
+      statusCode: 400,
+      message:
+        "Use POST /api/v1/projects/:id/save-sf-credentials to configure Salesforce credentials, then initiate OAuth.",
+    }
+  }
+
+  throw { statusCode: 400, message: `Unsupported category: '${category}'` }
+}
+
+/**
+ * Delete the first integration found for a project.
+ * Returns false if no integration exists.
+ */
+export async function deleteIntegration(projectId: string): Promise<boolean> {
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+  if (!integration) return false
+
+  await prisma.project_integrations.delete({
+    where: { id: integration.id },
+  })
+  return true
+}
+
+/**
+ * Get the first integration record for a project (raw DB row).
+ * Internal helper — callers should use getIntegrationStatus for the
+ * frontend-facing response shape.
+ */
+export async function getIntegration(projectId: string) {
+  return prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+}
+
+/**
+ * Get integration status in the shape expected by the frontend.
+ * Matches Python: GET /api/v1/projects/:id/integration-status
+ */
+export async function getIntegrationStatus(projectId: string) {
+  const integration = await getIntegration(projectId)
+
+  // Collect ui_session fields from the project row
+  const project = await prisma.projects.findUnique({
+    where: { id: projectId },
+    select: {
+      ui_session_active: true,
+      ui_session_last_created_at: true,
+      ui_session_source: true,
+    },
+  })
+
+  const sessionStatus = {
+    active: project?.ui_session_active ?? false,
+    last_created_at: project?.ui_session_last_created_at?.toISOString() ?? null,
+    source: project?.ui_session_source ?? null,
+  }
+
+  if (!integration) {
+    return {
+      status: 'disconnected',
+      category: null,
+      message: 'No integration configured for this project',
+      sync_counts: null,
+      ui_session: sessionStatus,
+    }
+  }
+
+  const syncCounts = await getSyncCounts(projectId)
+
+  return {
+    id: integration.id,
+    project_id: integration.project_id,
+    category: integration.category,
+    status: integration.status,
+    base_url: integration.base_url,
+    instance_url: integration.instance_url,
+    login_strategy: integration.login_strategy,
+    org_id: integration.org_id,
+    salesforce_login_url: integration.salesforce_login_url,
+    has_sf_credentials:
+      integration.category === 'salesforce' ? Boolean(integration.client_id) : null,
+    mcp_connected: Boolean(integration.mcp_connected),
+    last_synced_at: integration.last_synced_at?.toISOString() ?? null,
+    sync_error: integration.sync_error,
+    sync_counts: syncCounts,
+    ui_session: sessionStatus,
+    created_at: integration.created_at?.toISOString() ?? null,
+    updated_at: integration.updated_at?.toISOString() ?? null,
+  }
+}
+
+/** Count Salesforce metadata records — returned in integration status. */
+async function getSyncCounts(projectId: string) {
+  const [raw, normalized, domain, embeddings] = await Promise.all([
+    prisma.metadata_raw_store.count({ where: { project_id: projectId } }),
+    prisma.metadata_normalized.count({ where: { project_id: projectId } }),
+    prisma.domain_models.count({ where: { project_id: projectId } }),
+    prisma.vector_embeddings.count({ where: { project_id: projectId } }),
+  ])
+  return {
+    raw_count: raw,
+    normalized_count: normalized,
+    domain_model_count: domain,
+    embedding_count: embeddings,
+  }
+}
+
+// ─── Salesforce OAuth ────────────────────────────────────────────
+
+/**
+ * Save Salesforce Connected App credentials (Fernet-encrypted).
+ * Must be called before initiating OAuth.
+ */
+export async function saveSfCredentials(projectId: string, data: SalesforceCredentials) {
+  const encClientId = fernetEncrypt(data.client_id)
+  const encClientSecret = fernetEncrypt(data.client_secret)
+  const encUsername = data.sf_username ? fernetEncrypt(data.sf_username) : null
+  const encPassword = data.sf_password ? fernetEncrypt(data.sf_password) : null
+
+  const redirectUri =
+    data.redirect_uri ??
+    process.env.SALESFORCE_REDIRECT_URI ??
+    `http://localhost:4000/api/v1/integrations/salesforce/callback`
+
+  const existing = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+
+  if (existing) {
+    return prisma.project_integrations.update({
+      where: { id: existing.id },
+      data: {
+        category: 'salesforce',
+        client_id: encClientId,
+        client_secret: encClientSecret,
+        username: encUsername,
+        password: encPassword,
+        salesforce_redirect_uri: redirectUri,
+        salesforce_login_url: data.login_url ?? 'https://login.salesforce.com',
+      },
+    })
+  }
+
+  return prisma.project_integrations.create({
+    data: {
+      project_id: projectId,
+      category: 'salesforce',
+      status: 'disconnected',
+      client_id: encClientId,
+      client_secret: encClientSecret,
+      username: encUsername,
+      password: encPassword,
+      salesforce_redirect_uri: redirectUri,
+      salesforce_login_url: data.login_url ?? 'https://login.salesforce.com',
+    },
+  })
+}
+
+// ─── Credential Access (cross-module public interface) ───────────
+
+/**
+ * Return decrypted integration tokens for a project.
+ * Used by salesforce.service.ts and execution.service.ts — they must
+ * never query project_integrations directly.
+ */
+export async function getDecryptedTokens(integrationId: string) {
+  const integration = await prisma.project_integrations.findUnique({
+    where: { id: integrationId },
+  })
+  if (!integration) throw { statusCode: 404, message: 'Integration not found' }
+
+  const result: Record<string, string | null> = {}
+
+  if (integration.username) result.username = fernetDecrypt(integration.username)
+  if (integration.password) result.password = fernetDecrypt(integration.password)
+  if (integration.access_token) result.access_token = fernetDecrypt(integration.access_token)
+  if (integration.refresh_token) result.refresh_token = fernetDecrypt(integration.refresh_token)
+  if (integration.client_id) result.client_id = fernetDecrypt(integration.client_id)
+  if (integration.client_secret) result.client_secret = fernetDecrypt(integration.client_secret)
+  if (integration.security_token) result.security_token = fernetDecrypt(integration.security_token)
+  if (integration.jira_token) result.jira_token = fernetDecrypt(integration.jira_token)
+
+  return result
+}
+
+/**
+ * Get the raw integration record by project ID (for internal service use).
+ * Other modules call this to discover if a Salesforce/Jira connection exists.
+ */
+export async function getIntegrationByProject(projectId: string) {
+  return prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+}
+
+// ─── Jira ────────────────────────────────────────────────────────
+
+export async function jiraConnect(data: JiraConnect) {
+  // Validate and normalise domain
+  let domain = data.jira_domain.replace(/\/+$/, '')
+  if (!domain.includes('.atlassian.net')) {
+    throw {
+      statusCode: 400,
+      message: 'Jira domain must be a valid Atlassian URL (e.g., yoursite.atlassian.net)',
+    }
+  }
+  if (!domain.startsWith('https://')) domain = `https://${domain}`
+
+  const authHeader =
+    'Basic ' + Buffer.from(`${data.jira_email}:${data.jira_token}`).toString('base64')
+  const response = await fetch(`${domain}/rest/api/3/myself`, {
+    headers: { Authorization: authHeader, Accept: 'application/json' },
+  })
+
+  if (!response.ok) {
+    const text = await response.text()
+    throw { statusCode: 400, message: `Jira connection failed: ${text}` }
+  }
+
+  const user = await response.json()
+  return { connected: true, user }
+}
+
+export async function jiraBoards(data: JiraConnect) {
+  let domain = data.jira_domain.replace(/\/+$/, '')
+  if (!domain.startsWith('https://')) domain = `https://${domain}`
+
+  const authHeader =
+    'Basic ' + Buffer.from(`${data.jira_email}:${data.jira_token}`).toString('base64')
+  const response = await fetch(`${domain}/rest/agile/1.0/board`, {
+    headers: { Authorization: authHeader, Accept: 'application/json' },
+  })
+
+  if (!response.ok) throw { statusCode: 400, message: 'Failed to fetch Jira boards' }
+
+  const result = (await response.json()) as any
+  return result.values ?? []
+}
+
+export async function jiraBoardIssues(
+  domain: string,
+  email: string,
+  token: string,
+  boardId: string | number,
+) {
+  if (!domain.startsWith('https://')) domain = `https://${domain}`
+
+  const authHeader =
+    'Basic ' + Buffer.from(`${email}:${token}`).toString('base64')
+  const response = await fetch(
+    `${domain}/rest/agile/1.0/board/${boardId}/issue?maxResults=50`,
+    { headers: { Authorization: authHeader, Accept: 'application/json' } },
+  )
+
+  if (!response.ok) throw { statusCode: 400, message: 'Failed to fetch board issues' }
+
+  const result = (await response.json()) as any
+  return result.issues ?? []
+}
+
+export async function saveJiraConfig(projectId: string, data: JiraProjectConfig) {
+  const encToken = fernetEncrypt(data.jira_token)
+
+  const existing = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+
+  if (existing) {
+    return prisma.project_integrations.update({
+      where: { id: existing.id },
+      data: {
+        jira_domain: data.jira_domain,
+        jira_email: data.jira_email,
+        jira_token: encToken,
+        jira_board_id: String(data.board_id),
+        jira_board_name: data.board_name ?? null,
+      },
+    })
+  }
+
+  return prisma.project_integrations.create({
+    data: {
+      project_id: projectId,
+      category: 'webapp',
+      status: 'connected',
+      jira_domain: data.jira_domain,
+      jira_email: data.jira_email,
+      jira_token: encToken,
+      jira_board_id: String(data.board_id),
+      jira_board_name: data.board_name ?? null,
+    },
+  })
+}
+
+export async function getJiraConfig(projectId: string) {
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+    select: {
+      jira_domain: true,
+      jira_email: true,
+      jira_token: true,
+      jira_board_id: true,
+      jira_board_name: true,
+    },
+  })
+
+  if (!integration || !integration.jira_domain) return null
+
+  return {
+    jira_domain: integration.jira_domain,
+    jira_email: integration.jira_email,
+    jira_board_id: integration.jira_board_id,
+    jira_board_name: integration.jira_board_name,
+    configured: true,
+  }
+}
+
+export async function getJiraStories(projectId: string) {
+  const config = await getJiraConfig(projectId)
+  if (!config || !config.jira_domain || !config.jira_board_id) {
+    throw { statusCode: 404, message: 'Jira not configured for this project' }
+  }
+
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+    select: {
+      jira_token: true,
+      jira_email: true,
+      jira_domain: true,
+      jira_board_id: true,
+    },
+  })
+
+  if (!integration?.jira_token) throw { statusCode: 404, message: 'Jira token not found' }
+
+  const token = fernetDecrypt(integration.jira_token)
+  return jiraBoardIssues(
+    integration.jira_domain!,
+    integration.jira_email!,
+    token,
+    integration.jira_board_id!,
+  )
+}

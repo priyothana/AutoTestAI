@@ -7,11 +7,36 @@ services:
     ports:
       - "3002:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      # ── Switch to Node.js backend on 4000 ──
+      - NEXT_PUBLIC_API_URL=http://localhost:4000
       - NEXT_TURBOPACK=false
     depends_on:
-      - backend
+      - api
 
+  # ── Node.js API (migration target) ─────────────────────────────
+  api:
+    build: ./services/api
+    container_name: autotest-api
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/autotestdb
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${SECRET_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - SALESFORCE_ENCRYPTION_KEY=${SALESFORCE_ENCRYPTION_KEY}
+      - SALESFORCE_REDIRECT_URI=${SALESFORCE_REDIRECT_URI}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  # ── Python backend (kept alive during migration) ────────────────
   backend:
     build: ./backend
     volumes:
@@ -45,7 +70,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U postgres -d autotestdb" ]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d autotestdb"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -57,3 +82,4 @@ services:
 
 volumes:
   postgres_data:
+
