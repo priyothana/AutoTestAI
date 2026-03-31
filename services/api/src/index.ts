@@ -3,6 +3,10 @@
  *
  * Single Node.js backend on port 4000.
  * Registers all module routes under /api/v1 — identical paths to Python FastAPI.
+ *
+ * Stage 3 additions:
+ *   - TASK 2: Rich /health endpoint (db + redis + per-queue waiting counts)
+ *   - TASK 3: pino-http structured request logging → stdout + logs/node.log (50MB rotation)
  */
 import 'dotenv/config'
 import Fastify from 'fastify'
@@ -12,7 +16,18 @@ import fastifyStatic from '@fastify/static'
 import { registerJwt } from './shared/auth/jwt.js'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
-import { mkdirSync } from 'fs'
+import { mkdirSync, statSync, renameSync, createWriteStream } from 'fs'
+import pino from 'pino'
+import { randomUUID } from 'crypto'
+import { Queue } from 'bullmq'
+import type { IncomingMessage, ServerResponse } from 'http'
+// pino-http is CJS-only; use createRequire for type-safe compat
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const pinoHttp: (...args: any[]) => any = (() => {
+  const _r = createRequire(import.meta.url)
+  const m = _r('pino-http')
+  return typeof m === 'function' ? m : m.default ?? m.pinoHttp
+})()
 
 // Module route imports
 import { authRoutes } from './modules/auth/auth.routes.js'
@@ -27,6 +42,16 @@ import { generationRoutes } from './modules/test-generation/generation.routes.js
 import { executionRoutes } from './modules/execution/execution.routes.js'
 import { notificationRoutes } from './modules/notification/notification.routes.js'
 import prisma from './shared/db/prisma.js'
+import { redisConnection, getRedisOptions } from './shared/queue/connection.js'
+import { QUEUES } from './shared/queue/queues.js'
+
+// ─── Read package version once ───────────────────────────────────────────────
+import { createRequire } from 'module'
+const require = createRequire(import.meta.url) // shared require for CJS interop
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pkgVersion: string = (() => {
+  try { return (require('../package.json') as { version: string }).version } catch { return 'unknown' }
+})()
 
 // ─── Global crash handlers — print everything to stdout for docker logs ──
 process.on('uncaughtException', (err) => {
@@ -51,9 +76,75 @@ try {
   console.warn('[WARN] Could not create static dirs:', e)
 }
 
+// ─── TASK 3: Log file setup with 50MB rotation ───────────────────────────────
+const logsDir = join(__dirname, '..', 'logs')
+const logFilePath = join(logsDir, 'node.log')
+const LOG_MAX_BYTES = 50 * 1024 * 1024 // 50 MB
+
+function setupLogFile(): ReturnType<typeof createWriteStream> {
+  mkdirSync(logsDir, { recursive: true })
+  try {
+    const stat = statSync(logFilePath)
+    if (stat.size >= LOG_MAX_BYTES) {
+      const rotated = join(logsDir, 'node.log.1')
+      renameSync(logFilePath, rotated)
+      console.log(`[STARTUP] 📦 Log rotated: node.log → node.log.1 (was ${(stat.size / 1024 / 1024).toFixed(1)} MB)`)
+    }
+  } catch {
+    // File does not exist yet — that's fine
+  }
+  return createWriteStream(logFilePath, { flags: 'a' })
+}
+
+const logFileStream = setupLogFile()
+
+// ─── Pino logger: fan-out to stdout + log file ───────────────────────────────
+const logger = pino(
+  {
+    level: 'info',
+    base: { backend: 'node' },
+    timestamp: pino.stdTimeFunctions.epochTime, // unix ms
+  },
+  pino.multistream([
+    { stream: process.stdout },
+    { stream: logFileStream },
+  ]),
+)
+
+// ─── pino-http middleware factory ─────────────────────────────────────────────
+const httpLogger = pinoHttp({
+  logger,
+  genReqId: () => randomUUID(),
+  customAttributeKeys: { reqId: 'reqId' },
+  serializers: {
+    req(req: IncomingMessage & { id?: string }) {
+      return {
+        method: (req as { method?: string }).method,
+        url: (req as { url?: string }).url,
+        reqId: req.id,
+      }
+    },
+    res(res: ServerResponse) {
+      return { statusCode: res.statusCode }
+    },
+  },
+  customSuccessMessage(_req: IncomingMessage, res: ServerResponse) {
+    return `${res.statusCode}`
+  },
+  customErrorMessage(_req: IncomingMessage, res: ServerResponse) {
+    return `${res.statusCode}`
+  },
+})
+
 // ─── Build Fastify app ───────────────────────────────────────────────────────
 export async function buildApp() {
   const app = Fastify({ logger: false, ignoreTrailingSlash: true })
+
+  // Attach pino-http as a global hook
+  app.addHook('onRequest', (req, reply, done) => {
+    httpLogger(req.raw, reply.raw)
+    done()
+  })
 
   await app.register(cors, {
     origin: [
@@ -82,7 +173,8 @@ export async function buildApp() {
   }
 
   // ─── Register each module with individual error reporting ────────────────
-  const modules: Array<{ name: string; fn: (app: typeof app, opts: object) => Promise<void>; prefix: string }> = [
+  type ModuleEntry = { name: string; fn: (a: ReturnType<typeof Fastify>, opts: object) => Promise<void>; prefix: string }
+  const modules: ModuleEntry[] = [
     { name: 'auth',         fn: authRoutes as never,         prefix: '/api/v1/users' },
     { name: 'project',      fn: projectRoutes as never,      prefix: '/api/v1' },
     { name: 'test-case',    fn: testCaseRoutes as never,     prefix: '/api/v1' },
@@ -107,9 +199,68 @@ export async function buildApp() {
     }
   }
 
-  // Health endpoints
-  app.get('/', async () => ({ message: 'AutoTest AI API', status: 'ok', port: 4000 }))
-  app.get('/health', async () => ({ status: 'ok', service: 'autotest-ai-api', timestamp: new Date().toISOString() }))
+  // ─── TASK 2: Root ping ────────────────────────────────────────────────────
+  app.get('/', async () => ({ message: 'AutoTest AI API', status: 'ok', backend: 'node', port: 4000 }))
+
+  // ─── TASK 2: Rich /health endpoint ───────────────────────────────────────
+  app.get('/health', async (_req, reply) => {
+    const startCheck = Date.now()
+
+    // DB check
+    let dbStatus: 'ok' | 'error' = 'error'
+    try {
+      await prisma.$queryRaw`SELECT 1`
+      dbStatus = 'ok'
+    } catch { /* stays 'error' */ }
+
+    // Redis check via shared connection
+    let redisStatus: 'ok' | 'error' = 'error'
+    try {
+      await redisConnection.ping()
+      redisStatus = 'ok'
+    } catch { /* stays 'error' */ }
+
+    // Queue waiting counts
+    const connOpts = getRedisOptions()
+    const executionQueue  = new Queue(QUEUES.EXECUTION,    { ...connOpts })
+    const healingQueue    = new Queue(QUEUES.HEALING,      { ...connOpts })
+    const notificationQueue = new Queue(QUEUES.NOTIFICATION, { ...connOpts })
+
+    let executionWaiting  = -1
+    let healingWaiting    = -1
+    let notificationWaiting = -1
+
+    try { executionWaiting    = await executionQueue.getWaitingCount()    } catch { /* skip */ }
+    try { healingWaiting      = await healingQueue.getWaitingCount()      } catch { /* skip */ }
+    try { notificationWaiting = await notificationQueue.getWaitingCount() } catch { /* skip */ }
+
+    // Cleanup throwaway Queue instances (don't close the shared connection)
+    await executionQueue.close().catch(() => {})
+    await healingQueue.close().catch(() => {})
+    await notificationQueue.close().catch(() => {})
+
+    const overallOk = dbStatus === 'ok' && redisStatus === 'ok'
+    const httpStatus = overallOk ? 200 : 503
+
+    logger.info({ event: 'health_check', db: dbStatus, redis: redisStatus, durationMs: Date.now() - startCheck })
+
+    return reply.status(httpStatus).send({
+      status:    overallOk ? 'ok' : 'error',
+      backend:   'node',
+      version:   pkgVersion,
+      timestamp: new Date().toISOString(),
+      uptime:    process.uptime(),
+      modules: {
+        db:    dbStatus,
+        redis: redisStatus,
+        queues: {
+          execution:    executionWaiting,
+          healing:      healingWaiting,
+          notification: notificationWaiting,
+        },
+      },
+    })
+  })
 
   return app
 }
@@ -118,11 +269,14 @@ export async function buildApp() {
 async function main() {
   const port = parseInt(process.env.PORT ?? '4000', 10)
 
+  logger.info({ event: 'startup', port, nodeEnv: process.env.NODE_ENV ?? 'not set', version: pkgVersion },
+    'AutoTest AI API starting')
   console.log('[STARTUP] ========================================')
   console.log(`[STARTUP] AutoTest AI API starting on port ${port}`)
   console.log(`[STARTUP] NODE_ENV    = ${process.env.NODE_ENV ?? 'not set'}`)
   console.log(`[STARTUP] DATABASE_URL= ${(process.env.DATABASE_URL ?? 'not set').replace(/:\/\/[^@]+@/, '://<redacted>@')}`)
   console.log(`[STARTUP] REDIS_URL   = ${process.env.REDIS_URL ?? 'not set'}`)
+  console.log(`[STARTUP] Log file    = ${logFilePath}`)
   console.log('[STARTUP] ========================================')
 
   let app: Awaited<ReturnType<typeof buildApp>>
