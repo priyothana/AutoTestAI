@@ -7,15 +7,18 @@ import { z } from 'zod'
 
 export const UserCreateSchema = z.object({
   email: z.string().email(),
-  username: z.string().min(1),
+  username: z.string().min(1).optional(),
   password: z.string().min(1),
   full_name: z.string().optional().nullable(),
   role: z.string().default('TESTER'),
 })
 
 export const UserLoginSchema = z.object({
-  username: z.string().min(1),
+  username: z.string().min(1).optional(),
+  email: z.string().optional(),
   password: z.string().min(1),
+}).refine((data) => data.username || data.email, {
+  message: 'Either username or email is required',
 })
 
 export const UserResponseSchema = z.object({

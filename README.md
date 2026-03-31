@@ -14,9 +14,39 @@ AutoTest AI is a no-code, AI-powered test automation platform that helps users g
 ## Tech Stack
 
 - **Frontend**: Next.js 15, React 19, TypeScript, Tailwind CSS, Shadcn/UI.
-- **Backend**: Python 3.12, FastAPI, SQLAlchemy, AsyncPG.
+- **Backend**: Node.js 22, Fastify, Prisma, BullMQ, LangChain.js (migrated from Python FastAPI).
+- **Salesforce Engine**: JSforce (TypeScript, ~500 lines) — replaces the legacy Python engine.
 - **Database**: PostgreSQL 16.
+- **Queue**: Redis + BullMQ.
 - **Infrastructure**: Docker, Docker Compose.
+
+## Salesforce Engine
+
+The Salesforce integration is handled entirely by **JSforce** within the Node.js API service.
+
+> The Python Salesforce engine (≈240K lines) has been **fully replaced**. The Python service is no longer required.
+
+Key capabilities:
+- `GET /api/salesforce/metadata/:objectName` — object describe with field + record type data
+- `GET /api/salesforce/fields/:objectName` — typed field descriptors
+- `GET /api/salesforce/picklist/:objectName/:fieldName` — picklist values
+- `GET /api/salesforce/picklist-dependent/:objectName/:controller/:dependent` — bitmap-decoded dependent picklists
+- `GET /api/salesforce/objects` — global describe (queryable objects)
+- `GET /api/salesforce/record-types/:objectName` — record type infos
+- `POST /api/salesforce/cache/invalidate` — targeted in-process cache eviction (JWT-auth required)
+
+Connection pool features:
+- One persistent JSforce connection per project (password + OAuth2 flows)
+- Health-check eviction every 30 minutes via `conn.identity()`
+- Concurrent-request deduplication — only one login per project at a time
+- Graceful drain on SIGTERM (`conn.logout()` for all pooled connections)
+
+To run the parity verification against a Python engine (if still available):
+
+```bash
+PROJECT_ID=<your-project-id> npx tsx scripts/sf-parity-check.ts
+```
+
 
 ## Getting Started
 

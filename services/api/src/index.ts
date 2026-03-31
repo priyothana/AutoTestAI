@@ -10,7 +10,6 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import fastifyStatic from '@fastify/static'
 import { registerJwt } from './shared/auth/jwt.js'
-import { createModuleLogger } from './shared/logger/index.js'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { mkdirSync } from 'fs'
@@ -23,28 +22,46 @@ import { testRunRoutes } from './modules/test-run/test-run.routes.js'
 import { analyticsRoutes } from './modules/analytics/analytics.routes.js'
 import { settingsRoutes } from './modules/settings/settings.routes.js'
 import { salesforceRoutes } from './modules/salesforce/salesforce.routes.js'
-import { selfHealingRoutes } from './modules/self-healing/self-healing.routes.js'
+import { healingRoutes } from './modules/self-healing/healing.routes.js'
+import { generationRoutes } from './modules/test-generation/generation.routes.js'
+import { executionRoutes } from './modules/execution/execution.routes.js'
+import { notificationRoutes } from './modules/notification/notification.routes.js'
 import prisma from './shared/db/prisma.js'
 
-const log = createModuleLogger('server')
+// ─── Global crash handlers — print everything to stdout for docker logs ──
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught Exception:', err.message)
+  console.error(err.stack)
+  process.exit(1)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled Rejection:', String(reason))
+  process.exit(1)
+})
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
-// ─── Prepare static dirs ─────────────────────────────────────────
+// ─── Prepare static dirs ─────────────────────────────────────────────────────
 const staticDir = join(__dirname, '..', 'static')
 const screenshotsDir = join(__dirname, '..', 'screenshots')
-mkdirSync(join(staticDir, 'test-runs'), { recursive: true })
-mkdirSync(screenshotsDir, { recursive: true })
+try {
+  mkdirSync(join(staticDir, 'test-runs'), { recursive: true })
+  mkdirSync(screenshotsDir, { recursive: true })
+} catch (e) {
+  console.warn('[WARN] Could not create static dirs:', e)
+}
 
-// ─── Build app ───────────────────────────────────────────────────
+// ─── Build Fastify app ───────────────────────────────────────────────────────
 export async function buildApp() {
-  const app = Fastify({ logger: false })
+  const app = Fastify({ logger: false, ignoreTrailingSlash: true })
 
-  // CORS — match Python's allow_origins
   await app.register(cors, {
     origin: [
       'http://localhost:3000',
       'http://127.0.0.1:3000',
       'http://localhost:3001',
+      'http://localhost:3002',
+      'http://127.0.0.1:3002',
       'http://localhost:4000',
       'http://127.0.0.1:4000',
     ],
@@ -54,65 +71,85 @@ export async function buildApp() {
   })
 
   await app.register(helmet, { contentSecurityPolicy: false })
-
-  // JWT
   await registerJwt(app)
 
-  // Static file serving (test run screenshots + assets)
-  await app.register(fastifyStatic, {
-    root: staticDir,
-    prefix: '/static/',
-    decorateReply: false,
-  })
+  // Static file serving
+  try {
+    await app.register(fastifyStatic, { root: staticDir, prefix: '/static/', decorateReply: false })
+    await app.register(fastifyStatic, { root: screenshotsDir, prefix: '/screenshots/', decorateReply: false })
+  } catch (e) {
+    console.warn('[WARN] Static serving unavailable:', e)
+  }
 
-  await app.register(fastifyStatic, {
-    root: screenshotsDir,
-    prefix: '/screenshots/',
-    decorateReply: false,
-  })
+  // ─── Register each module with individual error reporting ────────────────
+  const modules: Array<{ name: string; fn: (app: typeof app, opts: object) => Promise<void>; prefix: string }> = [
+    { name: 'auth',         fn: authRoutes as never,         prefix: '/api/v1/users' },
+    { name: 'project',      fn: projectRoutes as never,      prefix: '/api/v1' },
+    { name: 'test-case',    fn: testCaseRoutes as never,     prefix: '/api/v1' },
+    { name: 'test-run',     fn: testRunRoutes as never,      prefix: '/api/v1/test-runs' },
+    { name: 'analytics',    fn: analyticsRoutes as never,    prefix: '/api/v1/analytics' },
+    { name: 'settings',     fn: settingsRoutes as never,     prefix: '/api/v1/settings' },
+    { name: 'salesforce',   fn: salesforceRoutes as never,   prefix: '/api/v1' },
+    { name: 'healing',      fn: healingRoutes as never,      prefix: '/api/v1' },
+    { name: 'generation',   fn: generationRoutes as never,   prefix: '/api/v1' },
+    { name: 'execution',    fn: executionRoutes as never,    prefix: '/api/v1' },
+    { name: 'notification', fn: notificationRoutes as never, prefix: '/api/v1' },
+  ]
 
-  // ─── Module Registration ────────────────────────────────────────
-  // Every path must match Python FastAPI's /api/v1/<resource> exactly
+  for (const mod of modules) {
+    try {
+      await app.register(mod.fn, { prefix: mod.prefix })
+      console.log(`[STARTUP] ✓ ${mod.name} routes registered`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`[STARTUP] ✗ FAILED to register ${mod.name}: ${msg}`)
+      throw err
+    }
+  }
 
-  await app.register(authRoutes,      { prefix: '/api/v1/users' })
-  await app.register(projectRoutes,   { prefix: '/api/v1' })
-  await app.register(testCaseRoutes,  { prefix: '/api/v1' })
-  await app.register(testRunRoutes,   { prefix: '/api/v1/test-runs' })
-  await app.register(analyticsRoutes, { prefix: '/api/v1/analytics' })
-  await app.register(settingsRoutes,  { prefix: '/api/v1/settings' })
-  await app.register(salesforceRoutes,  { prefix: '/api/v1' })
-  await app.register(selfHealingRoutes, { prefix: '/api/v1' })
-
-  // Root health check (no DB dependency — always responds)
+  // Health endpoints
   app.get('/', async () => ({ message: 'AutoTest AI API', status: 'ok', port: 4000 }))
-
-  // /health — liveness probe
-  app.get('/health', async () => ({
-    status: 'ok',
-    service: 'autotest-ai-api',
-    timestamp: new Date().toISOString(),
-  }))
+  app.get('/health', async () => ({ status: 'ok', service: 'autotest-ai-api', timestamp: new Date().toISOString() }))
 
   return app
 }
 
-// ─── Start Server ────────────────────────────────────────────────
-const port = parseInt(process.env.PORT ?? '4000', 10)
+// ─── Main ────────────────────────────────────────────────────────────────────
+async function main() {
+  const port = parseInt(process.env.PORT ?? '4000', 10)
 
-const app = await buildApp()
+  console.log('[STARTUP] ========================================')
+  console.log(`[STARTUP] AutoTest AI API starting on port ${port}`)
+  console.log(`[STARTUP] NODE_ENV    = ${process.env.NODE_ENV ?? 'not set'}`)
+  console.log(`[STARTUP] DATABASE_URL= ${(process.env.DATABASE_URL ?? 'not set').replace(/:\/\/[^@]+@/, '://<redacted>@')}`)
+  console.log(`[STARTUP] REDIS_URL   = ${process.env.REDIS_URL ?? 'not set'}`)
+  console.log('[STARTUP] ========================================')
 
-try {
-  await app.listen({ port, host: '0.0.0.0' })
-  log.info(`🚀 AutoTest AI API running on http://localhost:${port}`)
-  log.info(`📍 API prefix: /api/v1`)
-} catch (err) {
-  log.error(err)
-  process.exit(1)
+  let app: Awaited<ReturnType<typeof buildApp>>
+  try {
+    app = await buildApp()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[FATAL] buildApp() failed: ${msg}`)
+    if (err instanceof Error && err.stack) console.error(err.stack)
+    process.exit(1)
+  }
+
+  try {
+    await app.listen({ port, host: '0.0.0.0' })
+    console.log(`[STARTUP] 🚀 Server running → http://0.0.0.0:${port}`)
+    console.log(`[STARTUP] 🏥 Health     → http://localhost:${port}/health`)
+    console.log(`[STARTUP] 📍 API        → http://localhost:${port}/api/v1`)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[FATAL] listen() failed: ${msg}`)
+    process.exit(1)
+  }
+
+  // Non-blocking DB check
+  prisma.$queryRaw`SELECT 1`
+    .then(() => console.log('[STARTUP] ✅ Database connected'))
+    .catch((e: Error) => console.warn('[STARTUP] ⚠️  Database unreachable:', e.message))
 }
 
-// Non-blocking DB connectivity check — warns if Postgres is unreachable
-prisma.$queryRaw`SELECT 1`
-  .then(() => log.info('✅ Database connected'))
-  .catch((err: Error) => log.warn({ msg: err.message }, '⚠️  Database unreachable — DB routes will fail until Postgres is available'))
-
-export default app
+main()

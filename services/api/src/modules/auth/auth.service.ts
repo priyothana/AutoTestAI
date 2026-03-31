@@ -15,7 +15,8 @@ const log = createModuleLogger('auth')
  * Create a new user. Throws if email or username already exists.
  */
 export async function createUser(data: UserCreate) {
-  log.info(`[AUTH] Signup triggered for username: ${data.username}, email: ${data.email}`)
+  const username = data.username ?? data.email.split('@')[0]
+  log.info(`[AUTH] Signup triggered for username: ${username}, email: ${data.email}`)
 
   // Check existing email
   const existingEmail = await prisma.users.findUnique({
@@ -28,10 +29,10 @@ export async function createUser(data: UserCreate) {
 
   // Check existing username
   const existingUsername = await prisma.users.findUnique({
-    where: { username: data.username },
+    where: { username },
   })
   if (existingUsername) {
-    log.info(`[AUTH] Signup failed: Username ${data.username} already exists`)
+    log.info(`[AUTH] Signup failed: Username ${username} already exists`)
     throw { statusCode: 400, message: 'Username already taken' }
   }
 
@@ -39,7 +40,7 @@ export async function createUser(data: UserCreate) {
 
   const newUser = await prisma.users.create({
     data: {
-      username: data.username,
+      username,
       email: data.email,
       hashed_password: hashedPassword,
       full_name: data.full_name ?? null,
@@ -60,24 +61,31 @@ export async function createUser(data: UserCreate) {
  * We preserve this exact response for frontend compatibility.
  */
 export async function loginUser(data: UserLogin) {
-  log.info(`[AUTH] Login attempt for username: ${data.username}`)
+  const identifier = data.username ?? data.email ?? ''
+  log.info(`[AUTH] Login attempt for: ${identifier}`)
 
-  const user = await prisma.users.findUnique({
-    where: { username: data.username },
+  // Try username first, then email
+  let user = await prisma.users.findUnique({
+    where: { username: identifier },
   })
+  if (!user) {
+    user = await prisma.users.findUnique({
+      where: { email: identifier },
+    })
+  }
 
   if (!user) {
-    log.info(`[AUTH] Login failed: Username ${data.username} not found`)
+    log.info(`[AUTH] Login failed: User ${identifier} not found`)
     throw { statusCode: 400, message: 'Incorrect username or password' }
   }
 
   const valid = await verifyPassword(data.password, user.hashed_password)
   if (!valid) {
-    log.info(`[AUTH] Login failed: Invalid password for ${data.username}`)
+    log.info(`[AUTH] Login failed: Invalid password for ${identifier}`)
     throw { statusCode: 400, message: 'Incorrect username or password' }
   }
 
-  log.info(`[AUTH] Login successful for username: ${data.username} (ID: ${user.id})`)
+  log.info(`[AUTH] Login successful for: ${identifier} (ID: ${user.id})`)
 
   // Match Python response exactly
   return {
