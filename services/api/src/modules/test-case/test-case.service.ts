@@ -15,6 +15,8 @@ import type {
   StepModel,
   GenerateTestSteps,
 } from './test-case.schema.js'
+// Cross-module: generation pipeline now lives in test-generation module
+import { generateTest, humanizeSteps as humanizeStepsInternal } from '../test-generation/generation.service.js'
 
 const log = createModuleLogger('test-case')
 
@@ -98,40 +100,21 @@ export async function updateTestSteps(id: string, steps: StepModel[]) {
 }
 
 // ─── AI Generation ──────────────────────────────────────────────
-// TODO: Port from Python ai_service.py (50K) in Phase 4.
-// These stubs match the Python response shape so the frontend works.
+// Delegates to the test-generation module (generation.service.ts)
+// SKILL.md cross-module rule: service.ts is the public interface.
 
 export async function generateTestSteps(data: GenerateTestSteps) {
-  log.info(`[TEST-GEN] Generating steps for prompt: "${data.prompt.substring(0, 80)}..."`)
-  log.info(`[TEST-GEN] Provider: ${data.provider ?? 'claude'}, Model: ${data.model ?? 'default'}`)
-
-  // TODO: Implement AI generation pipeline:
-  // 1. Detect project type (webapp, salesforce, api)
-  // 2. If webapp + crawler → crawl DOM metadata → ground AI prompt
-  // 3. If MCP + metadata → RAG retrieval → strict metadata generation
-  // 4. Otherwise → generic LLM generation
-  //
-  // For now, return a placeholder that matches the Python response shape.
-  return {
-    name: `Test: ${data.prompt.substring(0, 50)}`,
-    description: data.prompt,
-    steps: [
-      { id: '1', action: 'Navigate', target: 'https://example.com', value: '' },
-      { id: '2', action: 'Click', target: 'Login Button', value: '' },
-    ],
-    priority: 'medium',
-    preconditions: [],
-    expected_outcome: 'Test should complete successfully',
-    model_provider: data.provider ?? 'claude',
-  }
+  log.info(`[TEST-GEN] Delegating to generation.service for prompt: "${data.prompt.substring(0, 80)}..."`)
+  return generateTest({
+    prompt:     data.prompt,
+    provider:   data.provider ?? 'claude',
+    model:      data.model       ?? undefined,
+    project_id: data.project_id  ?? undefined,
+  })
 }
 
 export async function humanizeSteps(steps: StepModel[]) {
-  // TODO: Port from Python ai_service.py — uses LLM to convert technical steps to readable descriptions
-  return {
-    steps: steps.map((s) => ({
-      ...s,
-      description: `${s.action} on "${s.target ?? ''}" with value "${s.value ?? ''}"`,
-    })),
-  }
+  return humanizeStepsInternal(
+    steps as unknown as Record<string, unknown>[],
+  )
 }

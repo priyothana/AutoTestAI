@@ -11,11 +11,9 @@ import { UserCreateSchema, UserLoginSchema } from './auth.schema.js'
 import { createUser, loginUser } from './auth.service.js'
 
 export async function authRoutes(app: FastifyInstance) {
-  /**
-   * POST /api/v1/users/signup
-   * Response: UserResponse (id, email, full_name, is_active, role)
-   */
-  app.post('/signup', async (request, reply) => {
+
+  // Shared signup handler — used by both /signup and /register
+  const signupHandler = async (request: any, reply: any) => {
     try {
       const body = UserCreateSchema.parse(request.body)
       const user = await createUser(body)
@@ -32,7 +30,13 @@ export async function authRoutes(app: FastifyInstance) {
       }
       throw err
     }
-  })
+  }
+
+  /** POST /api/v1/users/signup — primary registration endpoint */
+  app.post('/signup', signupHandler)
+
+  /** POST /api/v1/users/register — alias (Python parity) */
+  app.post('/register', signupHandler)
 
   /**
    * POST /api/v1/users/login

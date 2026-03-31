@@ -51,7 +51,7 @@ export async function projectRoutes(app: FastifyInstance) {
   // ─── Project CRUD ───────────────────────────────────────────────
 
   // POST /api/v1/projects/  →  201 + project
-  app.post('/projects/', async (request, reply) => {
+  app.post('/projects', async (request, reply) => {
     try {
       const body = ProjectCreateSchema.parse(request.body)
       const project = await svc.createProject(body)
@@ -62,7 +62,7 @@ export async function projectRoutes(app: FastifyInstance) {
   })
 
   // GET /api/v1/projects/  →  200 + project[]
-  app.get('/projects/', async (request, reply) => {
+  app.get('/projects', async (request, reply) => {
     const q = request.query as any
     const projects = await svc.listProjects({
       skip: q.skip ? parseInt(q.skip, 10) : 0,

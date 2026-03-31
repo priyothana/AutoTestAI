@@ -9,27 +9,80 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// ─── Mock jsforce (dynamic import in service) ─────────────────────
-//
-// The service does `await import('jsforce')` at runtime — Vitest
-// intercepts this because we mock the module id 'jsforce' below.
-// The mock must expose a `default.Connection` constructor.
+// ─── Hoisted mocks (run before module initialisation) ────────────
+// vi.hoisted() is evaluated before vi.mock() factories, so variables
+// declared here are available inside every mock factory below.
+const { mockConnInstance, mockPrisma, mockSfMetadata, mockSfConnection } = vi.hoisted(() => {
+  const mockConnInstance = {
+    instanceUrl: 'https://test.my.salesforce.com',
+    login:       vi.fn().mockResolvedValue({ organizationId: 'ORG001' }),
+    query:       vi.fn(),
+    queryAll:    vi.fn(),
+    search:      vi.fn(),
+    describe:    vi.fn(),
+    describeGlobal: vi.fn(),
+    retrieve:    vi.fn(),
+    create:      vi.fn(),
+    update:      vi.fn(),
+    destroy:     vi.fn(),
+    limits:      vi.fn(),
+  }
 
-const mockConnInstance = {
-  instanceUrl: 'https://test.my.salesforce.com',
-  login:       vi.fn().mockResolvedValue({ organizationId: 'ORG001' }),
-  query:       vi.fn(),
-  queryAll:    vi.fn(),
-  search:      vi.fn(),
-  describe:    vi.fn(),
-  describeGlobal: vi.fn(),
-  retrieve:    vi.fn(),
-  create:      vi.fn(),
-  update:      vi.fn(),
-  destroy:     vi.fn(),
-  limits:      vi.fn(),
-}
+  const mockPrisma = {
+    metadata_raw_store: {
+      findFirst: vi.fn(),
+      findMany:  vi.fn().mockResolvedValue([]),
+      create:    vi.fn().mockResolvedValue({}),
+      update:    vi.fn().mockResolvedValue({}),
+      count:     vi.fn().mockResolvedValue(0),
+    },
+    metadata_normalized: {
+      findFirst: vi.fn().mockResolvedValue(null),
+      count:     vi.fn().mockResolvedValue(0),
+    },
+    domain_models: {
+      count: vi.fn().mockResolvedValue(0),
+    },
+    vector_embeddings: {
+      count: vi.fn().mockResolvedValue(0),
+    },
+    project_integrations: {
+      findFirst:  vi.fn(),
+      findUnique: vi.fn(),
+      create:     vi.fn().mockResolvedValue({ id: 'new-intg' }),
+      update:     vi.fn().mockResolvedValue({ id: 'existing-intg' }),
+    },
+    salesforce_connections: {
+      create:   vi.fn().mockResolvedValue({ id: 'conn-1' }),
+      findMany: vi.fn().mockResolvedValue([]),
+      delete:   vi.fn().mockResolvedValue({}),
+    },
+  }
 
+  // Mock for lib/sf-metadata — prevents in-process cache leakage between tests
+  const mockSfMetadata = {
+    describeObject:    vi.fn(),
+    getFields:         vi.fn(),
+    getPicklistValues: vi.fn(),
+    listObjects:       vi.fn(),
+    getRecordTypes:    vi.fn(),
+    invalidateCache:        vi.fn(),
+    invalidateDescribeCache: vi.fn(),
+  }
+
+  // Mock for lib/sf-connection — prevents real pool / SIGTERM handler side-effects
+  const mockSfConnection = {
+    getConnection:       vi.fn(),
+    invalidateConnection: vi.fn(),
+    executeWithRetry:    vi.fn(),
+    drainPool:           vi.fn(),
+    wrapJsforceError:    vi.fn(),
+  }
+
+  return { mockConnInstance, mockPrisma, mockSfMetadata, mockSfConnection }
+})
+
+// ─── Mock jsforce (mcpConnect does `await import('jsforce')`) ─────
 vi.mock('jsforce', () => ({
   default: {
     Connection: vi.fn().mockImplementation(() => mockConnInstance),
@@ -49,37 +102,6 @@ vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
 }))
 
 // ─── Mock Prisma ─────────────────────────────────────────────────
-const mockPrisma = {
-  metadata_raw_store: {
-    findFirst: vi.fn(),
-    findMany:  vi.fn().mockResolvedValue([]),
-    create:    vi.fn().mockResolvedValue({}),
-    update:    vi.fn().mockResolvedValue({}),
-    count:     vi.fn().mockResolvedValue(0),
-  },
-  metadata_normalized: {
-    findFirst: vi.fn().mockResolvedValue(null),
-    count:     vi.fn().mockResolvedValue(0),
-  },
-  domain_models: {
-    count: vi.fn().mockResolvedValue(0),
-  },
-  vector_embeddings: {
-    count: vi.fn().mockResolvedValue(0),
-  },
-  project_integrations: {
-    findFirst:  vi.fn(),
-    findUnique: vi.fn(),
-    create:     vi.fn().mockResolvedValue({ id: 'new-intg' }),
-    update:     vi.fn().mockResolvedValue({ id: 'existing-intg' }),
-  },
-  salesforce_connections: {
-    create:   vi.fn().mockResolvedValue({ id: 'conn-1' }),
-    findMany: vi.fn().mockResolvedValue([]),
-    delete:   vi.fn().mockResolvedValue({}),
-  },
-}
-
 vi.mock('../../shared/db/prisma.js', () => ({ default: mockPrisma }))
 
 // ─── Mock project.service.ts (cross-module boundary) ─────────────
@@ -87,6 +109,12 @@ vi.mock('../project/project.service.js', () => ({
   getIntegrationByProject: vi.fn(),
   getDecryptedTokens:      vi.fn(),
 }))
+
+// ─── Mock lib/sf-metadata (prevents in-process cache leakage) ────
+vi.mock('./lib/sf-metadata.js', () => mockSfMetadata)
+
+// ─── Mock lib/sf-connection (prevents pool/SIGTERM side-effects) ──
+vi.mock('./lib/sf-connection.js', () => mockSfConnection)
 
 // ─── Stub encryption & logger ────────────────────────────────────
 vi.mock('../../shared/encryption/fernet.js', () => ({
@@ -98,6 +126,7 @@ vi.mock('../../shared/logger/index.js', () => ({
     info:  vi.fn(),
     warn:  vi.fn(),
     error: vi.fn(),
+    debug: vi.fn(),
   }),
 }))
 
@@ -177,13 +206,47 @@ const ACCOUNT_DESCRIBE = {
 beforeEach(() => {
   vi.clearAllMocks()
 
-  // Integration + tokens — valid by default
+  // Integration + tokens — valid by default (used by mcpConnect)
   vi.mocked(getIntegrationByProject).mockResolvedValue(SF_INTEGRATION as never)
   vi.mocked(getDecryptedTokens).mockResolvedValue(DECRYPTED_TOKENS as never)
 
-  // jsforce describe returns Account fixture
+  // jsforce (used by mcpConnect)
   mockConnInstance.login.mockResolvedValue({ organizationId: 'ORG001' })
-  mockConnInstance.describe.mockResolvedValue(ACCOUNT_DESCRIBE)
+  mockConnInstance.query.mockResolvedValue({ totalSize: 0, records: [], done: true })
+
+  // sf-metadata lib defaults — live describe succeeds with Account fixture
+  const MAPPED_FIELDS = [
+    {
+      name: 'Name', label: 'Account Name', type: 'string', length: 255,
+      required: true, updateable: true, createable: true,
+      picklistValues: [], referenceTo: [], relationshipName: null,
+    },
+    {
+      name: 'Industry', label: 'Industry', type: 'picklist', length: 0,
+      required: false, updateable: true, createable: true,
+      picklistValues: [
+        { value: 'Banking',    label: 'Banking',    active: true,  defaultValue: false },
+        { value: 'Technology', label: 'Technology', active: true,  defaultValue: false },
+        { value: 'Healthcare', label: 'Healthcare', active: false, defaultValue: false },
+      ],
+      referenceTo: [], relationshipName: null,
+    },
+  ]
+  mockSfMetadata.describeObject.mockResolvedValue({
+    name: 'Account', label: 'Account',
+    fields: MAPPED_FIELDS, recordTypeInfos: [], childRelationships: [],
+  })
+  mockSfMetadata.getFields.mockResolvedValue(MAPPED_FIELDS)
+  mockSfMetadata.getPicklistValues.mockResolvedValue([
+    { value: 'Banking',    label: 'Banking',    active: true,  defaultValue: false },
+    { value: 'Technology', label: 'Technology', active: true,  defaultValue: false },
+    { value: 'Healthcare', label: 'Healthcare', active: false, defaultValue: false },
+  ])
+
+  // sf-connection lib defaults — getConnection returns mockConnInstance
+  mockSfConnection.getConnection.mockResolvedValue(mockConnInstance)
+  mockSfConnection.invalidateConnection.mockImplementation(() => undefined)
+  mockSfConnection.wrapJsforceError.mockImplementation((err: unknown) => err)
 
   // Prisma: no cached data by default
   mockPrisma.metadata_raw_store.findFirst.mockResolvedValue(null)
@@ -213,7 +276,7 @@ describe('getObjectMetadata()', () => {
   })
 
   it('falls back to metadata_normalized when jsforce fails', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)  // no integration → SF error
+    mockSfMetadata.describeObject.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_normalized.findFirst.mockResolvedValue({
       object_name:     'Account',
       label:           'Account (cached)',
@@ -229,7 +292,7 @@ describe('getObjectMetadata()', () => {
   })
 
   it('falls back to metadata_raw_store when normalized is missing', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.describeObject.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_normalized.findFirst.mockResolvedValue(null)
     mockPrisma.metadata_raw_store.findFirst.mockResolvedValue({
       api_name:      'Account',
@@ -244,7 +307,7 @@ describe('getObjectMetadata()', () => {
   })
 
   it('throws 404 when no data exists anywhere', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.describeObject.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_normalized.findFirst.mockResolvedValue(null)
     mockPrisma.metadata_raw_store.findFirst.mockResolvedValue(null)
 
@@ -287,7 +350,8 @@ describe('getFields()', () => {
   })
 
   it('falls back to field records in metadata_raw_store when jsforce fails', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.getFields.mockRejectedValue(new Error('SF unavailable'))
+    mockSfMetadata.describeObject.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_raw_store.findMany.mockResolvedValue([
       {
         api_name:      'Account.Name',
@@ -302,7 +366,8 @@ describe('getFields()', () => {
   })
 
   it('falls back to embedded fields in parent object raw record', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.getFields.mockRejectedValue(new Error('SF unavailable'))
+    mockSfMetadata.describeObject.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_raw_store.findMany.mockResolvedValue([])
     mockPrisma.metadata_raw_store.findFirst.mockResolvedValue({
       api_name:      'Account',
@@ -315,7 +380,8 @@ describe('getFields()', () => {
   })
 
   it('throws 404 when no field data found', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.getFields.mockRejectedValue(new Error('SF unavailable'))
+    mockSfMetadata.describeObject.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_raw_store.findMany.mockResolvedValue([])
     mockPrisma.metadata_raw_store.findFirst.mockResolvedValue(null)
 
@@ -352,7 +418,7 @@ describe('getPicklistValues()', () => {
   })
 
   it('falls back to metadata_raw_store field record when jsforce fails', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.getPicklistValues.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_raw_store.findFirst.mockResolvedValue({
       api_name:      'Account.Industry',
       metadata_type: 'field',
@@ -369,7 +435,7 @@ describe('getPicklistValues()', () => {
   })
 
   it('falls back to parent object raw record', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.getPicklistValues.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_raw_store.findFirst
       .mockResolvedValueOnce(null)          // field record missing
       .mockResolvedValueOnce({             // parent object found
@@ -383,11 +449,11 @@ describe('getPicklistValues()', () => {
   })
 
   it('throws 404 when field does not exist on the describe result', async () => {
-    mockConnInstance.describe.mockResolvedValue({
-      name:   'Account',
-      label:  'Account',
-      fields: [{ name: 'Name', label: 'Name', type: 'string', picklistValues: [] }],
-    })
+    // The lib throws 404 — service re-throws it
+    const { SalesforceError } = await import('./lib/sf-types.js')
+    mockSfMetadata.getPicklistValues.mockRejectedValue(
+      new SalesforceError({ message: "Field 'NonExistent' not found", errorCode: 'FIELD_NOT_FOUND', statusCode: 404 })
+    )
 
     await expect(
       getPicklistValues(PROJECT_ID, 'Account', 'NonExistent'),
@@ -395,7 +461,7 @@ describe('getPicklistValues()', () => {
   })
 
   it('throws 404 when no picklist data found anywhere', async () => {
-    vi.mocked(getIntegrationByProject).mockResolvedValue(null)
+    mockSfMetadata.getPicklistValues.mockRejectedValue(new Error('SF unavailable'))
     mockPrisma.metadata_raw_store.findFirst.mockResolvedValue(null)
 
     await expect(
@@ -481,6 +547,7 @@ describe('mcpConnect()', () => {
 
 describe('mcpQuery()', () => {
   it('calls conn.query() for standard SOQL', async () => {
+    mockSfConnection.getConnection.mockResolvedValue(mockConnInstance)
     mockConnInstance.query.mockResolvedValue({ totalSize: 1, records: [{ Id: '001' }], done: true })
 
     const result = await mcpQuery(PROJECT_ID, {
@@ -493,6 +560,7 @@ describe('mcpQuery()', () => {
   })
 
   it('throws 500 when the query fails', async () => {
+    mockSfConnection.getConnection.mockResolvedValue(mockConnInstance)
     mockConnInstance.query.mockRejectedValue(new Error('MALFORMED_QUERY'))
 
     await expect(

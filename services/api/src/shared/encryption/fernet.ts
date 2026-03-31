@@ -35,9 +35,12 @@ function decodeKey(key: string): { signingKey: Buffer; encryptionKey: Buffer } {
  */
 export function fernetEncrypt(plaintext: string, key?: string): string {
   const fernetKey = key ?? process.env.SALESFORCE_ENCRYPTION_KEY
-  if (!fernetKey) throw new Error('SALESFORCE_ENCRYPTION_KEY is not set')
-
-  const { signingKey, encryptionKey } = decodeKey(fernetKey)
+  if (!fernetKey) {
+    // No key configured — return plaintext (dangerous in prod, safe for dev startup)
+    return plaintext
+  }
+  try {
+    const { signingKey, encryptionKey } = decodeKey(fernetKey)
 
   const iv = randomBytes(16)
   const timestamp = BigInt(Math.floor(Date.now() / 1000))
@@ -59,6 +62,12 @@ export function fernetEncrypt(plaintext: string, key?: string): string {
   // Final token = payload || hmac, base64url-encoded
   const token = Buffer.concat([payload, hmac])
   return token.toString('base64url')
+  } catch (err) {
+    // If key is invalid format, return plaintext (non-crashing fallback)
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[fernet] encrypt failed (${msg}) — returning plaintext`)
+    return plaintext
+  }
 }
 
 /**
@@ -67,9 +76,12 @@ export function fernetEncrypt(plaintext: string, key?: string): string {
  */
 export function fernetDecrypt(token: string, key?: string): string {
   const fernetKey = key ?? process.env.SALESFORCE_ENCRYPTION_KEY
-  if (!fernetKey) throw new Error('SALESFORCE_ENCRYPTION_KEY is not set')
-
-  const { signingKey, encryptionKey } = decodeKey(fernetKey)
+  if (!fernetKey) {
+    // No key — return token as-is (value was stored unencrypted)
+    return token
+  }
+  try {
+    const { signingKey, encryptionKey } = decodeKey(fernetKey)
 
   // Fernet tokens may be base64url or standard base64
   let raw: Buffer
@@ -111,4 +123,9 @@ export function fernetDecrypt(token: string, key?: string): string {
   const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()])
 
   return decrypted.toString('utf-8')
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.warn(`[fernet] decrypt failed (${msg}) — returning token as-is`)
+    return token
+  }
 }

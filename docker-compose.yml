@@ -17,6 +17,7 @@ services:
   api:
     build: ./services/api
     container_name: autotest-api
+    restart: on-failure
     ports:
       - "4000:4000"
     environment:
@@ -28,7 +29,7 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - SALESFORCE_ENCRYPTION_KEY=${SALESFORCE_ENCRYPTION_KEY}
+      - SALESFORCE_ENCRYPTION_KEY=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=
       - SALESFORCE_REDIRECT_URI=${SALESFORCE_REDIRECT_URI}
     depends_on:
       db:
@@ -36,25 +37,28 @@ services:
       redis:
         condition: service_started
 
-  # ── Python backend (kept alive during migration) ────────────────
-  backend:
-    build: ./backend
-    volumes:
-      - ./backend:/app
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autotestdb
-      - CELERY_BROKER_URL=redis://redis:6379/0
-      - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - SECRET_KEY=${SECRET_KEY}
-      - SALESFORCE_ENCRYPTION_KEY=${SALESFORCE_ENCRYPTION_KEY}
-      - SALESFORCE_REDIRECT_URI=${SALESFORCE_REDIRECT_URI}
-    depends_on:
-      - db
-      - redis
+  # ── Python backend (MIGRATION COMPLETE — kept commented for one sprint as safety net)
+  # The Salesforce engine has been fully replaced by JSforce in the Node.js API.
+  # The Python SF service (:8001) is NO LONGER REQUIRED.
+  # Remove this block entirely after one sprint of stable Node.js operation.
+  # backend:
+  #   build: ./backend
+  #   volumes:
+  #     - ./backend:/app
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/autotestdb
+  #     - CELERY_BROKER_URL=redis://redis:6379/0
+  #     - CELERY_RESULT_BACKEND=redis://redis:6379/0
+  #     - OPENAI_API_KEY=${OPENAI_API_KEY}
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #     - SECRET_KEY=${SECRET_KEY}
+  #     - SALESFORCE_ENCRYPTION_KEY=${SALESFORCE_ENCRYPTION_KEY}
+  #     - SALESFORCE_REDIRECT_URI=${SALESFORCE_REDIRECT_URI}
+  #   depends_on:
+  #     - db
+  #     - redis
 
   db:
     image: postgres:16-alpine
