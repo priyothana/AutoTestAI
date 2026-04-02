@@ -304,6 +304,30 @@ async function main() {
   prisma.$queryRaw`SELECT 1`
     .then(() => console.log('[STARTUP] ✅ Database connected'))
     .catch((e: Error) => console.warn('[STARTUP] ⚠️  Database unreachable:', e.message))
+
+  // ── Auto-start the metadata-sync worker (4-stage Salesforce pipeline) ──────
+  // Import is non-blocking — if Redis is unavailable the worker logs a warning
+  // but the API server continues to serve requests normally.
+  import('./workers/metadata-sync.worker.js')
+    .then(() => console.log('[STARTUP] ✅ Metadata-sync worker started'))
+    .catch((e: Error) => console.warn('[STARTUP] ⚠️  Metadata-sync worker failed to start:', e.message))
+
+  // ── Auto-start the execution worker (Playwright test runner) ─────────────
+  // This worker consumes from execution-queue and runs Playwright headlessly.
+  // Must be running for "Run Test" to work — it is the ONLY place Playwright runs.
+  import('./workers/execution.worker.js')
+    .then(() => console.log('[STARTUP] ✅ Execution worker started (Playwright runner active)'))
+    .catch((e: Error) => console.warn('[STARTUP] ⚠️  Execution worker failed to start:', e.message))
+
+  // ── Auto-start the healing worker (AI self-healing) ──────────────────────
+  import('./workers/healing.worker.js')
+    .then(() => console.log('[STARTUP] ✅ Healing worker started'))
+    .catch((e: Error) => console.warn('[STARTUP] ⚠️  Healing worker failed to start:', e.message))
+
+  // ── Auto-start the notification worker ───────────────────────────────────
+  import('./workers/notification.worker.js')
+    .then(() => console.log('[STARTUP] ✅ Notification worker started'))
+    .catch((e: Error) => console.warn('[STARTUP] ⚠️  Notification worker failed to start:', e.message))
 }
 
 main()

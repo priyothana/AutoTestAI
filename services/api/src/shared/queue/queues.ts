@@ -16,6 +16,9 @@ export const QUEUES = {
 
   /** WebApp crawling — Playwright DOM crawl for metadata */
   CRAWLER: 'crawler-queue',
+
+  /** Salesforce metadata sync pipeline — Normalizer → Domain Builder → Embeddings */
+  METADATA_SYNC: 'metadata-sync-queue',
 } as const
 
 export type QueueName = (typeof QUEUES)[keyof typeof QUEUES]

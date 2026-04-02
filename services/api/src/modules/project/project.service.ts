@@ -129,8 +129,7 @@ export async function updateProject(projectId: string, data: ProjectUpdate) {
 
 /**
  * Soft-delete a project by setting status to 'Archived'.
- * Hard delete is not supported — preserves referential integrity for
- * test_cases, executions, and integration records.
+ * Preserves referential integrity for test_cases, executions, and integration records.
  */
 export async function deleteProject(projectId: string) {
   const existing = await prisma.projects.findUnique({
@@ -141,6 +140,27 @@ export async function deleteProject(projectId: string) {
   await prisma.projects.update({
     where: { id: projectId },
     data: { status: 'Archived' },
+  })
+}
+
+/**
+ * Hard-delete a project and all its related records permanently.
+ * This is irreversible — cascades to project_integrations, test_cases,
+ * executions, and any related metadata via DB ON DELETE CASCADE constraints.
+ */
+export async function hardDeleteProject(projectId: string) {
+  const existing = await prisma.projects.findUnique({
+    where: { id: projectId },
+  })
+  if (!existing) throw { statusCode: 404, message: 'Project not found' }
+
+  // Delete integration records first (avoids FK constraint errors if no cascade)
+  await prisma.project_integrations.deleteMany({
+    where: { project_id: projectId },
+  })
+
+  await prisma.projects.delete({
+    where: { id: projectId },
   })
 }
 
@@ -469,16 +489,36 @@ export async function getDecryptedTokens(integrationId: string) {
 }
 
 /**
- * Get the raw integration record by project ID (for internal service use).
- * Other modules call this to discover if a Salesforce/Jira connection exists.
+ * Get the Salesforce integration record by project ID (for internal service use).
+ * Filters by category='salesforce' to ensure the correct integration is always
+ * returned even if a project has multiple integration rows (e.g., web_app + salesforce).
+ * Other modules call this to discover if a Salesforce connection exists.
  */
 export async function getIntegrationByProject(projectId: string) {
+  // First try to find a Salesforce-specific integration
+  const sfIntegration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId, category: 'salesforce' },
+  })
+  if (sfIntegration) return sfIntegration
+
+  // Fall back to any integration (for legacy callers that may pass web_app projects)
   return prisma.project_integrations.findFirst({
     where: { project_id: projectId },
   })
 }
 
 // ─── Jira ────────────────────────────────────────────────────────
+
+/** Safe JSON parse helper — returns null when the response body is not JSON. */
+async function tryParseJson(response: Response): Promise<any | null> {
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.includes('application/json')) return null
+  try {
+    return await response.json()
+  } catch {
+    return null
+  }
+}
 
 export async function jiraConnect(data: JiraConnect) {
   // Validate and normalise domain
@@ -493,16 +533,34 @@ export async function jiraConnect(data: JiraConnect) {
 
   const authHeader =
     'Basic ' + Buffer.from(`${data.jira_email}:${data.jira_token}`).toString('base64')
-  const response = await fetch(`${domain}/rest/api/3/myself`, {
-    headers: { Authorization: authHeader, Accept: 'application/json' },
-  })
 
-  if (!response.ok) {
-    const text = await response.text()
-    throw { statusCode: 400, message: `Jira connection failed: ${text}` }
+  let response: Response
+  try {
+    response = await fetch(`${domain}/rest/api/3/myself`, {
+      headers: { Authorization: authHeader, Accept: 'application/json' },
+    })
+  } catch (err: any) {
+    throw { statusCode: 502, message: `Cannot reach Jira at ${domain}: ${err.message}` }
   }
 
-  const user = await response.json()
+  if (!response.ok) {
+    // Try to get a meaningful error message from Jira, but never embed HTML
+    const json = await tryParseJson(response)
+    const detail =
+      json?.message ?? json?.errorMessages?.[0] ?? `HTTP ${response.status} from Jira`
+    throw { statusCode: 400, message: `Jira connection failed: ${detail}` }
+  }
+
+  // Guard against Atlassian returning HTML (CAPTCHA / login redirect) on 2xx
+  const user = await tryParseJson(response)
+  if (!user) {
+    throw {
+      statusCode: 400,
+      message:
+        'Jira returned an unexpected response (not JSON). This usually means the domain is wrong or Atlassian is blocking the request. Please check your Jira domain and API token.',
+    }
+  }
+
   return { connected: true, user }
 }
 
@@ -512,13 +570,33 @@ export async function jiraBoards(data: JiraConnect) {
 
   const authHeader =
     'Basic ' + Buffer.from(`${data.jira_email}:${data.jira_token}`).toString('base64')
-  const response = await fetch(`${domain}/rest/agile/1.0/board`, {
-    headers: { Authorization: authHeader, Accept: 'application/json' },
-  })
 
-  if (!response.ok) throw { statusCode: 400, message: 'Failed to fetch Jira boards' }
+  let response: Response
+  try {
+    response = await fetch(`${domain}/rest/agile/1.0/board`, {
+      headers: { Authorization: authHeader, Accept: 'application/json' },
+    })
+  } catch (err: any) {
+    throw { statusCode: 502, message: `Cannot reach Jira boards at ${domain}: ${err.message}` }
+  }
 
-  const result = (await response.json()) as any
+  if (!response.ok) {
+    const json = await tryParseJson(response)
+    const detail =
+      json?.message ?? json?.errorMessages?.[0] ?? `HTTP ${response.status} from Jira Agile API`
+    throw { statusCode: 400, message: `Failed to fetch Jira boards: ${detail}` }
+  }
+
+  // Guard against HTML response
+  const result = await tryParseJson(response)
+  if (!result) {
+    throw {
+      statusCode: 400,
+      message:
+        'Jira boards API returned a non-JSON response. Verify your Jira domain and credentials.',
+    }
+  }
+
   return result.values ?? []
 }
 

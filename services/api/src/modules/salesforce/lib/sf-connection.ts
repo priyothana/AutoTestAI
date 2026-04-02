@@ -94,9 +94,15 @@ async function resolveCredential(projectId: string): Promise<SFCredential> {
     integration.salesforce_login_url ??
     'https://login.salesforce.com'
 
+  // Use the explicitly stored login URL (test.salesforce.com or login.salesforce.com)
+  // rather than inferring from instanceUrl, which for sandbox orgs is the instance
+  // domain (e.g. xyz.my.salesforce.com) — NOT test.salesforce.com.
+  const loginUrl = integration.salesforce_login_url ?? 'https://login.salesforce.com'
+
   if (authType === 'oauth2') {
     return {
       instanceUrl,
+      loginUrl,
       authType: 'oauth2',
       accessToken: tokens.access_token ?? undefined,
       refreshToken: tokens.refresh_token ?? undefined,
@@ -117,6 +123,7 @@ async function resolveCredential(projectId: string): Promise<SFCredential> {
 
   return {
     instanceUrl,
+    loginUrl,
     authType: 'password',
     username: tokens.username,
     password: tokens.password,
@@ -144,17 +151,15 @@ async function _createAndAuth(projectId: string): Promise<Connection> {
       return conn
     }
 
-    // Username + Password flow
-    const loginUrl = credential.instanceUrl.includes('test.salesforce.com')
-      ? 'https://test.salesforce.com'
-      : 'https://login.salesforce.com'
-
-    const conn = new jsforce.Connection({ loginUrl })
+    // Username + Password flow — use the explicitly stored loginUrl so that
+    // sandbox orgs (whose instanceUrl is xyz.my.salesforce.com, not test.salesforce.com)
+    // are authenticated against the correct Salesforce login endpoint.
+    const conn = new jsforce.Connection({ loginUrl: credential.loginUrl })
     await conn.login(
       credential.username!,
       `${credential.password!}${credential.securityToken ?? ''}`,
     )
-    log.debug(`[connection] Authenticated via password flow — instanceUrl=${conn.instanceUrl}`)
+    log.debug(`[connection] Authenticated via password flow — instanceUrl=${conn.instanceUrl} loginUrl=${credential.loginUrl}`)
     return conn
   } catch (err: unknown) {
     throw wrapJsforceError(err, undefined)

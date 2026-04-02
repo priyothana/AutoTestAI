@@ -50,6 +50,8 @@ export interface StepData {
   action: string
   target?: string
   value?: string
+  /** Playwright locator strategy: 'label' | 'placeholder' | 'text' | 'role' | 'testid' | 'css' (default) */
+  locator_type?: string
 }
 
 /** Healing queue — consumed by healing.worker.ts */
@@ -85,4 +87,12 @@ export interface CrawlerJob {
     username: string
     password: string
   }
+}
+
+/** Metadata-sync queue — consumed by metadata-sync.worker.ts */
+export interface MetadataSyncJob {
+  /** UUID of the project whose metadata should be synced */
+  projectId: string
+  /** Who triggered the sync — 'manual' from the UI, 'auto' from connection flow */
+  triggeredBy: 'manual' | 'auto'
 }

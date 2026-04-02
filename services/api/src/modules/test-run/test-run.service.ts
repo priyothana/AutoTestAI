@@ -44,13 +44,22 @@ export async function createTestRun(data: TestRunCreate) {
 
   // Build execution context
   const steps = (testCase.steps as any[]).map((s: any) => ({
-    id: s.id ?? '',
-    action: s.action ?? '',
-    target: s.target ?? '',
-    value: s.value ?? '',
+    id:           s.id           ?? '',
+    action:       s.action       ?? '',
+    target:       s.target       ?? '',
+    value:        s.value        ?? '',
+    locator_type: s.locator_type ?? '',
   })) as StepData[]
 
+  // Determine which integration category to look for based on project category
+  const projectCategory = (testCase.project.category as string) ?? 'webapp'
+  const integrationCategory =
+    projectCategory === 'salesforce' ? 'salesforce' : 'web_app'
+
+  // Fetch the integration matching the project's own category first; fall back to any integration
   const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: testCase.project_id!, category: integrationCategory },
+  }) ?? await prisma.project_integrations.findFirst({
     where: { project_id: testCase.project_id! },
   })
 
@@ -65,7 +74,7 @@ export async function createTestRun(data: TestRunCreate) {
   const context: ExecutionContext = {
     baseUrl: testCase.project.base_url ?? '',
     steps,
-    projectCategory: (testCase.project.category as any) ?? 'webapp',
+    projectCategory: (projectCategory as any) ?? 'webapp',
     integrationStatus: (integration?.status as any) ?? 'disconnected',
     useSessionReuse,
     isLoginTest,
@@ -85,7 +94,8 @@ export async function createTestRun(data: TestRunCreate) {
       } else if (integration.category === 'web_app') {
         if (integration.username) context.webUsername = fernetDecrypt(integration.username)
         if (integration.password) context.webPassword = fernetDecrypt(integration.password)
-        context.webLoginUrl = integration.base_url ?? undefined
+        // Prefer integration.base_url (the login URL) over project base_url
+        context.webLoginUrl = integration.base_url ?? testCase.project.base_url ?? undefined
         context.webLoginStrategy = (integration.login_strategy as any) ?? 'form'
       }
     } catch (err) {
@@ -114,6 +124,7 @@ export async function createTestRun(data: TestRunCreate) {
 
 /**
  * Get a single test run by ID (with test case name).
+ * Includes a stale-run guard: auto-marks runs stuck in pending/running >5min as error.
  */
 export async function getTestRun(id: string) {
   const testRun = await prisma.test_runs.findUnique({
@@ -124,6 +135,31 @@ export async function getTestRun(id: string) {
   })
 
   if (!testRun) throw { statusCode: 404, message: 'Test run not found' }
+
+  // ── Stale-run guard ────────────────────────────────────────────────
+  // If the run has been in pending or running for >5 minutes the BullMQ
+  // worker likely crashed before writing. Mark it as error so the
+  // frontend polling loop can exit cleanly.
+  if (['pending', 'running'].includes(testRun.status ?? '') && testRun.created_at) {
+    const ageMs = Date.now() - testRun.created_at.getTime()
+    if (ageMs > 5 * 60 * 1000) {
+      log.warn(`[TEST-RUN] Stale run ${id} in '${testRun.status}' for ${(ageMs / 1000).toFixed(0)}s — auto-marking as error`)
+      await prisma.test_runs.update({
+        where: { id },
+        data: {
+          status: 'error',
+          result: 'error',
+          logs: [{ step_order: 999, action: 'SYSTEM', error: 'Test run timed out: worker did not complete within 5 minutes.', status: 'error' }],
+        },
+      })
+      return {
+        ...testRun,
+        status: 'error',
+        result: 'error',
+        test_case_name: testRun.test_case?.name ?? null,
+      }
+    }
+  }
 
   return {
     ...testRun,
@@ -160,21 +196,14 @@ export async function deleteTestRun(id: string) {
 }
 
 /**
- * Detect if a test case is a login test.
+ * Detect if a test case IS the login test (i.e. it tests the login flow itself).
+ *
+ * Conservative: only returns true when the ENTIRE test name is about logging in.
+ * A test called "Verify Post-Login Navigation" or "Test Login and Create Account"
+ * should NOT be treated as a login test — those still need the pre-login phase.
+ *
+ * Matches: "Login", "Log In", "Sign In", "Signin", "Login Test", "Sign-In Test", etc.
  */
-function detectLoginTest(name: string, steps: StepData[]): boolean {
-  if (name.toLowerCase().includes('login')) return true
-
-  for (const step of steps) {
-    const action = step.action.toLowerCase()
-    const target = (step.target ?? '').toLowerCase()
-    if (
-      action === 'type' &&
-      (target.includes('email') || target.includes('username') || target.includes('password'))
-    ) {
-      return true
-    }
-  }
-
-  return false
+function detectLoginTest(name: string, _steps: StepData[]): boolean {
+  return /^(log[-\s]?in|sign[-\s]?in|signin|login)(\s+test)?[\s.!]*$/i.test(name.trim())
 }

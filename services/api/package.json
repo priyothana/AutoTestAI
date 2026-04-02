@@ -15,7 +15,8 @@
     "test:watch": "vitest",
     "worker:execution": "tsx src/workers/execution.worker.ts",
     "worker:healing": "tsx src/workers/healing.worker.ts",
-    "worker:notification": "tsx src/workers/notification.worker.ts"
+    "worker:notification": "tsx src/workers/notification.worker.ts",
+    "worker:metadata-sync": "tsx src/workers/metadata-sync.worker.ts"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

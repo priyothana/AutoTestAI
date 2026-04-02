@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
-import { Plus, Search, Edit, Trash2, Eye, Loader2, Check, X } from "lucide-react"
+import { Plus, Search, Trash2, Eye, Loader2, Check, X, Archive } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -31,10 +31,16 @@ export default function ProjectsPage() {
     const [searchQuery, setSearchQuery] = useState("")
     const [statusFilter, setStatusFilter] = useState<string>("all")
     const [typeFilter, setTypeFilter] = useState<string>("all")
+    const [archiveProjectId, setArchiveProjectId] = useState<string | null>(null)
     const [deleteProjectId, setDeleteProjectId] = useState<string | null>(null)
     const [page, setPage] = useState(0)
     const [hasMore, setHasMore] = useState(true)
     const [integrationStatuses, setIntegrationStatuses] = useState<Record<string, string>>({})
+    const [mounted, setMounted] = useState(false)
+
+    useEffect(() => {
+        setMounted(true)
+    }, [])
 
     const fetchProjects = async () => {
         setIsLoading(true)
@@ -89,15 +95,28 @@ export default function ProjectsPage() {
         fetchProjects()
     }, [page, searchQuery, statusFilter, typeFilter])
 
-    const handleDelete = async (id: string) => {
+    const handleArchive = async (id: string) => {
         try {
             const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}`, {
                 method: "DELETE"
             })
-
-            if (!response.ok) throw new Error("Failed to delete project")
-
+            if (!response.ok) throw new Error("Failed to archive project")
             toast.success("Project archived successfully")
+            fetchProjects()
+        } catch (error) {
+            toast.error("Failed to archive project")
+        } finally {
+            setArchiveProjectId(null)
+        }
+    }
+
+    const handleDelete = async (id: string) => {
+        try {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/permanent`, {
+                method: "DELETE"
+            })
+            if (!response.ok) throw new Error("Failed to delete project")
+            toast.success("Project permanently deleted")
             fetchProjects()
         } catch (error) {
             toast.error("Failed to delete project")
@@ -148,29 +167,37 @@ export default function ProjectsPage() {
                         }}
                     />
                 </div>
-                <Select value={statusFilter} onValueChange={(value) => { setStatusFilter(value); setPage(0) }}>
-                    <SelectTrigger className="w-full sm:w-[180px]">
-                        <SelectValue placeholder="Filter by status" />
-                    </SelectTrigger>
-                    <SelectContent>
-                        <SelectItem value="all">All Statuses</SelectItem>
-                        <SelectItem value="Active">Active</SelectItem>
-                        <SelectItem value="Draft">Draft</SelectItem>
-                        <SelectItem value="Archived">Archived</SelectItem>
-                    </SelectContent>
-                </Select>
-                <Select value={typeFilter} onValueChange={(value) => { setTypeFilter(value); setPage(0) }}>
-                    <SelectTrigger className="w-full sm:w-[180px]">
-                        <SelectValue placeholder="Filter by type" />
-                    </SelectTrigger>
-                    <SelectContent>
-                        <SelectItem value="all">All Types</SelectItem>
-                        <SelectItem value="WEB">Web</SelectItem>
-                        <SelectItem value="MOBILE">Mobile</SelectItem>
-                        <SelectItem value="API">API</SelectItem>
-                        <SelectItem value="DESKTOP">Desktop</SelectItem>
-                    </SelectContent>
-                </Select>
+                {mounted ? (
+                    <Select value={statusFilter} onValueChange={(value) => { setStatusFilter(value); setPage(0) }}>
+                        <SelectTrigger className="w-full sm:w-[180px]">
+                            <SelectValue placeholder="Filter by status" />
+                        </SelectTrigger>
+                        <SelectContent>
+                            <SelectItem value="all">All Statuses</SelectItem>
+                            <SelectItem value="Active">Active</SelectItem>
+                            <SelectItem value="Draft">Draft</SelectItem>
+                            <SelectItem value="Archived">Archived</SelectItem>
+                        </SelectContent>
+                    </Select>
+                ) : (
+                    <div className="w-full sm:w-[180px] h-10 rounded-md border border-input bg-background" />
+                )}
+                {mounted ? (
+                    <Select value={typeFilter} onValueChange={(value) => { setTypeFilter(value); setPage(0) }}>
+                        <SelectTrigger className="w-full sm:w-[180px]">
+                            <SelectValue placeholder="Filter by type" />
+                        </SelectTrigger>
+                        <SelectContent>
+                            <SelectItem value="all">All Types</SelectItem>
+                            <SelectItem value="WEB">Web</SelectItem>
+                            <SelectItem value="MOBILE">Mobile</SelectItem>
+                            <SelectItem value="API">API</SelectItem>
+                            <SelectItem value="DESKTOP">Desktop</SelectItem>
+                        </SelectContent>
+                    </Select>
+                ) : (
+                    <div className="w-full sm:w-[180px] h-10 rounded-md border border-input bg-background" />
+                )}
             </div>
 
             {/* Content */}
@@ -228,7 +255,7 @@ export default function ProjectsPage() {
                                         </TableCell>
                                         <TableCell>{formatDate(project.created_at)}</TableCell>
                                         <TableCell className="text-right">
-                                            <div className="flex justify-end gap-2">
+                                            <div className="flex justify-end gap-1">
                                                 <Button variant="ghost" size="sm" asChild>
                                                     <Link href={`/dashboard/projects/${project.id}`}>
                                                         <Eye className="h-4 w-4" />
@@ -237,6 +264,15 @@ export default function ProjectsPage() {
                                                 <Button
                                                     variant="ghost"
                                                     size="sm"
+                                                    title="Archive project"
+                                                    onClick={() => setArchiveProjectId(project.id)}
+                                                >
+                                                    <Archive className="h-4 w-4 text-amber-500" />
+                                                </Button>
+                                                <Button
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    title="Permanently delete project"
                                                     onClick={() => setDeleteProjectId(project.id)}
                                                 >
                                                     <Trash2 className="h-4 w-4 text-destructive" />
@@ -291,6 +327,15 @@ export default function ProjectsPage() {
                                     <Button
                                         variant="outline"
                                         size="sm"
+                                        title="Archive project"
+                                        onClick={() => setArchiveProjectId(project.id)}
+                                    >
+                                        <Archive className="h-4 w-4 text-amber-500" />
+                                    </Button>
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        title="Permanently delete"
                                         onClick={() => setDeleteProjectId(project.id)}
                                     >
                                         <Trash2 className="h-4 w-4 text-destructive" />
@@ -324,20 +369,49 @@ export default function ProjectsPage() {
             )}
 
 
-
-            {/* Delete Confirmation */}
-            <AlertDialog open={!!deleteProjectId} onOpenChange={() => setDeleteProjectId(null)}>
+            {/* Archive Confirmation */}
+            <AlertDialog open={!!archiveProjectId} onOpenChange={() => setArchiveProjectId(null)}>
                 <AlertDialogContent>
                     <AlertDialogHeader>
-                        <AlertDialogTitle>Archive Project?</AlertDialogTitle>
+                        <AlertDialogTitle className="flex items-center gap-2">
+                            <Archive className="h-5 w-5 text-amber-500" />
+                            Archive Project?
+                        </AlertDialogTitle>
                         <AlertDialogDescription>
-                            This will archive the project. You can restore it later from archived projects.
+                            This will archive the project and hide it from the default list. You can restore it later by changing its status back to Active.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
                         <AlertDialogCancel>Cancel</AlertDialogCancel>
-                        <AlertDialogAction onClick={() => deleteProjectId && handleDelete(deleteProjectId)}>
+                        <AlertDialogAction
+                            className="bg-amber-500 hover:bg-amber-600 text-white"
+                            onClick={() => archiveProjectId && handleArchive(archiveProjectId)}
+                        >
                             Archive
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
+
+            {/* Permanent Delete Confirmation */}
+            <AlertDialog open={!!deleteProjectId} onOpenChange={() => setDeleteProjectId(null)}>
+                <AlertDialogContent>
+                    <AlertDialogHeader>
+                        <AlertDialogTitle className="flex items-center gap-2 text-destructive">
+                            <Trash2 className="h-5 w-5" />
+                            Permanently Delete Project?
+                        </AlertDialogTitle>
+                        <AlertDialogDescription>
+                            <span className="font-semibold text-foreground">This action cannot be undone.</span> The project and all its associated test cases, executions, and integration data will be permanently removed from the database.
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                        <AlertDialogCancel>Cancel</AlertDialogCancel>
+                        <AlertDialogAction
+                            className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
+                            onClick={() => deleteProjectId && handleDelete(deleteProjectId)}
+                        >
+                            Delete Permanently
                         </AlertDialogAction>
                     </AlertDialogFooter>
                 </AlertDialogContent>

@@ -13,6 +13,8 @@
  */
 export interface SFCredential {
   instanceUrl: string
+  /** Explicit login URL (login.salesforce.com or test.salesforce.com). */
+  loginUrl: string
   authType: 'password' | 'oauth2'
   /** username+password flow */
   username?: string
