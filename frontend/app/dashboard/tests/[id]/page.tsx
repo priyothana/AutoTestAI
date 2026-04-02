@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, use } from "react"
+import { useState, useEffect, use, useRef } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -71,6 +71,9 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [isGenerating, setIsGenerating] = useState(false)
     const [isSaving, setIsSaving] = useState(false)
     const [isRunning, setIsRunning] = useState(false)
+    const isRunningRef = useRef(false)
+    const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+    const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const [projects, setProjects] = useState<Project[]>([])
     const [selectedProjectId, setSelectedProjectId] = useState<string>("")
     const [priority, setPriority] = useState("medium")
@@ -195,6 +198,18 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const [lastRunResult, setLastRunResult] = useState<any>(null)
 
+    // ── Helper: stop polling and reset running state ────────────────────
+    const stopRunning = (toastId: string | number, message: string, type: "success" | "error" | "warning" | "info" = "warning") => {
+        if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
+        if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
+        setIsRunning(false)
+        isRunningRef.current = false
+        if (type === "success") toast.success(message, { id: toastId })
+        else if (type === "error") toast.error(message, { id: toastId })
+        else if (type === "info") toast.info(message, { id: toastId })
+        else toast.warning(message, { id: toastId })
+    }
+
     const handleRunTest = async () => {
         if (!selectedProjectId) {
             toast.error("Please select a project before running the test")
@@ -206,29 +221,24 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             return
         }
 
+        // Clear any previous intervals
+        if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+        if (pollTimeoutRef.current) clearTimeout(pollTimeoutRef.current)
+
         setIsRunning(true)
+        isRunningRef.current = true
         setLastRunResult(null)
         const runToastId = toast.loading("Saving & starting execution...")
 
         try {
             // ── Auto-save current steps before running ──────────────────
-            // This ensures any UI changes (including accepted AI Healing
-            // steps) are persisted before execution starts.
             if (!isInternalNew && currentId) {
                 const saveRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${currentId}`, {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        name: testName,
-                        description,
-                        project_id: selectedProjectId,
-                        steps,
-                        priority,
-                    }),
+                    body: JSON.stringify({ name: testName, description, project_id: selectedProjectId, steps, priority }),
                 })
-                if (!saveRes.ok) {
-                    throw new Error("Failed to auto-save test steps before running")
-                }
+                if (!saveRes.ok) throw new Error("Failed to auto-save test steps before running")
             }
 
             toast.loading("Running test...", { id: runToastId })
@@ -253,69 +263,96 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 { id: runToastId }
             )
 
-            const interval = setInterval(async () => {
+            let consecutivePollErrors = 0
+            const MAX_POLL_ERRORS = 5
+
+            pollIntervalRef.current = setInterval(async () => {
+                // Guard: if we've already been stopped, clear and exit
+                if (!isRunningRef.current) {
+                    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+                    return
+                }
+
                 try {
                     const pollRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${runData.id}`)
-                    if (pollRes.ok) {
-                        const statusData = await pollRes.json()
-                        const status = statusData.status?.toLowerCase()
-
-                        if (status !== "running" && status !== "pending") {
-                            clearInterval(interval)
-                            setIsRunning(false)
-                            setLastRunResult(statusData)
-
-                            if (status === "passed") {
-                                toast.success(`Test Passed! (${statusData.duration?.toFixed(1) || 0}s)`, { id: runToastId })
-                                setTestStatus("passed")
-                            } else {
-                                toast.error(`Test ${status} – View details below`, { id: runToastId })
-                                setTestStatus("failed")
-
-                                // AI Fix Assistant runs async after the status update.
-                                // Poll every 4s (up to 10x = 40s) until ai_suggestions are stored.
-                                let healAttempts = 0
-                                const healPoll = setInterval(async () => {
-                                    healAttempts++
-                                    try {
-                                        const healRes = await fetch(`http://localhost:8000/api/v1/test-runs/${runData.id}`)
-                                        if (healRes.ok) {
-                                            const healData = await healRes.json()
-                                            const ai = healData.ai_suggestions
-                                            const hasHeal = ai?.corrected_steps?.length > 0 || (Array.isArray(ai) && ai.length > 0)
-                                            console.log(`[AI Heal] attempt ${healAttempts}: hasHeal=${hasHeal}`)
-                                            if (hasHeal) {
-                                                clearInterval(healPoll)
-                                                setLastRunResult(healData)
-                                                toast.info("💡 AI Fix Assistant has suggestions — scroll down!", { duration: 6000 })
-                                            } else if (healAttempts >= 10) {
-                                                clearInterval(healPoll)
-                                                console.log("[AI Heal] No suggestions after 10 attempts — giving up")
-                                            }
-                                        }
-                                    } catch (_) { /* non-critical */ }
-                                }, 4000)
-                            }
-                            fetchTestCase()
+                    if (!pollRes.ok) {
+                        consecutivePollErrors++
+                        console.warn(`[Poll] HTTP ${pollRes.status} (error ${consecutivePollErrors}/${MAX_POLL_ERRORS})`)
+                        if (consecutivePollErrors >= MAX_POLL_ERRORS) {
+                            stopRunning(runToastId, "Lost connection to backend. Check Execution tab for results.", "warning")
                         }
+                        return
+                    }
+                    consecutivePollErrors = 0 // reset on success
+
+                    const statusData = await pollRes.json()
+                    const status = statusData.status?.toLowerCase()
+
+                    if (status !== "running" && status !== "pending") {
+                        // Clear timeout first so it doesn't fire after we've finished
+                        if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
+                        if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
+                        setIsRunning(false)
+                        isRunningRef.current = false
+                        setLastRunResult(statusData)
+
+                        if (status === "passed") {
+                            toast.success(`Test Passed! (${statusData.duration?.toFixed(1) || 0}s)`, { id: runToastId })
+                            setTestStatus("passed")
+                        } else {
+                            toast.error(`Test ${status} – View details below`, { id: runToastId })
+                            setTestStatus("failed")
+
+                            // Poll for AI healing suggestions (up to 40s)
+                            let healAttempts = 0
+                            const healPoll = setInterval(async () => {
+                                healAttempts++
+                                try {
+                                    const healRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${runData.id}`)
+                                    if (healRes.ok) {
+                                        const healData = await healRes.json()
+                                        const ai = healData.ai_suggestions
+                                        const hasHeal = ai?.corrected_steps?.length > 0 || (Array.isArray(ai) && ai.length > 0)
+                                        if (hasHeal) {
+                                            clearInterval(healPoll)
+                                            setLastRunResult(healData)
+                                            toast.info("💡 AI Fix Assistant has suggestions — scroll down!", { duration: 6000 })
+                                        } else if (healAttempts >= 10) {
+                                            clearInterval(healPoll)
+                                        }
+                                    }
+                                } catch (_) { /* non-critical */ }
+                            }, 4000)
+                        }
+                        fetchTestCase()
                     }
                 } catch (pollErr) {
+                    consecutivePollErrors++
                     console.error("Polling error:", pollErr)
+                    if (consecutivePollErrors >= MAX_POLL_ERRORS) {
+                        stopRunning(runToastId, "Polling failed repeatedly. Check Execution tab for results.", "warning")
+                    }
                 }
             }, 3000)
 
-            setTimeout(() => {
-                clearInterval(interval)
-                if (isRunning) {
-                    setIsRunning(false)
-                    toast.warning("Polling timed out. Check results in Execution tab.", { id: runToastId })
+            // ── Safety timeout: 90 seconds max ────────────────────────────
+            pollTimeoutRef.current = setTimeout(() => {
+                if (isRunningRef.current) {
+                    stopRunning(
+                        runToastId,
+                        "Test is taking longer than expected. Check the Execution tab for results.",
+                        "warning"
+                    )
                 }
-            }, 600000)
+            }, 90000)
 
         } catch (error: any) {
             console.error("Run error:", error)
             toast.error(error.message || "Failed to start test execution", { id: runToastId })
             setIsRunning(false)
+            isRunningRef.current = false
+            if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
+            if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
         }
     }
 
@@ -443,18 +480,33 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         )}
                         Save
                     </Button>
-                    <Button
-                        className="bg-green-600 hover:bg-green-700"
-                        onClick={handleRunTest}
-                        disabled={steps.length === 0 || isInternalNew || isRunning || isSaving}
-                    >
-                        {isRunning ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        ) : (
+                    {isRunning ? (
+                        <>
+                            <Button
+                                className="bg-green-600 hover:bg-green-700"
+                                disabled
+                            >
+                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                Running...
+                            </Button>
+                            <Button
+                                variant="outline"
+                                className="border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
+                                onClick={() => stopRunning("run-stop", "Test run stopped manually. Check Execution tab for results.", "warning")}
+                            >
+                                Stop
+                            </Button>
+                        </>
+                    ) : (
+                        <Button
+                            className="bg-green-600 hover:bg-green-700"
+                            onClick={handleRunTest}
+                            disabled={steps.length === 0 || isInternalNew || isSaving}
+                        >
                             <Play className="mr-2 h-4 w-4" />
-                        )}
-                        {isRunning ? "Running..." : "Run Test"}
-                    </Button>
+                            Run Test
+                        </Button>
+                    )}
                 </div>
             </div>
 
@@ -865,19 +917,26 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                 <div className="space-y-3">
                                     {lastRunResult.logs?.map((log: any, idx: number) => (
                                         <div key={idx} className="flex items-start gap-3 text-sm border-b border-gray-50 dark:border-gray-900 pb-2 last:border-0">
-                                            <span className="font-mono text-muted-foreground w-6">#{log.step_order}</span>
+                                            <span className="font-mono text-muted-foreground w-6">#{log.step ?? log.step_order ?? (idx + 1)}</span>
                                             <div className="flex-1">
                                                 <div className="flex items-center gap-2 mb-1">
                                                     <Badge variant="outline" className="text-[10px] uppercase font-bold px-1 h-4">{log.action}</Badge>
-                                                    <Badge variant={log.status === 'success' ? 'default' : 'destructive'} className={`${log.status === 'success' ? 'bg-green-500' : ''} text-[10px] px-1 h-4`}>
+                                                    <Badge
+                                                        variant={log.status === 'passed' || log.status === 'success' ? 'default' : 'destructive'}
+                                                        className={`${log.status === 'passed' || log.status === 'success' ? 'bg-green-500' : ''} text-[10px] px-1 h-4`}
+                                                    >
                                                         {log.status}
                                                     </Badge>
                                                 </div>
                                                 <div className="text-xs font-medium text-gray-700 dark:text-gray-300">
                                                     {log.target && <span className="text-blue-600 dark:text-blue-400 font-mono mr-1">{log.target}</span>}
                                                     {log.value && <span className="text-gray-500 italic">&quot;{log.value}&quot;</span>}
+                                                    {log.message && !log.error && <span className="text-gray-400 italic ml-1">{log.message}</span>}
                                                 </div>
                                                 {log.error && <p className="text-red-500 text-xs mt-1 font-medium">{log.error}</p>}
+                                                {log.duration_ms != null && (
+                                                    <p className="text-gray-400 text-[10px] mt-0.5">{log.duration_ms}ms</p>
+                                                )}
                                             </div>
                                         </div>
                                     ))}
@@ -935,8 +994,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     // Save the fresh steps directly — avoids stale React state closure
                     if (!testName || !selectedProjectId) return
                     const url = isInternalNew
-                      ? "http://localhost:8000/api/v1/tests"
-                      : `http://localhost:8000/api/v1/tests/${currentId}`
+                      ? `${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests`
+                      : `${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${currentId}`
                     await fetch(url, {
                       method: isInternalNew ? "POST" : "PUT",
                       headers: { "Content-Type": "application/json" },

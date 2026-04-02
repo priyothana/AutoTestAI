@@ -591,8 +591,13 @@ export async function mcpLimits(projectId: string) {
 // Metadata Sync
 // ═══════════════════════════════════════════════════════════════════
 
-export async function syncMetadata(projectId: string) {
-  log.info(`[METADATA] Sync triggered for project ${projectId}`)
+/**
+ * Stage 1 of the metadata pipeline: JSforce raw extraction only.
+ * Exported so metadata-sync.worker.ts can call it directly.
+ * Returns the count of object-level records upserted.
+ */
+export async function syncMetadataRaw(projectId: string): Promise<number> {
+  log.info(`[METADATA] Raw extraction started for project ${projectId}`)
 
   let rawCount = 0
   try {
@@ -623,27 +628,93 @@ export async function syncMetadata(projectId: string) {
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
-    log.error({ err }, '[METADATA] Sync extraction failed')
-    throw { statusCode: 500, message: `Metadata sync failed: ${msg}` }
+    log.error({ err }, '[METADATA] Raw extraction failed')
+    throw new Error(`Metadata extraction failed: ${msg}`)
   }
 
-  // Invalidate metadata caches after sync so fresh data is used
+  // Invalidate describe cache so next live call re-fetches from Salesforce
   const { invalidateDescribeCache } = await import('./lib/sf-metadata.js')
   invalidateDescribeCache(projectId)
 
-  const [normalized, domain, embeddings] = await Promise.all([
+  log.info(`[METADATA] Raw extraction done — ${rawCount} objects upserted`)
+  return rawCount
+}
+
+/**
+ * Public sync endpoint handler.
+ *
+ * Enqueues a MetadataSyncJob on the metadata-sync-queue and returns
+ * immediately with status='queued'. The BullMQ worker runs the full
+ * 4-stage pipeline in the background (raw → normalize → domain → embed).
+ *
+ * The frontend's fetchIntegration() re-fetches integration-status after
+ * the sync call, and the tile counts will refresh once the worker finishes.
+ */
+export async function syncMetadata(projectId: string) {
+  log.info(`[METADATA] Sync queued for project ${projectId}`)
+
+  try {
+    // Lazy import to avoid circular dependency at module load time
+    const { metadataSyncQueue } = await import('../../workers/metadata-sync.worker.js')
+
+    await metadataSyncQueue.add(
+      'sync',
+      { projectId, triggeredBy: 'manual' },
+      {
+        attempts: 2,
+        backoff: { type: 'fixed', delay: 5000 },
+        removeOnComplete: { count: 10 },
+        removeOnFail:     { count: 20 },
+      },
+    )
+  } catch (queueErr: unknown) {
+    // If Redis/BullMQ is unavailable, fall back to a synchronous in-process run
+    // so the sync still works in environments without Redis configured.
+    log.warn({ err: queueErr }, '[METADATA] Queue unavailable — running pipeline inline')
+    try {
+      const { normalizeMetadata }  = await import('./salesforce.normalizer.js')
+      const { buildDomainModels }  = await import('./salesforce.domain-builder.js')
+      const { generateEmbeddings } = await import('./salesforce.embeddings.js')
+
+      const rawCount        = await syncMetadataRaw(projectId)
+      const normalizedCount = await normalizeMetadata(projectId)
+      const domainCount     = await buildDomainModels(projectId)
+      const embeddingCount  = await generateEmbeddings(projectId)
+
+      await prisma.project_integrations.updateMany({
+        where: { project_id: projectId },
+        data:  { last_synced_at: new Date(), sync_error: null },
+      })
+
+      return {
+        status: 'completed',
+        message: 'Metadata sync completed (inline fallback)',
+        raw_count:          rawCount,
+        normalized_count:   normalizedCount,
+        domain_model_count: domainCount,
+        embedding_count:    embeddingCount,
+      }
+    } catch (inlineErr: unknown) {
+      const msg = inlineErr instanceof Error ? inlineErr.message : String(inlineErr)
+      throw { statusCode: 500, message: `Metadata sync failed: ${msg}` }
+    }
+  }
+
+  // Return current DB counts (worker will update them asynchronously)
+  const [raw, normalized, domain, embeddings] = await Promise.all([
+    prisma.metadata_raw_store.count({ where: { project_id: projectId } }),
     prisma.metadata_normalized.count({ where: { project_id: projectId } }),
     prisma.domain_models.count({ where: { project_id: projectId } }),
     prisma.vector_embeddings.count({ where: { project_id: projectId } }),
   ])
 
   return {
-    status: 'completed',
-    message: 'Metadata sync completed',
-    raw_count: rawCount,
-    normalized_count: normalized,
+    status: 'queued',
+    message: 'Metadata sync queued — pipeline running in background',
+    raw_count:          raw,
+    normalized_count:   normalized,
     domain_model_count: domain,
-    embedding_count: embeddings,
+    embedding_count:    embeddings,
   }
 }
 

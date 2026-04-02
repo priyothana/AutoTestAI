@@ -105,6 +105,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const [selectedJiraBoardName, setSelectedJiraBoardName] = useState("")
     const [jiraSaving, setJiraSaving] = useState(false)
     const [jiraReconfiguring, setJiraReconfiguring] = useState(false)
+    const [jiraConnectError, setJiraConnectError] = useState<string | null>(null)
 
     useEffect(() => {
         if (id) {
@@ -133,24 +134,64 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const handleJiraConnect = async () => {
         if (!jiraDomain || !jiraEmail || !jiraApiToken) { toast.error("Please fill in all Jira fields"); return }
         setJiraConnecting(true)
+        setJiraConnectError(null)
         try {
-            const connectRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/connect`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
-            })
-            if (!connectRes.ok) { const err = await connectRes.json().catch(() => ({})); throw new Error(err.detail || "Connection failed") }
-            const boardsRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/boards`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken }),
-            })
-            if (!boardsRes.ok) { const err = await boardsRes.json().catch(() => ({})); throw new Error(err.detail || "Failed to fetch boards") }
-            const data = await boardsRes.json()
+            // Step 1: Validate credentials
+            let connectRes: Response
+            try {
+                connectRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/connect`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    // Node.js schema requires: jira_domain, jira_email, jira_token
+                    body: JSON.stringify({ jira_domain: jiraDomain, jira_email: jiraEmail, jira_token: jiraApiToken }),
+                })
+            } catch (networkErr: any) {
+                throw new Error(`Network error: Cannot reach the backend server. Is it running? (${networkErr.message})`)
+            }
+            if (!connectRes.ok) {
+                let errMsg = "Connection failed"
+                try {
+                    const err = await connectRes.json()
+                    errMsg = err.detail || err.message || errMsg
+                } catch { /* ignore parse error */ }
+                throw new Error(errMsg)
+            }
+
+            // Step 2: Fetch boards
+            let boardsRes: Response
+            try {
+                boardsRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/boards`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    // Node.js schema requires: jira_domain, jira_email, jira_token
+                    body: JSON.stringify({ jira_domain: jiraDomain, jira_email: jiraEmail, jira_token: jiraApiToken }),
+                })
+            } catch (networkErr: any) {
+                throw new Error(`Network error fetching boards: ${networkErr.message}`)
+            }
+            if (!boardsRes.ok) {
+                let errMsg = "Failed to fetch boards"
+                try {
+                    const err = await boardsRes.json()
+                    errMsg = err.detail || err.message || errMsg
+                } catch { /* ignore parse error */ }
+                throw new Error(errMsg)
+            }
+
+            const data = await boardsRes.json().catch(() => null)
+            if (!data) throw new Error("Boards response was not valid JSON. Check that the backend is running correctly.")
             const boards = data.boards || []
+            if (boards.length === 0) {
+                toast.warning("Connected, but no boards found. Make sure your Jira account has access to at least one board.")
+            } else {
+                toast.success(`Connected to Jira! Found ${boards.length} board${boards.length > 1 ? "s" : ""}.`)
+            }
             setJiraBoards(boards)
             setJiraConnected(true)
             if (boards.length > 0) { setSelectedJiraBoard(boards[0].id); setSelectedJiraBoardName(boards[0].name) }
-            toast.success("Connected to Jira!")
-        } catch (error: any) { toast.error(error.message || "Jira connection failed") }
+        } catch (error: any) {
+            const msg = error.message || "Jira connection failed"
+            setJiraConnectError(msg)
+            toast.error(msg, { duration: 8000 })
+        }
         finally { setJiraConnecting(false) }
     }
 
@@ -160,7 +201,8 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         try {
             const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/jira/projects/${id}/config`, {
                 method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ domain: jiraDomain, email: jiraEmail, api_token: jiraApiToken, board_id: selectedJiraBoard, board_name: selectedJiraBoardName }),
+                // Node.js schema requires: jira_domain, jira_email, jira_token, board_id, board_name
+                body: JSON.stringify({ jira_domain: jiraDomain, jira_email: jiraEmail, jira_token: jiraApiToken, board_id: selectedJiraBoard, board_name: selectedJiraBoardName }),
             })
             if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.detail || "Save failed") }
             toast.success("Jira configuration saved!")
@@ -1019,22 +1061,63 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                         <div className="grid gap-4 max-w-lg">
                                             <div>
                                                 <label className={labelClass}>Jira Domain</label>
-                                                <input type="text" placeholder="https://yourcompany.atlassian.net" value={jiraDomain} onChange={(e) => setJiraDomain(e.target.value)} className={inputClass} />
+                                                <input
+                                                    type="text"
+                                                    placeholder="https://yourcompany.atlassian.net"
+                                                    value={jiraDomain}
+                                                    onChange={(e) => { setJiraDomain(e.target.value); setJiraConnectError(null) }}
+                                                    className={inputClass}
+                                                />
+                                                <p className="text-xs text-muted-foreground mt-1">Use your Jira Cloud site URL (e.g. https://yourteam.atlassian.net)</p>
                                             </div>
                                             <div>
                                                 <label className={labelClass}>Email</label>
-                                                <input type="email" placeholder="you@company.com" value={jiraEmail} onChange={(e) => setJiraEmail(e.target.value)} className={inputClass} />
+                                                <input
+                                                    type="email"
+                                                    placeholder="you@company.com"
+                                                    value={jiraEmail}
+                                                    onChange={(e) => { setJiraEmail(e.target.value); setJiraConnectError(null) }}
+                                                    className={inputClass}
+                                                />
                                             </div>
                                             <div>
                                                 <label className={labelClass}>API Token</label>
-                                                <input type="password" placeholder="Enter your Jira API token" value={jiraApiToken} onChange={(e) => setJiraApiToken(e.target.value)} className={inputClass} />
+                                                <input
+                                                    type="password"
+                                                    placeholder="Enter your Jira API token"
+                                                    value={jiraApiToken}
+                                                    onChange={(e) => { setJiraApiToken(e.target.value); setJiraConnectError(null) }}
+                                                    className={inputClass}
+                                                />
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noreferrer" className="text-purple-600 underline">Generate an API token</a> from your Atlassian account settings.
+                                                </p>
                                             </div>
+
+                                            {/* Error display */}
+                                            {jiraConnectError && (
+                                                <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 rounded-md">
+                                                    <AlertCircle className="h-4 w-4 text-red-600 mt-0.5 flex-shrink-0" />
+                                                    <div>
+                                                        <p className="text-sm font-medium text-red-700 dark:text-red-400">Connection failed</p>
+                                                        <p className="text-xs text-red-600 dark:text-red-500 mt-0.5">{jiraConnectError}</p>
+                                                    </div>
+                                                </div>
+                                            )}
+
                                             <div className="flex gap-2">
-                                                <Button onClick={handleJiraConnect} disabled={jiraConnecting || !jiraDomain || !jiraEmail || !jiraApiToken} className="bg-purple-600 hover:bg-purple-700">
-                                                    {jiraConnecting ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</> : <><Link2 className="mr-2 h-4 w-4" />Connect & Fetch Boards</>}
+                                                <Button
+                                                    onClick={handleJiraConnect}
+                                                    disabled={jiraConnecting || !jiraDomain || !jiraEmail || !jiraApiToken}
+                                                    className="bg-purple-600 hover:bg-purple-700"
+                                                >
+                                                    {jiraConnecting
+                                                        ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</>
+                                                        : <><Link2 className="mr-2 h-4 w-4" />Connect & Fetch Boards</>
+                                                    }
                                                 </Button>
                                                 {jiraReconfiguring && (
-                                                    <Button variant="outline" onClick={() => setJiraReconfiguring(false)}>Cancel</Button>
+                                                    <Button variant="outline" onClick={() => { setJiraReconfiguring(false); setJiraConnectError(null) }}>Cancel</Button>
                                                 )}
                                             </div>
                                         </div>

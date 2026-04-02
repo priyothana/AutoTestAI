@@ -97,11 +97,22 @@ export async function projectRoutes(app: FastifyInstance) {
     }
   })
 
-  // DELETE /api/v1/projects/:id  →  204 | 404
+  // DELETE /api/v1/projects/:id  →  204 | 404  (soft-delete → Archived)
   app.delete('/projects/:id', async (request, reply) => {
     try {
       const { id } = request.params as { id: string }
       await svc.deleteProject(id)
+      return reply.status(204).send()
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // DELETE /api/v1/projects/:id/permanent  →  204 | 404  (hard-delete — irreversible)
+  app.delete('/projects/:id/permanent', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      await svc.hardDeleteProject(id)
       return reply.status(204).send()
     } catch (err: any) {
       return handleErr(err, reply)
@@ -268,12 +279,13 @@ export async function projectRoutes(app: FastifyInstance) {
     }
   })
 
-  // POST /api/v1/jira/boards  →  200 + board[]
+  // POST /api/v1/jira/boards  →  200 + { boards: board[] }
   app.post('/jira/boards', async (request, reply) => {
     try {
       const body = JiraBoardsSchema.parse(request.body)
       const boards = await svc.jiraBoards(body)
-      return reply.send(boards)
+      // Wrap in { boards: [...] } to match Python FastAPI contract
+      return reply.send({ boards })
     } catch (err: any) {
       return handleErr(err, reply)
     }

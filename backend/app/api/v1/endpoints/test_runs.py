@@ -479,11 +479,39 @@ async def get_test_run(id: UUID, db: AsyncSession = Depends(get_db)):
     test_run = result.scalars().first()
     if not test_run:
         raise HTTPException(status_code=404, detail="Test run not found")
-    
+
+    # ── Safety guard: auto-expire stale "running" test runs ──────────────
+    # If a test run has been in "running" status for >5 minutes, the backend
+    # runner likely crashed or hung without writing a final status.
+    # Mark it as "error" so the frontend polling loop can exit cleanly.
+    if test_run.status in ("running", "pending") and test_run.created_at:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        created = test_run.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        elapsed = now - created
+        if elapsed > timedelta(minutes=5):
+            logger.warning(
+                f"[STALE-RUN] Test run {id} has been in '{test_run.status}' for "
+                f"{elapsed.total_seconds():.0f}s — auto-marking as error"
+            )
+            test_run.status = "error"
+            test_run.result = "error"
+            test_run.logs = test_run.logs or []
+            test_run.logs = list(test_run.logs) + [{
+                "step_order": 999,
+                "action": "SYSTEM",
+                "error": "Test run timed out: backend runner did not complete within 5 minutes.",
+                "status": "error"
+            }]
+            db.add(test_run)
+            await db.commit()
+
     # Populate test_case_name for the response
     test_case_result = await db.execute(select(TestCase.name).where(TestCase.id == test_run.test_case_id))
     test_case_name = test_case_result.scalar_one_or_none()
-    
+
     # Create a TestRunResponse object to include test_case_name
     return TestRunResponse(
         id=test_run.id,
