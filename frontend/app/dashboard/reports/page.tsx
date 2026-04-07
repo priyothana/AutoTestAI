@@ -161,9 +161,9 @@ export default function ReportsPage() {
                     <CardHeader>
                         <CardTitle className="flex items-center gap-2">
                             <BarChart3 className="h-4 w-4" />
-                            Project Summaries
+                            Environment Summaries
                         </CardTitle>
-                        <CardDescription>Execution health by project area</CardDescription>
+                        <CardDescription>Execution health by environment area</CardDescription>
                     </CardHeader>
                     <CardContent>
                         <div className="h-[300px] w-full">

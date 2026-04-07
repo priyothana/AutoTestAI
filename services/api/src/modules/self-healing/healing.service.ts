@@ -143,6 +143,23 @@ export async function applyHealingSuggestion(
   failedLocator:    string,
   suggestedLocator: string,
 ): Promise<{ applied: boolean; updatedStepCount: number }> {
+
+  // ── Safeguard: reject suggestions that replace core form actions with modal actions ──
+  // The healer sometimes sees an open modal (e.g. Advanced Search) in the failure
+  // screenshot and "fixes" the Save button to point to the modal's Select button.
+  // This corruption creates a vicious cycle (corrupted step → fail → re-apply).
+  const CORE_ACTIONS   = /\b(save|submit|next|cancel|delete|confirm)\b/i
+  const MODAL_ACTIONS  = /\b(select|search|close|advanced)\b/i
+  const failedIsCore   = CORE_ACTIONS.test(failedLocator)
+  const suggestedIsModal = MODAL_ACTIONS.test(suggestedLocator) && !CORE_ACTIONS.test(suggestedLocator)
+  if (failedIsCore && suggestedIsModal) {
+    log.warn(
+      `[HEAL] BLOCKED: refusing to replace core action '${failedLocator}' ` +
+      `with modal-specific action '${suggestedLocator}' — likely a misdiagnosis from a blocking modal`,
+    )
+    return { applied: false, updatedStepCount: 0 }
+  }
+
   const testCase = await prisma.test_cases.findUnique({
     where:  { id: testScriptId },
     select: { id: true, steps: true },

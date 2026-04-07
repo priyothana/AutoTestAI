@@ -36,3 +36,7 @@ npm-debug.log*
 backend/static/test-runs/
 backend/app/sessions/
 backend/screenshots/
+services/api/static/
+services/api/screenshots/
+services/api/sessions/
+services/api/logs/

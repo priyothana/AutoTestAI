@@ -8,9 +8,25 @@ function Input({ className, type, ...props }: React.ComponentProps<"input">) {
       type={type}
       data-slot="input"
       className={cn(
-        "file:text-foreground placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground dark:bg-input/30 border-input h-9 w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none file:inline-flex file:h-7 file:border-0 file:bg-transparent file:text-sm file:font-medium disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm",
-        "focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]",
-        "aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive",
+        // Layout — unchanged
+        "h-9 w-full min-w-0 px-3 py-1 text-sm",
+        // Shape
+        "rounded-[var(--radius-token-md)]",
+        // Colors — CSS var tokens
+        "[background:var(--color-bg-base)] [color:var(--color-text-primary)]",
+        "[border:1px_solid_var(--color-border-sem)]",
+        // Placeholder
+        "placeholder:[color:var(--color-text-muted)]",
+        // Focus — brand ring
+        "outline-none transition-[border-color,box-shadow]",
+        "focus-visible:[border-color:var(--color-brand)]",
+        "focus-visible:[box-shadow:0_0_0_3px_rgba(107,107,255,0.15)]",
+        // Disabled
+        "disabled:cursor-not-allowed disabled:[background:var(--color-bg-overlay)] disabled:[color:var(--color-text-muted)] disabled:opacity-70",
+        // File input
+        "file:text-foreground file:inline-flex file:h-7 file:border-0 file:bg-transparent file:text-sm file:font-medium",
+        // Validation
+        "aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:[border-color:var(--color-danger)]",
         className
       )}
       {...props}

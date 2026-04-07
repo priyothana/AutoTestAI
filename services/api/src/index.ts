@@ -37,9 +37,10 @@ import { testRunRoutes } from './modules/test-run/test-run.routes.js'
 import { analyticsRoutes } from './modules/analytics/analytics.routes.js'
 import { settingsRoutes } from './modules/settings/settings.routes.js'
 import { salesforceRoutes } from './modules/salesforce/salesforce.routes.js'
-import { healingRoutes } from './modules/self-healing/healing.routes.js'
-import { generationRoutes } from './modules/test-generation/generation.routes.js'
-import { executionRoutes } from './modules/execution/execution.routes.js'
+import { healingRoutes }     from './modules/self-healing/healing.routes.js'
+import { selfHealingRoutes } from './modules/self-healing/self-healing.routes.js'
+import { generationRoutes }  from './modules/test-generation/generation.routes.js'
+import { executionRoutes }   from './modules/execution/execution.routes.js'
 import { notificationRoutes } from './modules/notification/notification.routes.js'
 import prisma from './shared/db/prisma.js'
 import { redisConnection, getRedisOptions } from './shared/queue/connection.js'
@@ -68,7 +69,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ─── Prepare static dirs ─────────────────────────────────────────────────────
 const staticDir = join(__dirname, '..', 'static')
-const screenshotsDir = join(__dirname, '..', 'screenshots')
+const screenshotsDir = join(staticDir, 'screenshots')
 try {
   mkdirSync(join(staticDir, 'test-runs'), { recursive: true })
   mkdirSync(screenshotsDir, { recursive: true })
@@ -77,7 +78,7 @@ try {
 }
 
 // ─── TASK 3: Log file setup with 50MB rotation ───────────────────────────────
-const logsDir = join(__dirname, '..', 'logs')
+const logsDir = join(staticDir, 'logs')
 const logFilePath = join(logsDir, 'node.log')
 const LOG_MAX_BYTES = 50 * 1024 * 1024 // 50 MB
 
@@ -161,7 +162,10 @@ export async function buildApp() {
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
 
-  await app.register(helmet, { contentSecurityPolicy: false })
+  await app.register(helmet, { 
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: false 
+  })
   await registerJwt(app)
 
   // Static file serving
@@ -183,6 +187,7 @@ export async function buildApp() {
     { name: 'settings',     fn: settingsRoutes as never,     prefix: '/api/v1/settings' },
     { name: 'salesforce',   fn: salesforceRoutes as never,   prefix: '/api/v1' },
     { name: 'healing',      fn: healingRoutes as never,      prefix: '/api/v1' },
+    { name: 'self-healing', fn: selfHealingRoutes as never,  prefix: '/api/v1' },
     { name: 'generation',   fn: generationRoutes as never,   prefix: '/api/v1' },
     { name: 'execution',    fn: executionRoutes as never,    prefix: '/api/v1' },
     { name: 'notification', fn: notificationRoutes as never, prefix: '/api/v1' },

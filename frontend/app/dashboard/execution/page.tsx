@@ -158,8 +158,8 @@ export default function ExecutionPage() {
         <div className="space-y-6">
             <div className="flex items-center justify-between">
                 <div>
-                    <h1 className="text-3xl font-bold tracking-tight">Execution History</h1>
-                    <p className="text-muted-foreground">
+                    <h1 className="page-title">Execution History</h1>
+                    <p className="page-subtitle">
                         Monitor and review all automated test executions.
                     </p>
                 </div>
@@ -207,8 +207,12 @@ export default function ExecutionPage() {
                                 </TableRow>
                             ) : runs.length === 0 ? (
                                 <TableRow>
-                                    <TableCell colSpan={6} className="text-center py-10 text-muted-foreground">
-                                        No executions found. Run a test to see it here.
+                                    <TableCell colSpan={6} className="text-center">
+                                        <div className="empty-state">
+                                            <PlayCircle className="empty-state-icon" />
+                                            <p className="empty-state-title">No executions found</p>
+                                            <p className="empty-state-message">Run a test to see it here.</p>
+                                        </div>
                                     </TableCell>
                                 </TableRow>
                             ) : runs.filter(run => (run.test_case_name || "").toLowerCase().includes(searchTerm.toLowerCase())).map((run) => (

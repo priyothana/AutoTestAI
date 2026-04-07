@@ -37,6 +37,9 @@ import { getDependentPicklistValues as _getDependentPicklistValues } from './lib
 import { executeWithRetry, wrapJsforceError } from './lib/sf-connection.js'
 import { SalesforceError } from './lib/sf-types.js'
 
+// Re-export page layout fetcher for generation service
+export { getPageLayoutFields } from './lib/sf-metadata.js'
+
 // ─── Schema types (keep existing imports for MCP shapes) ──────────
 import type {
   McpConnect,
@@ -125,6 +128,36 @@ export async function getObjectMetadata(
   }
 
   throw { statusCode: 404, message: `No metadata found for object '${objectName}'` }
+}
+
+/**
+ * Query a small number of real records from a Salesforce object and return
+ * their display names. Used to seed lookup field manifests with real values
+ * so the LLM doesn't generate fictional search terms like "TEST-SKU-001".
+ *
+ * @param projectId  — the project/environment ID
+ * @param objectName — Salesforce API object name (e.g. 'SKU__c', 'Warehouse__c')
+ * @param nameField  — the field to return as the display name (default: 'Name')
+ * @param limit      — max records to return (default: 5)
+ */
+export async function queryLookupSamples(
+  projectId: string,
+  objectName: string,
+  nameField = 'Name',
+  limit = 5,
+): Promise<string[]> {
+  try {
+    const results = await executeWithRetry(projectId, async (conn) => {
+      const soql = `SELECT ${nameField} FROM ${objectName} WHERE IsDeleted = false LIMIT ${limit}`
+      const res = await conn.query(soql)
+      return (res.records ?? []).map(
+        (r) => String((r as Record<string, unknown>)[nameField] ?? ''),
+      ).filter(Boolean)
+    })
+    return results ?? []
+  } catch {
+    return []
+  }
 }
 
 /**

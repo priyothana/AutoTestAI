@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
-import { Plus, Search, Trash2, Eye, Loader2, Check, X, Archive } from "lucide-react"
+import { Plus, Search, Trash2, Eye, Loader2, Check, X, Archive, ExternalLink } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
@@ -101,10 +101,10 @@ export default function ProjectsPage() {
                 method: "DELETE"
             })
             if (!response.ok) throw new Error("Failed to archive project")
-            toast.success("Project archived successfully")
+            toast.success("Environment archived successfully")
             fetchProjects()
         } catch (error) {
-            toast.error("Failed to archive project")
+            toast.error("Failed to archive environment")
         } finally {
             setArchiveProjectId(null)
         }
@@ -116,21 +116,22 @@ export default function ProjectsPage() {
                 method: "DELETE"
             })
             if (!response.ok) throw new Error("Failed to delete project")
-            toast.success("Project permanently deleted")
+            toast.success("Environment permanently deleted")
             fetchProjects()
         } catch (error) {
-            toast.error("Failed to delete project")
+            toast.error("Failed to delete environment")
         } finally {
             setDeleteProjectId(null)
         }
     }
 
-    const getStatusBadgeVariant = (status: string) => {
+    // IMPROVEMENT 4 — Status badge colour classes
+    const getStatusBadgeClass = (status: string) => {
         switch (status) {
-            case "Active": return "default"
-            case "Draft": return "secondary"
-            case "Archived": return "outline"
-            default: return "default"
+            case "Active": return "bg-green-50 text-green-700 border border-green-200"
+            case "Draft": return "bg-amber-50 text-amber-700 border border-amber-200"
+            case "Archived": return "bg-gray-100 text-gray-500 border border-gray-200"
+            default: return "bg-green-50 text-green-700 border border-green-200"
         }
     }
 
@@ -143,12 +144,12 @@ export default function ProjectsPage() {
         <div className="space-y-6">
             <div className="flex items-center justify-between">
                 <div>
-                    <h2 className="text-3xl font-bold tracking-tight">Projects</h2>
-                    <p className="text-muted-foreground">Manage your test automation projects</p>
+                    <h2 className="text-3xl font-bold tracking-tight">Environments</h2>
+                    <p className="text-muted-foreground">Manage your test automation environments</p>
                 </div>
                 <Button onClick={() => router.push("/dashboard/projects/create")} className="bg-green-600 hover:bg-green-700">
                     <Plus className="mr-2 h-4 w-4" />
-                    Create New Project
+                    Create New Environment
                 </Button>
             </div>
 
@@ -158,7 +159,7 @@ export default function ProjectsPage() {
                     <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                     <Input
                         type="search"
-                        placeholder="Search projects by name or description..."
+                        placeholder="Search environments by name or description..."
                         className="pl-8"
                         value={searchQuery}
                         onChange={(e) => {
@@ -214,7 +215,7 @@ export default function ProjectsPage() {
                         <Table>
                             <TableHeader>
                                 <TableRow>
-                                    <TableHead>Project Name</TableHead>
+                                    <TableHead>Environment Name</TableHead>
                                     <TableHead>Description</TableHead>
                                     <TableHead>Type</TableHead>
                                     <TableHead>Status</TableHead>
@@ -225,9 +226,19 @@ export default function ProjectsPage() {
                             </TableHeader>
                             <TableBody>
                                 {projects.map((project) => (
-                                    <TableRow key={project.id}>
+                                    // IMPROVEMENT 1 — Row hover highlight
+                                    // IMPROVEMENT 3 — Row click opens project detail
+                                    <TableRow
+                                        key={project.id}
+                                        className="group hover:bg-muted/50 cursor-pointer transition-colors"
+                                        onClick={() => router.push(`/dashboard/projects/${project.id}`)}
+                                    >
                                         <TableCell className="font-medium">
-                                            <Link href={`/dashboard/projects/${project.id}`} className="hover:underline">
+                                            <Link
+                                                href={`/dashboard/projects/${project.id}`}
+                                                className="hover:underline"
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
                                                 {project.name}
                                             </Link>
                                         </TableCell>
@@ -238,13 +249,21 @@ export default function ProjectsPage() {
                                             <Badge variant="outline">{project.type}</Badge>
                                         </TableCell>
                                         <TableCell>
-                                            <Badge variant={getStatusBadgeVariant(project.status)}>
+                                            {/* IMPROVEMENT 4 — Colour-coded status badge */}
+                                            <Badge
+                                                variant="outline"
+                                                className={`capitalize ${getStatusBadgeClass(project.status)}`}
+                                            >
                                                 {project.status}
                                             </Badge>
                                         </TableCell>
                                         <TableCell>
                                             {integrationStatuses[project.id] === "connected" ? (
-                                                <Badge className="bg-green-100 text-green-700 border-green-200 hover:bg-green-100">
+                                                <Badge
+                                                    variant="outline"
+                                                    style={{ backgroundColor: '#D6E5BD', color: '#15803d', borderColor: '#c2d1a7' }}
+                                                    className="hover:opacity-90"
+                                                >
                                                     <Check className="h-3 w-3 mr-1" /> Connected
                                                 </Badge>
                                             ) : (
@@ -255,25 +274,59 @@ export default function ProjectsPage() {
                                         </TableCell>
                                         <TableCell>{formatDate(project.created_at)}</TableCell>
                                         <TableCell className="text-right">
-                                            <div className="flex justify-end gap-1">
-                                                <Button variant="ghost" size="sm" asChild>
+                                            {/* IMPROVEMENT 2 — Inline View button + existing action buttons */}
+                                            <div className="flex justify-end items-center gap-1">
+
+                                                {/* Inline View button — hidden by default, visible on row hover */}
+                                                <Link
+                                                    href={`/dashboard/projects/${project.id}`}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                >
+                                                    <button
+                                                        className="opacity-0 group-hover:opacity-100 transition-opacity duration-150
+                                                                   px-2 py-1 text-xs rounded
+                                                                   bg-transparent hover:bg-blue-50
+                                                                   text-blue-600 border border-blue-200"
+                                                    >
+                                                        <ExternalLink className="inline h-3 w-3 mr-1" />
+                                                        View
+                                                    </button>
+                                                </Link>
+
+                                                {/* Existing Eye icon button — unchanged */}
+                                                <Button
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    asChild
+                                                    onClick={(e) => e.stopPropagation()}
+                                                >
                                                     <Link href={`/dashboard/projects/${project.id}`}>
                                                         <Eye className="h-4 w-4" />
                                                     </Link>
                                                 </Button>
+
+                                                {/* Existing Archive button — unchanged */}
                                                 <Button
                                                     variant="ghost"
                                                     size="sm"
-                                                    title="Archive project"
-                                                    onClick={() => setArchiveProjectId(project.id)}
+                                                    title="Archive environment"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setArchiveProjectId(project.id)
+                                                    }}
                                                 >
                                                     <Archive className="h-4 w-4 text-amber-500" />
                                                 </Button>
+
+                                                {/* Existing Delete button — unchanged */}
                                                 <Button
                                                     variant="ghost"
                                                     size="sm"
-                                                    title="Permanently delete project"
-                                                    onClick={() => setDeleteProjectId(project.id)}
+                                                    title="Permanently delete environment"
+                                                    onClick={(e) => {
+                                                        e.stopPropagation()
+                                                        setDeleteProjectId(project.id)
+                                                    }}
                                                 >
                                                     <Trash2 className="h-4 w-4 text-destructive" />
                                                 </Button>
@@ -288,17 +341,29 @@ export default function ProjectsPage() {
                     {/* Mobile Cards */}
                     <div className="md:hidden space-y-4">
                         {projects.map((project) => (
-                            <div key={project.id} className="border rounded-lg p-4 space-y-3">
+                            // Mobile card — IMPROVEMENT 1 + 3: hover highlight + clickable card
+                            <div
+                                key={project.id}
+                                className="border rounded-lg p-4 space-y-3 hover:bg-muted/50 cursor-pointer transition-colors"
+                                onClick={() => router.push(`/dashboard/projects/${project.id}`)}
+                            >
                                 <div className="flex items-start justify-between">
                                     <div className="flex-1">
-                                        <Link href={`/dashboard/projects/${project.id}`}>
+                                        <Link
+                                            href={`/dashboard/projects/${project.id}`}
+                                            onClick={(e) => e.stopPropagation()}
+                                        >
                                             <h3 className="font-semibold hover:underline">{project.name}</h3>
                                         </Link>
                                         <p className="text-sm text-muted-foreground mt-1 line-clamp-2">
                                             {project.description || "No description"}
                                         </p>
                                     </div>
-                                    <Badge variant={getStatusBadgeVariant(project.status)}>
+                                    {/* IMPROVEMENT 4 — Colour-coded status badge (mobile) */}
+                                    <Badge
+                                        variant="outline"
+                                        className={`capitalize ${getStatusBadgeClass(project.status)}`}
+                                    >
                                         {project.status}
                                     </Badge>
                                 </div>
@@ -306,8 +371,13 @@ export default function ProjectsPage() {
                                     <Badge variant="outline">{project.type}</Badge>
                                     <span className="text-muted-foreground">•</span>
                                     {integrationStatuses[project.id] === "connected" ? (
-                                        <Badge className="bg-green-100 text-green-700 border-green-200 hover:bg-green-100 text-xs">
-                                            <Check className="h-3 w-3 mr-1" /> Connected
+                                        <Badge
+                                            variant="outline"
+                                            style={{ backgroundColor: '#D6E5BD', color: '#15803d', borderColor: '#c2d1a7' }}
+                                            className="hover:opacity-90 text-xs font-medium px-3 py-1 rounded-full flex items-center gap-1"
+                                        >
+                                            <Check className="h-3.5 w-3.5" />
+                                            Connected
                                         </Badge>
                                     ) : (
                                         <Badge variant="outline" className="text-muted-foreground text-xs">
@@ -318,7 +388,9 @@ export default function ProjectsPage() {
                                     <span className="text-muted-foreground">{formatDate(project.created_at)}</span>
                                 </div>
                                 <div className="flex gap-2 pt-2">
-                                    <Button variant="outline" size="sm" className="flex-1" asChild>
+                                    <Button variant="outline" size="sm" className="flex-1" asChild
+                                        onClick={(e: React.MouseEvent) => e.stopPropagation()}
+                                    >
                                         <Link href={`/dashboard/projects/${project.id}`}>
                                             <Eye className="mr-2 h-4 w-4" />
                                             View
@@ -327,8 +399,11 @@ export default function ProjectsPage() {
                                     <Button
                                         variant="outline"
                                         size="sm"
-                                        title="Archive project"
-                                        onClick={() => setArchiveProjectId(project.id)}
+                                        title="Archive environment"
+                                        onClick={(e) => {
+                                            e.stopPropagation()
+                                            setArchiveProjectId(project.id)
+                                        }}
                                     >
                                         <Archive className="h-4 w-4 text-amber-500" />
                                     </Button>
@@ -336,7 +411,10 @@ export default function ProjectsPage() {
                                         variant="outline"
                                         size="sm"
                                         title="Permanently delete"
-                                        onClick={() => setDeleteProjectId(project.id)}
+                                        onClick={(e) => {
+                                            e.stopPropagation()
+                                            setDeleteProjectId(project.id)
+                                        }}
                                     >
                                         <Trash2 className="h-4 w-4 text-destructive" />
                                     </Button>
@@ -375,10 +453,10 @@ export default function ProjectsPage() {
                     <AlertDialogHeader>
                         <AlertDialogTitle className="flex items-center gap-2">
                             <Archive className="h-5 w-5 text-amber-500" />
-                            Archive Project?
+                            Archive Environment?
                         </AlertDialogTitle>
                         <AlertDialogDescription>
-                            This will archive the project and hide it from the default list. You can restore it later by changing its status back to Active.
+                            This will archive the environment and hide it from the default list. You can restore it later by changing its status back to Active.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>
@@ -399,10 +477,10 @@ export default function ProjectsPage() {
                     <AlertDialogHeader>
                         <AlertDialogTitle className="flex items-center gap-2 text-destructive">
                             <Trash2 className="h-5 w-5" />
-                            Permanently Delete Project?
+                            Permanently Delete Environment?
                         </AlertDialogTitle>
                         <AlertDialogDescription>
-                            <span className="font-semibold text-foreground">This action cannot be undone.</span> The project and all its associated test cases, executions, and integration data will be permanently removed from the database.
+                            <span className="font-semibold text-foreground">This action cannot be undone.</span> The environment and all its associated test cases, executions, and integration data will be permanently removed from the database.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
                     <AlertDialogFooter>

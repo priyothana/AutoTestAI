@@ -13,7 +13,8 @@ import {
 } from "@/components/ui/card"
 import { toast } from "sonner"
 
-const API_BASE = "http://localhost:8000/api/v1"
+// Use the configured API URL — falls back to port 4000 for local dev
+const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000") + "/api/v1"
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 interface Story {
@@ -54,15 +55,20 @@ export default function JiraImportPanel({ projectId, onImport }: JiraImportPanel
             const res = await fetch(`${API_BASE}/jira/projects/${projectId}/stories`)
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}))
-                throw new Error(err.detail || "Failed to fetch stories")
+                throw new Error(err.detail || err.message || `Failed to fetch stories (HTTP ${res.status})`)
             }
             const data = await res.json()
-            setBoardName(data.board_name || "")
+
+            // Backend may return a plain array OR { board_name, issues, board_id }
+            const issueList: any[] = Array.isArray(data) ? data : (data.issues ?? data.values ?? [])
+            const name: string = Array.isArray(data) ? "" : (data.board_name ?? "")
+
+            setBoardName(name)
             setStories(
-                (data.issues || []).map((issue: any) => ({
-                    key: issue.key,
-                    summary: issue.summary,
-                    description: issue.description || "",
+                issueList.map((issue: any) => ({
+                    key: issue.key ?? issue.id ?? "",
+                    summary: issue.fields?.summary ?? issue.summary ?? "(no summary)",
+                    description: issue.fields?.description ?? issue.description ?? "",
                 }))
             )
         } catch (error: any) {

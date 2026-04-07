@@ -18,6 +18,12 @@ export const StepSchema = z.object({
   target:       z.string().optional(),
   value:        z.string().optional(),
   locator_type: z.string().optional(),
+  /**
+   * SF Lightning field type — used by the execution worker to dispatch the
+   * correct interaction handler.
+   * Values: 'picklist' | 'lookup' | 'lookup_advanced' | 'date' | 'dependent_picklist'
+   */
+  sf_field_type: z.string().optional(),
 })
 
 export type Step = z.infer<typeof StepSchema>

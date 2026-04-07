@@ -44,11 +44,14 @@ export async function createTestRun(data: TestRunCreate) {
 
   // Build execution context
   const steps = (testCase.steps as any[]).map((s: any) => ({
-    id:           s.id           ?? '',
-    action:       s.action       ?? '',
-    target:       s.target       ?? '',
-    value:        s.value        ?? '',
-    locator_type: s.locator_type ?? '',
+    id:            s.id            ?? '',
+    action:        s.action        ?? '',
+    target:        s.target        ?? '',
+    value:         s.value         ?? '',
+    locator_type:  s.locator_type  ?? '',
+    // Preserve SF field type so the execution worker dispatches the correct
+    // Salesforce handler (selectSFPicklist / selectSFLookup / fillSFDate)
+    ...(s.sf_field_type ? { sf_field_type: s.sf_field_type } : {}),
   })) as StepData[]
 
   // Determine which integration category to look for based on project category

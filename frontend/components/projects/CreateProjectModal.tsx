@@ -53,7 +53,7 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
                 payload.login_strategy = "form"
             }
 
-            const response = await fetch("http://localhost:8000/api/v1/projects/", {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000"}/api/v1/projects/`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
@@ -66,7 +66,7 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
                 throw new Error(error.detail || "Failed to create project")
             }
 
-            toast.success("Project created successfully! Credentials saved securely.")
+            toast.success("Environment created successfully! Credentials saved securely.")
             onOpenChange(false)
             onSuccess()
 
@@ -84,7 +84,7 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
             })
             setShowCredentials(false)
         } catch (error: any) {
-            toast.error(error.message || "Failed to create project")
+            toast.error(error.message || "Failed to create environment")
         } finally {
             setIsLoading(false)
         }
@@ -95,14 +95,14 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
             <DialogContent className="sm:max-w-[525px]">
                 <form onSubmit={handleSubmit}>
                     <DialogHeader>
-                        <DialogTitle>Create New Project</DialogTitle>
+                        <DialogTitle>Create New Environment</DialogTitle>
                         <DialogDescription>
-                            Add a new test automation project. Fill in the details below.
+                            Add a new test automation environment. Fill in the details below.
                         </DialogDescription>
                     </DialogHeader>
                     <div className="grid gap-4 py-4">
                         <div className="grid gap-2">
-                            <Label htmlFor="name">Project Name *</Label>
+                            <Label htmlFor="name">Environment Name *</Label>
                             <Input
                                 id="name"
                                 value={formData.name}
@@ -240,7 +240,7 @@ export function CreateProjectModal({ open, onOpenChange, onSuccess }: CreateProj
                         </Button>
                         <Button type="submit" disabled={isLoading}>
                             {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                            Create Project
+                            Create Environment
                         </Button>
                     </DialogFooter>
                 </form>
