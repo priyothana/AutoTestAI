@@ -159,7 +159,7 @@ export default function AiFixAssistant({
     const updatedHistory: ChatMessage[] = [...chatHistory, { role: "user", content: userMsg }]
     setChatHistory(updatedHistory)
     try {
-      const res = await fetch(`http://localhost:8000/api/v1/test-runs/${runId}/heal`, {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000"}/api/v1/test-runs/${runId}/heal`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -59,7 +59,8 @@ export default function DashboardPage() {
                     const formattedDist = distData.map((d: any) => ({
                         name: d.result.charAt(0).toUpperCase() + d.result.slice(1),
                         value: d.count,
-                        color: d.result === 'passed' ? '#22C55E' : d.result === 'error' || d.result === 'failed' ? '#EF4444' : '#F59E0B'
+                        // Updated to brand palette colors
+                        color: d.result === 'passed' ? '#22c55e' : d.result === 'error' || d.result === 'failed' ? '#ef4444' : d.result === 'running' ? '#6b6bff' : '#f59e0b'
                     }))
                     setDistribution(formattedDist)
                 }
@@ -128,7 +129,7 @@ export default function DashboardPage() {
 
             const projectId = projects.length > 0 ? projects[0].id : null
             if (!projectId) {
-                setStatusMessage({ type: 'error', text: "No projects available. Please create a project first." })
+                setStatusMessage({ type: 'error', text: "No environments available. Please create an environment first." })
                 setIsLoading(false)
                 return
             }
@@ -232,15 +233,15 @@ export default function DashboardPage() {
     return (
         <div className="space-y-8">
             <div>
-                <h2 className="text-3xl font-bold tracking-tight">Dashboard</h2>
-                <p className="text-muted-foreground">Overview of your testing activity and reports.</p>
+                <h2 className="page-title">Dashboard</h2>
+                <p className="page-subtitle">Overview of your testing activity and reports.</p>
             </div>
 
             {/* AI Generator Section */}
-            <Card className="border-primary/20 bg-primary/5">
+            <Card style={{ borderColor: 'var(--color-brand)', backgroundColor: 'var(--color-brand-light)', borderLeftWidth: '3px', borderLeftStyle: 'solid', borderLeftColor: 'var(--color-brand)' }}>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <Sparkles className="h-5 w-5 text-primary" />
+                        <Sparkles className="h-5 w-5" style={{ color: 'var(--color-brand)' }} />
                         AI Test Generator
                     </CardTitle>
                     <CardDescription>
@@ -285,8 +286,18 @@ export default function DashboardPage() {
                     </div>
 
                     {statusMessage && (
-                        <div className={`p-4 rounded-md flex items-center gap-2 text-sm ${statusMessage.type === 'success' ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'
-                            }`}>
+                        <div
+                            className="p-4 rounded-[var(--radius-token-md)] flex items-center gap-2 text-sm"
+                            style={statusMessage.type === 'success' ? {
+                                backgroundColor: 'var(--color-success-light)',
+                                color: 'var(--color-success)',
+                                borderLeft: '3px solid var(--color-success)',
+                            } : {
+                                backgroundColor: 'var(--color-danger-light)',
+                                color: 'var(--color-danger)',
+                                borderLeft: '3px solid var(--color-danger)',
+                            }}
+                        >
                             {statusMessage.type === 'success' ?
                                 <CheckCircle2 className="h-4 w-4" /> :
                                 <AlertCircle className="h-4 w-4" />
@@ -379,57 +390,72 @@ export default function DashboardPage() {
             </Card>
 
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-                <Card>
+                {/* Total Projects — brand accent */}
+                <Card style={{ borderLeft: '3px solid var(--color-brand)', paddingLeft: '0' }}>
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                        <CardTitle className="text-sm font-medium">Total Projects</CardTitle>
-                        <FolderIcon className="h-4 w-4 text-primary" />
+                        <CardTitle style={{ fontSize: '13px', color: 'var(--color-text-muted)', fontWeight: 400 }}>Total Environments</CardTitle>
+                        <div className="p-2 rounded-full" style={{ backgroundColor: 'var(--color-brand-light)' }}>
+                            <FolderIcon className="h-4 w-4" style={{ color: 'var(--color-brand)' }} />
+                        </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="text-2xl font-bold">
-                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" /> : stats.total_projects}
+                        <div style={{ fontSize: '28px', fontWeight: 700, color: 'var(--color-text-primary)', letterSpacing: '-0.03em', lineHeight: 1 }}>
+                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" style={{ color: 'var(--color-text-muted)' }} /> : stats.total_projects}
                         </div>
                     </CardContent>
                 </Card>
-                <Card>
+
+                {/* Total Test Cases — brand accent */}
+                <Card style={{ borderLeft: '3px solid var(--color-brand)', paddingLeft: '0' }}>
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                        <CardTitle className="text-sm font-medium">Total Test Cases</CardTitle>
-                        <FileText className="h-4 w-4 text-blue-500" />
+                        <CardTitle style={{ fontSize: '13px', color: 'var(--color-text-muted)', fontWeight: 400 }}>Total Test Cases</CardTitle>
+                        <div className="p-2 rounded-full" style={{ backgroundColor: 'var(--color-brand-light)' }}>
+                            <FileText className="h-4 w-4" style={{ color: 'var(--color-brand)' }} />
+                        </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="text-2xl font-bold">
-                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" /> : stats.total_test_cases}
+                        <div style={{ fontSize: '28px', fontWeight: 700, color: 'var(--color-text-primary)', letterSpacing: '-0.03em', lineHeight: 1 }}>
+                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" style={{ color: 'var(--color-text-muted)' }} /> : stats.total_test_cases}
                         </div>
                     </CardContent>
                 </Card>
-                <Card>
+
+                {/* Total Executions — info accent */}
+                <Card style={{ borderLeft: '3px solid var(--color-info)', paddingLeft: '0' }}>
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                        <CardTitle className="text-sm font-medium">Total Executions</CardTitle>
-                        <Play className="h-4 w-4 text-indigo-500" />
+                        <CardTitle style={{ fontSize: '13px', color: 'var(--color-text-muted)', fontWeight: 400 }}>Total Executions</CardTitle>
+                        <div className="p-2 rounded-full" style={{ backgroundColor: 'var(--color-info-light)' }}>
+                            <Play className="h-4 w-4" style={{ color: 'var(--color-info)' }} />
+                        </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="text-2xl font-bold">
-                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" /> : stats.total_executions}
+                        <div style={{ fontSize: '28px', fontWeight: 700, color: 'var(--color-text-primary)', letterSpacing: '-0.03em', lineHeight: 1 }}>
+                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" style={{ color: 'var(--color-text-muted)' }} /> : stats.total_executions}
                         </div>
                     </CardContent>
                 </Card>
-                <Card>
+
+                {/* Pass Rate — success accent */}
+                <Card style={{ borderLeft: '3px solid var(--color-success)', paddingLeft: '0' }}>
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                        <CardTitle className="text-sm font-medium">Pass Rate</CardTitle>
-                        <CheckCircle2 className="h-4 w-4 text-green-500" />
+                        <CardTitle style={{ fontSize: '13px', color: 'var(--color-text-muted)', fontWeight: 400 }}>Pass Rate</CardTitle>
+                        <div className="p-2 rounded-full" style={{ backgroundColor: 'var(--color-success-light)' }}>
+                            <CheckCircle2 className="h-4 w-4" style={{ color: 'var(--color-success)' }} />
+                        </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="text-2xl font-bold">
-                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" /> : `${stats.pass_rate}%`}
+                        <div style={{ fontSize: '28px', fontWeight: 700, color: 'var(--color-text-primary)', letterSpacing: '-0.03em', lineHeight: 1 }}>
+                            {isLoadingData ? <Loader2 className="h-5 w-5 animate-spin" style={{ color: 'var(--color-text-muted)' }} /> : `${stats.pass_rate}%`}
                         </div>
                     </CardContent>
                 </Card>
             </div>
 
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-7">
-                <Card className="col-span-4">
+                <Card className="col-span-4" style={{ overflow: 'hidden' }}>
                     <CardHeader>
                         <CardTitle className="flex items-center gap-2">
-                            <BarChart2 className="h-5 w-5 text-muted-foreground" />
+                            <BarChart2 className="h-5 w-5" style={{ color: 'var(--color-text-muted)' }} />
                             Execution Status
                         </CardTitle>
                     </CardHeader>
@@ -453,14 +479,32 @@ export default function DashboardPage() {
                                                 <Cell key={`cell-${index}`} fill={entry.color} />
                                             ))}
                                         </Pie>
-                                        <Tooltip />
-                                        <Legend verticalAlign="bottom" height={36} />
+                                        <Tooltip
+                                            contentStyle={{
+                                                backgroundColor: 'var(--color-bg-elevated)',
+                                                border: '1px solid var(--color-border-sem)',
+                                                borderRadius: 'var(--radius-token-md)',
+                                                boxShadow: 'var(--shadow-md)',
+                                                color: 'var(--color-text-primary)',
+                                                fontSize: '13px',
+                                            }}
+                                            itemStyle={{ color: 'var(--color-text-secondary)' }}
+                                            labelStyle={{ color: 'var(--color-text-primary)', fontWeight: 600 }}
+                                        />
+                                        <Legend
+                                            verticalAlign="bottom"
+                                            height={36}
+                                            formatter={(value) => (
+                                                <span style={{ color: 'var(--color-text-secondary)', fontSize: '12px' }}>{value}</span>
+                                            )}
+                                        />
                                     </PieChart>
                                 </ResponsiveContainer>
                             ) : (
-                                <div className="text-muted-foreground bg-muted/30 p-8 rounded-lg text-center w-full">
-                                    <p>No execution data available.</p>
-                                    <p className="text-sm mt-1">Run tests to see distribution.</p>
+                                <div className="p-8 rounded-[var(--radius-token-lg)] text-center w-full" style={{ backgroundColor: 'var(--color-bg-overlay)', color: 'var(--color-text-muted)' }}>
+                                    <BarChart2 className="h-10 w-10 mx-auto mb-3" style={{ color: 'var(--color-text-muted)', opacity: 0.4 }} />
+                                    <p style={{ fontSize: '14px', color: 'var(--color-text-secondary)', fontWeight: 500 }}>No execution data available.</p>
+                                    <p className="text-sm mt-1" style={{ color: 'var(--color-text-muted)' }}>Run tests to see distribution.</p>
                                 </div>
                             )}
                         </div>
@@ -482,32 +526,40 @@ export default function DashboardPage() {
                                     No recent test runs. 🚀
                                 </div>
                             ) : (
-                                recentRuns.slice(0, 5).map((run) => (
-                                    <div key={run.id} className="flex items-center gap-4 border-b border-border/50 pb-3 last:border-0 last:pb-0">
-                                        <div className={`p-2 rounded-full ${run.status === 'running' ? 'bg-blue-100 text-blue-600 animate-pulse' :
-                                            run.result === 'passed' ? 'bg-green-100 text-green-600' :
-                                                'bg-red-100 text-red-600'
-                                            }`}>
-                                            {run.status === 'running' ? <Play className="h-4 w-4" /> :
-                                                run.result === 'passed' ? <CheckCircle2 className="h-4 w-4" /> :
-                                                    <AlertCircle className="h-4 w-4" />}
+                                recentRuns.slice(0, 5).map((run) => {
+                                    const isRunning = run.status === 'running'
+                                    const isPassed = run.result === 'passed'
+                                    const isFailed = !isRunning && !isPassed
+                                    const iconBg = isRunning ? 'var(--color-info-light)' : isPassed ? 'var(--color-success-light)' : 'var(--color-danger-light)'
+                                    const iconColor = isRunning ? 'var(--color-info)' : isPassed ? 'var(--color-success)' : 'var(--color-danger)'
+                                    return (
+                                        <div key={run.id} className="flex items-center gap-4 pb-3 last:pb-0" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
+                                            <div
+                                                className={`p-2 rounded-full flex-shrink-0${isRunning ? ' animate-pulse' : ''}`}
+                                                style={{ backgroundColor: iconBg, color: iconColor }}
+                                            >
+                                                {isRunning ? <Play className="h-4 w-4" /> :
+                                                    isPassed ? <CheckCircle2 className="h-4 w-4" /> :
+                                                        <AlertCircle className="h-4 w-4" />}
+                                            </div>
+                                            <div className="space-y-1 flex-1 min-w-0">
+                                                <p className="text-sm font-medium leading-none truncate" style={{ color: 'var(--color-text-primary)' }}>
+                                                    {run.test_case_name || "Test Case"}
+                                                </p>
+                                                <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+                                                    {formatDistanceToNow(new Date(run.created_at), { addSuffix: true })}
+                                                </p>
+                                            </div>
+                                            <Badge
+                                                variant="outline"
+                                                className="text-[10px]"
+                                                style={{ color: iconColor, borderColor: iconColor, opacity: 0.85 }}
+                                            >
+                                                {run.result || run.status}
+                                            </Badge>
                                         </div>
-                                        <div className="space-y-1 flex-1 min-w-0">
-                                            <p className="text-sm font-medium leading-none truncate">
-                                                {run.test_case_name || "Test Case"}
-                                            </p>
-                                            <p className="text-xs text-muted-foreground">
-                                                {formatDistanceToNow(new Date(run.created_at), { addSuffix: true })}
-                                            </p>
-                                        </div>
-                                        <Badge variant="outline" className={`text-[10px] ${run.status === 'running' ? 'border-blue-200 text-blue-600' :
-                                            run.result === 'passed' ? 'border-green-200 text-green-600' :
-                                                'border-red-200 text-red-600'
-                                            }`}>
-                                            {run.result || run.status}
-                                        </Badge>
-                                    </div>
-                                ))
+                                    )
+                                })
                             )}
                         </div>
                     </CardContent>

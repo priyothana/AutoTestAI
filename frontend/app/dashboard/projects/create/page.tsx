@@ -111,10 +111,10 @@ export default function CreateProjectPage() {
 
             const data = await response.json()
             setCreatedProjectId(data.id)
-            toast.success("Project created! Now connect your application.")
+            toast.success("Environment created! Now connect your application.")
             setCurrentStep(5)
         } catch (error: any) {
-            toast.error(error.message || "Failed to create project")
+            toast.error(error.message || "Failed to create environment")
         } finally {
             setIsCreating(false)
         }
@@ -178,7 +178,7 @@ export default function CreateProjectPage() {
                 throw new Error(err.detail || "Failed to save credentials")
             }
 
-            // Step 2: Start OAuth flow
+            // Step 2: Start OAuth flow (Legacy - Node.js backend returns empty auth_url for JSForce)
             const oauthRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/connect`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -186,12 +186,15 @@ export default function CreateProjectPage() {
             })
             if (!oauthRes.ok) {
                 const err = await oauthRes.json().catch(() => ({}))
-                throw new Error(err.detail || "Failed to initiate OAuth")
+                throw new Error(err.detail || "Failed to initiate connection")
             }
             const data = await oauthRes.json()
             if (data.auth_url) {
                 toast.info("Redirecting to Salesforce login...")
                 window.location.href = data.auth_url
+            } else {
+                toast.success("Salesforce credentials saved successfully!")
+                setTimeout(() => router.push(`/dashboard/projects/${createdProjectId}`), 1000)
             }
         } catch (error: any) {
             toast.error(error.message || "Salesforce connection failed")
@@ -296,7 +299,7 @@ export default function CreateProjectPage() {
                 throw new Error(err.detail || "Failed to save Jira config")
             }
             setJiraSaved(true)
-            toast.success("Jira configuration saved to project!")
+            toast.success("Jira configuration saved to environment!")
         } catch (error: any) {
             toast.error(error.message || "Failed to save Jira config")
         } finally {
@@ -305,7 +308,7 @@ export default function CreateProjectPage() {
     }
 
     const handleSkipConnect = () => {
-        toast.info("You can connect later from project settings.")
+        toast.info("You can connect later from environment settings.")
         router.push(`/dashboard/projects/${createdProjectId}`)
     }
 
@@ -333,8 +336,8 @@ export default function CreateProjectPage() {
     return (
         <div className="max-w-3xl mx-auto py-10">
             <div className="mb-8">
-                <h1 className="text-3xl font-bold mb-2">Create New Project</h1>
-                <p className="text-muted-foreground">Follow the wizard to set up your new testing project.</p>
+                <h1 className="text-3xl font-bold mb-2">Create New Environment</h1>
+                <p className="text-muted-foreground">Follow the wizard to set up your new testing environment.</p>
             </div>
 
             {/* Progress Steps */}
@@ -353,18 +356,18 @@ export default function CreateProjectPage() {
             <Card>
                 <CardHeader>
                     <CardTitle>
-                        {currentStep === 1 && "Project Details"}
+                        {currentStep === 1 && "Environment Details"}
                         {currentStep === 2 && "Application Type"}
                         {currentStep === 3 && "Configuration"}
                         {currentStep === 4 && "Review & Create"}
-                        {currentStep === 5 && "🔗 Connect to Project"}
+                        {currentStep === 5 && "🔗 Connect to Environment"}
                     </CardTitle>
                     <CardDescription>
-                        {currentStep === 1 && "Enter the basic information for your project."}
+                        {currentStep === 1 && "Enter the basic information for your environment."}
                         {currentStep === 2 && "Select the type of application you are testing."}
                         {currentStep === 3 && "Configure environment settings."}
                         {currentStep === 4 && "Review your settings before creating."}
-                        {currentStep === 5 && "Connect your project to enable authentication and metadata sync."}
+                        {currentStep === 5 && "Connect your environment to enable authentication and metadata sync."}
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -376,7 +379,7 @@ export default function CreateProjectPage() {
                                 <>
                                     <FormField control={form.control} name="name" render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel>Project Name</FormLabel>
+                                            <FormLabel>Environment Name</FormLabel>
                                             <FormControl><Input placeholder="e.g., Customer Portal" {...field} /></FormControl>
                                             <FormMessage />
                                         </FormItem>
@@ -384,7 +387,7 @@ export default function CreateProjectPage() {
                                     <FormField control={form.control} name="description" render={({ field }) => (
                                         <FormItem>
                                             <FormLabel>Description (Optional)</FormLabel>
-                                            <FormControl><Textarea placeholder="Brief description of the project..." {...field} /></FormControl>
+                                            <FormControl><Textarea placeholder="Brief description of the environment..." {...field} /></FormControl>
                                             <FormMessage />
                                         </FormItem>
                                     )} />
@@ -561,7 +564,7 @@ export default function CreateProjectPage() {
                                                 </div>
                                             </div>
                                             <div className="bg-white/60 dark:bg-black/20 rounded-md p-3 text-sm space-y-1 border mt-2">
-                                                <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Per-project credentials — isolated per org</div>
+                                                <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Per-environment credentials — isolated per org</div>
                                                 <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Encrypted at rest with Fernet</div>
                                                 <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Auto metadata sync after OAuth</div>
                                             </div>
@@ -717,7 +720,7 @@ export default function CreateProjectPage() {
                     )}
                     {currentStep === 4 && (
                         <Button onClick={form.handleSubmit(onSubmit)} disabled={isCreating} className="bg-green-600 hover:bg-green-700">
-                            {isCreating ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</>) : (<>Create Project <ChevronRight className="ml-2 h-4 w-4" /></>)}
+                            {isCreating ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</>) : (<>Create Environment <ChevronRight className="ml-2 h-4 w-4" /></>)}
                         </Button>
                     )}
                     {currentStep === 5 && (

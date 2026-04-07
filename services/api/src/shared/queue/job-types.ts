@@ -52,6 +52,12 @@ export interface StepData {
   value?: string
   /** Playwright locator strategy: 'label' | 'placeholder' | 'text' | 'role' | 'testid' | 'css' (default) */
   locator_type?: string
+  /**
+   * SF Lightning field type — used by the execution worker to dispatch the
+   * correct interaction handler when action is 'select'.
+   * Values: 'picklist' | 'lookup' | 'lookup_advanced' | 'date' | 'dependent_picklist' | 'filtered_lookup'
+   */
+  sf_field_type?: string
 }
 
 /** Healing queue — consumed by healing.worker.ts */

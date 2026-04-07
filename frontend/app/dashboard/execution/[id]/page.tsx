@@ -41,7 +41,7 @@ type LogEntry = {
     ended_at?: string
     duration_ms?: number
     error?: string
-    screenshot_url?: string
+    screenshot_path?: string
 }
 
 type TestRun = {
@@ -216,9 +216,9 @@ export default function ExecutionDetailsPage({ params }: { params: Promise<{ id:
                                         {log.duration_ms ? `${(log.duration_ms / 1000).toFixed(2)}s` : "--"}
                                     </TableCell>
                                     <TableCell className="text-right">
-                                        {log.screenshot_url && (
+                                        {log.screenshot_path && (
                                             <Button variant="outline" size="sm" asChild>
-                                                <a href={`${process.env.NEXT_PUBLIC_API_URL}${log.screenshot_url}`} target="_blank" rel="noreferrer">
+                                                <a href={log.screenshot_path.startsWith('http') ? log.screenshot_path : `${process.env.NEXT_PUBLIC_API_URL}${log.screenshot_path.startsWith('/') ? '' : '/'}${log.screenshot_path}`} target="_blank" rel="noreferrer">
                                                     <ImageIcon className="mr-2 h-4 w-4" />
                                                     Screenshot
                                                 </a>

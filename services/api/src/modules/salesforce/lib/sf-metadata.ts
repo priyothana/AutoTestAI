@@ -303,3 +303,130 @@ export async function getRecordTypes(
   const metadata = await describeObject(projectId, objectName)
   return metadata.recordTypeInfos
 }
+
+/**
+ * Fetch the set of field API names that appear on a page layout for an object.
+ * Uses the JSForce Metadata API (conn.metadata.list + conn.metadata.read).
+ * Returns null if layouts cannot be fetched (caller should fall back to schema fields).
+ *
+ * @param preferredRecordTypeName — when provided, try to find the layout assigned to
+ *   that specific record type (e.g. 'Damage'). Salesforce names RT layouts as
+ *   'ObjectName-<RecordTypeName> Layout' or similar. Falls back to first layout if
+ *   no RT-specific match is found.
+ *
+ * Result is cached per (objectName, recordTypeName) with the same TTL as other metadata.
+ */
+export async function getPageLayoutFields(
+  projectId: string,
+  objectName: string,
+  preferredRecordTypeName?: string,
+): Promise<Set<string> | null> {
+  const cacheKey = buildCacheKey(
+    projectId,
+    `${objectName}:layout-fields:${(preferredRecordTypeName ?? 'default').toLowerCase()}`,
+  )
+  const cached = getCached<string[]>(cacheKey)
+  if (cached) {
+    log.debug(`[metadata] Layout fields cache hit: ${objectName} (RT: ${preferredRecordTypeName ?? 'default'})`)
+    return new Set(cached)
+  }
+
+  try {
+    const layoutFieldNames = await executeWithRetry(projectId, async (conn) => {
+      // List all layouts — filter to this object
+      const allLayouts = await (conn as unknown as {
+        metadata: {
+          list: (types: { type: string }[], apiVersion?: string) => Promise<{ fullName: string }[]>
+          read: (type: string, fullNames: string | string[]) => Promise<unknown>
+        }
+      }).metadata.list([{ type: 'Layout' }])
+
+      const objectLayouts = allLayouts.filter(
+        (l) => l.fullName.startsWith(`${objectName}-`),
+      )
+      if (objectLayouts.length === 0) return null
+
+      // Select the best matching layout for the requested record type.
+      // SF names RT layouts as: "ObjectName-<RecordTypeName> Layout"
+      // e.g. "Inventory__c-Damage Layout", "Inventory__c-Standard Layout"
+      let targetLayout = objectLayouts[0]
+      if (preferredRecordTypeName && objectLayouts.length > 1) {
+        const rtNorm = preferredRecordTypeName.toLowerCase().replace(/[\s_-]+/g, '')
+
+        // Score each layout: does its name (after the object prefix) contain the RT name?
+        const scored = objectLayouts.map((l) => {
+          const namePart = l.fullName
+            .slice(objectName.length + 1)       // strip "ObjectName-"
+            .toLowerCase()
+            .replace(/[\s_-]+/g, '')
+          let score = 0
+          if (namePart === rtNorm)               score = 3  // exact
+          else if (namePart.startsWith(rtNorm))  score = 2  // prefix
+          else if (namePart.includes(rtNorm))    score = 1  // contains
+          return { layout: l, score }
+        })
+
+        scored.sort((a, b) => b.score - a.score)
+        if (scored[0].score > 0) {
+          targetLayout = scored[0].layout
+          log.info(`[metadata] RT-specific layout selected: ${targetLayout.fullName} (RT: ${preferredRecordTypeName})`)
+        } else {
+          log.info(`[metadata] No layout matched RT "${preferredRecordTypeName}" — using first: ${targetLayout.fullName}`)
+        }
+      }
+
+      // Read the selected layout
+      const layoutData = await (conn as unknown as {
+        metadata: { read: (type: string, name: string) => Promise<unknown> }
+      }).metadata.read('Layout', targetLayout.fullName)
+
+      // Extract field API names from layout sections
+      const fieldNames = new Set<string>()
+      const layout = layoutData as Record<string, unknown>
+      const sections = layout['layoutSections'] as Record<string, unknown>[] | undefined
+      if (!sections) return null
+
+      // Extract EDITABLE field API names from layout sections.
+      // Each layoutItem has a 'behavior' property:
+      //   "Edit"     — user can fill it in (normal field)
+      //   "Required" — user must fill it in (enforced by layout)
+      //   "Readonly" — displayed for reference only (auto-number, formula, system fields)
+      // We EXCLUDE Readonly fields so they never appear in the manifest and the LLM
+      // won't try to interact with them (e.g. auto-generated Record Numbers).
+      const readonlyFields: string[] = []
+      for (const section of sections) {
+        const columns = (section['layoutColumns'] ?? []) as Record<string, unknown>[]
+        for (const col of columns) {
+          const items = (col['layoutItems'] ?? []) as Record<string, unknown>[]
+          for (const item of items) {
+            const field = item['field']
+            const behavior = item['behavior']   // 'Edit' | 'Required' | 'Readonly' | undefined
+            if (typeof field !== 'string' || !field) continue
+
+            if (typeof behavior === 'string' && behavior.toLowerCase() === 'readonly') {
+              readonlyFields.push(field)
+              continue   // skip — display only, not interactable
+            }
+
+            fieldNames.add(field)
+          }
+        }
+      }
+      if (readonlyFields.length > 0) {
+        log.info(`[metadata] Excluded ${readonlyFields.length} Readonly layout fields: ${readonlyFields.join(', ')}`)
+      }
+
+      return Array.from(fieldNames)
+    })
+
+    if (!layoutFieldNames) return null
+
+    setCached(cacheKey, layoutFieldNames)
+    log.info(`[metadata] Fetched ${layoutFieldNames.length} layout fields for ${objectName} (RT: ${preferredRecordTypeName ?? 'default'})`)
+    return new Set(layoutFieldNames)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    log.warn({ err: msg }, `[metadata] Could not fetch page layout for ${objectName} — will use schema fields`)
+    return null
+  }
+}

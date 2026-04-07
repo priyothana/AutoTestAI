@@ -14,6 +14,7 @@ import {
     Menu,
     Bell
 } from "lucide-react"
+import ThemeToggle from "@/components/shared/ThemeToggle"
 
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
@@ -34,7 +35,7 @@ interface DashboardLayoutProps {
 
 const sidebarItems = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
-    { name: "Projects", href: "/dashboard/projects", icon: FolderKanban },
+    { name: "Environments", href: "/dashboard/projects", icon: FolderKanban },
     { name: "Tests", href: "/dashboard/tests", icon: TestTube2 },
     { name: "Execution", href: "/dashboard/execution", icon: PlayCircle },
     { name: "Reports", href: "/dashboard/reports", icon: FileBarChart },
@@ -58,32 +59,65 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
     }
 
     return (
-        <div className="flex min-h-screen bg-slate-50 dark:bg-slate-950">
+        <div className="flex min-h-screen" style={{ backgroundColor: 'var(--color-bg-base)' }}>
             {/* Desktop Sidebar */}
-            <aside className="hidden w-64 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 md:block shadow-sm z-10">
-                <div className="flex h-16 items-center border-b border-slate-100 dark:border-slate-800 px-6">
-                    <Link href="/dashboard" className="flex items-center gap-2 font-bold text-xl text-slate-900 dark:text-white">
-                        <div className="flex items-center justify-center p-1.5 bg-primary/10 rounded-md">
-                            <TestTube2 className="h-5 w-5 text-primary" />
+            <aside className="hidden w-64 md:block z-10" style={{ backgroundColor: 'var(--color-bg-elevated)', borderRight: '1px solid var(--color-border-sem)', boxShadow: 'var(--shadow-md)' }}>
+                <div className="flex h-16 items-center px-6" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
+                    <Link href="/dashboard" className="flex items-center gap-2 font-bold text-xl" style={{ color: 'var(--color-text-primary)' }}>
+                        <div className="flex items-center justify-center p-1.5 rounded-md" style={{ backgroundColor: 'var(--color-brand-light)' }}>
+                            <TestTube2 className="h-5 w-5" style={{ color: 'var(--color-brand)' }} />
                         </div>
-                        <span>AutoTest <span className="text-primary font-black">AI</span></span>
+                        <span>AutoTest <span className="font-black" style={{ color: 'var(--color-brand)' }}>AI</span></span>
                     </Link>
                 </div>
 
                 <nav className="flex flex-col gap-1 px-3">
-                    <div className="px-3 mb-2 mt-4 text-xs font-semibold text-slate-500 uppercase tracking-wider">Main</div>
+                    <div className="px-3 mb-2 mt-4 text-xs font-semibold uppercase" style={{ color: 'var(--color-text-muted)', letterSpacing: '0.08em' }}>Main</div>
                     {sidebarItems.map((item) => {
                         const isActive = pathname === item.href
                         return (
                             <Link
                                 key={item.href}
                                 href={item.href}
-                                className={`flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-all ${isActive
-                                    ? "bg-primary/10 text-primary dark:bg-primary/20 dark:text-indigo-400 font-semibold"
-                                    : "text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-slate-50"
-                                    }`}
+                                className="group flex items-center gap-3 rounded-md px-3 py-2.5 text-sm transition-all"
+                                style={isActive ? {
+                                    color: 'var(--color-brand)',
+                                    backgroundColor: 'var(--color-brand-light)',
+                                    borderLeft: '2px solid var(--color-brand)',
+                                    paddingLeft: '10px',
+                                    fontWeight: 500,
+                                    transitionDuration: 'var(--transition-fast)',
+                                } : {
+                                    color: 'var(--color-text-secondary)',
+                                    backgroundColor: 'transparent',
+                                    borderLeft: '2px solid transparent',
+                                    paddingLeft: '10px',
+                                    fontWeight: 400,
+                                    transitionDuration: 'var(--transition-fast)',
+                                }}
+                                onMouseEnter={e => {
+                                    if (!isActive) {
+                                        const el = e.currentTarget as HTMLAnchorElement
+                                        el.style.color = 'var(--color-text-primary)'
+                                        el.style.backgroundColor = 'var(--color-bg-overlay)'
+                                    }
+                                }}
+                                onMouseLeave={e => {
+                                    if (!isActive) {
+                                        const el = e.currentTarget as HTMLAnchorElement
+                                        el.style.color = 'var(--color-text-secondary)'
+                                        el.style.backgroundColor = 'transparent'
+                                    }
+                                }}
                             >
-                                <item.icon className={`h-4 w-4 ${isActive ? 'text-primary dark:text-indigo-400' : 'text-slate-400'}`} />
+                                <item.icon
+                                    className="h-4 w-4 flex-shrink-0"
+                                    style={{
+                                        opacity: isActive ? 1 : 0.6,
+                                        color: isActive ? 'var(--color-brand)' : 'currentColor',
+                                        transition: 'opacity var(--transition-fast), color var(--transition-fast)',
+                                    }}
+                                />
                                 {item.name}
                             </Link>
                         )
@@ -93,7 +127,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
 
             <div className="flex flex-1 flex-col overflow-hidden">
                 {/* Header */}
-                <header className="flex h-16 items-center justify-between border-b border-slate-200 dark:border-slate-800 bg-white/80 backdrop-blur-md px-6 dark:bg-slate-900/80 sticky top-0 z-20">
+                <header className="flex h-16 items-center justify-between px-6 sticky top-0 z-20 backdrop-blur-md" style={{ backgroundColor: 'color-mix(in srgb, var(--color-bg-elevated) 85%, transparent)', borderBottom: '1px solid var(--color-border-sem)' }}>
                     <div className="flex items-center gap-4 md:hidden">
                         {mounted ? (
                             <Sheet>
@@ -103,21 +137,42 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                         <span className="sr-only">Toggle menu</span>
                                     </Button>
                                 </SheetTrigger>
-                                <SheetContent side="left" className="w-64 p-0">
-                                    <div className="flex h-16 items-center border-b px-6">
-                                        <span className="text-lg font-bold">AutoTest AI</span>
+                                <SheetContent side="left" className="w-64 p-0" style={{ backgroundColor: 'var(--color-bg-elevated)', borderRight: '1px solid var(--color-border-sem)' }}>
+                                    <div className="flex h-16 items-center px-6" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
+                                        <span className="text-lg font-bold" style={{ color: 'var(--color-text-primary)' }}>AutoTest AI</span>
                                     </div>
                                     <nav className="flex flex-col gap-1 p-4">
-                                        {sidebarItems.map((item) => (
+                                        {sidebarItems.map((item) => {
+                                            const isActiveMobile = pathname === item.href
+                                            return (
                                             <Link
                                                 key={item.href}
                                                 href={item.href}
-                                                className="flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium hover:bg-muted"
+                                                className="flex items-center gap-3 rounded-md py-2 text-sm"
+                                                style={isActiveMobile ? {
+                                                    color: 'var(--color-brand)',
+                                                    backgroundColor: 'var(--color-brand-light)',
+                                                    borderLeft: '2px solid var(--color-brand)',
+                                                    paddingLeft: '10px',
+                                                    paddingRight: '12px',
+                                                    fontWeight: 500,
+                                                } : {
+                                                    color: 'var(--color-text-secondary)',
+                                                    borderLeft: '2px solid transparent',
+                                                    paddingLeft: '10px',
+                                                    paddingRight: '12px',
+                                                }}
                                             >
-                                                <item.icon className="h-4 w-4" />
+                                                <item.icon
+                                                    className="h-4 w-4 flex-shrink-0"
+                                                    style={{
+                                                        opacity: isActiveMobile ? 1 : 0.6,
+                                                        color: isActiveMobile ? 'var(--color-brand)' : 'currentColor',
+                                                    }}
+                                                />
                                                 {item.name}
                                             </Link>
-                                        ))}
+                                        )})}
                                     </nav>
                                 </SheetContent>
                             </Sheet>
@@ -131,6 +186,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                     </div>
 
                     <div className="flex flex-1 items-center justify-end gap-4">
+                        <ThemeToggle />
                         <Button variant="ghost" size="icon">
                             <Bell className="h-5 w-5" />
                         </Button>
@@ -150,7 +206,11 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                     <DropdownMenuItem>Profile</DropdownMenuItem>
                                     <DropdownMenuItem>Billing</DropdownMenuItem>
                                     <DropdownMenuSeparator />
-                                    <DropdownMenuItem className="text-red-500 cursor-pointer" onClick={handleLogout}>
+                                    <DropdownMenuItem
+                                        style={{ color: 'var(--color-danger)' }}
+                                        className="cursor-pointer"
+                                        onClick={handleLogout}
+                                    >
                                         <LogOut className="mr-2 h-4 w-4" />
                                         Log out
                                     </DropdownMenuItem>
@@ -168,7 +228,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                 </header>
 
                 {/* Main Content */}
-                <main className="flex-1 p-6">
+                <main className="flex-1 p-6 page-in">
                     {children}
                 </main>
             </div>

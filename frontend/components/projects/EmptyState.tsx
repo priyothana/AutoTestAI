@@ -13,12 +13,12 @@ export function EmptyState({ onCreateClick }: EmptyStateProps) {
             <div className="rounded-full bg-muted p-6 mb-4">
                 <FolderOpen className="h-12 w-12 text-muted-foreground" />
             </div>
-            <h3 className="text-lg font-semibold mb-2">No projects yet</h3>
+            <h3 className="text-lg font-semibold mb-2">No environments yet</h3>
             <p className="text-muted-foreground mb-6 max-w-sm">
-                Create your first project to get started with test automation.
+                Create your first environment to get started with test automation.
             </p>
             <Button onClick={onCreateClick} size="lg">
-                Create New Project
+                Create New Environment
             </Button>
         </div>
     )

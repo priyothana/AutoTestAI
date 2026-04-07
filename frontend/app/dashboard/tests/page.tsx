@@ -26,6 +26,7 @@ import {
     TableHeader,
     TableRow,
 } from "@/components/ui/table"
+import { useRouter } from "next/navigation"
 
 interface TestCase {
     id: string
@@ -38,9 +39,17 @@ interface TestCase {
     created_at: string
 }
 
+// IMPROVEMENT 4 — Priority badge colour map
+const priorityStyles: Record<string, string> = {
+    high: "bg-red-50 text-red-700 border border-red-200",
+    medium: "bg-amber-50 text-amber-700 border border-amber-200",
+    low: "bg-green-50 text-green-700 border border-green-200",
+}
+
 export default function TestsPage() {
     const [tests, setTests] = useState<TestCase[]>([])
     const [isLoading, setIsLoading] = useState(true)
+    const router = useRouter()
 
     const fetchTests = async () => {
         setIsLoading(true)
@@ -85,8 +94,8 @@ export default function TestsPage() {
         <div className="space-y-6">
             <div className="flex items-center justify-between">
                 <div>
-                    <h2 className="text-3xl font-bold tracking-tight">Test Cases</h2>
-                    <p className="text-muted-foreground">Manage and execute your automated test scenarios.</p>
+                    <h2 className="page-title">Test Cases</h2>
+                    <p className="page-subtitle">Manage and execute your automated test scenarios.</p>
                 </div>
                 <Button asChild>
                     <Link href="/dashboard/tests/create">
@@ -98,7 +107,7 @@ export default function TestsPage() {
 
             <div className="flex items-center gap-2">
                 <div className="relative flex-1 max-w-sm">
-                    <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                    <Search className="absolute left-2.5 top-2.5 h-4 w-4" style={{ color: 'var(--color-text-muted)' }} />
                     <Input type="search" placeholder="Search tests..." className="pl-8" />
                 </div>
             </div>
@@ -106,14 +115,14 @@ export default function TestsPage() {
             <Card>
                 <CardHeader>
                     <CardTitle>All Tests</CardTitle>
-                    <CardDescription>List of all test cases across projects.</CardDescription>
+                    <CardDescription>List of all test cases across environments.</CardDescription>
                 </CardHeader>
                 <CardContent>
                     <Table>
                         <TableHeader>
                             <TableRow>
                                 <TableHead>Test Name</TableHead>
-                                <TableHead>Project</TableHead>
+                                <TableHead>Environment</TableHead>
                                 <TableHead>Steps</TableHead>
                                 <TableHead>Priority</TableHead>
                                 <TableHead>Created</TableHead>
@@ -129,18 +138,23 @@ export default function TestsPage() {
                                 </TableRow>
                             ) : tests.length === 0 ? (
                                 <TableRow>
-                                    <TableCell colSpan={6} className="text-center py-10 text-muted-foreground">
-                                        <div className="flex flex-col items-center justify-center space-y-3">
-                                            <FileText className="h-10 w-10 text-muted-foreground/50" />
-                                            <p>No tests found.</p>
-                                            <Button variant="outline" size="sm" asChild>
+                                    <TableCell colSpan={6} className="text-center">
+                                        <div className="empty-state">
+                                            <FileText className="empty-state-icon" />
+                                            <p className="empty-state-title">No tests found</p>
+                                            <p className="empty-state-message">Create your first test case to get started.</p>
+                                            <Button variant="outline" size="sm" asChild className="mt-4">
                                                 <Link href="/dashboard/tests/create">Create your first test</Link>
                                             </Button>
                                         </div>
                                     </TableCell>
                                 </TableRow>
                             ) : tests.map((test) => (
-                                <TableRow key={test.id}>
+                                <TableRow
+                                    key={test.id}
+                                    className="group hover:bg-muted/50 cursor-pointer transition-colors"
+                                    onClick={() => router.push(`/dashboard/tests/${test.id}`)}
+                                >
                                     <TableCell className="font-medium">
                                         <div className="flex items-center gap-2">
                                             <FileText className="h-4 w-4 text-muted-foreground" />
@@ -150,7 +164,10 @@ export default function TestsPage() {
                                     <TableCell>{test.project_name}</TableCell>
                                     <TableCell>{test.steps?.length || 0}</TableCell>
                                     <TableCell>
-                                        <Badge variant="outline" className="capitalize">
+                                        <Badge
+                                            variant="outline"
+                                            className={`capitalize ${priorityStyles[test.priority?.toLowerCase()] ?? ""}`}
+                                        >
                                             {test.priority}
                                         </Badge>
                                     </TableCell>
@@ -158,27 +175,60 @@ export default function TestsPage() {
                                         {format(new Date(test.created_at), "MMM d, yyyy")}
                                     </TableCell>
                                     <TableCell className="text-right">
-                                        <DropdownMenu>
-                                            <DropdownMenuTrigger asChild>
-                                                <Button variant="ghost" className="h-8 w-8 p-0">
-                                                    <span className="sr-only">Open menu</span>
-                                                    <MoreVertical className="h-4 w-4" />
-                                                </Button>
-                                            </DropdownMenuTrigger>
-                                            <DropdownMenuContent align="end">
-                                                <DropdownMenuLabel>Actions</DropdownMenuLabel>
-                                                <DropdownMenuItem asChild>
-                                                    <Link href={`/dashboard/tests/${test.id}`} className="cursor-pointer">
-                                                        <Edit className="mr-2 h-4 w-4" /> Edit
-                                                    </Link>
-                                                </DropdownMenuItem>
-                                                <DropdownMenuItem onClick={() => handleRunTest(test.id)}>
-                                                    <Play className="mr-2 h-4 w-4" /> Run
-                                                </DropdownMenuItem>
-                                                <DropdownMenuSeparator />
-                                                <DropdownMenuItem className="text-red-500">Delete</DropdownMenuItem>
-                                            </DropdownMenuContent>
-                                        </DropdownMenu>
+                                        <div className="flex items-center justify-end gap-2">
+                                            <Link
+                                                href={`/dashboard/tests/${test.id}`}
+                                                onClick={(e) => e.stopPropagation()}
+                                            >
+                                                <button
+                                                    className="opacity-0 group-hover:opacity-100 transition-opacity duration-150
+                                                               px-2 py-1 text-xs rounded
+                                                               bg-transparent hover:bg-blue-50
+                                                               text-blue-600 border border-blue-200"
+                                                >
+                                                    <Edit className="inline h-3 w-3 mr-1" />
+                                                    Edit
+                                                </button>
+                                            </Link>
+                                            <button
+                                                className="opacity-0 group-hover:opacity-100 transition-opacity duration-150
+                                                           px-2 py-1 text-xs rounded
+                                                           bg-transparent hover:bg-green-50
+                                                           text-green-600 border border-green-200"
+                                                onClick={(e) => {
+                                                    e.stopPropagation()
+                                                    handleRunTest(test.id)
+                                                }}
+                                            >
+                                                <Play className="inline h-3 w-3 mr-1" />
+                                                Run
+                                            </button>
+                                            <DropdownMenu>
+                                                <DropdownMenuTrigger asChild>
+                                                    <Button
+                                                        variant="ghost"
+                                                        className="h-8 w-8 p-0"
+                                                        onClick={(e) => e.stopPropagation()}
+                                                    >
+                                                        <span className="sr-only">Open menu</span>
+                                                        <MoreVertical className="h-4 w-4" />
+                                                    </Button>
+                                                </DropdownMenuTrigger>
+                                                <DropdownMenuContent align="end">
+                                                    <DropdownMenuLabel>Actions</DropdownMenuLabel>
+                                                    <DropdownMenuItem asChild>
+                                                        <Link href={`/dashboard/tests/${test.id}`} className="cursor-pointer">
+                                                            <Edit className="mr-2 h-4 w-4" /> Edit
+                                                        </Link>
+                                                    </DropdownMenuItem>
+                                                    <DropdownMenuItem onClick={() => handleRunTest(test.id)}>
+                                                        <Play className="mr-2 h-4 w-4" /> Run
+                                                    </DropdownMenuItem>
+                                                    <DropdownMenuSeparator />
+                                                    <DropdownMenuItem className="text-red-500">Delete</DropdownMenuItem>
+                                                </DropdownMenuContent>
+                                            </DropdownMenu>
+                                        </div>
                                     </TableCell>
                                 </TableRow>
                             ))}

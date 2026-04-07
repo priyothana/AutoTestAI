@@ -199,7 +199,12 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [lastRunResult, setLastRunResult] = useState<any>(null)
 
     // ── Helper: stop polling and reset running state ────────────────────
-    const stopRunning = (toastId: string | number, message: string, type: "success" | "error" | "warning" | "info" = "warning") => {
+    const stopRunning = (
+        toastId: string | number,
+        message: string,
+        type: "success" | "error" | "warning" | "info" = "warning",
+        finalRunId?: string,
+    ) => {
         if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
         if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
         setIsRunning(false)
@@ -208,11 +213,26 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         else if (type === "error") toast.error(message, { id: toastId })
         else if (type === "info") toast.info(message, { id: toastId })
         else toast.warning(message, { id: toastId })
+
+        // On timeout/warning, do one final fetch so the result panel is shown
+        // if the test actually finished while we were waiting.
+        if (finalRunId) {
+            fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${finalRunId}`)
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (data && data.status && !['pending','running'].includes(data.status)) {
+                        setLastRunResult(data)
+                        if (data.status === 'passed') setTestStatus('passed')
+                        else setTestStatus('failed')
+                    }
+                })
+                .catch(() => { /* non-critical */ })
+        }
     }
 
     const handleRunTest = async () => {
         if (!selectedProjectId) {
-            toast.error("Please select a project before running the test")
+            toast.error("Please select an environment before running the test")
             setProjectError(true)
             return
         }
@@ -333,18 +353,19 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         stopRunning(runToastId, "Polling failed repeatedly. Check Execution tab for results.", "warning")
                     }
                 }
-            }, 3000)
+            }, 5000)
 
-            // ── Safety timeout: 90 seconds max ────────────────────────────
+            // ── Safety timeout: 5 minutes max (matches backend stale-run guard) ─
             pollTimeoutRef.current = setTimeout(() => {
                 if (isRunningRef.current) {
                     stopRunning(
                         runToastId,
-                        "Test is taking longer than expected. Check the Execution tab for results.",
-                        "warning"
+                        "Test is taking longer than expected. Results will appear below if the test completed.",
+                        "warning",
+                        runData.id,  // triggers a final fetch to display the result
                     )
                 }
-            }, 90000)
+            }, 300000)
 
         } catch (error: any) {
             console.error("Run error:", error)
@@ -362,7 +383,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             return
         }
         if (!selectedProjectId) {
-            toast.error("Please select a project before saving")
+            toast.error("Please select an environment before saving")
             setProjectError(true)
             return
         }
@@ -451,67 +472,54 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     return (
         <div className="space-y-5 max-w-6xl mx-auto pb-10">
             {/* ── Header ──────────────────────────────────────────────────── */}
-            <div className="flex items-center justify-between">
-                <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                        <Input
-                            value={testName}
-                            onChange={(e) => setTestName(e.target.value)}
-                            className="text-2xl font-bold h-auto border-transparent hover:border-input px-0 w-[400px] focus-visible:ring-0"
-                            placeholder="Enter test case name..."
-                        />
-                        <Badge
-                            variant={testStatus === "passed" ? "default" : testStatus === "failed" ? "destructive" : "outline"}
-                            className={testStatus === "passed" ? "bg-green-600 hover:bg-green-600" : ""}
-                        >
-                            {isInternalNew ? "Draft" : testStatus.toUpperCase()}
-                        </Badge>
-                    </div>
-                    <p className="text-muted-foreground text-sm">
-                        {isInternalNew ? "Creating a new automated test" : `Editing test ID: ${currentId}`}
-                    </p>
-                </div>
-                <div className="flex items-center gap-2">
-                    <Button variant="outline" onClick={handleSave} disabled={isSaving}>
-                        {isSaving ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        ) : (
-                            <Save className="mr-2 h-4 w-4" />
-                        )}
-                        Save
-                    </Button>
-                    {isRunning ? (
-                        <>
-                            <Button
-                                className="bg-green-600 hover:bg-green-700"
-                                disabled
-                            >
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                                Running...
-                            </Button>
-                            <Button
-                                variant="outline"
-                                className="border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
-                                onClick={() => stopRunning("run-stop", "Test run stopped manually. Check Execution tab for results.", "warning")}
-                            >
-                                Stop
-                            </Button>
-                        </>
-                    ) : (
-                        <Button
-                            className="bg-green-600 hover:bg-green-700"
-                            onClick={handleRunTest}
-                            disabled={steps.length === 0 || isInternalNew || isSaving}
-                        >
-                            <Play className="mr-2 h-4 w-4" />
-                            Run Test
-                        </Button>
-                    )}
-                </div>
+            <div className="flex items-center gap-2">
+                <Input
+                    value={testName}
+                    onChange={(e) => setTestName(e.target.value)}
+                    className="text-2xl font-bold h-auto border-transparent hover:border-input px-0 w-[400px] focus-visible:ring-0"
+                    placeholder="Enter test case name..."
+                />
+                <Badge
+                    variant={testStatus === "passed" ? "default" : testStatus === "failed" ? "destructive" : "outline"}
+                    className={testStatus === "passed" ? "bg-green-600 hover:bg-green-600" : ""}
+                >
+                    {isInternalNew ? "Draft" : testStatus.toUpperCase()}
+                </Badge>
+                <p className="text-muted-foreground text-sm ml-4 self-end pb-0.5">
+                    {isInternalNew ? "Creating a new automated test" : `Editing test ID: ${currentId}`}
+                </p>
             </div>
 
             {/* ══════════════════════════════════════════════════════════════
-                SECTION 1 — Test Case Source
+                SECTION 1 — Environment Mapping
+               ══════════════════════════════════════════════════════════════ */}
+            <Card className="border-blue-100 dark:border-blue-900 shadow-sm">
+                <CardHeader className="px-4 py-1 space-y-0 border-b bg-gray-50/50 dark:bg-gray-900/50 min-h-0 flex items-center justify-start">
+                    <CardTitle className="text-[13px] font-semibold text-gray-800 dark:text-gray-200 leading-none m-0">Environment Mapping</CardTitle>
+                </CardHeader>
+                <CardContent className="px-4 pb-3 pt-1.5">
+                    <div className="max-w-md space-y-1.5">
+                        <label className="text-xs font-medium text-gray-700 dark:text-gray-300 leading-none">
+                            Select Environment <span className="text-red-500">*</span>
+                        </label>
+                        <Select value={selectedProjectId} onValueChange={(val) => { setSelectedProjectId(val); setProjectError(false) }}>
+                            <SelectTrigger className={projectError ? "border-red-500 ring-1 ring-red-500" : ""}>
+                                <SelectValue placeholder="Select an environment..." />
+                            </SelectTrigger>
+                            <SelectContent>
+                                {projects.map((project) => (
+                                    <SelectItem key={project.id} value={project.id}>
+                                        {project.name}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+                    </div>
+                </CardContent>
+            </Card>
+
+            {/* ══════════════════════════════════════════════════════════════
+                SECTION 2 — Test Case Source
                ══════════════════════════════════════════════════════════════ */}
             <div className="space-y-3">
                 <div>
@@ -570,12 +578,12 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                 <h4 className="font-semibold text-sm">Import from Jira</h4>
                                 <p className="text-xs text-muted-foreground">
                                     {!selectedProjectId
-                                        ? 'Select a project first'
+                                        ? 'Select an environment first'
                                         : jiraConfigured === null
                                             ? 'Checking Jira config...'
                                             : jiraConfigured
                                                 ? 'Import user stories from your connected Jira board'
-                                                : 'Jira not configured for this project. Configure in Project Settings.'}
+                                                : 'Jira not configured for this environment. Configure in Environment Settings.'}
                                 </p>
                             </div>
                         </div>
@@ -630,7 +638,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             )}
 
             {/* ══════════════════════════════════════════════════════════════
-                SECTION 2 — AI Test Step Generator
+                SECTION 3 — AI Test Step Generator
                ══════════════════════════════════════════════════════════════ */}
             {testSource === 'manual' && (
                 <Card className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-950/20 dark:to-indigo-950/20 border-blue-200 dark:border-blue-900">
@@ -691,57 +699,9 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             </div>
 
             {/* ══════════════════════════════════════════════════════════════
-                SECTION 3 — Configuration + Test Steps (side by side)
+                SECTION 4 — Test Steps
                ══════════════════════════════════════════════════════════════ */}
-            <div className="grid gap-5 md:grid-cols-3 items-start">
-                {/* Left — Configuration */}
-                <Card>
-                    <CardHeader className="border-b">
-                        <CardTitle className="text-base">Configuration</CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-4 pt-4">
-                        <div className="space-y-2">
-                            <span className="text-sm font-medium">Project Mapping</span>
-                            <Select value={selectedProjectId} onValueChange={(val) => { setSelectedProjectId(val); setProjectError(false) }}>
-                                <SelectTrigger className={projectError ? "border-red-500 ring-1 ring-red-500" : ""}>
-                                    <SelectValue placeholder="Select a project *" />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    {projects.map((project) => (
-                                        <SelectItem key={project.id} value={project.id}>
-                                            {project.name}
-                                        </SelectItem>
-                                    ))}
-                                </SelectContent>
-                            </Select>
-                        </div>
-                        <div className="space-y-2">
-                            <span className="text-sm font-medium">Priority</span>
-                            <Select value={priority} onValueChange={setPriority}>
-                                <SelectTrigger>
-                                    <SelectValue />
-                                </SelectTrigger>
-                                <SelectContent>
-                                    <SelectItem value="low">Low</SelectItem>
-                                    <SelectItem value="medium">Medium</SelectItem>
-                                    <SelectItem value="high">High</SelectItem>
-                                </SelectContent>
-                            </Select>
-                        </div>
-                        <div className="space-y-2">
-                            <span className="text-sm font-medium">Description</span>
-                            <Textarea
-                                className="text-xs h-[80px]"
-                                placeholder="Brief description..."
-                                value={description}
-                                onChange={(e) => setDescription(e.target.value)}
-                            />
-                        </div>
-                    </CardContent>
-                </Card>
-
-                {/* Right — Test Steps */}
-                <Card className="md:col-span-2">
+            <Card>
                     <CardHeader className="border-b">
                         <CardTitle className="text-base">Test Steps ({steps.length})</CardTitle>
                         <CardAction>
@@ -772,10 +732,56 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                         </>
                                     )}
                                 </Button>
+
+                                {/* Divider */}
+                                <div className="w-px h-5 bg-gray-200 dark:bg-gray-700" />
+
                                 <Button variant="ghost" size="sm" onClick={addStep} className="text-blue-600 hover:text-blue-700 hover:bg-blue-50">
                                     <Plus className="mr-2 h-4 w-4" />
                                     Add Step
                                 </Button>
+
+                                {/* Save button */}
+                                <Button variant="outline" size="sm" onClick={handleSave} disabled={isSaving}>
+                                    {isSaving ? (
+                                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                    ) : (
+                                        <Save className="mr-2 h-4 w-4" />
+                                    )}
+                                    Save
+                                </Button>
+
+                                {/* Run Test / Running… / Stop */}
+                                {isRunning ? (
+                                    <>
+                                        <Button
+                                            size="sm"
+                                            className="bg-green-600 hover:bg-green-700"
+                                            disabled
+                                        >
+                                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                            Running...
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            className="border-red-300 text-red-600 hover:bg-red-50 hover:text-red-700"
+                                            onClick={() => stopRunning("run-stop", "Test run stopped manually. Check Execution tab for results.", "warning")}
+                                        >
+                                            Stop
+                                        </Button>
+                                    </>
+                                ) : (
+                                    <Button
+                                        size="sm"
+                                        className="bg-green-600 hover:bg-green-700"
+                                        onClick={handleRunTest}
+                                        disabled={steps.length === 0 || isInternalNew || isSaving}
+                                    >
+                                        <Play className="mr-2 h-4 w-4" />
+                                        Run Test
+                                    </Button>
+                                )}
                             </div>
                         </CardAction>
                     </CardHeader>
@@ -880,7 +886,6 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         )}
                     </CardContent>
                 </Card>
-            </div>
 
             {/* ── Run Results Section ─────────────────────────────────────── */}
             {lastRunResult && (
@@ -951,18 +956,18 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                 <h3 className="font-semibold mb-4">Final Screenshot</h3>
                                 {lastRunResult.screenshot_path ? (
                                     <div className="rounded-lg border bg-white dark:bg-black overflow-hidden shadow-sm group relative">
-                                        <img
-                                            src={`${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path}`}
-                                            alt="Test Run Screenshot"
-                                            className="w-full h-auto object-contain max-h-[400px]"
-                                        />
-                                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                                            <Button variant="secondary" size="sm" asChild>
-                                                <a href={`${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path}`} target="_blank" rel="noreferrer">
-                                                    View Full Size
-                                                </a>
-                                            </Button>
-                                        </div>
+                                            <img
+                                                src={lastRunResult.screenshot_path.startsWith('http') ? lastRunResult.screenshot_path : `${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path.startsWith('/') ? '' : '/'}${lastRunResult.screenshot_path}`}
+                                                alt="Test Run Screenshot"
+                                                className="w-full h-auto object-contain max-h-[400px]"
+                                            />
+                                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                                <Button variant="secondary" size="sm" asChild>
+                                                    <a href={lastRunResult.screenshot_path.startsWith('http') ? lastRunResult.screenshot_path : `${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path.startsWith('/') ? '' : '/'}${lastRunResult.screenshot_path}`} target="_blank" rel="noreferrer">
+                                                        View Full Size
+                                                    </a>
+                                                </Button>
+                                            </div>
                                     </div>
                                 ) : (
                                     <div className="h-[200px] border-2 border-dashed rounded-lg flex flex-col items-center justify-center text-muted-foreground bg-gray-50/50">

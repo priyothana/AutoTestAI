@@ -422,8 +422,8 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     )
     if (!project) return (
         <div className="flex flex-col items-center justify-center py-16">
-            <h3 className="text-lg font-semibold mb-2">Project not found</h3>
-            <Button onClick={() => router.push("/dashboard/projects")}>Back to Projects</Button>
+            <h3 className="text-lg font-semibold mb-2">Environment not found</h3>
+            <Button onClick={() => router.push("/dashboard/projects")}>Back to Environments</Button>
         </div>
     )
 
@@ -453,7 +453,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         <div className="space-y-6">
             {/* Breadcrumb */}
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Link href="/dashboard/projects" className="hover:text-foreground">Projects</Link>
+                <Link href="/dashboard/projects" className="hover:text-foreground">Environments</Link>
                 <span>›</span>
                 <span className="text-foreground">{project.name}</span>
             </div>
@@ -466,12 +466,20 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                         <Badge variant="outline">{project.type}</Badge>
                         <Badge variant="secondary">{project.category || "webapp"}</Badge>
                         {isConnected && (
-                            <Badge className="bg-green-100 text-green-700 border-green-200">
+                            <Badge
+                                variant="outline"
+                                style={{ backgroundColor: '#D6E5BD', color: '#15803d', borderColor: '#c2d1a7' }}
+                                className="hover:opacity-90"
+                            >
                                 <Check className="h-3 w-3 mr-1" /> Connected
                             </Badge>
                         )}
                         {isConnected && isMcp && (
-                            <Badge className="bg-orange-100 text-orange-700 border-orange-200">
+                            <Badge
+                                variant="outline"
+                                style={{ backgroundColor: '#FFE5E7', color: '#b91c1c', borderColor: '#fecaca' }}
+                                className="hover:opacity-90"
+                            >
                                 <Zap className="h-3 w-3 mr-1" /> MCP
                             </Badge>
                         )}
@@ -512,7 +520,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                         </Card>
                     </div>
                     <Card>
-                        <CardHeader><CardTitle>Project Information</CardTitle></CardHeader>
+                        <CardHeader><CardTitle>Environment Information</CardTitle></CardHeader>
                         <CardContent>
                             <div className="grid grid-cols-2 gap-4">
                                 {[
@@ -545,8 +553,8 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                         <div className="flex items-center gap-2">
                                             {getCategoryIcon()}
                                             <CardTitle>{getCategoryLabel()}</CardTitle>
-                                            <Badge className="bg-green-100 text-green-700">Connected</Badge>
-                                            {isMcp && <Badge className="bg-orange-100 text-orange-700">MCP Server</Badge>}
+                                            <Badge variant="outline" style={{ backgroundColor: '#D6E5BD', color: '#15803d', borderColor: '#c2d1a7' }} className="hover:opacity-90">Connected</Badge>
+                                            {isMcp && <Badge variant="outline" style={{ backgroundColor: '#FFE5E7', color: '#b91c1c', borderColor: '#fecaca' }} className="hover:opacity-90">MCP Server</Badge>}
                                         </div>
                                         <div className="flex gap-2">
                                             {(isSalesforce || isApi) && (
@@ -606,7 +614,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                 <p className="text-sm font-medium text-muted-foreground">Connected App</p>
                                                 <p className="text-sm">
                                                     {integration?.has_sf_credentials ? (
-                                                        <span className="text-green-600 flex items-center gap-1"><Check className="h-3 w-3" /> Per-project credentials</span>
+                                                        <span className="text-green-600 flex items-center gap-1"><Check className="h-3 w-3" /> Per-environment credentials</span>
                                                     ) : (
                                                         <span className="text-amber-600">Using global env vars</span>
                                                     )}
@@ -663,7 +671,11 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                 <p className="text-sm font-medium text-muted-foreground">OAuth Status</p>
                                                 <p className="text-sm mt-1">
                                                     {isConnected ? (
-                                                        <Badge className="bg-green-100 text-green-700 border-green-200">
+                                                        <Badge
+                                                            variant="outline"
+                                                            style={{ backgroundColor: '#D6E5BD', color: '#15803d', borderColor: '#c2d1a7' }}
+                                                            className="hover:opacity-90"
+                                                        >
                                                             <Check className="h-3 w-3 mr-1" /> Connected
                                                         </Badge>
                                                     ) : (
@@ -794,7 +806,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                         }
                                     </p>
                                     <Button onClick={handleConnect} className="bg-blue-600 hover:bg-blue-700">
-                                        <Link2 className="mr-2 h-4 w-4" /> {isSalesforceProject ? "Connect via OAuth" : "Connect to Project"}
+                                        <Link2 className="mr-2 h-4 w-4" /> {isSalesforceProject ? "Connect via OAuth" : "Connect to Environment"}
                                     </Button>
                                 </CardContent>
                             </Card>

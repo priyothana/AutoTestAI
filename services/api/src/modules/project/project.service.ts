@@ -154,14 +154,36 @@ export async function hardDeleteProject(projectId: string) {
   })
   if (!existing) throw { statusCode: 404, message: 'Project not found' }
 
-  // Delete integration records first (avoids FK constraint errors if no cascade)
-  await prisma.project_integrations.deleteMany({
+  // Find all test cases for this project to cascade delete their dependencies
+  const testCases = await prisma.test_cases.findMany({
     where: { project_id: projectId },
+    select: { id: true }
   })
+  const testCaseIds = testCases.map((tc) => tc.id)
 
-  await prisma.projects.delete({
-    where: { id: projectId },
-  })
+  // Use a transaction to ensure all related records are deleted (avoids FK constraint errors if no DB-level cascade)
+  await prisma.$transaction([
+    prisma.project_integrations.deleteMany({ where: { project_id: projectId } }),
+    prisma.integrations.deleteMany({ where: { project_id: projectId } }),
+    prisma.salesforce_connections.deleteMany({ where: { project_id: projectId } }),
+    prisma.environments.deleteMany({ where: { project_id: projectId } }),
+    prisma.test_data_sets.deleteMany({ where: { project_id: projectId } }),
+    prisma.metadata_raw_store.deleteMany({ where: { project_id: projectId } }),
+    prisma.metadata_normalized.deleteMany({ where: { project_id: projectId } }),
+    prisma.domain_models.deleteMany({ where: { project_id: projectId } }),
+    prisma.vector_embeddings.deleteMany({ where: { project_id: projectId } }),
+    prisma.rag_query_logs.deleteMany({ where: { project_id: projectId } }),
+    prisma.execution_learnings.deleteMany({ where: { project_id: projectId } }),
+
+    // Test cases and deep dependencies
+    prisma.executions.deleteMany({ where: { test_case_id: { in: testCaseIds } } }),
+    prisma.test_runs.deleteMany({ where: { test_case_id: { in: testCaseIds } } }),
+    prisma.test_steps.deleteMany({ where: { test_case_id: { in: testCaseIds } } }),
+    
+    prisma.test_cases.deleteMany({ where: { project_id: projectId } }),
+
+    prisma.projects.delete({ where: { id: projectId } }),
+  ])
 }
 
 // ─── Integration Management ──────────────────────────────────────
@@ -520,53 +542,109 @@ async function tryParseJson(response: Response): Promise<any | null> {
   }
 }
 
-export async function jiraConnect(data: JiraConnect) {
-  // Validate and normalise domain
-  let domain = data.jira_domain.replace(/\/+$/, '')
-  if (!domain.includes('.atlassian.net')) {
-    throw {
-      statusCode: 400,
-      message: 'Jira domain must be a valid Atlassian URL (e.g., yoursite.atlassian.net)',
-    }
+/** Read up to 300 chars of the raw response body for error context. */
+async function peekBody(response: Response): Promise<string> {
+  try {
+    const text = await response.text()
+    return text.slice(0, 300).replace(/\s+/g, ' ').trim()
+  } catch {
+    return '(unreadable body)'
+  }
+}
+
+/** Standard request headers that prevent Atlassian from returning HTML redirects. */
+function jiraHeaders(authHeader: string) {
+  return {
+    Authorization: authHeader,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'User-Agent': 'AutoTestAI/1.0 (Node.js; Jira integration)',
+    'X-Atlassian-Token': 'no-check',
+  }
+}
+
+/** Normalise a user-supplied Jira domain to a clean https:// base URL. */
+function normaliseDomain(raw: string): string {
+  // Strip trailing slashes and any path segments — keep only the origin
+  let domain = raw.trim().replace(/\/+$/, '')
+  // Strip any path after the TLD (e.g. https://site.atlassian.net/jira → https://site.atlassian.net)
+  try {
+    const url = new URL(domain.startsWith('http') ? domain : `https://${domain}`)
+    domain = url.origin // e.g. https://yoursite.atlassian.net
+  } catch {
+    // fall through — validation below will catch it
   }
   if (!domain.startsWith('https://')) domain = `https://${domain}`
+  return domain
+}
+
+export async function jiraConnect(data: JiraConnect) {
+  const domain = normaliseDomain(data.jira_domain)
+
+  // Validate that it is an Atlassian cloud URL
+  if (!domain.includes('atlassian.net') && !domain.includes('atlassian.com')) {
+    throw {
+      statusCode: 400,
+      message:
+        `Invalid Jira domain '${domain}'. Expected a URL like https://yoursite.atlassian.net`,
+    }
+  }
 
   const authHeader =
     'Basic ' + Buffer.from(`${data.jira_email}:${data.jira_token}`).toString('base64')
 
+  log.info({ domain }, 'Attempting Jira connection')
+
   let response: Response
   try {
-    response = await fetch(`${domain}/rest/api/3/myself`, {
-      headers: { Authorization: authHeader, Accept: 'application/json' },
+    // Use REST API v2 — more permissive for server-side requests than v3
+    response = await fetch(`${domain}/rest/api/2/myself`, {
+      headers: jiraHeaders(authHeader),
     })
   } catch (err: any) {
     throw { statusCode: 502, message: `Cannot reach Jira at ${domain}: ${err.message}` }
   }
 
-  if (!response.ok) {
-    // Try to get a meaningful error message from Jira, but never embed HTML
-    const json = await tryParseJson(response)
-    const detail =
-      json?.message ?? json?.errorMessages?.[0] ?? `HTTP ${response.status} from Jira`
-    throw { statusCode: 400, message: `Jira connection failed: ${detail}` }
-  }
+  log.info({ status: response.status, contentType: response.headers.get('content-type') }, 'Jira /myself response')
 
-  // Guard against Atlassian returning HTML (CAPTCHA / login redirect) on 2xx
-  const user = await tryParseJson(response)
-  if (!user) {
+  if (!response.ok) {
+    // Clone the response so we can read it twice if needed
+    const json = await tryParseJson(response.clone())
+    if (json) {
+      const detail = json.message ?? json.errorMessages?.[0] ?? `HTTP ${response.status}`
+      throw { statusCode: 400, message: `Jira connection failed: ${detail}` }
+    }
+    // Non-JSON error — surface a snippet of whatever was returned
+    const snippet = await peekBody(response)
     throw {
       statusCode: 400,
       message:
-        'Jira returned an unexpected response (not JSON). This usually means the domain is wrong or Atlassian is blocking the request. Please check your Jira domain and API token.',
+        `Jira returned HTTP ${response.status} with a non-JSON body. ` +
+        `Check your domain (${domain}) and API token. ` +
+        (snippet ? `Response preview: ${snippet}` : ''),
     }
   }
 
+  // Guard against Atlassian returning HTML (CAPTCHA / login redirect) on 2xx
+  const user = await tryParseJson(response.clone())
+  if (!user) {
+    const snippet = await peekBody(response)
+    throw {
+      statusCode: 400,
+      message:
+        `Jira returned a non-JSON 2xx response — this usually means the domain is wrong ` +
+        `or Atlassian is redirecting to a login/CAPTCHA page. ` +
+        `Domain used: ${domain}. ` +
+        (snippet ? `Response preview: ${snippet}` : 'Empty body.'),
+    }
+  }
+
+  log.info({ accountId: user.accountId, displayName: user.displayName }, 'Jira connected successfully')
   return { connected: true, user }
 }
 
 export async function jiraBoards(data: JiraConnect) {
-  let domain = data.jira_domain.replace(/\/+$/, '')
-  if (!domain.startsWith('https://')) domain = `https://${domain}`
+  const domain = normaliseDomain(data.jira_domain)
 
   const authHeader =
     'Basic ' + Buffer.from(`${data.jira_email}:${data.jira_token}`).toString('base64')
@@ -574,26 +652,37 @@ export async function jiraBoards(data: JiraConnect) {
   let response: Response
   try {
     response = await fetch(`${domain}/rest/agile/1.0/board`, {
-      headers: { Authorization: authHeader, Accept: 'application/json' },
+      headers: jiraHeaders(authHeader),
     })
   } catch (err: any) {
     throw { statusCode: 502, message: `Cannot reach Jira boards at ${domain}: ${err.message}` }
   }
 
   if (!response.ok) {
-    const json = await tryParseJson(response)
-    const detail =
-      json?.message ?? json?.errorMessages?.[0] ?? `HTTP ${response.status} from Jira Agile API`
-    throw { statusCode: 400, message: `Failed to fetch Jira boards: ${detail}` }
-  }
-
-  // Guard against HTML response
-  const result = await tryParseJson(response)
-  if (!result) {
+    const json = await tryParseJson(response.clone())
+    if (json) {
+      const detail = json.message ?? json.errorMessages?.[0] ?? `HTTP ${response.status}`
+      throw { statusCode: 400, message: `Failed to fetch Jira boards: ${detail}` }
+    }
+    const snippet = await peekBody(response)
     throw {
       statusCode: 400,
       message:
-        'Jira boards API returned a non-JSON response. Verify your Jira domain and credentials.',
+        `Jira boards API returned HTTP ${response.status} with a non-JSON body. ` +
+        `Domain: ${domain}. ` +
+        (snippet ? `Preview: ${snippet}` : ''),
+    }
+  }
+
+  // Guard against HTML response
+  const result = await tryParseJson(response.clone())
+  if (!result) {
+    const snippet = await peekBody(response)
+    throw {
+      statusCode: 400,
+      message:
+        `Jira boards API returned a non-JSON response. Verify your domain (${domain}) and credentials. ` +
+        (snippet ? `Preview: ${snippet}` : ''),
     }
   }
 
@@ -606,19 +695,39 @@ export async function jiraBoardIssues(
   token: string,
   boardId: string | number,
 ) {
-  if (!domain.startsWith('https://')) domain = `https://${domain}`
+  domain = normaliseDomain(domain)
 
   const authHeader =
     'Basic ' + Buffer.from(`${email}:${token}`).toString('base64')
-  const response = await fetch(
-    `${domain}/rest/agile/1.0/board/${boardId}/issue?maxResults=50`,
-    { headers: { Authorization: authHeader, Accept: 'application/json' } },
-  )
 
-  if (!response.ok) throw { statusCode: 400, message: 'Failed to fetch board issues' }
+  // Request the specific fields we need — Jira returns issue data under issue.fields.*
+  const url = `${domain}/rest/agile/1.0/board/${boardId}/issue?maxResults=50&fields=summary,description,status,issuetype,priority`
+  const response = await fetch(url, { headers: jiraHeaders(authHeader) })
+
+  if (!response.ok) {
+    const json = await tryParseJson(response.clone())
+    const detail = json?.message ?? json?.errorMessages?.[0] ?? `HTTP ${response.status}`
+    throw { statusCode: 400, message: `Failed to fetch board issues: ${detail}` }
+  }
 
   const result = (await response.json()) as any
-  return result.issues ?? []
+  const rawIssues: any[] = result.issues ?? []
+
+  // Normalize: flatten Jira's nested `fields` object for easy consumption
+  return rawIssues.map((issue) => ({
+    id: issue.id,
+    key: issue.key,
+    summary: issue.fields?.summary ?? '(no summary)',
+    description:
+      typeof issue.fields?.description === 'string'
+        ? issue.fields.description
+        : issue.fields?.description?.content
+            ?.map((b: any) => b.content?.map((c: any) => c.text ?? '').join('') ?? '')
+            .join('\n') ?? '',
+    status: issue.fields?.status?.name ?? null,
+    issue_type: issue.fields?.issuetype?.name ?? null,
+    priority: issue.fields?.priority?.name ?? null,
+  }))
 }
 
 export async function saveJiraConfig(projectId: string, data: JiraProjectConfig) {
@@ -691,16 +800,24 @@ export async function getJiraStories(projectId: string) {
       jira_email: true,
       jira_domain: true,
       jira_board_id: true,
+      jira_board_name: true,
     },
   })
 
   if (!integration?.jira_token) throw { statusCode: 404, message: 'Jira token not found' }
 
   const token = fernetDecrypt(integration.jira_token)
-  return jiraBoardIssues(
+  const issues = await jiraBoardIssues(
     integration.jira_domain!,
     integration.jira_email!,
     token,
     integration.jira_board_id!,
   )
+
+  // Return envelope so the frontend can display the board name
+  return {
+    board_id: integration.jira_board_id,
+    board_name: integration.jira_board_name ?? null,
+    issues,
+  }
 }

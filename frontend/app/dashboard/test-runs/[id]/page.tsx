@@ -29,7 +29,7 @@ type LogEntry = {
     value?: string
     status: "success" | "failed" | "pending" | "error"
     error?: string
-    screenshot?: string
+    screenshot_path?: string
     timestamp: string
 }
 
@@ -153,11 +153,11 @@ export default function TestRunDetailsPage({ params }: { params: Promise<{ id: s
                                             </div>
                                         )}
 
-                                        {log.screenshot && (
+                                        {log.screenshot_path && (
                                             <div className="mt-2">
                                                 <img
-                                                    src={`${process.env.NEXT_PUBLIC_API_URL}/${log.screenshot}`}
-                                                    alt="Failure Screenshot"
+                                                    src={log.screenshot_path.startsWith('http') ? log.screenshot_path : `${process.env.NEXT_PUBLIC_API_URL}${log.screenshot_path.startsWith('/') ? '' : '/'}${log.screenshot_path}`}
+                                                    alt="Execution Screenshot"
                                                     className="rounded border shadow-sm max-w-sm"
                                                 />
                                             </div>
