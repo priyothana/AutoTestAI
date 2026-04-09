@@ -143,7 +143,12 @@ function mapField(raw: Record<string, unknown>): FieldMetadata {
     name: String(raw['name'] ?? ''),
     label: String(raw['label'] ?? ''),
     type: String(raw['type'] ?? 'string'),
-    required: raw['nillable'] === false || raw['required'] === true,
+    // A field is truly required if it is non-nullable AND not auto-filled by SF.
+    // defaultedOnCreate=true means Salesforce sets the value automatically (e.g. OwnerId,
+    // system dates) — exclude those from "required" even if nillable=false.
+    required:
+      (raw['nillable'] === false || raw['required'] === true) &&
+      !Boolean(raw['defaultedOnCreate']),
     updateable: Boolean(raw['updateable']),
     createable: Boolean(raw['createable']),
     length: typeof raw['length'] === 'number' ? raw['length'] : undefined,
@@ -304,6 +309,19 @@ export async function getRecordTypes(
   return metadata.recordTypeInfos
 }
 
+// ─── Page layout result type ─────────────────────────────────────
+
+/**
+ * Return type for getPageLayoutFields.
+ * - available:      all editable fields on the layout (behavior=Edit or Required)
+ * - layoutRequired: fields that the layout enforces as required (behavior=Required)
+ *                   These must be included as required even if nillable=true in schema.
+ */
+export interface LayoutFieldResult {
+  available:      Set<string>
+  layoutRequired: Set<string>
+}
+
 /**
  * Fetch the set of field API names that appear on a page layout for an object.
  * Uses the JSForce Metadata API (conn.metadata.list + conn.metadata.read).
@@ -320,19 +338,21 @@ export async function getPageLayoutFields(
   projectId: string,
   objectName: string,
   preferredRecordTypeName?: string,
-): Promise<Set<string> | null> {
+): Promise<LayoutFieldResult | null> {
+  // Two separate cache keys — one for available, one for layoutRequired
   const cacheKey = buildCacheKey(
     projectId,
-    `${objectName}:layout-fields:${(preferredRecordTypeName ?? 'default').toLowerCase()}`,
+    `${objectName}:layout-fields-v2:${(preferredRecordTypeName ?? 'default').toLowerCase()}`,
   )
-  const cached = getCached<string[]>(cacheKey)
+  type CachedLayout = { available: string[]; layoutRequired: string[] }
+  const cached = getCached<CachedLayout>(cacheKey)
   if (cached) {
     log.debug(`[metadata] Layout fields cache hit: ${objectName} (RT: ${preferredRecordTypeName ?? 'default'})`)
-    return new Set(cached)
+    return { available: new Set(cached.available), layoutRequired: new Set(cached.layoutRequired) }
   }
 
   try {
-    const layoutFieldNames = await executeWithRetry(projectId, async (conn) => {
+    const layoutResult = await executeWithRetry(projectId, async (conn) => {
       // List all layouts — filter to this object
       const allLayouts = await (conn as unknown as {
         metadata: {
@@ -381,10 +401,19 @@ export async function getPageLayoutFields(
       }).metadata.read('Layout', targetLayout.fullName)
 
       // Extract field API names from layout sections
-      const fieldNames = new Set<string>()
+      const fieldNames         = new Set<string>()
+      const layoutRequiredNames = new Set<string>()
       const layout = layoutData as Record<string, unknown>
-      const sections = layout['layoutSections'] as Record<string, unknown>[] | undefined
-      if (!sections) return null
+      const sectionsRaw = layout['layoutSections']
+      if (!sectionsRaw) return null
+
+      // JSForce collapses single-element arrays to plain objects in Metadata API
+      // responses (e.g. one section → object, not [object]). Normalise everything
+      // to arrays before iterating so we never silently skip items.
+      const toArray = <T>(v: unknown): T[] => {
+        if (!v) return []
+        return Array.isArray(v) ? (v as T[]) : [v as T]
+      }
 
       // Extract EDITABLE field API names from layout sections.
       // Each layoutItem has a 'behavior' property:
@@ -394,11 +423,9 @@ export async function getPageLayoutFields(
       // We EXCLUDE Readonly fields so they never appear in the manifest and the LLM
       // won't try to interact with them (e.g. auto-generated Record Numbers).
       const readonlyFields: string[] = []
-      for (const section of sections) {
-        const columns = (section['layoutColumns'] ?? []) as Record<string, unknown>[]
-        for (const col of columns) {
-          const items = (col['layoutItems'] ?? []) as Record<string, unknown>[]
-          for (const item of items) {
+      for (const section of toArray<Record<string, unknown>>(sectionsRaw)) {
+        for (const col of toArray<Record<string, unknown>>(section['layoutColumns'])) {
+          for (const item of toArray<Record<string, unknown>>(col['layoutItems'])) {
             const field = item['field']
             const behavior = item['behavior']   // 'Edit' | 'Required' | 'Readonly' | undefined
             if (typeof field !== 'string' || !field) continue
@@ -409,21 +436,34 @@ export async function getPageLayoutFields(
             }
 
             fieldNames.add(field)
+
+            // Track layout-required fields separately — these must be included as
+            // [REQUIRED] in the manifest even if nillable=true in the object schema.
+            // This catches fields like AccountId (Account Name) on Contact that
+            // Salesforce admins have made required on the page layout.
+            if (typeof behavior === 'string' && behavior.toLowerCase() === 'required') {
+              layoutRequiredNames.add(field)
+            }
           }
         }
       }
       if (readonlyFields.length > 0) {
         log.info(`[metadata] Excluded ${readonlyFields.length} Readonly layout fields: ${readonlyFields.join(', ')}`)
       }
+      if (layoutRequiredNames.size > 0) {
+        log.info(`[metadata] Layout-required fields (behavior=Required): ${Array.from(layoutRequiredNames).join(', ')}`)
+      }
+      log.info(`[metadata] Layout parsed: ${fieldNames.size} editable fields found for ${objectName}`)
 
-      return Array.from(fieldNames)
+      return { available: Array.from(fieldNames), layoutRequired: Array.from(layoutRequiredNames) }
     })
 
-    if (!layoutFieldNames) return null
+    if (!layoutResult) return null
 
-    setCached(cacheKey, layoutFieldNames)
-    log.info(`[metadata] Fetched ${layoutFieldNames.length} layout fields for ${objectName} (RT: ${preferredRecordTypeName ?? 'default'})`)
-    return new Set(layoutFieldNames)
+    const cachePayload = { available: layoutResult.available, layoutRequired: layoutResult.layoutRequired }
+    setCached(cacheKey, cachePayload)
+    log.info(`[metadata] Fetched ${layoutResult.available.length} layout fields (${layoutResult.layoutRequired.length} layout-required) for ${objectName} (RT: ${preferredRecordTypeName ?? 'default'})`)
+    return { available: new Set(layoutResult.available), layoutRequired: new Set(layoutResult.layoutRequired) }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     log.warn({ err: msg }, `[metadata] Could not fetch page layout for ${objectName} — will use schema fields`)

@@ -1,14 +1,22 @@
 /**
  * Test-Run Module — Routes
  *
- * POST   /api/v1/test-runs/    — Create + enqueue execution
- * GET    /api/v1/test-runs/:id — Get run details
- * GET    /api/v1/test-runs/    — List runs
- * DELETE /api/v1/test-runs/:id — Delete run
+ * POST   /api/v1/test-runs/           — Create + enqueue execution
+ * POST   /api/v1/test-runs/:id/resume — Resume a paused HITL run
+ * GET    /api/v1/test-runs/:id        — Get run details
+ * GET    /api/v1/test-runs/           — List runs
+ * DELETE /api/v1/test-runs/:id        — Delete run
  */
 import type { FastifyInstance } from 'fastify'
+import { z } from 'zod'
 import { TestRunCreateSchema } from './test-run.schema.js'
 import * as svc from './test-run.service.js'
+import { resolvePause, isPaused } from '../../shared/execution/pause-gate.js'
+import prisma from '../../shared/db/prisma.js'
+
+const ResumeSchema = z.object({
+  action: z.enum(['resume', 'skip']),
+})
 
 export async function testRunRoutes(app: FastifyInstance) {
   app.post('/', async (request, reply) => {
@@ -16,6 +24,34 @@ export async function testRunRoutes(app: FastifyInstance) {
       const body = TestRunCreateSchema.parse(request.body)
       const testRun = await svc.createTestRun(body)
       return reply.status(201).send(testRun)
+    } catch (err: any) {
+      if (err.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
+      throw err
+    }
+  })
+
+  // ── HITL: Resume a paused step ──────────────────────────────────────────
+  app.post('/:id/resume', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const { action } = ResumeSchema.parse(request.body)
+
+      if (!isPaused(id)) {
+        return reply.status(409).send({ detail: 'This run is not currently paused.' })
+      }
+
+      // Flip DB status back to running before resolving the gate
+      await prisma.test_runs.update({
+        where: { id },
+        data: { status: 'running' },
+      }).catch(() => { /* non-fatal — worker will update status itself */ })
+
+      const resolved = resolvePause(id, action)
+      if (!resolved) {
+        return reply.status(409).send({ detail: 'Pause gate already resolved or expired.' })
+      }
+
+      return reply.send({ ok: true, action })
     } catch (err: any) {
       if (err.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
       throw err
@@ -34,9 +70,10 @@ export async function testRunRoutes(app: FastifyInstance) {
   })
 
   app.get('/', async (request, reply) => {
-    const query = request.query as { limit?: string }
+    const query = request.query as { limit?: string; test_case_id?: string }
     const limit = query.limit ? parseInt(query.limit, 10) : undefined
-    const testRuns = await svc.listTestRuns(limit)
+    const testCaseId = query.test_case_id || undefined
+    const testRuns = await svc.listTestRuns(limit, testCaseId)
     return reply.send(testRuns)
   })
 

@@ -16,7 +16,10 @@ import {
     ArrowDown,
     Sparkles,
     BookOpen,
-    Code2
+    Code2,
+    MonitorPlay,
+    CheckCircle,
+    SkipForward
 } from "lucide-react"
 import { format } from "date-fns"
 
@@ -74,6 +77,12 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const isRunningRef = useRef(false)
     const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
     const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+    // HITL interactive state
+    const [isPaused, setIsPaused] = useState(false)
+    const [pausedStepIndex, setPausedStepIndex] = useState<number | null>(null)
+    const [activeRunId, setActiveRunId] = useState<string | null>(null)
+    const [isResumingPause, setIsResumingPause] = useState(false)
     const [projects, setProjects] = useState<Project[]>([])
     const [selectedProjectId, setSelectedProjectId] = useState<string>("")
     const [priority, setPriority] = useState("medium")
@@ -86,10 +95,18 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [testSource, setTestSource] = useState<'manual' | 'jira' | null>(null)
     const [jiraConfigured, setJiraConfigured] = useState<boolean | null>(null) // null = loading
 
-    // Readable view state
-    const [readableSteps, setReadableSteps] = useState<string[]>([])
+    // Readable view state — default to readable
+    interface ReadableStep {
+        test_step: string
+        test_data: string
+        expected_result: string
+        actual_result: string
+        status: string
+        comments: string
+    }
+    const [readableSteps, setReadableSteps] = useState<ReadableStep[]>([])
     const [isHumanizing, setIsHumanizing] = useState(false)
-    const [showReadableView, setShowReadableView] = useState(false)
+    const [showReadableView, setShowReadableView] = useState(true)
 
     useEffect(() => {
         setHasMounted(true)
@@ -115,9 +132,63 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 const data = await response.json()
                 setTestName(data.name)
                 setDescription(data.description || "")
-                setSteps(data.steps || [])
+                const loadedSteps = data.steps || []
+                setSteps(loadedSteps)
                 setSelectedProjectId(data.project_id)
                 setPriority(data.priority || "medium")
+
+                // Fetch last run result for this test (to pre-fill execution columns)
+                let lastRunLogs: any[] = []
+                try {
+                    const runsRes = await fetch(
+                        `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/?test_case_id=${currentId}&limit=1`
+                    )
+                    if (runsRes.ok) {
+                        const runsData = await runsRes.json()
+                        const runs = Array.isArray(runsData) ? runsData : (runsData.items || [])
+                        if (runs.length > 0) {
+                            // Fetch full run detail (includes logs)
+                            const runDetailRes = await fetch(
+                                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${runs[0].id}`
+                            )
+                            if (runDetailRes.ok) {
+                                const runDetail = await runDetailRes.json()
+                                setLastRunResult(runDetail)
+                                lastRunLogs = runDetail.logs || []
+                                // Sync test status badge
+                                if (runDetail.status === 'passed') setTestStatus('passed')
+                                else if (runDetail.status === 'failed') setTestStatus('failed')
+                            }
+                        }
+                    }
+                } catch { /* non-critical */ }
+
+                // Auto-fetch readable steps so Readable View is ready by default
+                if (loadedSteps.length > 0) {
+                    try {
+                        setIsHumanizing(true)
+                        const humanRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ steps: loadedSteps, provider: "claude" })
+                        })
+                        if (humanRes.ok) {
+                            const humanData = await humanRes.json()
+                            let freshSteps: any[] = humanData.readable_steps || []
+                            // Merge last run logs if available
+                            if (lastRunLogs.length > 0) {
+                                freshSteps = mergeExecutionIntoReadableSteps(freshSteps, lastRunLogs)
+                            }
+                            setReadableSteps(freshSteps)
+                            setShowReadableView(true)
+                        }
+                    } catch {
+                        // Non-critical — fall back to editor view silently
+                        setShowReadableView(false)
+                    } finally {
+                        setIsHumanizing(false)
+                    }
+                }
             }
         } catch (error) {
             toast.error("Failed to load test case")
@@ -188,6 +259,30 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             }))
 
             setSteps(newSteps)
+            
+            if (newSteps.length > 0) {
+                try {
+                    setIsHumanizing(true)
+                    const humanRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ steps: newSteps, provider: selectedProvider })
+                    })
+                    if (humanRes.ok) {
+                        const humanData = await humanRes.json()
+                        setReadableSteps(humanData.readable_steps || [])
+                        setShowReadableView(true)
+                    } else {
+                        setShowReadableView(false)
+                    }
+                } catch {
+                    setShowReadableView(false)
+                } finally {
+                    setIsHumanizing(false)
+                }
+            } else {
+                setShowReadableView(false)
+            }
         } catch (error: any) {
             console.error("Generation error:", error)
             toast.error(error.message || "AI generation failed. Please try again.")
@@ -209,6 +304,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
         setIsRunning(false)
         isRunningRef.current = false
+        setIsPaused(false)
+        setPausedStepIndex(null)
         if (type === "success") toast.success(message, { id: toastId })
         else if (type === "error") toast.error(message, { id: toastId })
         else if (type === "info") toast.info(message, { id: toastId })
@@ -220,7 +317,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${finalRunId}`)
                 .then(r => r.ok ? r.json() : null)
                 .then(data => {
-                    if (data && data.status && !['pending','running'].includes(data.status)) {
+                    if (data && data.status && !['pending','running','paused'].includes(data.status)) {
                         setLastRunResult(data)
                         if (data.status === 'passed') setTestStatus('passed')
                         else setTestStatus('failed')
@@ -230,7 +327,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         }
     }
 
-    const handleRunTest = async () => {
+    // ── Shared run launcher (called by both Run Test and Run Interactive) ────
+    const launchRun = async (interactive: boolean) => {
         if (!selectedProjectId) {
             toast.error("Please select an environment before running the test")
             setProjectError(true)
@@ -247,6 +345,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
         setIsRunning(true)
         isRunningRef.current = true
+        setIsPaused(false)
+        setPausedStepIndex(null)
         setLastRunResult(null)
         const runToastId = toast.loading("Saving & starting execution...")
 
@@ -261,12 +361,15 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 if (!saveRes.ok) throw new Error("Failed to auto-save test steps before running")
             }
 
-            toast.loading("Running test...", { id: runToastId })
+            toast.loading(
+                interactive ? "🖥️  Opening browser window & running test..." : "Running test...",
+                { id: runToastId }
+            )
 
             const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ test_case_id: currentId })
+                body: JSON.stringify({ test_case_id: currentId, interactive })
             })
 
             if (!response.ok) {
@@ -275,9 +378,10 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             }
 
             const runData = await response.json()
+            setActiveRunId(runData.id)
             toast.loading(
                 <div className="flex flex-col gap-1">
-                    <span>Test is running in background...</span>
+                    <span>{interactive ? '🖥️  Browser window open — test running...' : 'Test is running in background...'}</span>
                     <Link href="/dashboard/execution" className="text-xs text-blue-500 underline">Check Execution Tab</Link>
                 </div>,
                 { id: runToastId }
@@ -308,13 +412,43 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     const statusData = await pollRes.json()
                     const status = statusData.status?.toLowerCase()
 
-                    if (status !== "running" && status !== "pending") {
+                    // ── HITL: paused status ───────────────────────────────
+                    if (status === 'paused') {
+                        // Detect which step is paused from the last log entry
+                        const logs = statusData.logs ?? []
+                        const lastLog = logs[logs.length - 1]
+                        const pausedStep = lastLog?.step ?? null
+                        setIsPaused(true)
+                        setPausedStepIndex(pausedStep)
+                        toast.warning(
+                            `⏸ Step ${pausedStep ?? '?'} needs manual help — see banner below`,
+                            { id: runToastId, duration: Infinity }
+                        )
+                        return // keep polling so we can detect resume
+                    }
+
+                    // Clear pause state if status moved on
+                    if (isPaused && status === 'running') {
+                        setIsPaused(false)
+                        setPausedStepIndex(null)
+                        toast.loading('▶ Continuing from next step...', { id: runToastId })
+                        return
+                    }
+
+                    if (status !== "running" && status !== "pending" && status !== "paused") {
                         // Clear timeout first so it doesn't fire after we've finished
                         if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
                         if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
                         setIsRunning(false)
                         isRunningRef.current = false
+                        setIsPaused(false)
+                        setPausedStepIndex(null)
                         setLastRunResult(statusData)
+                        // Merge execution results into the readable steps table
+                        if (statusData.logs?.length > 0) {
+                            setReadableSteps(prev => mergeExecutionIntoReadableSteps(prev, statusData.logs))
+                            setShowReadableView(true)
+                        }
 
                         if (status === "passed") {
                             toast.success(`Test Passed! (${statusData.duration?.toFixed(1) || 0}s)`, { id: runToastId })
@@ -353,27 +487,59 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         stopRunning(runToastId, "Polling failed repeatedly. Check Execution tab for results.", "warning")
                     }
                 }
-            }, 5000)
+            }, 3000)
 
-            // ── Safety timeout: 5 minutes max (matches backend stale-run guard) ─
+            // ── Safety timeout: 15 minutes for interactive (user has 10min to resume) ─
             pollTimeoutRef.current = setTimeout(() => {
                 if (isRunningRef.current) {
                     stopRunning(
                         runToastId,
                         "Test is taking longer than expected. Results will appear below if the test completed.",
                         "warning",
-                        runData.id,  // triggers a final fetch to display the result
+                        runData.id,
                     )
                 }
-            }, 300000)
+            }, interactive ? 15 * 60 * 1000 : 5 * 60 * 1000)
 
         } catch (error: any) {
             console.error("Run error:", error)
             toast.error(error.message || "Failed to start test execution", { id: runToastId })
             setIsRunning(false)
             isRunningRef.current = false
+            setIsPaused(false)
             if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
             if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
+        }
+    }
+
+    const handleRunTest        = () => launchRun(false)
+    const handleRunInteractive = () => launchRun(true)
+
+    // ── HITL: Resume or skip the paused step ────────────────────────────
+    const handlePauseAction = async (action: 'resume' | 'skip') => {
+        if (!activeRunId) return
+        setIsResumingPause(true)
+        try {
+            const res = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${activeRunId}/resume`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action }),
+                }
+            )
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({ detail: 'Failed' }))
+                toast.error(err.detail || 'Failed to resume run')
+            } else {
+                setIsPaused(false)
+                setPausedStepIndex(null)
+                toast.success(action === 'resume' ? '▶ Continuing test...' : '⏭ Step skipped — continuing...')
+            }
+        } catch (e) {
+            toast.error('Network error — could not reach backend')
+        } finally {
+            setIsResumingPause(false)
         }
     }
 
@@ -437,6 +603,45 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         setSteps(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s))
     }
 
+    // ── Merge execution logs into readable steps ──────────────────────
+    // Called after run completes. Maps each log entry (1-based step index)
+    // to the corresponding readable step and fills actual_result / status / comments.
+    const mergeExecutionIntoReadableSteps = (
+        current: ReadableStep[],
+        logs: any[]
+    ): ReadableStep[] => {
+        if (!current.length || !logs.length) return current
+
+        // Build a map: stepIndex (1-based) → log entry
+        // A step may have multiple log entries (e.g. retry); use the last one.
+        const logMap = new Map<number, any>()
+        for (const log of logs) {
+            const stepIdx = log.step ?? log.step_order ?? null
+            if (stepIdx != null) logMap.set(Number(stepIdx), log)
+        }
+
+        return current.map((step, idx) => {
+            const stepNum = idx + 1   // readable steps are 0-indexed; logs are 1-based
+            const log = logMap.get(stepNum)
+            if (!log) return step    // no log for this step — leave as-is
+
+            const isPassed = log.status === 'passed' || log.status === 'success'
+            const isFailed = log.status === 'failed' || log.status === 'error' || log.status === 'skipped'
+
+            const actual_result = isPassed
+                ? (log.message ? String(log.message) : 'Step completed successfully')
+                : (log.error   ? String(log.error)   : log.message ? String(log.message) : 'Step failed')
+
+            const status = isPassed ? 'Pass' : isFailed ? 'Fail' : '—'
+
+            const comments = isFailed
+                ? [log.error, log.message].filter(Boolean).join(' — ') || 'Step failed'
+                : '—'
+
+            return { ...step, actual_result, status, comments }
+        })
+    }
+
     const handleHumanizeSteps = async () => {
         if (steps.length === 0) return
 
@@ -459,7 +664,14 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             }
 
             const data = await response.json()
-            setReadableSteps(data.readable_steps || [])
+            let freshSteps: ReadableStep[] = data.readable_steps || []
+
+            // If a run result already exists with logs, pre-fill the result columns
+            if (lastRunResult?.logs?.length > 0) {
+                freshSteps = mergeExecutionIntoReadableSteps(freshSteps, lastRunResult.logs)
+            }
+
+            setReadableSteps(freshSteps)
             setShowReadableView(true)
         } catch (error: any) {
             console.error("Humanize error:", error)
@@ -479,16 +691,52 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     className="text-2xl font-bold h-auto border-transparent hover:border-input px-0 w-[400px] focus-visible:ring-0"
                     placeholder="Enter test case name..."
                 />
-                <Badge
-                    variant={testStatus === "passed" ? "default" : testStatus === "failed" ? "destructive" : "outline"}
-                    className={testStatus === "passed" ? "bg-green-600 hover:bg-green-600" : ""}
-                >
-                    {isInternalNew ? "Draft" : testStatus.toUpperCase()}
-                </Badge>
                 <p className="text-muted-foreground text-sm ml-4 self-end pb-0.5">
                     {isInternalNew ? "Creating a new automated test" : `Editing test ID: ${currentId}`}
                 </p>
             </div>
+
+            {/* ── HITL Pause Banner ────────────────────────────────────────── */}
+            {isPaused && (
+                <div className="flex items-start gap-4 p-4 rounded-xl border-2 border-amber-400 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-600 shadow-md animate-pulse">
+                    <div className="flex-shrink-0 bg-amber-100 dark:bg-amber-900/40 p-2 rounded-full">
+                        <AlertCircle className="h-6 w-6 text-amber-600 dark:text-amber-400" />
+                    </div>
+                    <div className="flex-1">
+                        <p className="font-semibold text-amber-800 dark:text-amber-200 text-sm">
+                            ⏸ Step {pausedStepIndex ?? '?'} is stuck — manual intervention needed
+                        </p>
+                        <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
+                            The browser window is open and waiting. Complete the action manually in the Chrome window,
+                            then click <strong>Resume</strong> below. Or click <strong>Skip</strong> to skip this step and continue.
+                        </p>
+                        <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5 font-mono">
+                            ⚠️  Step editing is locked while paused. You have up to 10 minutes.
+                        </p>
+                    </div>
+                    <div className="flex flex-col gap-2 flex-shrink-0">
+                        <Button
+                            size="sm"
+                            className="bg-green-600 hover:bg-green-700 text-white gap-1"
+                            onClick={() => handlePauseAction('resume')}
+                            disabled={isResumingPause}
+                        >
+                            {isResumingPause ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle className="h-3 w-3" />}
+                            Resume (I completed it)
+                        </Button>
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-amber-400 text-amber-700 hover:bg-amber-100 gap-1"
+                            onClick={() => handlePauseAction('skip')}
+                            disabled={isResumingPause}
+                        >
+                            <SkipForward className="h-3 w-3" />
+                            Skip this step
+                        </Button>
+                    </div>
+                </div>
+            )}
 
             {/* ══════════════════════════════════════════════════════════════
                 SECTION 1 — Environment Mapping
@@ -702,23 +950,31 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 SECTION 4 — Test Steps
                ══════════════════════════════════════════════════════════════ */}
             <Card>
-                    <CardHeader className="border-b">
-                        <CardTitle className="text-base">Test Steps ({steps.length})</CardTitle>
+                    <CardHeader className="border-b flex flex-row items-center justify-between">
+                        <CardTitle className="text-base flex items-center gap-2">
+                            Test Steps ({steps.length})
+                            <Badge
+                                variant={testStatus === "passed" ? "default" : testStatus === "failed" ? "destructive" : "outline"}
+                                className={testStatus === "passed" ? "bg-green-600 hover:bg-green-600" : ""}
+                            >
+                                {isInternalNew ? "Draft" : testStatus.toUpperCase()}
+                            </Badge>
+                        </CardTitle>
                         <CardAction>
                             <div className="flex items-center gap-2">
                                 <Button
-                                    variant={showReadableView ? "default" : "ghost"}
+                                    variant={showReadableView ? "ghost" : "default"}
                                     size="sm"
                                     onClick={handleHumanizeSteps}
                                     disabled={steps.length === 0 || isHumanizing}
                                     className={showReadableView
-                                        ? "bg-indigo-600 hover:bg-indigo-700 text-white"
-                                        : "text-indigo-600 hover:text-indigo-700 hover:bg-indigo-50"}
+                                        ? "text-gray-600 hover:text-gray-800 hover:bg-gray-100"
+                                        : "bg-indigo-600 hover:bg-indigo-700 text-white"}
                                 >
                                     {isHumanizing ? (
                                         <>
                                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                                            Converting...
+                                            Loading...
                                         </>
                                     ) : showReadableView ? (
                                         <>
@@ -760,7 +1016,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                             disabled
                                         >
                                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                                            Running...
+                                            {isPaused ? 'Paused...' : 'Running...'}
                                         </Button>
                                         <Button
                                             size="sm"
@@ -772,46 +1028,110 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                         </Button>
                                     </>
                                 ) : (
-                                    <Button
-                                        size="sm"
-                                        className="bg-green-600 hover:bg-green-700"
-                                        onClick={handleRunTest}
-                                        disabled={steps.length === 0 || isInternalNew || isSaving}
-                                    >
-                                        <Play className="mr-2 h-4 w-4" />
-                                        Run Test
-                                    </Button>
+                                    <>
+                                        <Button
+                                            size="sm"
+                                            className="hidden bg-green-600 hover:bg-green-700"
+                                            onClick={handleRunTest}
+                                            disabled={steps.length === 0 || isInternalNew || isSaving}
+                                        >
+                                            <Play className="mr-2 h-4 w-4" />
+                                            Auto Run Test
+                                        </Button>
+                                        <Button
+                                            size="sm"
+                                            variant="outline"
+                                            className="border-indigo-400 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/30 gap-1"
+                                            onClick={handleRunInteractive}
+                                            disabled={steps.length === 0 || isInternalNew || isSaving}
+                                            title="Opens a real browser window. If a step fails, you can complete it manually and click Resume."
+                                        >
+                                            <MonitorPlay className="h-4 w-4" />
+                                            Run Test
+                                        </Button>
+                                    </>
                                 )}
                             </div>
                         </CardAction>
                     </CardHeader>
                     <CardContent className="pt-4">
                         {showReadableView && readableSteps.length > 0 ? (
-                            /* ── Readable View ── */
-                            <div className="space-y-2">
-                                <div className="flex items-center gap-2 mb-3">
+                            /* ── Readable View — Structured Table ── */
+                            <div className="space-y-3">
+                                <div className="flex items-center gap-2 mb-1">
                                     <BookOpen className="h-4 w-4 text-indigo-500" />
                                     <span className="text-sm font-medium text-indigo-600 dark:text-indigo-400">AI-Generated Readable Steps</span>
                                 </div>
-                                <ol className="space-y-2">
-                                    {readableSteps.map((text, index) => (
-                                        <li key={index} className="flex items-start gap-3 p-3 rounded-lg bg-gradient-to-r from-indigo-50/60 to-blue-50/40 dark:from-indigo-950/20 dark:to-blue-950/15 border border-indigo-100 dark:border-indigo-900/50 transition-all duration-200 hover:shadow-sm">
-                                            <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-sm font-bold flex items-center justify-center">
-                                                {index + 1}
-                                            </span>
-                                            <span className="text-sm text-gray-800 dark:text-gray-200 leading-relaxed pt-1">
-                                                {text}
-                                            </span>
-                                        </li>
-                                    ))}
-                                </ol>
+                                <div className="overflow-x-auto rounded-lg border border-indigo-100 dark:border-indigo-900/50">
+                                    <table className="w-full text-sm">
+                                        <thead>
+                                            <tr className="bg-gradient-to-r from-indigo-50 to-blue-50 dark:from-indigo-950/40 dark:to-blue-950/30 border-b border-indigo-100 dark:border-indigo-900/50">
+                                                <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 w-8">#</th>
+                                                <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[200px]">Test Steps</th>
+                                                <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[120px]">Test Data</th>
+                                                <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[160px]">Expected Result</th>
+                                                <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[140px]">Actual Result</th>
+                                                <th className="px-3 py-2.5 text-center font-semibold text-indigo-700 dark:text-indigo-300 w-20">Status</th>
+                                                <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[120px]">Comments / Defects</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {readableSteps.map((step, index) => (
+                                                <tr
+                                                    key={index}
+                                                    className={`border-b border-indigo-50 dark:border-indigo-900/30 transition-colors duration-150 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20 ${
+                                                        index % 2 === 0 ? 'bg-white dark:bg-gray-950/20' : 'bg-indigo-50/20 dark:bg-indigo-950/10'
+                                                    }`}
+                                                >
+                                                    <td className="px-3 py-2.5 align-top">
+                                                        <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-xs font-bold">
+                                                            {index + 1}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-3 py-2.5 align-top text-gray-800 dark:text-gray-200 leading-relaxed">
+                                                        {step.test_step}
+                                                    </td>
+                                                    <td className="px-3 py-2.5 align-top text-gray-600 dark:text-gray-400 font-mono text-xs leading-relaxed">
+                                                        {step.test_data}
+                                                    </td>
+                                                    <td className="px-3 py-2.5 align-top text-gray-700 dark:text-gray-300 leading-relaxed">
+                                                        {step.expected_result}
+                                                    </td>
+                                                    <td className="px-3 py-2.5 align-top text-gray-500 dark:text-gray-400 italic leading-relaxed">
+                                                        {step.actual_result}
+                                                    </td>
+                                                    <td className="px-3 py-2.5 align-top text-center">
+                                                        {step.status === 'Pass' ? (
+                                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
+                                                                ✓ Pass
+                                                            </span>
+                                                        ) : step.status === 'Fail' ? (
+                                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">
+                                                                ✗ Fail
+                                                            </span>
+                                                        ) : (
+                                                            <span className="text-xs text-gray-400 dark:text-gray-500">—</span>
+                                                        )}
+                                                    </td>
+                                                    <td className="px-3 py-2.5 align-top text-gray-500 dark:text-gray-400 text-xs leading-relaxed">
+                                                        {step.comments}
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
                             </div>
                         ) : (
                             /* ── Editor View (original, untouched) ── */
                             <>
                                 <div className="space-y-3">
                                     {steps.map((step, index) => (
-                                        <Card key={step.id} className="group hover:border-blue-400 transition-all duration-200">
+                                        <Card key={step.id} className={`group transition-all duration-200 ${
+                                            isPaused && pausedStepIndex === index + 1
+                                                ? 'border-amber-400 bg-amber-50/40 dark:bg-amber-950/10 ring-2 ring-amber-300'
+                                                : 'hover:border-blue-400'
+                                        }`}>
                                             <CardContent className="p-4 flex items-start gap-4">
                                                 <div className="mt-2 text-muted-foreground cursor-grab active:cursor-grabbing">
                                                     <GripVertical className="h-4 w-4" />
@@ -819,13 +1139,17 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                 <div className="flex-1 grid grid-cols-12 gap-3">
                                                     <div className="col-span-1 pt-2 font-mono text-sm text-muted-foreground">
                                                         #{index + 1}
+                                                        {isPaused && pausedStepIndex === index + 1 && (
+                                                            <span className="block text-[9px] text-amber-600 font-bold leading-none mt-0.5">PAUSED</span>
+                                                        )}
                                                     </div>
                                                     <div className="col-span-3">
                                                         <Select
                                                             value={step.action}
                                                             onValueChange={(val) => updateStep(step.id, "action", val)}
+                                                            disabled={isPaused}
                                                         >
-                                                            <SelectTrigger className="h-9">
+                                                            <SelectTrigger className="h-9" disabled={isPaused}>
                                                                 <SelectValue />
                                                             </SelectTrigger>
                                                             <SelectContent>
@@ -843,6 +1167,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                             value={step.target}
                                                             onChange={(e) => updateStep(step.id, "target", e.target.value)}
                                                             className="h-9 font-mono text-xs focus-visible:ring-blue-400"
+                                                            disabled={isPaused}
                                                         />
                                                     </div>
                                                     <div className="col-span-4">
@@ -851,6 +1176,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                             value={step.value}
                                                             onChange={(e) => updateStep(step.id, "value", e.target.value)}
                                                             className="h-9 focus-visible:ring-blue-400"
+                                                            disabled={isPaused}
                                                         />
                                                     </div>
                                                 </div>
@@ -859,12 +1185,14 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                     size="icon"
                                                     className="opacity-0 group-hover:opacity-100 transition-opacity text-red-500 hover:text-red-600 hover:bg-red-50"
                                                     onClick={() => removeStep(step.id)}
+                                                    disabled={isPaused}
                                                 >
                                                     <Trash2 className="h-4 w-4" />
                                                 </Button>
                                             </CardContent>
                                         </Card>
                                     ))}
+
                                 </div>
 
                                 {steps.length === 0 && (

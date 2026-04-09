@@ -26,6 +26,12 @@ import { HumanMessage, SystemMessage } from '@langchain/core/messages'
 import { StringOutputParser }  from '@langchain/core/output_parsers'
 import type { HealRequest, CorrectedStep } from './self-healing.schema.js'
 
+// Cross-module: fetch SF metadata for manifest injection in healing prompts
+import {
+  getObjectMetadata,
+  getPageLayoutFields,
+} from '../salesforce/salesforce.service.js'
+
 const log = createModuleLogger('self-healing-chat')
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -117,6 +123,123 @@ Rules:
 4. Output the FULL updated corrected_steps array every time — never partial.
 5. In "analysis", briefly describe what was changed.`.trim()
 
+// ── Salesforce field manifest injection ───────────────────────────────────────
+
+/**
+ * Extracts the Salesforce object API name from a test steps array by scanning
+ * NAVIGATE step values for Lightning URL patterns like /lightning/o/{Object}/list.
+ * Returns null if no Lightning object URL is found.
+ */
+function extractSfObjectFromSteps(steps: { action?: string; value?: string; target?: string }[]): string | null {
+  for (const step of steps) {
+    const action = String(step.action ?? '').toLowerCase()
+    if (action !== 'navigate') continue
+    const url = String(step.value ?? step.target ?? '')
+    // Match /lightning/o/ObjectApiName/... patterns
+    const match = url.match(/\/lightning\/o\/([^/]+)/i)
+    if (match?.[1]) return match[1]
+  }
+  return null
+}
+
+/**
+ * Fetches a compact field manifest for a Salesforce object to inject into healing prompts.
+ * Returns an empty string if the project has no SF integration or metadata is unavailable.
+ *
+ * This ensures the LLM knows exactly which fields are required (by schema OR by page layout)
+ * so it doesn't regenerate test steps that skip them.
+ */
+async function fetchSfFieldManifestForHealing(
+  projectId: string,
+  objectApiName: string,
+): Promise<string> {
+  try {
+    const [sfMeta, layoutResult] = await Promise.all([
+      getObjectMetadata(projectId, objectApiName).catch(() => null),
+      getPageLayoutFields(projectId, objectApiName).catch(() => null),
+    ])
+    if (!sfMeta?.metadata) return ''
+
+    const fields = (sfMeta.metadata['fields'] ?? []) as Record<string, unknown>[]
+    const layoutAvailable = layoutResult?.available ?? null
+    const layoutRequired  = layoutResult?.layoutRequired ?? new Set<string>()
+
+    const AUTO_FILLED = new Set(['id', 'ownerid', 'recordtypeid', 'masterrecordid',
+      'createddate', 'createdbyid', 'lastmodifieddate', 'lastmodifiedbyid',
+      'systemmodstamp', 'isdeleted'])
+
+    const lines: string[] = [
+      `=== FIELD MANIFEST for ${objectApiName} ===`,
+      '  [REQUIRED] = MUST include a fill/lookup step or record save WILL fail',
+      '  [OPTIONAL] = include only if it was in the original steps or is clearly needed',
+      '',
+    ]
+
+    let anyField = false
+
+    for (const f of fields) {
+      const apiName = String(f['name'] ?? '').toLowerCase()
+      if (AUTO_FILLED.has(apiName)) continue
+      if (!Boolean(f['createable'])) continue
+      const name  = String(f['name'] ?? '')
+      const label = String(f['label'] ?? name)
+      const type  = String(f['type'] ?? 'string').toLowerCase()
+
+      // Skip fields not on the layout if layout data is available
+      if (layoutAvailable && layoutAvailable.size > 0 && !layoutAvailable.has(name)) {
+        const hasNillable = 'nillable' in f
+        const isSchemaReq = hasNillable
+          ? (!Boolean(f['nillable']) && !Boolean(f['defaultedOnCreate']))
+          : Boolean(f['required'])
+        const isLayoutReq = layoutRequired.has(name)
+        if (!isSchemaReq && !isLayoutReq) continue
+      }
+
+      const hasNillable = 'nillable' in f
+      const isSchemaReq = hasNillable
+        ? (!Boolean(f['nillable']) && !Boolean(f['defaultedOnCreate']))
+        : Boolean(f['required'])
+      const isLayoutReq = layoutRequired.has(name)
+      const isRequired  = isSchemaReq || isLayoutReq
+
+      const tag = isRequired ? '[REQUIRED]' : '[OPTIONAL]'
+
+      const plv = (f['picklistValues'] as Record<string, unknown>[] | undefined) ?? []
+      const picklistVals = plv.filter(v => Boolean(v['active'])).map(v => String(v['label'] ?? v['value'] ?? '')).filter(Boolean)
+      const refs = (f['referenceTo'] as string[] | undefined) ?? []
+
+      let desc = `${tag} • ${label} (apiName: ${name}, type: ${type})`
+      if (isLayoutReq && !isSchemaReq) desc += ' [layout-required]'
+      if (picklistVals.length > 0) desc += ` | values: [${picklistVals.join(', ')}]`
+      if (refs.length > 0) desc += ` | lookup to: ${refs.join(', ')}`
+
+      lines.push(desc)
+      anyField = true
+    }
+
+    if (!anyField) lines.push('  (no form fields found)')
+    lines.push('', '=== END FIELD MANIFEST ===')
+    return lines.join('\n')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Look up the project_id for a test run so we can fetch SF metadata.
+ */
+async function getProjectIdForTestRun(testRunId: string): Promise<string | null> {
+  try {
+    const run = await prisma.test_runs.findUnique({
+      where:  { id: testRunId },
+      select: { test_case: { select: { project_id: true } } },
+    })
+    return run?.test_case?.project_id ?? null
+  } catch {
+    return null
+  }
+}
+
 // ── LLM factory ───────────────────────────────────────────────────────────────
 function buildLlm(): BaseChatModel {
   if (LLM_PROVIDER === 'openai') {
@@ -168,7 +291,7 @@ export async function healTestRun(
   // ── Load test run + steps ──────────────────────────────────────────────────
   const testRun = await prisma.test_runs.findUnique({
     where:   { id: testRunId },
-    include: { test_case: { select: { steps: true, name: true } } },
+    include: { test_case: { select: { steps: true, name: true, project_id: true } } },
   })
   if (!testRun) throw { statusCode: 404, message: 'Test run not found' }
 
@@ -264,10 +387,34 @@ No markdown, no code fences.`
     }
   }
 
+  let sfFieldManifest = ''
+  try {
+    // Use project_id from the already-loaded test_case (avoids second DB query)
+    const projectId = testRun.test_case?.project_id ?? await getProjectIdForTestRun(testRunId)
+    if (projectId) {
+      const stepsForObj = stepsList.map(s => ({ action: s.action, value: s.value, target: s.target }))
+      const objectName = extractSfObjectFromSteps(stepsForObj)
+      if (objectName) {
+        sfFieldManifest = await fetchSfFieldManifestForHealing(projectId, objectName)
+        if (sfFieldManifest) {
+          log.info(`[HEAL-CHAT] SF field manifest injected for ${objectName} (${sfFieldManifest.length} chars)`)
+        } else {
+          log.warn(`[HEAL-CHAT] SF field manifest empty for ${objectName} — metadata may not be cached yet`)
+        }
+      } else {
+        log.info(`[HEAL-CHAT] No Lightning object found in steps — skipping field manifest`)
+      }
+    } else {
+      log.warn(`[HEAL-CHAT] Could not resolve project_id for run ${testRunId} — skipping field manifest`)
+    }
+  } catch (err) {
+    log.warn({ err }, `[HEAL-CHAT] Non-critical: failed to fetch SF field manifest`)
+  }
+
   const contextPrompt = `=== FAILED TEST CONTEXT ===
 Failing step: #${failingStep?.['step'] ?? failingStep?.['step_order'] ?? '?'} | action=${failingStep?.['action'] ?? '?'} | target=${failingStep?.['target'] ?? '?'}
 Error: "${errorMessage}"
-
+${sfFieldManifest ? '\n' + sfFieldManifest + '\n' : ''}
 === CURRENT TEST STEPS ===
 ${JSON.stringify(stepsList, null, 2)}
 
@@ -276,7 +423,18 @@ The following steps PASSED in the actual test run. These workflow steps MUST be 
 ${passingLogSteps.length > 0 ? JSON.stringify(passingLogSteps, null, 2) : 'No passing steps available.'}
 
 === YOUR TASK ===
-Fix ONLY the failing step and any missing required fields.
+${sfFieldManifest ? `
+CRITICAL: This is a Salesforce record creation/edit test. A FIELD MANIFEST is provided above.
+You MUST:
+1. Include fill/lookup/select steps for EVERY field listed under "REQUIRED fields" in the manifest
+2. Insert these steps AFTER navigate/click-New and BEFORE the Save button click
+3. Do NOT skip any REQUIRED field even if it was not in the original steps
+4. Use these action types by field type:
+   - text/string/email/phone fields → action="fill", locator_type="label"
+   - picklist fields → action="fill" with EXACT picklist value, locator_type="label"
+   - lookup/reference fields → action="lookup", locator_type="label"
+5. Use the field LABEL (not API name) as the target for fill/lookup actions
+` : 'Fix ONLY the failing step and any missing required fields.'}
 KEEP all the passing workflow steps (navigate, search, click record, wait, click Edit) exactly as they succeeded.
 Do NOT skip the record-opening steps. You CANNOT fill fields on a list view.
 Output ONLY the JSON object with 'analysis' and 'corrected_steps'. No markdown.`
@@ -383,10 +541,33 @@ export async function generateAiSuggestions(
       }
     }
 
+    const stepsForObj2 = stepsList.map(s => ({ action: s.action, value: s.value, target: s.target }))
+    let sfManifest = ''
+    try {
+      const projectId = await getProjectIdForTestRun(testRunId)
+      if (projectId) {
+        const objName = extractSfObjectFromSteps(stepsForObj2)
+        if (objName) {
+          sfManifest = await fetchSfFieldManifestForHealing(projectId, objName)
+          if (sfManifest) {
+            log.info(`[AI-SUGGEST] SF field manifest injected for ${objName} (${sfManifest.length} chars)`)
+          } else {
+            log.warn(`[AI-SUGGEST] SF field manifest empty for ${objName} — metadata may not be cached yet`)
+          }
+        } else {
+          log.info(`[AI-SUGGEST] No Lightning object found in steps — skipping field manifest`)
+        }
+      } else {
+        log.warn(`[AI-SUGGEST] Could not resolve project_id for run ${testRunId} — skipping field manifest`)
+      }
+    } catch (err) {
+      log.warn({ err }, `[AI-SUGGEST] Non-critical: failed to fetch SF field manifest`)
+    }
+
     const prompt = `=== FAILED TEST CONTEXT ===
 Failing step: #${failingStep['step'] ?? failingStep['step_order'] ?? '?'} | action=${failingStep['action'] ?? '?'} | target=${failingStep['target'] ?? '?'}
 Error: "${errorMessage}"
-
+${sfManifest ? '\n' + sfManifest + '\n' : ''}
 === CURRENT TEST STEPS ===
 ${JSON.stringify(stepsList, null, 2)}
 
@@ -394,7 +575,18 @@ ${JSON.stringify(stepsList, null, 2)}
 ${passingLogs.length > 0 ? JSON.stringify(passingLogs, null, 2) : 'No passing steps available.'}
 
 === YOUR TASK ===
-Fix ONLY the failing step and any missing required fields.
+${sfManifest ? `
+CRITICAL: This is a Salesforce record creation/edit test. A FIELD MANIFEST is provided above.
+You MUST:
+1. Include fill/lookup/select steps for EVERY field listed under "REQUIRED fields" in the manifest
+2. Insert these steps AFTER navigate/click-New and BEFORE the Save button click
+3. Do NOT skip any REQUIRED field even if it was not in the original steps
+4. Use these action types by field type:
+   - text/string/email/phone fields → action="fill", locator_type="label"
+   - picklist fields → action="fill" with EXACT picklist value, locator_type="label"
+   - lookup/reference fields → action="lookup", locator_type="label"
+5. Use the field LABEL (not API name) as the target for fill/lookup actions
+` : 'Fix ONLY the failing step and any missing required fields.'}
 KEEP all the passing workflow steps exactly as they succeeded.
 Output ONLY the JSON object with 'analysis' and 'corrected_steps'. No markdown.`
 

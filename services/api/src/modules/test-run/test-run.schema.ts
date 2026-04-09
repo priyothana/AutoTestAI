@@ -5,6 +5,7 @@ import { z } from 'zod'
 
 export const TestRunCreateSchema = z.object({
   test_case_id: z.string().uuid(),
+  interactive: z.boolean().optional().default(false),
 })
 
 export const TestRunResponseSchema = z.object({
