@@ -148,19 +148,31 @@ export async function buildApp() {
   })
 
   await app.register(cors, {
-    origin: [
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-      'http://localhost:3001',
-      'http://localhost:3002',
-      'http://127.0.0.1:3002',
-      'http://localhost:4000',
-      'http://127.0.0.1:4000',
-    ],
+    origin: (origin, cb) => {
+      // Allow requests from the AutoTest frontend origins, localhost variants,
+      // AND from direct API calls / Playwright in-browser overlays (null or undefined origin).
+      const allowedOrigins = [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://localhost:3002',
+        'http://127.0.0.1:3002',
+        'http://localhost:4000',
+        'http://127.0.0.1:4000',
+      ]
+      // Allow null origin (Playwright in-browser fetch, file:// pages, etc.)
+      // and undefined (same-origin / direct server calls)
+      if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+        cb(null, true)
+      } else {
+        cb(null, false)
+      }
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   })
+
 
   await app.register(helmet, { 
     contentSecurityPolicy: false,

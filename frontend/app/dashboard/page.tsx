@@ -26,7 +26,15 @@ export default function DashboardPage() {
     const [projects, setProjects] = useState<any[]>([])
 
     // Readable view state for dashboard
-    const [dashReadableSteps, setDashReadableSteps] = useState<string[]>([])
+    interface ReadableStep {
+        test_step: string
+        test_data: string
+        expected_result: string
+        actual_result: string
+        status: string
+        comments: string
+    }
+    const [dashReadableSteps, setDashReadableSteps] = useState<ReadableStep[]>([])
     const [isDashHumanizing, setIsDashHumanizing] = useState(false)
     const [showDashReadable, setShowDashReadable] = useState(false)
 
@@ -362,11 +370,65 @@ export default function DashboardPage() {
                                     </Button>
                                 </div>
                                 {showDashReadable && dashReadableSteps.length > 0 ? (
-                                    <ol className="list-decimal list-inside space-y-1 text-sm bg-indigo-50/50 dark:bg-indigo-950/20 p-3 rounded-md">
-                                        {dashReadableSteps.map((text, index) => (
-                                            <li key={index} className="text-gray-800 dark:text-gray-200">{text}</li>
-                                        ))}
-                                    </ol>
+                                    <div className="overflow-x-auto rounded-lg border border-indigo-100 dark:border-indigo-900/50">
+                                        <table className="w-full text-sm">
+                                            <thead>
+                                                <tr className="bg-gradient-to-r from-indigo-50 to-blue-50 dark:from-indigo-950/40 dark:to-blue-950/30 border-b border-indigo-100 dark:border-indigo-900/50">
+                                                    <th className="px-2.5 py-2 text-left font-semibold text-indigo-700 dark:text-indigo-300 w-7">#</th>
+                                                    <th className="px-2.5 py-2 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[160px]">Test Steps</th>
+                                                    <th className="px-2.5 py-2 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[100px]">Test Data</th>
+                                                    <th className="px-2.5 py-2 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[130px]">Expected Result</th>
+                                                    <th className="px-2.5 py-2 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[110px]">Actual Result</th>
+                                                    <th className="px-2.5 py-2 text-center font-semibold text-indigo-700 dark:text-indigo-300 w-16">Status</th>
+                                                    <th className="px-2.5 py-2 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[100px]">Comments</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {dashReadableSteps.map((step, index) => (
+                                                    <tr
+                                                        key={index}
+                                                        className={`border-b border-indigo-50 dark:border-indigo-900/30 transition-colors duration-150 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20 ${
+                                                            index % 2 === 0 ? 'bg-white dark:bg-gray-950/20' : 'bg-indigo-50/20 dark:bg-indigo-950/10'
+                                                        }`}
+                                                    >
+                                                        <td className="px-2.5 py-2 align-top">
+                                                            <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold">
+                                                                {index + 1}
+                                                            </span>
+                                                        </td>
+                                                        <td className="px-2.5 py-2 align-top text-gray-800 dark:text-gray-200 text-xs leading-relaxed">
+                                                            {step.test_step}
+                                                        </td>
+                                                        <td className="px-2.5 py-2 align-top text-gray-600 dark:text-gray-400 font-mono text-[10px] leading-relaxed">
+                                                            {step.test_data}
+                                                        </td>
+                                                        <td className="px-2.5 py-2 align-top text-gray-700 dark:text-gray-300 text-xs leading-relaxed">
+                                                            {step.expected_result}
+                                                        </td>
+                                                        <td className="px-2.5 py-2 align-top text-gray-500 dark:text-gray-400 italic text-xs leading-relaxed">
+                                                            {step.actual_result}
+                                                        </td>
+                                                        <td className="px-2.5 py-2 align-top text-center">
+                                                            {step.status === 'Pass' ? (
+                                                                <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400">
+                                                                    ✓ Pass
+                                                                </span>
+                                                            ) : step.status === 'Fail' ? (
+                                                                <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400">
+                                                                    ✗ Fail
+                                                                </span>
+                                                            ) : (
+                                                                <span className="text-[10px] text-gray-400 dark:text-gray-500">—</span>
+                                                            )}
+                                                        </td>
+                                                        <td className="px-2.5 py-2 align-top text-gray-500 dark:text-gray-400 text-[10px] leading-relaxed">
+                                                            {step.comments}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
                                 ) : (
                                     <ul className="list-decimal list-inside space-y-1 text-sm bg-muted/50 p-3 rounded-md">
                                         {generatedTest.steps.map((step: any, index: number) => (

@@ -81,6 +81,7 @@ export async function createTestRun(data: TestRunCreate) {
     integrationStatus: (integration?.status as any) ?? 'disconnected',
     useSessionReuse,
     isLoginTest,
+    interactive: data.interactive ?? false,
   }
 
   // Resolve credentials from integration (if present)
@@ -143,6 +144,8 @@ export async function getTestRun(id: string) {
   // If the run has been in pending or running for >5 minutes the BullMQ
   // worker likely crashed before writing. Mark it as error so the
   // frontend polling loop can exit cleanly.
+  // NOTE: 'paused' is intentionally excluded — HITL runs can wait up to
+  // 10 minutes for user intervention and must NOT be auto-marked as error.
   if (['pending', 'running'].includes(testRun.status ?? '') && testRun.created_at) {
     const ageMs = Date.now() - testRun.created_at.getTime()
     if (ageMs > 5 * 60 * 1000) {
@@ -171,10 +174,11 @@ export async function getTestRun(id: string) {
 }
 
 /**
- * List test runs with optional limit.
+ * List test runs with optional limit and test case filter.
  */
-export async function listTestRuns(limit?: number) {
+export async function listTestRuns(limit?: number, testCaseId?: string) {
   const testRuns = await prisma.test_runs.findMany({
+    where: testCaseId ? { test_case_id: testCaseId } : undefined,
     include: {
       test_case: { select: { name: true } },
     },

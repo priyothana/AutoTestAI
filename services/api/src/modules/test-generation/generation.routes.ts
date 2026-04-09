@@ -83,4 +83,58 @@ export async function generationRoutes(app: FastifyInstance): Promise<void> {
       throw err
     }
   })
+
+  // ── GET /tests/debug-manifest/:projectId/:objectName ──────────────
+  // DEBUG ENDPOINT — shows the raw field manifest that the LLM receives.
+  // Usage: GET /api/v1/tests/debug-manifest/<project-uuid>/Contact
+  // Returns: { objectName, fieldsCount, layoutAvailable, layoutRequired, manifest }
+
+  app.get('/tests/debug-manifest/:projectId/:objectName', async (request, reply) => {
+    const { projectId, objectName } = request.params as { projectId: string; objectName: string }
+    try {
+      const { getObjectMetadata, getPageLayoutFields } = await import('../salesforce/salesforce.service.js')
+      const { buildFieldManifest } = await import('./generation.service.js')
+
+      const sfMeta = await getObjectMetadata(projectId, objectName).catch(() => null)
+      if (!sfMeta?.metadata) {
+        return reply.status(404).send({ error: `No metadata found for ${objectName} in project ${projectId}` })
+      }
+
+      const layoutResult = await getPageLayoutFields(projectId, objectName).catch(() => null)
+
+      const fields = (sfMeta.metadata['fields'] ?? []) as Record<string, unknown>[]
+
+      // Show which fields are nillable, required, createable for debugging
+      const fieldDebug = fields
+        .filter(f => Boolean(f['createable']))
+        .map(f => ({
+          name: f['name'],
+          label: f['label'],
+          type: f['type'],
+          nillable: f['nillable'],
+          required: f['required'],
+          defaultedOnCreate: f['defaultedOnCreate'],
+          inLayout: layoutResult?.available?.has(String(f['name'] ?? '')) ?? 'no_layout',
+          layoutRequired: layoutResult?.layoutRequired?.has(String(f['name'] ?? '')) ?? 'no_layout',
+        }))
+
+      const manifest = buildFieldManifest(sfMeta.metadata, layoutResult, 'Create ' + objectName)
+
+      return reply.send({
+        objectName: sfMeta.object_name,
+        label: sfMeta.label,
+        totalFields: fields.length,
+        createableFields: fieldDebug.length,
+        layoutAvailableCount: layoutResult?.available?.size ?? 'null (layout fetch failed)',
+        layoutRequiredCount: layoutResult?.layoutRequired?.size ?? 'null (layout fetch failed)',
+        layoutAvailableFields: layoutResult ? Array.from(layoutResult.available) : null,
+        layoutRequiredFields: layoutResult ? Array.from(layoutResult.layoutRequired) : null,
+        fieldDebug,
+        manifest,
+      })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      return reply.status(500).send({ error: msg })
+    }
+  })
 }

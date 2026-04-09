@@ -30,6 +30,7 @@ import { getConnection, invalidateConnection } from '../modules/salesforce/lib/s
 import type { ExecutionJob, HealingJob, StepData } from '../shared/queue/job-types.js'
 import type { ExecutionStepResult } from '../modules/execution/execution.schema.js'
 import { generateAiSuggestions } from '../modules/self-healing/self-healing.service.js'
+import { waitForResume, clearPause, resolvePause } from '../shared/execution/pause-gate.js'
 
 const log = createModuleLogger('execution-worker')
 
@@ -1920,6 +1921,275 @@ async function loginToWebApp(
   }
 }
 
+// ─── Browser state highlighting ─────────────────────────────────────────────
+
+/**
+ * The border-injection script, used in both addInitScript (for future pages)
+ * and page.evaluate() (for the current page). Self-contained — creates the
+ * border overlay + badge, defaults to 'running' state, and watches for
+ * changes to document.body[data-autotest-state] via MutationObserver.
+ */
+const BORDER_INJECTION_SCRIPT = `
+(function() {
+  function inject() {
+    if (document.getElementById('autotest-state-border')) return;
+    if (!document.body) {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', inject, { once: true });
+      } else {
+        setTimeout(inject, 30);
+      }
+      return;
+    }
+
+    // ── Inject keyframe animations for 'running' flicker ──────────────────
+    if (!document.getElementById('autotest-state-style')) {
+      var styleEl = document.createElement('style');
+      styleEl.id = 'autotest-state-style';
+      styleEl.textContent =
+        '@keyframes at-border-flicker{' +
+          '0%,100%{border-color:#f59e0b;box-shadow:inset 0 0 20px rgba(245,158,11,0.35),0 0 0 2px rgba(245,158,11,0)}' +
+          '50%{border-color:#fbbf24;box-shadow:inset 0 0 48px rgba(251,191,36,0.75),0 0 0 4px rgba(251,191,36,0.3)}' +
+        '}' +
+        '@keyframes at-badge-flicker{' +
+          '0%,100%{opacity:1;background:#f59e0b}' +
+          '50%{opacity:0.65;background:#fbbf24}' +
+        '}';
+      (document.head || document.documentElement).appendChild(styleEl);
+    }
+
+    var colors = {
+      running: { border: '#f59e0b', shadow: 'rgba(245,158,11,0.35)', label: '\u25b6 RUNNING' },
+      paused:  { border: '#3b82f6', shadow: 'rgba(59,130,246,0.35)',  label: '\u23f8 PAUSED' },
+      passed:  { border: '#22c55e', shadow: 'rgba(34,197,94,0.35)',   label: '\u2705 PASSED' },
+      failed:  { border: '#ef4444', shadow: 'rgba(239,68,68,0.35)',   label: '\u274c FAILED' }
+    };
+
+    var overlay = document.createElement('div');
+    overlay.id = 'autotest-state-border';
+    // Start with flicker animation active (running state)
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:2147483646;border:4px solid #f59e0b;box-sizing:border-box;animation:at-border-flicker 1s ease-in-out infinite;box-shadow:inset 0 0 20px rgba(245,158,11,0.35)';
+
+    var badge = document.createElement('div');
+    badge.id = 'autotest-state-badge';
+    badge.textContent = '\u25b6 RUNNING';
+    badge.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483646;pointer-events:none;padding:4px 16px;border-radius:0 0 10px 10px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;color:#fff;background:#f59e0b;animation:at-badge-flicker 1s ease-in-out infinite';
+
+    document.body.appendChild(overlay);
+    document.body.appendChild(badge);
+
+    function applyState() {
+      var state = document.body.getAttribute('data-autotest-state') || 'running';
+      var cfg = colors[state];
+      if (!cfg) return;
+      if (state === 'running') {
+        // Flickering yellow — disable transition so animation takes full control
+        overlay.style.transition  = 'none';
+        overlay.style.animation   = 'at-border-flicker 1s ease-in-out infinite';
+        overlay.style.borderColor = cfg.border;
+        badge.style.animation     = 'at-badge-flicker 1s ease-in-out infinite';
+        badge.style.background    = cfg.border;
+      } else {
+        // Solid color with smooth transition for paused / passed / failed
+        overlay.style.animation   = 'none';
+        overlay.style.transition  = 'border-color 0.4s ease,box-shadow 0.4s ease';
+        overlay.style.borderColor = cfg.border;
+        overlay.style.boxShadow   = 'inset 0 0 20px ' + cfg.shadow;
+        badge.style.animation     = 'none';
+        badge.style.background    = cfg.border;
+      }
+      badge.textContent = cfg.label;
+    }
+
+    applyState();
+
+    new MutationObserver(applyState).observe(document.body, {
+      attributes: true,
+      attributeFilter: ['data-autotest-state']
+    });
+  }
+
+  inject();
+})();
+`
+
+/**
+ * Sets up the browser state border for interactive mode.
+ * Uses addInitScript so the border appears automatically on every page load.
+ * Does NOT run page.evaluate on the current page (about:blank) — instead
+ * the border appears naturally on the first real navigation.
+ */
+async function setupBrowserStateBorder(ctx: BrowserContext): Promise<void> {
+  await ctx.addInitScript({ content: BORDER_INJECTION_SCRIPT })
+}
+
+/**
+ * Changes the browser window border color. Call this to transition between states.
+ */
+async function setBrowserState(page: Page, state: 'running' | 'paused' | 'passed' | 'failed' | ''): Promise<void> {
+  try {
+    await page.evaluate((s) => {
+      if (document.body) document.body.setAttribute('data-autotest-state', s)
+    }, state)
+  } catch { /* page may have navigated — non-fatal */ }
+}
+
+// ─── HITL: In-browser pause overlay ─────────────────────────────────────────
+
+/**
+ * Injects a floating "Test Paused" overlay panel directly into the Playwright-
+ * controlled browser window. The overlay has Resume and Skip buttons.
+ *
+ * PRIMARY communication channel:
+ *   <a href="/autotest-hitl-signal?action=resume" target="hidden-iframe">
+ *   Clicking a native <a> link is pure HTML — immune to LWS, CSP, and all
+ *   JavaScript sandboxing. Playwright's page.route() intercepts the iframe's
+ *   navigation at the CDP Fetch domain layer.
+ *
+ * BACKUP channels (JS-based, fire when JS is available):
+ *   - page.exposeFunction('__autotestHitlSignal') — direct Node.js callback
+ *   - document.body.setAttribute('data-autotest-hitl-action') — polled by Node.js
+ *   - sessionStorage.setItem('autotest-hitl-action') — survives DOM issues
+ *   - hidden checkbox inputs — polled by Node.js as additional detection
+ */
+async function injectPauseOverlay(
+  page: Page,
+  executionId: string,
+  stepNum: number,
+  stepAction: string,
+  stepTarget: string,
+  stepValue: string,
+  errorMsg: string,
+  timeoutMs: number,
+): Promise<void> {
+  try {
+    await page.evaluate(
+      ({ stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs }: {
+        stepNum: number; stepAction: string; stepTarget: string;
+        stepValue: string; errorMsg: string; timeoutMs: number
+      }) => {
+        // Remove any existing overlay
+        document.getElementById('autotest-pause-overlay')?.remove()
+        // Clear stale signals
+        document.body.removeAttribute('data-autotest-hitl-action')
+        try { sessionStorage.removeItem('autotest-hitl-action') } catch {}
+
+        const TIMEOUT_SECS = Math.floor(timeoutMs / 1000)
+        const overlay = document.createElement('div')
+        overlay.id = 'autotest-pause-overlay'
+        overlay.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:auto'
+
+        const tgt = stepTarget ? stepTarget.replace(/</g, '&lt;') : stepAction
+        const val = stepValue ? stepValue.replace(/</g, '&lt;') : ''
+        const errTxt = (errorMsg || 'Failed \u2014 please complete this step manually.').replace(/</g, '&lt;')
+
+        // ── Overlay HTML ────────────────────────────────────────────────
+        // Resume/Skip are <a> tags targeting a hidden <iframe>.
+        // Clicking a native link is pure HTML — no JS event handlers needed.
+        // Playwright's page.route() intercepts the iframe request at CDP level.
+        overlay.innerHTML = `<div id="autotest-pause-card" style="background:linear-gradient(135deg,#1a1f2e 0%,#232941 100%);border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:28px 32px;width:420px;box-shadow:0 32px 80px rgba(0,0,0,0.6);position:relative;pointer-events:auto">
+          <style>@keyframes at-slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}} #autotest-pause-card{animation:at-slide .3s ease both} #autotest-pause-card a.at-btn:hover{filter:brightness(1.15)} #autotest-pause-card a.at-btn:active{transform:scale(.97);opacity:.8}</style>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+            <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#f59e0b,#fbbf24);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">\u23F8</div>
+            <div>
+              <div style="color:#fff;font-size:16px;font-weight:700">Test Paused</div>
+              <div style="color:#94a3b8;font-size:11px">AutoTest AI \u2022 Human-in-the-Loop</div>
+            </div>
+          </div>
+          <div style="height:1px;background:rgba(255,255,255,0.08);margin-bottom:16px"></div>
+          <div style="margin-bottom:12px">
+            <div style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Action Required</div>
+            <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 14px">
+              <span style="color:#f1f5f9;font-size:13px;font-weight:600">Step ${stepNum} &mdash; </span><span style="color:#fbbf24;font-size:13px;font-weight:600">${tgt}</span>${val ? '<br><span style="color:#10b981;font-size:13px;margin-top:4px;display:inline-block">' + val + '</span>' : ''}
+            </div>
+          </div>
+          <div style="margin-bottom:16px">
+            <div style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Error</div>
+            <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:10px 12px;color:#fca5a5;font-size:12px;line-height:1.5;max-height:64px;overflow-y:auto">${errTxt}</div>
+          </div>
+          <div style="background:rgba(255,255,255,0.03);border-left:3px solid #4ade80;border-radius:6px;padding:10px 12px;color:#cbd5e1;font-size:12px;line-height:1.5;margin-bottom:16px">Complete the step above manually, then click Resume or Skip.</div>
+          <iframe name="autotest-hitl-frame" style="display:none;width:0;height:0;border:none;position:absolute" aria-hidden="true"></iframe>
+          <input type="checkbox" id="autotest-resume-chk" style="display:none;position:absolute" aria-hidden="true">
+          <input type="checkbox" id="autotest-skip-chk" style="display:none;position:absolute" aria-hidden="true">
+          <div style="display:flex;gap:10px">
+            <a id="autotest-resume-btn" class="at-btn" href="/autotest-hitl-signal?action=resume" target="autotest-hitl-frame" style="flex:1;padding:12px 0;border-radius:10px;border:none;cursor:pointer;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:14px;font-weight:700;box-shadow:0 4px 12px rgba(34,197,94,.3);transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;display:block;user-select:none;-webkit-user-select:none;line-height:1.2">\u25B6 Resume</a>
+            <a id="autotest-skip-btn" class="at-btn" href="/autotest-hitl-signal?action=skip" target="autotest-hitl-frame" style="flex:1;padding:12px 0;border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);color:#cbd5e1;font-size:14px;font-weight:600;transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;display:block;user-select:none;-webkit-user-select:none;line-height:1.2">\u23ED Skip Step</a>
+          </div>
+          <div style="margin-top:12px;text-align:center">
+            <span style="color:#475569;font-size:11px">Auto-timeout in </span><span id="autotest-timer" style="color:#64748b;font-size:11px;font-weight:600">${Math.floor(TIMEOUT_SECS/60)}:${String(TIMEOUT_SECS%60).padStart(2,'0')}</span>
+          </div>
+        </div>`
+
+        document.body.appendChild(overlay)
+
+        // Countdown timer
+        let remaining = TIMEOUT_SECS
+        const timerEl = document.getElementById('autotest-timer')
+        const timerInterval = setInterval(() => {
+          remaining--
+          if (remaining <= 0) { clearInterval(timerInterval); return }
+          if (timerEl) {
+            const m = Math.floor(remaining / 60)
+            const s = remaining % 60
+            timerEl.textContent = `${m}:${String(s).padStart(2, '0')}`
+          }
+        }, 1000)
+
+        // JS-based signal channels (backup — the <a> + iframe approach works
+        // without JavaScript, but these provide additional redundancy)
+        function handleAction(action: string, btnId: string) {
+          clearInterval(timerInterval)
+          const btn = document.getElementById(btnId) as HTMLElement | null
+          if (btn) { btn.textContent = 'Processing\u2026'; btn.style.opacity = '0.6'; btn.style.pointerEvents = 'none' }
+          const card = document.getElementById('autotest-pause-card') as HTMLElement | null
+          if (card) { card.style.opacity = '0.6'; card.style.pointerEvents = 'none' }
+          // Check hidden checkbox for DOM poll detection
+          const chkId = action === 'resume' ? 'autotest-resume-chk' : 'autotest-skip-chk'
+          const chk = document.getElementById(chkId) as HTMLInputElement | null
+          if (chk) chk.checked = true
+          // exposeFunction channel
+          try { if (typeof (window as any).__autotestHitlSignal === 'function') { (window as any).__autotestHitlSignal(action) } } catch {}
+          // DOM attribute
+          document.body.setAttribute('data-autotest-hitl-action', action)
+          // sessionStorage
+          try { sessionStorage.setItem('autotest-hitl-action', action) } catch {}
+        }
+
+        // Attach JS event handlers as ADDITIONAL channels (may fail in LWS — non-fatal)
+        try {
+          const resumeBtn = overlay.querySelector('#autotest-resume-btn')
+          const skipBtn = overlay.querySelector('#autotest-skip-btn')
+          if (resumeBtn) {
+            resumeBtn.addEventListener('click', (e) => {
+              e.stopPropagation(); e.stopImmediatePropagation()
+              handleAction('resume', 'autotest-resume-btn')
+            }, { capture: true })
+          }
+          if (skipBtn) {
+            skipBtn.addEventListener('click', (e) => {
+              e.stopPropagation(); e.stopImmediatePropagation()
+              handleAction('skip', 'autotest-skip-btn')
+            }, { capture: true })
+          }
+        } catch { /* LWS may block addEventListener — the <a>+iframe channel handles it */ }
+      },
+      { stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs },
+    )
+    log.info(`[HITL] \u2705 Pause overlay injected for step ${stepNum} (execution ${executionId})`)
+  } catch (err) {
+    log.warn({ err }, '[HITL] Could not inject in-browser pause overlay (non-fatal)')
+  }
+}
+
+/**
+ * Removes the HITL pause overlay from the Playwright browser DOM.
+ */
+async function removePauseOverlay(page: Page): Promise<void> {
+  try {
+    await page.evaluate(() => document.getElementById('autotest-pause-overlay')?.remove())
+  } catch { /* page may have navigated — non-fatal */ }
+}
+
 // ─── Core worker function ─────────────────────────────────────────────────────
 
 async function processExecution(job: Job<ExecutionJob>): Promise<void> {
@@ -1949,7 +2219,13 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
   fs.mkdirSync(execScreenDir, { recursive: true })
 
   try {
-    browser = await chromium.launch({ headless: true })
+    const isInteractive = context.interactive === true
+    browser = await chromium.launch(
+      isInteractive
+        ? { headless: false, args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox'] }
+        : { headless: true },
+    )
+    if (isInteractive) log.info(`[EXEC] 🖥️  Interactive (headed) browser launched for ${executionId}`)
 
     const traceFile  = path.join(TRACES_DIR, `${executionId}.zip`)
     const useSession = context.useSessionReuse !== false && !!projectId
@@ -1985,6 +2261,13 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
       browserContext = fresh.ctx; page = fresh.pg
     }
 
+    // ── Set up browser state border (interactive mode only) ────
+    // addInitScript makes the border appear on every navigation (defaults to yellow/running).
+    // No page.evaluate needed here — border will show on the first real page load.
+    if (isInteractive && browserContext) {
+      await setupBrowserStateBorder(browserContext)
+    }
+
     // ── Login / session-validation phase ─────────────────────────
     if (!context.isLoginTest) {
       if (context.projectCategory === 'salesforce') {
@@ -2016,6 +2299,11 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     let failedScreenshotBase64: string | null = null
     let failedHtmlSnippet:      string | null = null
 
+    // ── HITL: Mutable resolve reference for signal channels ────
+    let hitlSettleFn: ((action: 'resume' | 'skip') => void) | null = null
+    let hitlRouteRegistered = false
+    let hitlFnExposed = false
+
     for (let i = 0; i < context.steps.length; i++) {
       const step       = context.steps[i]
       const isLastStep = i === context.steps.length - 1
@@ -2033,6 +2321,192 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
       )
 
       if (result.status === 'failed') {
+        // ── HITL: Interactive pause on step failure ───────────────────────
+        if (isInteractive && page) {
+          log.warn(
+            `[HITL] Step ${i + 1} failed in interactive mode — pausing for user intervention.`,
+          )
+
+          // Write 'paused' status to DB
+          await prisma.test_runs.update({
+            where: { id: executionId },
+            data: {
+              status: 'paused',
+              logs: [...stepResults, { ...result, message: `⏸ Step ${i + 1} paused — waiting for manual completion` }],
+            },
+          }).catch((e: unknown) => log.warn({ e }, '[HITL] Failed to write paused status'))
+
+          // ── Register CDP route interception ONCE ─────────────
+          if (!hitlRouteRegistered) {
+            try {
+              await page.route('**/autotest-hitl-signal**', async (route) => {
+                try {
+                  const url = new URL(route.request().url())
+                  const action = url.searchParams.get('action')
+                  log.info(`[HITL] ⚡ CDP route intercepted: action="${action}"`)
+                  if (hitlSettleFn && (action === 'resume' || action === 'skip')) {
+                    hitlSettleFn(action as 'resume' | 'skip')
+                  }
+                  await route.fulfill({ status: 200, contentType: 'text/plain', body: 'ok' })
+                } catch { await route.abort().catch(() => {}) }
+              })
+              hitlRouteRegistered = true
+              log.info('[HITL] ✅ CDP route registered for /autotest-hitl-signal')
+            } catch (routeErr) {
+              log.warn({ routeErr }, '[HITL] Could not register CDP route')
+            }
+          }
+
+          // ── Register exposeFunction (direct Node.js channel) ONCE ──────
+          if (!hitlFnExposed) {
+            try {
+              await page.exposeFunction('__autotestHitlSignal', (action: string) => {
+                log.info(`[HITL] ⚡ exposeFunction channel fired: action="${action}"`)
+                if (hitlSettleFn && (action === 'resume' || action === 'skip')) {
+                  hitlSettleFn(action as 'resume' | 'skip')
+                }
+              })
+              hitlFnExposed = true
+              log.info('[HITL] ✅ exposeFunction registered: __autotestHitlSignal')
+            } catch (fnErr) {
+              log.warn({ fnErr }, '[HITL] Could not register exposeFunction (non-fatal)')
+            }
+          }
+
+          // ── Inject floating overlay ──────────────────────────
+          const pauseTimeoutMs = 10 * 60 * 1000
+          await injectPauseOverlay(
+            page, executionId, i + 1,
+            step.action, step.target ?? '', step.value ?? '',
+            result.error ?? result.message ?? 'Step failed',
+            pauseTimeoutMs,
+          )
+          await setBrowserState(page, 'paused')
+
+          // ── Re-inject overlay after page navigation ─────────
+          let hitlPauseSettled = false
+          const reInjectOverlay = async () => {
+            if (hitlPauseSettled) return
+            try {
+              await page!.waitForTimeout(500)
+              if (hitlPauseSettled) return
+              await injectPauseOverlay(
+                page!, executionId, i + 1,
+                step.action, step.target ?? '', step.value ?? '',
+                result.error ?? result.message ?? 'Step failed',
+                pauseTimeoutMs,
+              )
+              log.info(`[HITL] ♻️ Overlay re-injected after page navigation for step ${i + 1}`)
+              await setBrowserState(page!, 'paused')
+            } catch (err) {
+              log.warn({ err }, '[HITL] Could not re-inject overlay after navigation (non-fatal)')
+            }
+          }
+          page.on('load', reInjectOverlay)
+
+          let pauseAction: 'resume' | 'skip' = 'resume'
+          try {
+            // Quad-channel HITL gate — whichever fires first wins:
+            //   Channel 0 (iframe link) — <a href> targeting hidden iframe, intercepted by page.route(). Pure HTML, no JS needed.
+            //   Channel 1 (exposeFunc)  — window.__autotestHitlSignal() calls Node.js directly. Survives navigation.
+            //   Channel 2 (DOM poll)    — polls checkbox state + data-autotest-hitl-action every 500ms.
+            //   Channel 3 (dashboard)   — waitForResume() resolves on POST /api/v1/test-runs/:id/resume.
+            pauseAction = await new Promise<'resume' | 'skip'>((resolve, reject) => {
+              const deadline = Date.now() + pauseTimeoutMs
+              let settled = false
+
+              function settle(action: 'resume' | 'skip') {
+                if (settled) return
+                settled = true
+                hitlPauseSettled = true
+                hitlSettleFn = null
+                clearInterval(pollInterval)
+                try { page?.off('load', reInjectOverlay) } catch {}
+                resolve(action)
+              }
+
+              hitlSettleFn = settle
+
+              // Channel 3: dashboard button → POST /resume → resolvePause → settle
+              waitForResume(executionId, pauseTimeoutMs)
+                .then(settle)
+                .catch((err) => { if (!settled) { settled = true; hitlSettleFn = null; clearInterval(pollInterval); reject(err) } })
+
+              // Channel 2: DOM polling (checkbox + attribute + sessionStorage)
+              let consecutivePollErrors = 0
+              const MAX_POLL_ERRORS = 30
+              const pollInterval = setInterval(async () => {
+                if (settled || Date.now() > deadline) {
+                  clearInterval(pollInterval)
+                  if (!settled) { settled = true; hitlSettleFn = null; reject(new Error('HITL pause timed out')) }
+                  return
+                }
+                try {
+                  const action = await page!.evaluate(() => {
+                    // Check hidden checkboxes (set by JS handlers)
+                    const resumeChk = document.getElementById('autotest-resume-chk') as HTMLInputElement | null
+                    const skipChk = document.getElementById('autotest-skip-chk') as HTMLInputElement | null
+                    if (resumeChk?.checked) return 'resume'
+                    if (skipChk?.checked) return 'skip'
+                    // Check DOM attribute + sessionStorage
+                    const a = document.body.getAttribute('data-autotest-hitl-action')
+                              || sessionStorage.getItem('autotest-hitl-action')
+                    if (a) {
+                      document.body.removeAttribute('data-autotest-hitl-action')
+                      try { sessionStorage.removeItem('autotest-hitl-action') } catch {}
+                    }
+                    return a
+                  })
+                  consecutivePollErrors = 0
+                  if (action === 'resume' || action === 'skip') settle(action)
+                } catch {
+                  consecutivePollErrors++
+                  if (consecutivePollErrors >= MAX_POLL_ERRORS) {
+                    clearInterval(pollInterval)
+                    log.warn(`[HITL] DOM poll stopped after ${MAX_POLL_ERRORS} consecutive errors — relying on CDP route + dashboard`)
+                  }
+                }
+              }, 500)
+            })
+
+            resolvePause(executionId, pauseAction)
+            await prisma.test_runs.update({ where: { id: executionId }, data: { status: 'running' } }).catch(() => {})
+            log.info(`[HITL] User chose: "${pauseAction}" for step ${i + 1}`)
+          } catch {
+            log.warn(`[HITL] Pause timed out for step ${i + 1} — marking as failed and stopping`)
+            hitlPauseSettled = true
+            hitlSettleFn = null
+            try { page.off('load', reInjectOverlay) } catch {}
+            await removePauseOverlay(page)
+            await setBrowserState(page, 'failed')
+            finalStatus = 'FAILED'
+            firstFailedLocator = step.target ?? ''
+            break
+          }
+
+          // Remove overlay
+          await removePauseOverlay(page)
+          await setBrowserState(page, 'running')
+
+          if (pauseAction === 'skip') {
+            stepResults[stepResults.length - 1] = {
+              ...result, status: 'skipped',
+              message: `Step ${i + 1} skipped by user (interactive mode)`, error: null,
+            }
+            log.info(`[HITL] Step ${i + 1} skipped — continuing to step ${i + 2}`)
+            continue
+          }
+
+          // resume: mark as manually completed
+          stepResults[stepResults.length - 1] = {
+            ...result, status: 'passed',
+            message: `Step ${i + 1} completed manually by user (interactive mode)`, error: null,
+          }
+          log.info(`[HITL] Step ${i + 1} marked as manually completed — continuing`)
+          continue
+        }
+
+        // ── Non-interactive: standard failure handling ────────────────────
         finalStatus = 'FAILED'
 
         if (!firstFailedLocator) {
@@ -2058,6 +2532,39 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
 
         break // Stop on first failure
       }
+    }
+
+    // ── Set final browser state color + capture result screenshot ──────
+    if (isInteractive && page) {
+      await setBrowserState(page, finalStatus === 'PASSED' ? 'passed' : 'failed')
+      // Wait for the 400ms CSS transition to fully settle before screenshotting
+      await page.waitForTimeout(600).catch(() => {})
+
+      // ── Capture the authoritative RESULT screenshot with border visible ──
+      const resultStatus   = finalStatus === 'PASSED' ? 'PASSED' : 'FAILED'
+      const resultSsFile   = `result-${resultStatus}-${Date.now()}.png`
+      const resultSsAbsPath = path.join(execScreenDir, resultSsFile)
+      try {
+        await page.screenshot({ path: resultSsAbsPath, fullPage: false })
+        // Inject it as the last step so it wins the lastScreenshot pick below
+        stepResults.push({
+          step:            stepResults.length + 1,
+          action:          'RESULT_SCREENSHOT',
+          target:          null,
+          value:           null,
+          status:          finalStatus === 'PASSED' ? 'passed' : 'failed',
+          message:         `Final result screenshot — ${resultStatus}`,
+          duration_ms:     0,
+          screenshot_path: `/screenshots/${executionId}/${resultSsFile}`,
+          error:           null,
+        })
+        log.info(`[EXEC] 📸 Result screenshot captured with ${resultStatus} border: ${resultSsFile}`)
+      } catch (ssErr) {
+        log.warn({ ssErr }, '[EXEC] Could not capture result screenshot (non-fatal)')
+      }
+
+      // Brief pause so the user can see the final result color
+      await page.waitForTimeout(2400).catch(() => {})
     }
 
     // ── Stop trace ────────────────────────────────────────────────
@@ -2097,6 +2604,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     })
   } finally {
     frameRegistry.delete(executionId)
+    clearPause(executionId)  // clean up HITL pause gate if still pending
     try { await browserContext?.close() } catch { /* ignore */ }
     try { await browser?.close()        } catch { /* ignore */ }
   }

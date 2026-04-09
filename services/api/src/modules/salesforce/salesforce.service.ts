@@ -38,7 +38,7 @@ import { executeWithRetry, wrapJsforceError } from './lib/sf-connection.js'
 import { SalesforceError } from './lib/sf-types.js'
 
 // Re-export page layout fetcher for generation service
-export { getPageLayoutFields } from './lib/sf-metadata.js'
+export { getPageLayoutFields, type LayoutFieldResult } from './lib/sf-metadata.js'
 
 // ─── Schema types (keep existing imports for MCP shapes) ──────────
 import type {

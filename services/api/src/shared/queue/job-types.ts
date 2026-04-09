@@ -27,6 +27,9 @@ export interface ExecutionContext {
   useSessionReuse: boolean
   isLoginTest: boolean
 
+  // Interactive (HITL) mode — runs headed Chrome; pauses on step failure for user intervention
+  interactive?: boolean
+
   // Salesforce (optional — only for SF projects)
   sfAccessToken?: string
   sfInstanceUrl?: string

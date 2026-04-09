@@ -65,8 +65,19 @@ export const HumanizeRequestSchema = z.object({
 
 export type HumanizeRequest = z.infer<typeof HumanizeRequestSchema>
 
+export const ReadableStepSchema = z.object({
+  test_step:       z.string(),
+  test_data:       z.string(),
+  expected_result: z.string(),
+  actual_result:   z.string().default('—'),
+  status:          z.string().default('—'),
+  comments:        z.string().default('—'),
+})
+
+export type ReadableStep = z.infer<typeof ReadableStepSchema>
+
 export const HumanizeResponseSchema = z.object({
-  readable_steps: z.array(z.string()),
+  readable_steps: z.array(ReadableStepSchema),
 })
 
 export type HumanizeResponse = z.infer<typeof HumanizeResponseSchema>

@@ -138,10 +138,10 @@ const VALID_LLM_RESPONSE = JSON.stringify({
 
 const VALID_HUMANIZE_RESPONSE = JSON.stringify({
   readable_steps: [
-    'Navigate to the login page',
-    "Enter 'user@test.com' in the Email field",
-    "Click on the 'Sign In' button",
-    "Verify that 'Dashboard' is displayed",
+    { test_step: 'Navigate to the login page', test_data: 'URL: /login', expected_result: 'Login page is displayed', actual_result: '—', status: '—', comments: '—' },
+    { test_step: "Enter 'user@test.com' in the Email field", test_data: 'user@test.com', expected_result: 'Email field is populated with user@test.com', actual_result: '—', status: '—', comments: '—' },
+    { test_step: "Click on the 'Sign In' button", test_data: '—', expected_result: 'User is redirected to the dashboard', actual_result: '—', status: '—', comments: '—' },
+    { test_step: "Verify that 'Dashboard' is displayed", test_data: '—', expected_result: 'Dashboard heading is visible on the page', actual_result: '—', status: '—', comments: '—' },
   ],
 })
 
