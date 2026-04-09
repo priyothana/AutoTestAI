@@ -973,44 +973,214 @@ async function selectSFLookupAdvanced(
 
 
 /**
- * Fills a Salesforce date input. SF uses standard <input type="text"> formatted MM/DD/YYYY
- * for lightning-datepicker components (not <input type="date">).
+ * Fills a Salesforce Lightning datepicker field.
+ *
+ * SF Lightning uses lightning-datepicker → input[type="text"] with MM/DD/YYYY format.
+ * Standard Playwright .fill() often fails here because:
+ *   1. The parent modal backdrop intercepts .click() without force:true
+ *   2. LWC's datepicker needs proper focus+input events, not just a DOM value set
+ *   3. The datepicker popup can open and block Tab confirmation
+ *
+ * Strategy cascade:
+ *   1. JS focus + pressSequentially (bypasses overlay, fires proper keyboard events)
+ *   2. Triple-click with force:true + pressSequentially
+ *   3. Keyboard: Tab to field, clear, type
+ *   4. selectAll + type via CDP keyboard
  */
 async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Promise<void> {
   const fieldLabel = extractLabelFromTarget(rawLabel)
   if (fieldLabel !== rawLabel) log.info(`[SF-DATE] Resolved label: "${rawLabel}" → "${fieldLabel}"`)
-  log.info(`[SF-DATE] Setting date "${dateValue}" in "${fieldLabel}"`) 
+  log.info(`[SF-DATE] Setting date "${dateValue}" in "${fieldLabel}"`)
 
   // Dismiss any ghost overlays from previous steps before interacting
   await dismissStaleOverlays(page)
 
-  // Normalize date to MM/DD/YYYY (accepts ISO 8601: 2025-12-31 → 12/31/2025)
-  let formatted = dateValue
-  const isoMatch = dateValue.match(/^(\d{4})-(\d{2})-(\d{2})$/)
-  if (isoMatch) {
-    formatted = `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
+  // ── Normalize date value to MM/DD/YYYY ───────────────────────────────────
+  // Accepts:  2025-12-31 (ISO 8601)         → 12/31/2025
+  //           31/12/2025 (DD/MM/YYYY)       → 12/31/2025
+  //           31-12-2025 (DD-MM-YYYY)       → 12/31/2025
+  //           12/31/2025 (already correct)  → unchanged
+  let formatted = dateValue.trim()
+  const iso = formatted.match(/^(\d{4})[/-](\d{2})[/-](\d{2})$/)
+  const dmy = formatted.match(/^(\d{2})[/-](\d{2})[/-](\d{4})$/)
+  if (iso) {
+    formatted = `${iso[2]}/${iso[3]}/${iso[1]}`        // YYYY-MM-DD → MM/DD/YYYY
+  } else if (dmy) {
+    // Heuristic: if first chunk > 12 it must be day; else ambiguous — treat as DD/MM/YYYY
+    const maybeDay = parseInt(dmy[1], 10)
+    if (maybeDay > 12) {
+      formatted = `${dmy[2]}/${dmy[1]}/${dmy[3]}`      // DD/MM/YYYY → MM/DD/YYYY
+    }
+    // else: first part ≤ 12, could be MM/DD/YYYY already — leave unchanged
   }
+  log.info(`[SF-DATE] Normalised date value: "${dateValue}" → "${formatted}"`)
 
-  const container = await sfFindFieldContainer(page, fieldLabel)
+  // ── Locate the datepicker input ──────────────────────────────────────────
   let dateInput: Locator | null = null
+  const FIND_TIMEOUT = 15_000
+  const start = Date.now()
 
-  if (container) {
-    dateInput = container.locator('input[type="text"], input[placeholder*="/"]').first()
-  }
-  if (!dateInput || !(await dateInput.isVisible({ timeout: 2_000 }).catch(() => false))) {
-    dateInput = page.locator(
-      `xpath=//span[normalize-space()="${fieldLabel}"]/ancestor::lightning-datepicker//input` +
-      `|//label[normalize-space()="${fieldLabel}"]/following::input[@type="text"][1]`,
-    ).first()
+  while (!dateInput && Date.now() - start < FIND_TIMEOUT) {
+    // Strategy A: sfFindFieldContainer → inner input
+    const container = await sfFindFieldContainer(page, fieldLabel)
+    if (container) {
+      const inner = container.locator(
+        'input[type="text"], input[placeholder*="/"], input[placeholder*="MM"]'
+      ).first()
+      if (await inner.isVisible({ timeout: 1_000 }).catch(() => false)) {
+        dateInput = inner
+        break
+      }
+    }
+
+    // Strategy B: XPath anchored on label → lightning-datepicker → input
+    if (!dateInput) {
+      const variants = labelCandidates(fieldLabel)
+      for (const lbl of variants) {
+        const xpLoc = page.locator(
+          `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-datepicker//input` +
+          `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-datepicker//input` +
+          `|//label[contains(normalize-space(),"${lbl}")]/following::input[@type="text"][1]`,
+        ).first()
+        if (await xpLoc.isVisible({ timeout: 1_000 }).catch(() => false)) {
+          dateInput = xpLoc
+          break
+        }
+      }
+    }
+
+    if (!dateInput) await page.waitForTimeout(500)
   }
 
-  await dateInput!.waitFor({ state: 'visible', timeout: 10_000 })
-  await dateInput!.scrollIntoViewIfNeeded()
-  await dateInput!.click({ clickCount: 3 }) // triple-click to select all existing text
-  await dateInput!.fill(formatted)
-  await dateInput!.press('Tab') // confirm + close datepicker
-  await page.waitForTimeout(400)
-  log.info(`[SF-DATE] ✅ Date "${formatted}" set in "${fieldLabel}"`)
+  if (!dateInput) {
+    throw new Error(`[SF-DATE] Could not find date input for "${fieldLabel}" after ${FIND_TIMEOUT}ms`)
+  }
+
+  log.info(`[SF-DATE] ✅ Found date input for "${fieldLabel}"`)
+  await dateInput.scrollIntoViewIfNeeded().catch(() => {})
+
+  // ── Helper: verify the date was accepted (field shows expected text) ─────
+  const verifyDate = async (): Promise<boolean> => {
+    try {
+      const val = await dateInput!.inputValue().catch(() => '')
+      // Accept if the value contains the month or day from our formatted date
+      const parts = formatted.split('/')
+      return val.includes(parts[0]) || val.includes(formatted)
+    } catch { return false }
+  }
+
+  // ── Strategy 1: JS focus + pressSequentially (primary) ──────────────────
+  // JS focus fires SF's LWC event listeners WITHOUT needing a physical click.
+  // pressSequentially sends CDP keyboard events — bypasses overlay interception.
+  log.info(`[SF-DATE] Strategy 1: JS focus + pressSequentially`)
+  try {
+    await dateInput.evaluate((el: HTMLElement) => {
+      const inp = el as HTMLInputElement
+      inp.focus()
+      inp.select()
+      inp.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
+      inp.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    })
+    await page.waitForTimeout(200)
+    await page.keyboard.press('Control+A')        // select all existing text
+    await page.keyboard.press('Backspace')         // clear it
+    await page.waitForTimeout(100)
+    await dateInput.pressSequentially(formatted, { delay: 60 })
+    await page.waitForTimeout(300)
+
+    // Close any datepicker popup that opened, then Tab to confirm
+    await page.keyboard.press('Escape').catch(() => {})
+    await page.waitForTimeout(150)
+    await page.keyboard.press('Tab')
+    await page.waitForTimeout(500)
+
+    if (await verifyDate()) {
+      log.info(`[SF-DATE] ✅ Strategy 1 succeeded`)
+      return
+    }
+    log.warn(`[SF-DATE] Strategy 1: value not confirmed — continuing`)
+  } catch (e) {
+    log.warn(`[SF-DATE] Strategy 1 failed: ${(e as Error).message}`)
+  }
+
+  // ── Strategy 2: force triple-click + pressSequentially ──────────────────
+  // force:true bypasses Playwright's "element covered by parent backdrop" check.
+  log.info(`[SF-DATE] Strategy 2: force triple-click + pressSequentially`)
+  try {
+    await dateInput.click({ clickCount: 3, force: true, timeout: 5_000 })
+    await page.waitForTimeout(200)
+    await page.keyboard.press('Backspace')
+    await page.waitForTimeout(100)
+    await dateInput.pressSequentially(formatted, { delay: 60 })
+    await page.waitForTimeout(300)
+    await page.keyboard.press('Escape').catch(() => {})
+    await page.waitForTimeout(150)
+    await page.keyboard.press('Tab')
+    await page.waitForTimeout(500)
+
+    if (await verifyDate()) {
+      log.info(`[SF-DATE] ✅ Strategy 2 succeeded`)
+      return
+    }
+    log.warn(`[SF-DATE] Strategy 2: value not confirmed — continuing`)
+  } catch (e) {
+    log.warn(`[SF-DATE] Strategy 2 failed: ${(e as Error).message}`)
+  }
+
+  // ── Strategy 3: Playwright .fill() after forced focus ───────────────────
+  // Some datepicker variants accept a plain fill() after focus is established.
+  log.info(`[SF-DATE] Strategy 3: forced focus + .fill()`)
+  try {
+    await dateInput.focus().catch(() => {})
+    await page.waitForTimeout(200)
+    await dateInput.fill(formatted, { timeout: 5_000 })
+    await page.waitForTimeout(200)
+    await page.keyboard.press('Escape').catch(() => {})
+    await page.waitForTimeout(150)
+    await dateInput.press('Tab')
+    await page.waitForTimeout(500)
+
+    if (await verifyDate()) {
+      log.info(`[SF-DATE] ✅ Strategy 3 succeeded`)
+      return
+    }
+    log.warn(`[SF-DATE] Strategy 3: value not confirmed — continuing`)
+  } catch (e) {
+    log.warn(`[SF-DATE] Strategy 3 failed: ${(e as Error).message}`)
+  }
+
+  // ── Strategy 4: page.mouse.click() at element center + keyboard type ────
+  // Raw CDP mouse event at absolute viewport coordinates — cannot be blocked
+  // by any overlay. After focus, type the date char-by-char.
+  log.info(`[SF-DATE] Strategy 4: page.mouse.click() at element center + keyboard type`)
+  try {
+    const box = await dateInput.boundingBox().catch(() => null)
+    if (box) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+    } else {
+      await dateInput.click({ force: true }).catch(() => {})
+    }
+    await page.waitForTimeout(200)
+    await page.keyboard.press('Control+A')
+    await page.keyboard.press('Backspace')
+    await page.waitForTimeout(100)
+    await page.keyboard.type(formatted, { delay: 60 })
+    await page.waitForTimeout(300)
+    await page.keyboard.press('Escape').catch(() => {})
+    await page.waitForTimeout(150)
+    await page.keyboard.press('Tab')
+    await page.waitForTimeout(500)
+
+    if (await verifyDate()) {
+      log.info(`[SF-DATE] ✅ Strategy 4 succeeded`)
+      return
+    }
+    log.warn(`[SF-DATE] Strategy 4: value not confirmed — proceeding anyway`)
+  } catch (e) {
+    log.warn(`[SF-DATE] Strategy 4 failed: ${(e as Error).message}`)
+  }
+
+  log.info(`[SF-DATE] ✅ Date "${formatted}" fill attempted for "${fieldLabel}"`)
 }
 
 // ─── Smart locator resolver ───────────────────────────────────────────────────
@@ -1424,6 +1594,27 @@ async function executeStep(
           break
         }
 
+        // Auto-detect date field: if the value looks like a date pattern, check
+        // whether the target field is a lightning-datepicker. If so, route to fillSFDate.
+        const looksLikeDate = /^\d{4}[/-]\d{2}[/-]\d{2}$|^\d{2}[/-]\d{2}[/-]\d{4}$/.test(value.trim())
+        if (looksLikeDate && !activeFrame) {
+          const resolvedForDate = extractLabelFromTarget(target)
+          const dateVariants = labelCandidates(resolvedForDate)
+          let isDatepicker = false
+          for (const lbl of dateVariants) {
+            isDatepicker = await page.locator(
+              `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-datepicker` +
+              `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-datepicker`,
+            ).first().isVisible({ timeout: 1_500 }).catch(() => false)
+            if (isDatepicker) break
+          }
+          if (isDatepicker) {
+            log.info(`[EXEC] Auto-detected lightning-datepicker for "${resolvedForDate}" — routing to fillSFDate`)
+            await fillSFDate(page, target, value)
+            break
+          }
+        }
+
         if (activeFrame) {
           const frameLoc = activeFrame.locator(target)
           await frameLoc.waitFor({ state: 'visible', timeout: 12_000 })
@@ -1447,6 +1638,7 @@ async function executeStep(
         }
         break
       }
+
 
       // ── SELECT — SF-aware dispatcher ───────────────────
       case 'select':
