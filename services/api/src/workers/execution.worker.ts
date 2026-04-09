@@ -703,30 +703,31 @@ async function selectSFLookupAdvanced(
     throw new Error(`[SF-LOOKUP-ADV] No result rows found for "${searchValue}" in Advanced Search modal`)
   }
 
-  // ── Select the row: LWS-safe cascade ──────────────────────────────────────
+  // ── Select the row: comprehensive cascade ──────────────────────────────────
   //
-  // Salesforce Lightning Web Security (LWS) sandboxes JavaScript run via
-  // page.evaluate() — event dispatches fired from that context are silently
-  // dropped by LWC component internals. We therefore rely exclusively on
-  // Playwright CDP-based interactions (.click(), page.mouse.click()) which
-  // send real browser input events that LWS cannot intercept.
+  // Why previous attempts failed:
+  //   1. Playwright .click() WITHOUT force:true → actionability check detects
+  //      the parent "New Contact" form modal's backdrop covering the Advanced
+  //      Search content → throws "element intercepted" → silently caught & skipped
+  //   2. page.mouse.click() at radio offsets → bounding box X is the row's left
+  //      edge INSIDE the scroll container, actual radio position varies by org
+  //   3. evaluate()-based JS events → blocked by Salesforce LWS sandbox
   //
-  // Priority order:
-  //   A) Playwright native .click() on the record-name <a> link
-  //      → selects the record AND closes the modal in one action (most reliable)
-  //   B) Playwright native .click() on the first row's radio-column cell
-  //   C) page.mouse.click() at multiple radio-column offsets + "Select" button
-  //   D) page.mouse.click() directly on the record-name <a> bounding box
+  // Fix: force:true on ALL clicks + keyboard navigation as primary strategy.
+  // Keyboard events go directly to the focused element — completely immune to
+  // overlay/z-index interception, LWS, and coordinate miscalculation.
   //
   await selectedRow.scrollIntoViewIfNeeded().catch(() => {})
+  await page.waitForTimeout(400)  // allow SF animation to settle after results load
 
   const selectBtn = modal.locator('button:has-text("Select"), button[title="Select"]').first()
   let modalClosed = false
 
-  /** Scroll Select button into view, then click it via CDP. Returns true if modal closed. */
+  /** Click the Select button (forced, keyboard fallback) and wait for modal close. */
   const clickSelectBtn = async (): Promise<boolean> => {
     await selectBtn.scrollIntoViewIfNeeded().catch(() => {})
     await page.waitForTimeout(200)
+    // Try mouse click at computed coordinates first
     const selectBox = await selectBtn.boundingBox().catch(() => null)
     if (selectBox) {
       await page.mouse.click(
@@ -735,132 +736,214 @@ async function selectSFLookupAdvanced(
       )
       log.info(`[SF-LOOKUP-ADV] Mouse-clicked "Select" button`)
     } else {
-      // Playwright native click as last resort (handles scroll + wait automatically)
-      await selectBtn.click({ timeout: 3_000 }).catch(() => {})
-      log.info(`[SF-LOOKUP-ADV] Playwright-clicked "Select" button`)
+      // force:true bypasses the "element covered" actionability check
+      await selectBtn.click({ force: true, timeout: 3_000 }).catch(() => {})
+      log.info(`[SF-LOOKUP-ADV] Force-clicked "Select" button`)
     }
-    return modal.waitFor({ state: 'hidden', timeout: 8_000 }).then(() => true).catch(() => false)
+    const closed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
+      .then(() => true).catch(() => false)
+    if (!closed) {
+      // Keyboard fallback: Tab to Select and Enter
+      await selectBtn.focus().catch(() => {})
+      await page.keyboard.press('Enter')
+      return modal.waitFor({ state: 'hidden', timeout: 4_000 }).then(() => true).catch(() => false)
+    }
+    return closed
   }
 
-  /** True if Select button is now enabled (radio was accepted by LWC). */
+  /** True if Select button is now enabled (radio accepted by LWC). */
   const isSelectEnabled = async (): Promise<boolean> => {
     await selectBtn.scrollIntoViewIfNeeded().catch(() => {})
     return selectBtn.isEnabled({ timeout: 2_500 }).catch(() => false)
   }
 
-  // ── Strategy A: Playwright .click() on the record-name <a> link ───────────
-  // This is the gold-standard approach: clicking the record name link in the
-  // Advanced Search table both selects the record AND dismisses the modal.
-  // .click() uses CDP DispatchMouseEvent at element coordinates — LWS cannot block it.
-  log.info(`[SF-LOOKUP-ADV] Strategy A: Playwright .click() on record-name link`)
-  const nameLink = selectedRow.locator('a[data-recordid], a[href*="/lightning/r/"], a').first()
-  const nameLinkVisible = await nameLink.isVisible({ timeout: 3_000 }).catch(() => false)
-  if (nameLinkVisible) {
-    try {
-      await nameLink.scrollIntoViewIfNeeded().catch(() => {})
-      await nameLink.click({ timeout: 5_000 })
-      log.info(`[SF-LOOKUP-ADV] Strategy A: .click() dispatched on record-name link`)
-      modalClosed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
-        .then(() => true).catch(() => false)
-      if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy A succeeded`)
-      else log.warn(`[SF-LOOKUP-ADV] Strategy A: modal did not close — continuing`)
-    } catch (e) {
-      log.warn(`[SF-LOOKUP-ADV] Strategy A failed: ${(e as Error).message}`)
+  // ── Strategy 1 (KEYBOARD): Tab + ArrowDown + Space ────────────────────────
+  // Keyboard events dispatch directly to whichever element has focus — completely
+  // immune to overlay/z-index interception. This is the most reliable strategy.
+  //
+  // After the search runs, the search input (or Search button) has focus.
+  // Tabbing moves focus into the results table; ArrowDown → first row;
+  // Space → checks the radio. Standard ARIA grid keyboard pattern.
+  log.info(`[SF-LOOKUP-ADV] Strategy 1: keyboard navigation (Tab→ArrowDown→Space)`)
+  try {
+    // Ensure modal has focus by force-clicking the header (header text is never covered)
+    const modalHeader = modal.locator('h2, .slds-modal__header, header').first()
+    await modalHeader.click({ force: true, timeout: 2_000 }).catch(() => {})
+    await page.waitForTimeout(200)
+
+    // Tab out of Search button → into the results table area
+    for (let t = 0; t < 5; t++) {
+      await page.keyboard.press('Tab')
+      await page.waitForTimeout(80)
     }
-  } else {
-    log.warn(`[SF-LOOKUP-ADV] Strategy A: no visible <a> link in result row`)
+
+    // ArrowDown enters the first data row (ARIA grid pattern)
+    await page.keyboard.press('ArrowDown')
+    await page.waitForTimeout(300)
+
+    // Space checks the radio button on the focused row
+    await page.keyboard.press('Space')
+    await page.waitForTimeout(1_200)  // LWC needs time to propagate state
+
+    if (await isSelectEnabled()) {
+      log.info(`[SF-LOOKUP-ADV] Strategy 1 ✅ keyboard: "Select" enabled — clicking it`)
+      modalClosed = await clickSelectBtn()
+      if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 1 (keyboard) succeeded`)
+    } else {
+      // Try fewer tabs (some SF orgs need only 2-3 tabs to reach table)
+      for (let t = 0; t < 3; t++) {
+        await page.keyboard.press('Tab')
+        await page.waitForTimeout(80)
+      }
+      await page.keyboard.press('ArrowDown')
+      await page.waitForTimeout(300)
+      await page.keyboard.press('Space')
+      await page.waitForTimeout(1_200)
+      if (await isSelectEnabled()) {
+        log.info(`[SF-LOOKUP-ADV] Strategy 1b ✅ keyboard (short tab): "Select" enabled`)
+        modalClosed = await clickSelectBtn()
+        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 1b succeeded`)
+      } else {
+        log.warn(`[SF-LOOKUP-ADV] Strategy 1: "Select" still disabled after keyboard nav`)
+      }
+    }
+  } catch (e) {
+    log.warn(`[SF-LOOKUP-ADV] Strategy 1 keyboard error: ${(e as Error).message}`)
   }
 
-  // ── Strategy B: Playwright .click() on the first table cell (radio column) ─
-  // The radio button's host cell responds to Playwright clicks even through
-  // shadow DOM because CDP DispatchMouseEvent targets the viewport coordinate
-  // of the cell, letting the browser's own hit-testing select the correct element.
+  // ── Strategy 2: force-click the record-name <a> link ─────────────────────
+  // force:true bypasses Playwright's "element is covered" check — the previous
+  // fix used .click() without force which was silently throwing and skipping.
   if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy B: Playwright .click() on first row cell`)
+    log.info(`[SF-LOOKUP-ADV] Strategy 2: force .click() on record-name link`)
+    const nameLink = selectedRow.locator('a[data-recordid], a[href*="/lightning/r/"], a').first()
     try {
-      const firstCell = selectedRow.locator('td, th').first()
+      const nameLinkVisible = await nameLink.isVisible({ timeout: 2_000 }).catch(() => false)
+      if (nameLinkVisible) {
+        await nameLink.scrollIntoViewIfNeeded().catch(() => {})
+        await nameLink.click({ force: true, timeout: 5_000 })
+        log.info(`[SF-LOOKUP-ADV] Strategy 2: force-click dispatched on .link`)
+        modalClosed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
+          .then(() => true).catch(() => false)
+        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 2 succeeded`)
+        else log.warn(`[SF-LOOKUP-ADV] Strategy 2: modal did not close`)
+      } else {
+        log.warn(`[SF-LOOKUP-ADV] Strategy 2: no visible <a> link in selected row`)
+      }
+    } catch (e) {
+      log.warn(`[SF-LOOKUP-ADV] Strategy 2 failed: ${(e as Error).message}`)
+    }
+  }
+
+  // ── Strategy 3: force-click the first <td> (radio host cell) ──────────────
+  // force:true lets CDP dispatch the event at the cell's center coordinates;
+  // browser hit-testing picks up the radio button inside the cell's shadow DOM.
+  if (!modalClosed) {
+    log.info(`[SF-LOOKUP-ADV] Strategy 3: force .click() on first <td>`)
+    try {
+      const firstCell = selectedRow.locator('td').first()
       const cellVisible = await firstCell.isVisible({ timeout: 2_000 }).catch(() => false)
       if (cellVisible) {
         await firstCell.scrollIntoViewIfNeeded().catch(() => {})
-        await firstCell.click({ timeout: 4_000 })
-        log.info(`[SF-LOOKUP-ADV] Strategy B: .click() on first cell`)
+        await firstCell.click({ force: true, timeout: 4_000 })
+        log.info(`[SF-LOOKUP-ADV] Strategy 3: force-click on first td`)
         await page.waitForTimeout(1_200)
         if (await isSelectEnabled()) {
-          log.info(`[SF-LOOKUP-ADV] Strategy B: "Select" enabled — clicking it`)
+          log.info(`[SF-LOOKUP-ADV] Strategy 3: "Select" enabled`)
           modalClosed = await clickSelectBtn()
-          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy B succeeded`)
+          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 3 succeeded`)
         } else {
-          log.warn(`[SF-LOOKUP-ADV] Strategy B: "Select" still disabled — continuing`)
+          log.warn(`[SF-LOOKUP-ADV] Strategy 3: "Select" still disabled`)
         }
       }
     } catch (e) {
-      log.warn(`[SF-LOOKUP-ADV] Strategy B failed: ${(e as Error).message}`)
+      log.warn(`[SF-LOOKUP-ADV] Strategy 3 failed: ${(e as Error).message}`)
     }
   }
 
-  // ── Strategy C: page.mouse.click() at multiple radio-column x-offsets ──────
-  // Sends a raw CDP mouse event to the viewport coordinate of the radio button.
-  // We try several x-offsets from the row left edge, checking isEnabled() after
-  // each attempt so we stop as soon as the radio registers.
+  // ── Strategy 4: page.mouse.click() at row CENTER (x AND y midpoints) ──────
+  // Instead of guessing the radio column x-offset, click the full row center.
+  // Some SF Advanced Search implementations treat any row click as selection.
+  // Also separately tries specific radio-column positions (leftmost 40px of row).
   if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy C: raw mouse clicks at multiple radio-column offsets`)
+    log.info(`[SF-LOOKUP-ADV] Strategy 4: page.mouse.click() at row center and radio positions`)
     const rowBox = await selectedRow.boundingBox().catch(() => null)
     if (rowBox) {
-      const rowMidY = rowBox.y + rowBox.height / 2
-      // Typical SF Lightning radio column positions: 12–35 px from row left edge
-      for (const xOffset of [12, 20, 30, 35, 8]) {
-        const clickX = rowBox.x + xOffset
-        const clickY = rowMidY
-        // Ensure coordinate is inside the viewport
-        if (clickX < 0 || clickY < 0) continue
-        await page.mouse.click(clickX, clickY)
-        log.info(`[SF-LOOKUP-ADV] Strategy C: mouse click at (${clickX.toFixed(0)}, ${clickY.toFixed(0)}) [x+${xOffset}]`)
-        await page.waitForTimeout(1_000)
-        if (await isSelectEnabled()) {
-          log.info(`[SF-LOOKUP-ADV] Strategy C: "Select" enabled after x+${xOffset} click`)
-          modalClosed = await clickSelectBtn()
-          if (modalClosed) {
-            log.info(`[SF-LOOKUP-ADV] ✅ Strategy C succeeded`)
-            break
+      const midY = rowBox.y + rowBox.height / 2
+      const midX = rowBox.x + rowBox.width / 2
+
+      // First try clicking row center (some SF orgs select on any row click)
+      await page.mouse.click(midX, midY)
+      log.info(`[SF-LOOKUP-ADV] Strategy 4: click at row center (${midX.toFixed(0)}, ${midY.toFixed(0)})`)
+      await page.waitForTimeout(1_000)
+
+      if (await isSelectEnabled()) {
+        log.info(`[SF-LOOKUP-ADV] Strategy 4: "Select" enabled after row-center click`)
+        modalClosed = await clickSelectBtn()
+        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 4 (center) succeeded`)
+      }
+
+      // If row-center didn't work, try radio-column positions
+      if (!modalClosed) {
+        for (const xOffset of [12, 20, 24, 30, 36, 8]) {
+          const clickX = rowBox.x + xOffset
+          if (clickX < 0 || clickX > rowBox.x + rowBox.width) continue
+          await page.mouse.click(clickX, midY)
+          log.info(`[SF-LOOKUP-ADV] Strategy 4: click at x+${xOffset} (${clickX.toFixed(0)}, ${midY.toFixed(0)})`)
+          await page.waitForTimeout(1_000)
+          if (await isSelectEnabled()) {
+            log.info(`[SF-LOOKUP-ADV] Strategy 4: "Select" enabled at x+${xOffset}`)
+            modalClosed = await clickSelectBtn()
+            if (modalClosed) {
+              log.info(`[SF-LOOKUP-ADV] ✅ Strategy 4 (offset x+${xOffset}) succeeded`)
+              break
+            }
           }
         }
       }
     } else {
-      log.warn(`[SF-LOOKUP-ADV] Strategy C: no bounding box for result row`)
-      // Attempt a Playwright force-click on the row as a fallback within Strategy C
+      log.warn(`[SF-LOOKUP-ADV] Strategy 4: no bounding box — force-clicking row`)
       await selectedRow.click({ force: true, timeout: 3_000 }).catch(() => {})
-      await page.waitForTimeout(1_000)
+      await page.waitForTimeout(1_200)
       if (await isSelectEnabled()) {
-        log.info(`[SF-LOOKUP-ADV] Strategy C force-click: "Select" enabled`)
+        log.info(`[SF-LOOKUP-ADV] Strategy 4 force: "Select" enabled`)
         modalClosed = await clickSelectBtn()
       }
     }
   }
 
-  // ── Strategy D: page.mouse.click() directly on the record-name <a> position ─
-  // Different from Strategy A: we get the bounding box and send a raw CDP mouse
-  // event rather than using Playwright's .click() — useful if .click() was
-  // intercepted by an overlay but the coordinates are still clear.
+  // ── Strategy 5: Playwright dispatchEvent('click') on row & link ───────────
+  // locator.dispatchEvent() uses CDP Runtime.callFunctionOn which bypasses
+  // Playwright's actionability checks entirely (different code path from .click()).
   if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] Strategy D: page.mouse.click() on record-name link viewport coords`)
-    const nameLinkBox = await nameLink.boundingBox().catch(() => null)
-    if (nameLinkBox) {
-      await page.mouse.click(
-        nameLinkBox.x + nameLinkBox.width / 2,
-        nameLinkBox.y + nameLinkBox.height / 2,
-      )
-      log.info(`[SF-LOOKUP-ADV] Strategy D: mouse click dispatched on link`)
-      modalClosed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
-        .then(() => true).catch(() => false)
-      if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy D succeeded`)
-    } else {
-      log.warn(`[SF-LOOKUP-ADV] Strategy D: no bounding box for record-name link`)
+    log.info(`[SF-LOOKUP-ADV] Strategy 5: dispatchEvent("click") via Playwright locator API`)
+    try {
+      // Try on the row itself
+      await selectedRow.dispatchEvent('click').catch(() => {})
+      await page.waitForTimeout(800)
+      if (await isSelectEnabled()) {
+        log.info(`[SF-LOOKUP-ADV] Strategy 5: "Select" enabled after row dispatchEvent`)
+        modalClosed = await clickSelectBtn()
+        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 5 (row) succeeded`)
+      }
+      // Try on the first <a> if row didn't work
+      if (!modalClosed) {
+        const nameLink2 = selectedRow.locator('a').first()
+        if (await nameLink2.isVisible({ timeout: 1_000 }).catch(() => false)) {
+          await nameLink2.dispatchEvent('click').catch(() => {})
+          modalClosed = await modal.waitFor({ state: 'hidden', timeout: 5_000 })
+            .then(() => true).catch(() => false)
+          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 5 (link) succeeded`)
+        }
+      }
+    } catch (e) {
+      log.warn(`[SF-LOOKUP-ADV] Strategy 5 failed: ${(e as Error).message}`)
     }
   }
 
   // ── Escalation: Escape key ────────────────────────────────────────────────
   if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] All strategies exhausted — pressing Escape to close modal`)
+    log.warn(`[SF-LOOKUP-ADV] All 5 strategies exhausted — pressing Escape to close modal`)
     await page.keyboard.press('Escape')
     modalClosed = await modal.waitFor({ state: 'hidden', timeout: 4_000 })
       .then(() => true).catch(() => false)
@@ -887,6 +970,7 @@ async function selectSFLookupAdvanced(
 
 
 // ─── SF Date Field handler ────────────────────────────────────────────────────
+
 
 /**
  * Fills a Salesforce date input. SF uses standard <input type="text"> formatted MM/DD/YYYY
