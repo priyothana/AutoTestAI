@@ -703,25 +703,30 @@ async function selectSFLookupAdvanced(
     throw new Error(`[SF-LOOKUP-ADV] No result rows found for "${searchValue}" in Advanced Search modal`)
   }
 
-  // ── Select the row: multi-strategy radio-button cascade ────────────────
-  // The SF Advanced Search radio button lives inside deeply nested shadow DOM:
-  //   lightning-primitive-cell-checkbox → #shadow-root → span.slds-radio → input[type="radio"]
-  // Direct Playwright locators (even with force:true) are unreliable because shadow
-  // roots prevent event propagation across DOM boundaries.
+  // ── Select the row: LWS-safe cascade ──────────────────────────────────────
   //
-  // We cascade through 4 strategies, verifying the "Select" button becomes enabled
-  // between each attempt before moving to the next.
+  // Salesforce Lightning Web Security (LWS) sandboxes JavaScript run via
+  // page.evaluate() — event dispatches fired from that context are silently
+  // dropped by LWC component internals. We therefore rely exclusively on
+  // Playwright CDP-based interactions (.click(), page.mouse.click()) which
+  // send real browser input events that LWS cannot intercept.
+  //
+  // Priority order:
+  //   A) Playwright native .click() on the record-name <a> link
+  //      → selects the record AND closes the modal in one action (most reliable)
+  //   B) Playwright native .click() on the first row's radio-column cell
+  //   C) page.mouse.click() at multiple radio-column offsets + "Select" button
+  //   D) page.mouse.click() directly on the record-name <a> bounding box
+  //
   await selectedRow.scrollIntoViewIfNeeded().catch(() => {})
 
   const selectBtn = modal.locator('button:has-text("Select"), button[title="Select"]').first()
   let modalClosed = false
 
-  /** Helper: check if the Select button is now enabled (radio was accepted by SF) */
-  const isSelectEnabled = async () =>
-    selectBtn.isEnabled({ timeout: 2_000 }).catch(() => false)
-
-  /** Helper: click Select and wait for modal dismissal */
+  /** Scroll Select button into view, then click it via CDP. Returns true if modal closed. */
   const clickSelectBtn = async (): Promise<boolean> => {
+    await selectBtn.scrollIntoViewIfNeeded().catch(() => {})
+    await page.waitForTimeout(200)
     const selectBox = await selectBtn.boundingBox().catch(() => null)
     if (selectBox) {
       await page.mouse.click(
@@ -730,147 +735,141 @@ async function selectSFLookupAdvanced(
       )
       log.info(`[SF-LOOKUP-ADV] Mouse-clicked "Select" button`)
     } else {
-      await selectBtn.evaluate((el: HTMLElement) => el.click())
-      log.info(`[SF-LOOKUP-ADV] JS-clicked "Select" button`)
+      // Playwright native click as last resort (handles scroll + wait automatically)
+      await selectBtn.click({ timeout: 3_000 }).catch(() => {})
+      log.info(`[SF-LOOKUP-ADV] Playwright-clicked "Select" button`)
     }
-    return modal.waitFor({ state: 'hidden', timeout: 6_000 }).then(() => true).catch(() => false)
+    return modal.waitFor({ state: 'hidden', timeout: 8_000 }).then(() => true).catch(() => false)
   }
 
-  // ── Strategy 1: JS shadow-DOM pierce ──────────────────────────────────────
-  // Walk all shadow roots inside the row to find the actual input[type="radio"]
-  // and fire a native click event on it — bypasses all overlay/z-index issues.
-  log.info(`[SF-LOOKUP-ADV] Strategy 1: JS shadow-DOM pierce for radio button`)
-  const radioClicked = await selectedRow.evaluate((row: Element): boolean => {
-    // Recursively search shadow roots
-    function findRadioInShadow(root: Element | ShadowRoot): HTMLInputElement | null {
-      // Direct radio inputs at this level
-      const directRadio = (root as Element | Document).querySelector?.('input[type="radio"]') as HTMLInputElement | null
-      if (directRadio) return directRadio
-      // Recurse into shadow roots of children
-      const children = (root as Element).querySelectorAll?.('*') ?? []
-      for (const child of Array.from(children)) {
-        if (child.shadowRoot) {
-          const found = findRadioInShadow(child.shadowRoot)
-          if (found) return found
-        }
-      }
-      return null
-    }
-    const radio = findRadioInShadow(row)
-    if (radio) {
-      radio.click()
-      radio.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
-      radio.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
-      radio.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }))
-      radio.checked = true
-      radio.dispatchEvent(new Event('change', { bubbles: true }))
-      return true
-    }
-    return false
-  }).catch(() => false)
+  /** True if Select button is now enabled (radio was accepted by LWC). */
+  const isSelectEnabled = async (): Promise<boolean> => {
+    await selectBtn.scrollIntoViewIfNeeded().catch(() => {})
+    return selectBtn.isEnabled({ timeout: 2_500 }).catch(() => false)
+  }
 
-  if (radioClicked) {
-    log.info(`[SF-LOOKUP-ADV] Strategy 1 ✅ JS shadow-DOM radio click dispatched`)
-    await page.waitForTimeout(1_200)  // let LWC propagate the change event
-    if (await isSelectEnabled()) {
-      log.info(`[SF-LOOKUP-ADV] "Select" button enabled after Strategy 1`)
-      modalClosed = await clickSelectBtn()
-    } else {
-      log.warn(`[SF-LOOKUP-ADV] "Select" still disabled after Strategy 1 — continuing cascade`)
+  // ── Strategy A: Playwright .click() on the record-name <a> link ───────────
+  // This is the gold-standard approach: clicking the record name link in the
+  // Advanced Search table both selects the record AND dismisses the modal.
+  // .click() uses CDP DispatchMouseEvent at element coordinates — LWS cannot block it.
+  log.info(`[SF-LOOKUP-ADV] Strategy A: Playwright .click() on record-name link`)
+  const nameLink = selectedRow.locator('a[data-recordid], a[href*="/lightning/r/"], a').first()
+  const nameLinkVisible = await nameLink.isVisible({ timeout: 3_000 }).catch(() => false)
+  if (nameLinkVisible) {
+    try {
+      await nameLink.scrollIntoViewIfNeeded().catch(() => {})
+      await nameLink.click({ timeout: 5_000 })
+      log.info(`[SF-LOOKUP-ADV] Strategy A: .click() dispatched on record-name link`)
+      modalClosed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
+        .then(() => true).catch(() => false)
+      if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy A succeeded`)
+      else log.warn(`[SF-LOOKUP-ADV] Strategy A: modal did not close — continuing`)
+    } catch (e) {
+      log.warn(`[SF-LOOKUP-ADV] Strategy A failed: ${(e as Error).message}`)
     }
   } else {
-    log.warn(`[SF-LOOKUP-ADV] Strategy 1: no radio found in shadow DOM`)
+    log.warn(`[SF-LOOKUP-ADV] Strategy A: no visible <a> link in result row`)
   }
 
-  // ── Strategy 2: raw mouse clicks at multiple offsets ──────────────────────
-  // Try several x-offsets from the row's left edge to account for varying layouts.
-  // Some SF orgs render the radio column wider/narrower depending on density settings.
+  // ── Strategy B: Playwright .click() on the first table cell (radio column) ─
+  // The radio button's host cell responds to Playwright clicks even through
+  // shadow DOM because CDP DispatchMouseEvent targets the viewport coordinate
+  // of the cell, letting the browser's own hit-testing select the correct element.
   if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy 2: raw mouse clicks at multiple row offsets`)
+    log.info(`[SF-LOOKUP-ADV] Strategy B: Playwright .click() on first row cell`)
+    try {
+      const firstCell = selectedRow.locator('td, th').first()
+      const cellVisible = await firstCell.isVisible({ timeout: 2_000 }).catch(() => false)
+      if (cellVisible) {
+        await firstCell.scrollIntoViewIfNeeded().catch(() => {})
+        await firstCell.click({ timeout: 4_000 })
+        log.info(`[SF-LOOKUP-ADV] Strategy B: .click() on first cell`)
+        await page.waitForTimeout(1_200)
+        if (await isSelectEnabled()) {
+          log.info(`[SF-LOOKUP-ADV] Strategy B: "Select" enabled — clicking it`)
+          modalClosed = await clickSelectBtn()
+          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy B succeeded`)
+        } else {
+          log.warn(`[SF-LOOKUP-ADV] Strategy B: "Select" still disabled — continuing`)
+        }
+      }
+    } catch (e) {
+      log.warn(`[SF-LOOKUP-ADV] Strategy B failed: ${(e as Error).message}`)
+    }
+  }
+
+  // ── Strategy C: page.mouse.click() at multiple radio-column x-offsets ──────
+  // Sends a raw CDP mouse event to the viewport coordinate of the radio button.
+  // We try several x-offsets from the row left edge, checking isEnabled() after
+  // each attempt so we stop as soon as the radio registers.
+  if (!modalClosed) {
+    log.info(`[SF-LOOKUP-ADV] Strategy C: raw mouse clicks at multiple radio-column offsets`)
     const rowBox = await selectedRow.boundingBox().catch(() => null)
     if (rowBox) {
       const rowMidY = rowBox.y + rowBox.height / 2
-      // Try offsets: 12px, 20px, 30px, 10px from left edge
-      for (const xOffset of [12, 20, 30, 10]) {
-        await page.mouse.click(rowBox.x + xOffset, rowMidY)
-        log.info(`[SF-LOOKUP-ADV] Mouse-clicked row at x+${xOffset} offset`)
-        await page.waitForTimeout(800)
+      // Typical SF Lightning radio column positions: 12–35 px from row left edge
+      for (const xOffset of [12, 20, 30, 35, 8]) {
+        const clickX = rowBox.x + xOffset
+        const clickY = rowMidY
+        // Ensure coordinate is inside the viewport
+        if (clickX < 0 || clickY < 0) continue
+        await page.mouse.click(clickX, clickY)
+        log.info(`[SF-LOOKUP-ADV] Strategy C: mouse click at (${clickX.toFixed(0)}, ${clickY.toFixed(0)}) [x+${xOffset}]`)
+        await page.waitForTimeout(1_000)
         if (await isSelectEnabled()) {
-          log.info(`[SF-LOOKUP-ADV] "Select" enabled after x+${xOffset} click`)
+          log.info(`[SF-LOOKUP-ADV] Strategy C: "Select" enabled after x+${xOffset} click`)
           modalClosed = await clickSelectBtn()
-          break
+          if (modalClosed) {
+            log.info(`[SF-LOOKUP-ADV] ✅ Strategy C succeeded`)
+            break
+          }
         }
       }
     } else {
-      // Bounding box unavailable — try a force-click on the row itself
-      log.warn(`[SF-LOOKUP-ADV] Strategy 2: no bounding box — force clicking row`)
-      await selectedRow.click({ force: true })
+      log.warn(`[SF-LOOKUP-ADV] Strategy C: no bounding box for result row`)
+      // Attempt a Playwright force-click on the row as a fallback within Strategy C
+      await selectedRow.click({ force: true, timeout: 3_000 }).catch(() => {})
       await page.waitForTimeout(1_000)
       if (await isSelectEnabled()) {
-        log.info(`[SF-LOOKUP-ADV] "Select" enabled after force-click`)
+        log.info(`[SF-LOOKUP-ADV] Strategy C force-click: "Select" enabled`)
         modalClosed = await clickSelectBtn()
       }
     }
   }
 
-  // ── Strategy 3: click record name link directly ───────────────────────────
-  // In SF Advanced Search the <a> record name link selects the record AND closes
-  // the modal in one action — no radio + Select button flow needed.
+  // ── Strategy D: page.mouse.click() directly on the record-name <a> position ─
+  // Different from Strategy A: we get the bounding box and send a raw CDP mouse
+  // event rather than using Playwright's .click() — useful if .click() was
+  // intercepted by an overlay but the coordinates are still clear.
   if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] Strategy 3: clicking record name <a> link directly`)
-    const nameLink = selectedRow.locator('a').first()
-    if (await nameLink.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      const linkBox = await nameLink.boundingBox().catch(() => null)
-      if (linkBox) {
-        await page.mouse.click(
-          linkBox.x + linkBox.width / 2,
-          linkBox.y + linkBox.height / 2,
-        )
-        log.info(`[SF-LOOKUP-ADV] Strategy 3: Mouse-clicked record name link`)
-      } else {
-        await nameLink.evaluate((el: HTMLElement) => el.click())
-        log.info(`[SF-LOOKUP-ADV] Strategy 3: JS-clicked record name link`)
-      }
-      modalClosed = await modal.waitFor({ state: 'hidden', timeout: 6_000 })
+    log.warn(`[SF-LOOKUP-ADV] Strategy D: page.mouse.click() on record-name link viewport coords`)
+    const nameLinkBox = await nameLink.boundingBox().catch(() => null)
+    if (nameLinkBox) {
+      await page.mouse.click(
+        nameLinkBox.x + nameLinkBox.width / 2,
+        nameLinkBox.y + nameLinkBox.height / 2,
+      )
+      log.info(`[SF-LOOKUP-ADV] Strategy D: mouse click dispatched on link`)
+      modalClosed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
         .then(() => true).catch(() => false)
-    }
-  }
-
-  // ── Strategy 4: row-level JS click dispatch ───────────────────────────────
-  // Fires a trusted-like click event chain directly on the <tr> element via
-  // evaluate() — last resort before escalation paths.
-  if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] Strategy 4: row-level JS click dispatch`)
-    await selectedRow.evaluate((row: Element) => {
-      const events = ['pointerover', 'pointerenter', 'mouseover', 'mouseenter',
-                      'pointermove', 'mousemove', 'pointerdown', 'mousedown',
-                      'pointerup', 'mouseup', 'click']
-      for (const evtName of events) {
-        const isPointer = evtName.startsWith('pointer')
-        row.dispatchEvent(new (isPointer ? PointerEvent : MouseEvent)(evtName, {
-          bubbles: true, cancelable: true, view: window,
-        }))
-      }
-    }).catch(() => {})
-    await page.waitForTimeout(1_200)
-    if (await isSelectEnabled()) {
-      log.info(`[SF-LOOKUP-ADV] "Select" enabled after Strategy 4`)
-      modalClosed = await clickSelectBtn()
+      if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy D succeeded`)
+    } else {
+      log.warn(`[SF-LOOKUP-ADV] Strategy D: no bounding box for record-name link`)
     }
   }
 
   // ── Escalation: Escape key ────────────────────────────────────────────────
   if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] All strategies exhausted — pressing Escape`)
+    log.warn(`[SF-LOOKUP-ADV] All strategies exhausted — pressing Escape to close modal`)
     await page.keyboard.press('Escape')
     modalClosed = await modal.waitFor({ state: 'hidden', timeout: 4_000 })
       .then(() => true).catch(() => false)
   }
 
-  // ── Last resort: forcibly close ONLY the topmost dialog ────────────────
+  // ── Last resort: forcibly remove ONLY the topmost dialog from DOM ───────
   // Do NOT remove all dialogs — that destroys the parent create/edit form modal.
   if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] Modal STILL open — force-closing TOPMOST dialog only`)
+    log.warn(`[SF-LOOKUP-ADV] Modal STILL open — force-removing TOPMOST dialog only`)
     await page.evaluate(() => {
       const dialogs = document.querySelectorAll('lightning-overlay-container section[role="dialog"]')
       const backdrops = document.querySelectorAll('lightning-overlay-container .slds-backdrop')
