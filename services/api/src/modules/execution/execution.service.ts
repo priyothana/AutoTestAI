@@ -101,14 +101,21 @@ export async function enqueueExecution(data: ExecuteRequest): Promise<{ executio
   if (!testCase.project) throw { statusCode: 404, message: 'Project not found for test case' }
 
   // 2. Build steps array from test case
+  // IMPORTANT: locator_type and sf_field_type MUST be forwarded to the worker.
+  // Dropping them causes the execution worker's lookup/picklist/date routing
+  // to be completely blind — e.g. a lookup field (sf_field_type='lookup') falls
+  // through to a plain fill() and types the value into the wrong field (Title).
   const steps = ((testCase.steps as unknown[]) ?? []).map((s: unknown) => {
     const step = s as Record<string, unknown>
-    return {
+    const mapped: StepData = {
       id: (step.id as string) ?? uuidv4(),
       action: (step.action as string) ?? '',
       target: (step.target as string | undefined) ?? '',
       value: (step.value as string | undefined) ?? '',
-    } satisfies StepData
+    }
+    if (step.locator_type != null) mapped.locator_type = step.locator_type as string
+    if (step.sf_field_type != null) mapped.sf_field_type = step.sf_field_type as string
+    return mapped
   })
 
   // 3. Resolve integration credentials

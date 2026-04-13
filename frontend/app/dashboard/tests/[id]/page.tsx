@@ -19,7 +19,8 @@ import {
     Code2,
     MonitorPlay,
     CheckCircle,
-    SkipForward
+    SkipForward,
+    Square
 } from "lucide-react"
 import { format } from "date-fns"
 
@@ -515,6 +516,30 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const handleRunTest        = () => launchRun(false)
     const handleRunInteractive = () => launchRun(true)
 
+    // ── HITL: Stop the test (close browser, return to app) ──────────────────
+    const handleStopTest = async () => {
+        if (!activeRunId) {
+            // No active run — just reset client state
+            stopRunning('run-stop', 'Test stopped.', 'warning')
+            return
+        }
+        setIsResumingPause(true)
+        try {
+            await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${activeRunId}/stop`,
+                { method: 'POST' }
+            )
+        } catch (e) {
+            // Non-fatal — browser will still close from the overlay signal
+            console.warn('Stop request failed:', e)
+        } finally {
+            setIsResumingPause(false)
+        }
+        // Reset all running/paused state and return to test page (clear state)
+        stopRunning('run-stop', '⏹ Test stopped — browser closed.', 'warning')
+    }
+
+
     // ── HITL: Resume or skip the paused step ────────────────────────────
     const handlePauseAction = async (action: 'resume' | 'skip') => {
         if (!activeRunId) return
@@ -733,6 +758,16 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         >
                             <SkipForward className="h-3 w-3" />
                             Skip this step
+                        </Button>
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-red-400 text-red-600 hover:bg-red-50 hover:text-red-700 dark:border-red-600 dark:text-red-400 dark:hover:bg-red-950/30 gap-1"
+                            onClick={handleStopTest}
+                            disabled={isResumingPause}
+                        >
+                            <Square className="h-3 w-3 fill-current" />
+                            Stop Testing
                         </Button>
                     </div>
                 </div>
@@ -1055,7 +1090,39 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         </CardAction>
                     </CardHeader>
                     <CardContent className="pt-4">
-                        {showReadableView && readableSteps.length > 0 ? (
+                        {isHumanizing ? (
+                            /* ── Loading skeleton — shown while humanize-steps is in progress ── */
+                            <div className="space-y-3 animate-pulse">
+                                <div className="flex items-center gap-2 mb-3">
+                                    <Loader2 className="h-4 w-4 text-indigo-500 animate-spin" />
+                                    <span className="text-sm font-medium text-indigo-600 dark:text-indigo-400">Generating Readable View...</span>
+                                </div>
+                                <div className="overflow-x-auto rounded-lg border border-indigo-100 dark:border-indigo-900/50">
+                                    <table className="w-full text-sm">
+                                        <thead>
+                                            <tr className="bg-gradient-to-r from-indigo-50 to-blue-50 dark:from-indigo-950/40 dark:to-blue-950/30 border-b border-indigo-100 dark:border-indigo-900/50">
+                                                {['#', 'Test Steps', 'Test Data', 'Expected Result', 'Actual Result', 'Status', 'Comments / Defects'].map((h) => (
+                                                    <th key={h} className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300">{h}</th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {Array.from({ length: 5 }).map((_, i) => (
+                                                <tr key={i} className={`border-b border-indigo-50 dark:border-indigo-900/30 ${i % 2 === 0 ? 'bg-white dark:bg-gray-950/20' : 'bg-indigo-50/20 dark:bg-indigo-950/10'}`}>
+                                                    <td className="px-3 py-3"><div className="w-6 h-6 rounded-full bg-indigo-100 dark:bg-indigo-900/40" /></td>
+                                                    <td className="px-3 py-3"><div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-48" /></td>
+                                                    <td className="px-3 py-3"><div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-24" /></td>
+                                                    <td className="px-3 py-3"><div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-36" /></td>
+                                                    <td className="px-3 py-3"><div className="h-3 bg-gray-100 dark:bg-gray-800 rounded w-20" /></td>
+                                                    <td className="px-3 py-3 text-center"><div className="h-5 bg-gray-100 dark:bg-gray-800 rounded-full w-14 mx-auto" /></td>
+                                                    <td className="px-3 py-3"><div className="h-3 bg-gray-100 dark:bg-gray-800 rounded w-16" /></td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        ) : showReadableView && readableSteps.length > 0 ? (
                             /* ── Readable View — Structured Table ── */
                             <div className="space-y-3">
                                 <div className="flex items-center gap-2 mb-1">
@@ -1255,8 +1322,11 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                 <div className="flex items-center gap-2 mb-1">
                                                     <Badge variant="outline" className="text-[10px] uppercase font-bold px-1 h-4">{log.action}</Badge>
                                                     <Badge
-                                                        variant={log.status === 'passed' || log.status === 'success' ? 'default' : 'destructive'}
-                                                        className={`${log.status === 'passed' || log.status === 'success' ? 'bg-green-500' : ''} text-[10px] px-1 h-4`}
+                                                        variant={log.status === 'passed' || log.status === 'success' ? 'default' : log.status === 'skipped' ? 'outline' : 'destructive'}
+                                                        className={`${
+                                                            log.status === 'passed' || log.status === 'success' ? 'bg-green-500' :
+                                                            log.status === 'skipped' ? 'bg-amber-100 text-amber-700 border-amber-300 dark:bg-amber-900/30 dark:text-amber-400 dark:border-amber-700' : ''
+                                                        } text-[10px] px-1 h-4`}
                                                     >
                                                         {log.status}
                                                     </Badge>

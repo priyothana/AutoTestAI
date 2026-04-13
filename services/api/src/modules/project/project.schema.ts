@@ -74,10 +74,10 @@ export const ConnectProjectSchema = z.object({
 })
 
 export const SalesforceCredentialsSchema = z.object({
-  client_id: z.string().min(1),
-  client_secret: z.string().min(1),
+  client_id: z.string().min(1, 'Client ID is required'),
+  client_secret: z.string().min(1, 'Client Secret is required'),
   redirect_uri: z.string().optional().nullable(),
-  login_url: z.string().default('https://login.salesforce.com').optional(),
+  login_url: z.string().url('Instance URL must be a valid URL').default('https://login.salesforce.com').optional(),
   sf_username: z.string().optional().nullable(),
   sf_password: z.string().optional().nullable(),
 })

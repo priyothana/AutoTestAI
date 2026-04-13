@@ -1,13 +1,13 @@
 "use client"
 
-import { useState } from "react"
-import { useRouter } from "next/navigation"
+import { useState, useEffect } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useForm } from "react-hook-form"
 import * as z from "zod"
 import {
     Check, Globe, Smartphone, Server, ChevronRight, ChevronLeft,
-    Cloud, Link2, Loader2, Eye, EyeOff, ExternalLink, Key, Copy
+    Cloud, Link2, Loader2, Eye, EyeOff, Key, Copy, Zap
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -41,9 +41,21 @@ const formSchema = z.object({
 
 export default function CreateProjectPage() {
     const router = useRouter()
+    const searchParams = useSearchParams()
     const [currentStep, setCurrentStep] = useState(1)
     const [createdProjectId, setCreatedProjectId] = useState<string | null>(null)
     const [isCreating, setIsCreating] = useState(false)
+
+    // If arriving from ?connect=<id>, skip straight to the Connect step
+    useEffect(() => {
+        const connectId = searchParams.get("connect")
+        if (connectId) {
+            setCreatedProjectId(connectId)
+            form.setValue("type", "SALESFORCE")
+            setCurrentStep(5)
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [])
 
     // Web App connect
     const [connectLoading, setConnectLoading] = useState(false)
@@ -52,15 +64,25 @@ export default function CreateProjectPage() {
     const [loginStrategy, setLoginStrategy] = useState("form")
     const [showPassword, setShowPassword] = useState(false)
 
-    // Salesforce Connected App creds
-    const [sfClientId, setSfClientId] = useState("")
-    const [sfClientSecret, setSfClientSecret] = useState("")
+    // Salesforce — unified credentials (Connected App + MCP, single form)
     const [sfUsername, setSfUsername] = useState("")
     const [sfPassword, setSfPassword] = useState("")
+    const [sfSecurityToken, setSfSecurityToken] = useState("")
+    const [sfClientId, setSfClientId] = useState("")
+    const [sfClientSecret, setSfClientSecret] = useState("")
     const [sfLoginUrl, setSfLoginUrl] = useState("https://login.salesforce.com")
-    const [sfRedirectUri, setSfRedirectUri] = useState(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/integrations/salesforce/callback`)
-    const [showSfSecret, setShowSfSecret] = useState(false)
+    const [sfRedirectUri] = useState(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/integrations/salesforce/callback`)
     const [showSfPassword, setShowSfPassword] = useState(false)
+    const [showSfToken, setShowSfToken] = useState(false)
+    const [showSfSecret, setShowSfSecret] = useState(false)
+
+    // Salesforce connect — per-field errors, API error banner, success state
+    const [sfUsernameError, setSfUsernameError] = useState<string | null>(null)
+    const [sfPasswordError, setSfPasswordError] = useState<string | null>(null)
+    const [sfClientIdError, setSfClientIdError] = useState<string | null>(null)
+    const [sfClientSecretError, setSfClientSecretError] = useState<string | null>(null)
+    const [sfConnectError, setSfConnectError] = useState<string | null>(null)
+    const [sfSuccess, setSfSuccess] = useState<{ oAuth: boolean; mcp: boolean; sync: boolean } | null>(null)
 
     // API connect
     const [apiKey, setApiKey] = useState("")
@@ -151,53 +173,104 @@ export default function CreateProjectPage() {
         }
     }
 
+    // Map backend error codes → human-readable messages
+    const SF_ERROR_MESSAGES: Record<string, string> = {
+        INVALID_CLIENT: "Invalid Salesforce credentials or Connected App details. Please check and try again.",
+        INVALID_CREDENTIALS: "Invalid Salesforce credentials or Connected App details. Please check and try again.",
+        CONNECTION_TIMEOUT: "Could not reach Salesforce. Check your instance URL and try again.",
+        INVALID_GRANT: "Invalid Salesforce credentials or Connected App details. Please check and try again.",
+        VALIDATION_ERROR: "Please fill in all required fields.",
+    }
+
     const handleConnectSalesforce = async () => {
         if (!createdProjectId) return
-        if (!sfClientId || !sfClientSecret) {
-            toast.error("Connected App Client ID and Secret are required")
-            return
-        }
 
+        // ── Validate all required fields ────────────────────────────────────
+        let hasError = false
+        if (!sfUsername.trim()) { setSfUsernameError("Username is required"); hasError = true }
+        if (!sfPassword.trim()) { setSfPasswordError("Password is required"); hasError = true }
+        if (!sfClientId.trim()) { setSfClientIdError("Client ID is required"); hasError = true }
+        if (!sfClientSecret.trim()) { setSfClientSecretError("Client Secret is required"); hasError = true }
+        if (hasError) return
+
+        setSfConnectError(null)
+        setSfSuccess(null)
         setConnectLoading(true)
         try {
-            // Step 1: Save Connected App credentials
-            const saveRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/save-sf-credentials`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    client_id: sfClientId,
-                    client_secret: sfClientSecret,
-                    redirect_uri: sfRedirectUri,
-                    login_url: sfLoginUrl,
-                    sf_username: sfUsername || undefined,
-                    sf_password: sfPassword || undefined,
-                }),
-            })
+            // ── Step 1: Save Connected App credentials ───────────────────────
+            const saveRes = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/save-sf-credentials`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        client_id: sfClientId,
+                        client_secret: sfClientSecret,
+                        redirect_uri: sfRedirectUri,
+                        login_url: sfLoginUrl,
+                        sf_username: sfUsername,
+                        sf_password: sfPassword,
+                    }),
+                },
+            )
             if (!saveRes.ok) {
                 const err = await saveRes.json().catch(() => ({}))
-                throw new Error(err.detail || "Failed to save credentials")
+                setSfConnectError(
+                    SF_ERROR_MESSAGES[err.error ?? ""] ??
+                    "Invalid Salesforce credentials or Connected App details. Please check and try again."
+                )
+                return
             }
 
-            // Step 2: Start OAuth flow (Legacy - Node.js backend returns empty auth_url for JSForce)
-            const oauthRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/connect`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ category: "salesforce" }),
-            })
+            // ── Step 2: OAuth / JSForce registration ─────────────────────────
+            const oauthRes = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${createdProjectId}/connect`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ category: "salesforce" }),
+                },
+            )
             if (!oauthRes.ok) {
                 const err = await oauthRes.json().catch(() => ({}))
-                throw new Error(err.detail || "Failed to initiate connection")
+                setSfConnectError(
+                    SF_ERROR_MESSAGES[err.error ?? ""] ??
+                    err.detail ??
+                    "Invalid Salesforce credentials or Connected App details. Please check and try again."
+                )
+                return
             }
-            const data = await oauthRes.json()
-            if (data.auth_url) {
+            const oauthData = await oauthRes.json()
+            if (oauthData.auth_url) {
                 toast.info("Redirecting to Salesforce login...")
-                window.location.href = data.auth_url
-            } else {
-                toast.success("Salesforce credentials saved successfully!")
-                setTimeout(() => router.push(`/dashboard/projects/${createdProjectId}`), 1000)
+                window.location.href = oauthData.auth_url
+                return
             }
-        } catch (error: any) {
-            toast.error(error.message || "Salesforce connection failed")
+
+            // ── Step 3: MCP connection using same credentials ─────────────────
+            let mcpOk = false
+            try {
+                const mcpRes = await fetch(
+                    `${process.env.NEXT_PUBLIC_API_URL}/api/v1/mcp/projects/${createdProjectId}/mcp-connect`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            sf_username: sfUsername,
+                            sf_password: sfPassword,
+                            sf_security_token: sfSecurityToken,
+                            domain: sfLoginUrl.includes("test") ? "test" : "login",
+                        }),
+                    },
+                )
+                mcpOk = mcpRes.ok
+            } catch { mcpOk = false }
+
+            // ── Show rich success state, auto-navigate after 3 s ─────────────
+            setSfSuccess({ oAuth: true, mcp: mcpOk, sync: mcpOk })
+            setTimeout(() => router.push(`/dashboard/projects/${createdProjectId}`), 3000)
+        } catch {
+            setSfConnectError("Invalid Salesforce credentials or Connected App details. Please check and try again.")
         } finally {
             setConnectLoading(false)
         }
@@ -463,6 +536,7 @@ export default function CreateProjectPage() {
                             {currentStep === 5 && (
                                 <div className="space-y-6">
 
+
                                     {/* Web App / Mobile */}
                                     {(category === "webapp") && (
                                         <div className="space-y-4 rounded-lg border-2 border-blue-100 dark:border-blue-900 p-6 bg-blue-50/30 dark:bg-blue-950/10">
@@ -505,69 +579,189 @@ export default function CreateProjectPage() {
                                         </div>
                                     )}
 
-                                    {/* Salesforce */}
+                                    {/* ── Unified Salesforce Connection ──────────────────── */}
                                     {category === "salesforce" && (
-                                        <div className="space-y-4 rounded-lg border-2 border-purple-100 dark:border-purple-900 p-6 bg-purple-50/30 dark:bg-purple-950/10">
-                                            <div className="flex items-center gap-2 mb-2">
-                                                <Cloud className="h-5 w-5 text-purple-600" />
-                                                <h3 className="font-semibold text-purple-700 dark:text-purple-400">Salesforce Connected App</h3>
-                                            </div>
-                                            <p className="text-sm text-muted-foreground mb-3">
-                                                Enter your Salesforce Connected App details. These are encrypted and stored securely.
-                                            </p>
-                                            <div className="grid gap-4">
-                                                <div>
-                                                    <label className="text-sm font-medium mb-1 block">Salesforce Username</label>
-                                                    <Input placeholder="e.g. admin@myorg.sandbox" value={sfUsername} onChange={(e) => setSfUsername(e.target.value)} autoComplete="off" />
-                                                    <p className="text-xs text-muted-foreground mt-1">Your Salesforce login email/username (used for browser-based login)</p>
+                                        <div className="rounded-xl border-2 border-blue-200 dark:border-blue-900 bg-gradient-to-br from-blue-50/60 to-indigo-50/40 dark:from-blue-950/20 dark:to-indigo-950/10 p-6 space-y-5">
+
+                                            {/* Header */}
+                                            <div className="flex items-center gap-3">
+                                                <div className="p-2 rounded-lg bg-blue-600 text-white">
+                                                    <Cloud className="h-5 w-5" />
                                                 </div>
                                                 <div>
-                                                    <label className="text-sm font-medium mb-1 block">Salesforce Password</label>
-                                                    <div className="relative">
-                                                        <Input type={showSfPassword ? "text" : "password"} placeholder="Password + Security Token" value={sfPassword} onChange={(e) => setSfPassword(e.target.value)} autoComplete="new-password" />
-                                                        <button type="button" onClick={() => setShowSfPassword(!showSfPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                                                            {showSfPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                                                        </button>
-                                                    </div>
-                                                    <p className="text-xs text-muted-foreground mt-1">Used to login via browser before test execution</p>
-                                                </div>
-                                                <hr className="border-purple-200 dark:border-purple-800" />
-                                                <div>
-                                                    <label className="text-sm font-medium mb-1 block">Connected App Client ID <span className="text-red-500">*</span></label>
-                                                    <Input placeholder="Enter Consumer Key from Connected App" value={sfClientId} onChange={(e) => setSfClientId(e.target.value)} autoComplete="off" />
-                                                </div>
-                                                <div>
-                                                    <label className="text-sm font-medium mb-1 block">Connected App Client Secret <span className="text-red-500">*</span></label>
-                                                    <div className="relative">
-                                                        <Input type={showSfSecret ? "text" : "password"} placeholder="Enter Consumer Secret" value={sfClientSecret} onChange={(e) => setSfClientSecret(e.target.value)} autoComplete="new-password" />
-                                                        <button type="button" onClick={() => setShowSfSecret(!showSfSecret)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
-                                                            {showSfSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                                <div>
-                                                    <label className="text-sm font-medium mb-1 block">Callback URL</label>
-                                                    <div className="flex gap-2">
-                                                        <Input value={sfRedirectUri} onChange={(e) => setSfRedirectUri(e.target.value)} className="font-mono text-xs" />
-                                                        <Button type="button" variant="outline" size="icon" onClick={() => copyToClipboard(sfRedirectUri)}>
-                                                            <Copy className="h-4 w-4" />
-                                                        </Button>
-                                                    </div>
-                                                    <p className="text-xs text-muted-foreground mt-1">Copy this URL into your Salesforce Connected App settings.</p>
-                                                </div>
-                                                <div>
-                                                    <label className="text-sm font-medium mb-1 block">Login URL</label>
-                                                    <select value={sfLoginUrl} onChange={(e) => setSfLoginUrl(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
-                                                        <option value="https://login.salesforce.com">Production (login.salesforce.com)</option>
-                                                        <option value="https://test.salesforce.com">Sandbox (test.salesforce.com)</option>
-                                                    </select>
+                                                    <h3 className="font-semibold text-gray-900 dark:text-gray-100 text-base">Salesforce Connection</h3>
+                                                    <p className="text-xs text-muted-foreground">All credentials are encrypted and stored securely per environment</p>
                                                 </div>
                                             </div>
-                                            <div className="bg-white/60 dark:bg-black/20 rounded-md p-3 text-sm space-y-1 border mt-2">
-                                                <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Per-environment credentials — isolated per org</div>
-                                                <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Encrypted at rest with Fernet</div>
-                                                <div className="flex items-center gap-2 text-green-600"><Check className="h-3.5 w-3.5" /> Auto metadata sync after OAuth</div>
-                                            </div>
+
+                                            {/* Error banner */}
+                                            {sfConnectError && (
+                                                <div className="flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 dark:bg-red-950/30 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+                                                    <svg className="mt-0.5 h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+                                                    <span>{sfConnectError}</span>
+                                                </div>
+                                            )}
+
+                                            {/* Success state */}
+                                            {sfSuccess ? (
+                                                <div className="rounded-lg border border-green-200 bg-green-50 dark:bg-green-950/30 dark:border-green-800 px-5 py-4 space-y-2">
+                                                    <p className="text-sm font-semibold text-green-800 dark:text-green-300 mb-3">Connected successfully — redirecting in a moment…</p>
+                                                    <div className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400">
+                                                        <Check className="h-4 w-4 shrink-0" />
+                                                        <span>Connected via Connected App (OAuth)</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 text-sm">
+                                                        {sfSuccess.mcp
+                                                            ? <Check className="h-4 w-4 shrink-0 text-green-600" />
+                                                            : <svg className="h-4 w-4 shrink-0 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>}
+                                                        <span className={sfSuccess.mcp ? "text-green-700 dark:text-green-400" : "text-amber-700 dark:text-amber-400"}>
+                                                            {sfSuccess.mcp ? "MCP Server connected" : "MCP connection skipped — retry from Integration tab"}
+                                                        </span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 text-sm">
+                                                        {sfSuccess.sync
+                                                            ? <Check className="h-4 w-4 shrink-0 text-green-600" />
+                                                            : <svg className="h-4 w-4 shrink-0 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="10"/></svg>}
+                                                        <span className={sfSuccess.sync ? "text-green-700 dark:text-green-400" : "text-muted-foreground"}>
+                                                            {sfSuccess.sync ? "Metadata sync started" : "Metadata sync will start after MCP connects"}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="grid gap-4">
+
+                                                    {/* Username */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">
+                                                            Salesforce Username <span className="text-red-500">*</span>
+                                                        </label>
+                                                        <Input
+                                                            placeholder="e.g. admin@myorg.sandbox"
+                                                            value={sfUsername}
+                                                            onChange={(e) => { setSfUsername(e.target.value); if (sfUsernameError) setSfUsernameError(null) }}
+                                                            autoComplete="off"
+                                                            className={sfUsernameError ? "border-red-500 focus-visible:ring-red-500" : ""}
+                                                        />
+                                                        {sfUsernameError && <p className="text-xs text-red-600 mt-1">{sfUsernameError}</p>}
+                                                    </div>
+
+                                                    {/* Password */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">
+                                                            Salesforce Password <span className="text-red-500">*</span>
+                                                        </label>
+                                                        <div className="relative">
+                                                            <Input
+                                                                type={showSfPassword ? "text" : "password"}
+                                                                placeholder="Your Salesforce password"
+                                                                value={sfPassword}
+                                                                onChange={(e) => { setSfPassword(e.target.value); if (sfPasswordError) setSfPasswordError(null) }}
+                                                                autoComplete="new-password"
+                                                                className={sfPasswordError ? "border-red-500 focus-visible:ring-red-500" : ""}
+                                                            />
+                                                            <button type="button" onClick={() => setShowSfPassword(!showSfPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                                                {showSfPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                                            </button>
+                                                        </div>
+                                                        {sfPasswordError && <p className="text-xs text-red-600 mt-1">{sfPasswordError}</p>}
+                                                    </div>
+
+                                                    {/* Security Token */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">Security Token</label>
+                                                        <div className="relative">
+                                                            <Input
+                                                                type={showSfToken ? "text" : "password"}
+                                                                placeholder="Your Salesforce security token"
+                                                                value={sfSecurityToken}
+                                                                onChange={(e) => setSfSecurityToken(e.target.value)}
+                                                                autoComplete="new-password"
+                                                            />
+                                                            <button type="button" onClick={() => setShowSfToken(!showSfToken)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                                                {showSfToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                                            </button>
+                                                        </div>
+                                                        <p className="text-xs text-muted-foreground mt-1">
+                                                            Find it in Salesforce → Settings → My Personal Information → Reset My Security Token
+                                                        </p>
+                                                    </div>
+
+                                                    <hr className="border-border" />
+
+                                                    {/* Client ID */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">
+                                                            Connected App Client ID <span className="text-red-500">*</span>
+                                                        </label>
+                                                        <Input
+                                                            placeholder="Enter Consumer Key from Connected App"
+                                                            value={sfClientId}
+                                                            onChange={(e) => { setSfClientId(e.target.value); if (sfClientIdError) setSfClientIdError(null) }}
+                                                            autoComplete="off"
+                                                            className={sfClientIdError ? "border-red-500 focus-visible:ring-red-500" : ""}
+                                                        />
+                                                        {sfClientIdError && <p className="text-xs text-red-600 mt-1">{sfClientIdError}</p>}
+                                                    </div>
+
+                                                    {/* Client Secret */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">
+                                                            Connected App Client Secret <span className="text-red-500">*</span>
+                                                        </label>
+                                                        <div className="relative">
+                                                            <Input
+                                                                type={showSfSecret ? "text" : "password"}
+                                                                placeholder="Enter Consumer Secret"
+                                                                value={sfClientSecret}
+                                                                onChange={(e) => { setSfClientSecret(e.target.value); if (sfClientSecretError) setSfClientSecretError(null) }}
+                                                                autoComplete="new-password"
+                                                                className={sfClientSecretError ? "border-red-500 focus-visible:ring-red-500" : ""}
+                                                            />
+                                                            <button type="button" onClick={() => setShowSfSecret(!showSfSecret)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                                                                {showSfSecret ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                                                            </button>
+                                                        </div>
+                                                        {sfClientSecretError && <p className="text-xs text-red-600 mt-1">{sfClientSecretError}</p>}
+                                                    </div>
+
+                                                    {/* Callback URL */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">Callback URL</label>
+                                                        <div className="flex gap-2">
+                                                            <Input value={sfRedirectUri} readOnly className="font-mono text-xs bg-muted" />
+                                                            <Button type="button" variant="outline" size="icon" onClick={() => copyToClipboard(sfRedirectUri)}>
+                                                                <Copy className="h-4 w-4" />
+                                                            </Button>
+                                                        </div>
+                                                        <p className="text-xs text-muted-foreground mt-1">Copy this URL into your Salesforce Connected App settings.</p>
+                                                    </div>
+
+                                                    {/* Login URL */}
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">Login URL</label>
+                                                        <select
+                                                            value={sfLoginUrl}
+                                                            onChange={(e) => setSfLoginUrl(e.target.value)}
+                                                            className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+                                                        >
+                                                            <option value="https://login.salesforce.com">Production (login.salesforce.com)</option>
+                                                            <option value="https://test.salesforce.com">Sandbox (test.salesforce.com)</option>
+                                                        </select>
+                                                    </div>
+
+                                                    {/* Primary connect button — inside the panel */}
+                                                    <Button
+                                                        type="button"
+                                                        onClick={handleConnectSalesforce}
+                                                        disabled={connectLoading}
+                                                        className="w-full h-11 text-base font-semibold bg-blue-600 hover:bg-blue-700 mt-1"
+                                                    >
+                                                        {connectLoading
+                                                            ? <><Loader2 className="mr-2 h-5 w-5 animate-spin" />Connecting…</>
+                                                            : <><Zap className="mr-2 h-5 w-5" />Connect to Salesforce</>}
+                                                    </Button>
+                                                </div>
+                                            )}
                                         </div>
                                     )}
 
@@ -725,20 +919,24 @@ export default function CreateProjectPage() {
                     )}
                     {currentStep === 5 && (
                         <div className="flex w-full justify-between">
-                            <Button variant="ghost" onClick={handleSkipConnect}>Skip for Now</Button>
-                            <Button
-                                onClick={handleConnect}
-                                disabled={connectLoading}
-                                className={category === "salesforce" ? "bg-purple-600 hover:bg-purple-700" : category === "api" ? "bg-green-600 hover:bg-green-700" : "bg-blue-600 hover:bg-blue-700"}
-                            >
-                                {connectLoading ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</>) : (
-                                    <>
-                                        {category === "salesforce" && <><ExternalLink className="mr-2 h-4 w-4" />Connect with Salesforce</>}
-                                        {category === "api" && <><Key className="mr-2 h-4 w-4" />Save API Credentials</>}
-                                        {category === "webapp" && <><Link2 className="mr-2 h-4 w-4" />Connect</>}
-                                    </>
-                                )}
+                            <Button variant="ghost" onClick={handleSkipConnect}>
+                                {sfSuccess ? "Continue to Environment" : "Skip for Now"}
                             </Button>
+                            {/* Salesforce has its own "Connect to Salesforce" button inside the form panel */}
+                            {category !== "salesforce" && (
+                                <Button
+                                    onClick={handleConnect}
+                                    disabled={connectLoading}
+                                    className={category === "api" ? "bg-green-600 hover:bg-green-700" : "bg-blue-600 hover:bg-blue-700"}
+                                >
+                                    {connectLoading ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</>) : (
+                                        <>
+                                            {category === "api" && <><Key className="mr-2 h-4 w-4" />Save API Credentials</>}
+                                            {category === "webapp" && <><Link2 className="mr-2 h-4 w-4" />Connect</>}
+                                        </>
+                                    )}
+                                </Button>
+                            )}
                         </div>
                     )}
                 </CardFooter>
