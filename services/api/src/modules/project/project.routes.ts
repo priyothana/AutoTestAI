@@ -222,16 +222,81 @@ export async function projectRoutes(app: FastifyInstance) {
     }
   })
 
-  // POST /api/v1/projects/:id/save-sf-credentials  →  200 + {status, redirect_uri, login_url}
+  // POST /api/v1/projects/:id/save-sf-credentials  →  200 + {success, environmentId, message}
   app.post('/projects/:id/save-sf-credentials', async (request, reply) => {
     try {
       const { id } = request.params as { id: string }
-      const body = SalesforceCredentialsSchema.parse(request.body)
+
+      // ── TASK 1: Zod input validation ──────────────────────────
+      let body: ReturnType<typeof SalesforceCredentialsSchema.parse>
+      try {
+        body = SalesforceCredentialsSchema.parse(request.body)
+      } catch (zodErr: any) {
+        // Map Zod issues to field-level error messages
+        const fields: Record<string, string> = {}
+        for (const issue of zodErr?.issues ?? []) {
+          const field = issue.path[0] as string | undefined
+          if (field) fields[field] = issue.message
+        }
+        return reply.status(400).send({
+          success: false,
+          error: 'VALIDATION_ERROR',
+          fields,
+        })
+      }
+
+      // ── Save credentials (Fernet-encrypted) to DB ─────────────
       const integration = await svc.saveSfCredentials(id, body)
+
+      // ── TASK 2: Test credentialed JSforce login ────────────────
+      // Only attempt if sf_username + sf_password were provided; Connected
+      // App credentials alone are valid for OAuth but cannot be verified
+      // via jsforce.login() — skip the live test in that case.
+      if (body.sf_username && body.sf_password) {
+        try {
+          const { default: jsforce } = await import('jsforce')
+          const loginUrl = body.login_url ?? 'https://login.salesforce.com'
+          const conn = new jsforce.Connection({ loginUrl })
+          await conn.login(body.sf_username, body.sf_password)
+        } catch (jsErr: any) {
+          const msg: string = (jsErr?.message ?? String(jsErr)).toLowerCase()
+
+          let errorCode = 'CONNECTION_FAILED'
+          if (msg.includes('invalid_client') || msg.includes('invalid client')) {
+            errorCode = 'INVALID_CLIENT'
+          } else if (
+            msg.includes('authentication failure') ||
+            msg.includes('invalid password') ||
+            msg.includes('invalid credentials') ||
+            msg.includes('login failed')
+          ) {
+            errorCode = 'INVALID_CREDENTIALS'
+          } else if (
+            msg.includes('timeout') ||
+            msg.includes('econnrefused') ||
+            msg.includes('enotfound')
+          ) {
+            errorCode = 'CONNECTION_TIMEOUT'
+          } else if (
+            msg.includes('invalid login url') ||
+            msg.includes('invalid url') ||
+            msg.includes('invalid_login_url')
+          ) {
+            errorCode = 'INVALID_URL'
+          }
+
+          return reply.status(401).send({ success: false, error: errorCode })
+        }
+      }
+
+      // ── TASK 3: Success — always include environmentId ─────────
       return reply.send({
+        success: true,
+        environmentId: integration.id,
+        message: 'Connected successfully',
+        // Legacy fields (kept so existing callers are unbroken)
         status: 'credentials_saved',
         integration_id: integration.id,
-        message: 'Connected App credentials saved. You can now initiate OAuth.',
         redirect_uri: integration.salesforce_redirect_uri,
         login_url: integration.salesforce_login_url,
       })

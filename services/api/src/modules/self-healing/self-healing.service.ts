@@ -374,6 +374,12 @@ No markdown, no code fences.`
       errorMessage = error
       break
     }
+    // Detect skipped steps (HITL) as failures — they indicate missing required data
+    if (status === 'skipped') {
+      failingStep  = logEntry
+      errorMessage = String(logEntry['message'] ?? 'Step was skipped by user — required field data may be missing')
+      break
+    }
   }
 
   // Extract passing steps from logs
@@ -496,6 +502,12 @@ export async function generateAiSuggestions(
       if ((status === 'failed' || status === 'error') && error) {
         failingStep  = entry
         errorMessage = error
+        break
+      }
+      // Detect skipped steps (HITL) as failures — they indicate missing required data
+      if (status === 'skipped') {
+        failingStep  = entry
+        errorMessage = String(entry['message'] ?? 'Step was skipped by user — required field data may be missing')
         break
       }
     }

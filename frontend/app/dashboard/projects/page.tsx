@@ -37,6 +37,7 @@ export default function ProjectsPage() {
     const [hasMore, setHasMore] = useState(true)
     const [integrationStatuses, setIntegrationStatuses] = useState<Record<string, string>>({})
     const [mounted, setMounted] = useState(false)
+    const [backendOffline, setBackendOffline] = useState(false)
 
     useEffect(() => {
         setMounted(true)
@@ -44,6 +45,7 @@ export default function ProjectsPage() {
 
     const fetchProjects = async () => {
         setIsLoading(true)
+        setBackendOffline(false)
         try {
             const params = new URLSearchParams({
                 skip: (page * 10).toString(),
@@ -54,7 +56,7 @@ export default function ProjectsPage() {
             if (statusFilter !== "all") params.append("status", statusFilter)
             if (typeFilter !== "all") params.append("type", typeFilter)
 
-            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/?${params}`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects?${params}`)
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
                 throw new Error(errorData.detail || `Failed to fetch projects (${response.status})`);
@@ -85,7 +87,12 @@ export default function ProjectsPage() {
             setIntegrationStatuses(statuses)
         } catch (error: any) {
             console.error("Failed to fetch projects:", error)
-            toast.error(error.message || "Connection error: Could not reach the backend server.")
+            // TypeError = network-level failure (backend not running / connection refused)
+            if (error instanceof TypeError) {
+                setBackendOffline(true)
+            } else {
+                toast.error(error.message || "Connection error: Could not reach the backend server.")
+            }
         } finally {
             setIsLoading(false)
         }
@@ -152,6 +159,21 @@ export default function ProjectsPage() {
                     Create New Environment
                 </Button>
             </div>
+
+            {/* Backend offline banner */}
+            {backendOffline && (
+                <div className="flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                    <span className="text-base">⚠️</span>
+                    <span className="flex-1">
+                        <strong>Backend unreachable</strong> — Could not connect to{" "}
+                        <code className="rounded bg-amber-100 px-1 font-mono text-xs">{process.env.NEXT_PUBLIC_API_URL}</code>.
+                        Make sure the API server is running (<code className="rounded bg-amber-100 px-1 font-mono text-xs">npm run dev</code> in <code className="rounded bg-amber-100 px-1 font-mono text-xs">services/api</code>).
+                    </span>
+                    <Button variant="outline" size="sm" onClick={fetchProjects} className="border-amber-300 text-amber-800 hover:bg-amber-100">
+                        Retry
+                    </Button>
+                </div>
+            )}
 
             {/* Filters */}
             <div className="flex flex-col sm:flex-row gap-4">

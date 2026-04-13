@@ -15,7 +15,7 @@ import { resolvePause, isPaused } from '../../shared/execution/pause-gate.js'
 import prisma from '../../shared/db/prisma.js'
 
 const ResumeSchema = z.object({
-  action: z.enum(['resume', 'skip']),
+  action: z.enum(['resume', 'skip', 'stop']),
 })
 
 export async function testRunRoutes(app: FastifyInstance) {
@@ -40,11 +40,19 @@ export async function testRunRoutes(app: FastifyInstance) {
         return reply.status(409).send({ detail: 'This run is not currently paused.' })
       }
 
-      // Flip DB status back to running before resolving the gate
-      await prisma.test_runs.update({
-        where: { id },
-        data: { status: 'running' },
-      }).catch(() => { /* non-fatal — worker will update status itself */ })
+      // For stop: mark DB status as 'stopped' before resolving the gate
+      if (action === 'stop') {
+        await prisma.test_runs.update({
+          where: { id },
+          data: { status: 'failed' },
+        }).catch(() => { /* non-fatal */ })
+      } else {
+        // Flip DB status back to running before resolving the gate
+        await prisma.test_runs.update({
+          where: { id },
+          data: { status: 'running' },
+        }).catch(() => { /* non-fatal — worker will update status itself */ })
+      }
 
       const resolved = resolvePause(id, action)
       if (!resolved) {
@@ -52,6 +60,29 @@ export async function testRunRoutes(app: FastifyInstance) {
       }
 
       return reply.send({ ok: true, action })
+    } catch (err: any) {
+      if (err.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
+      throw err
+    }
+  })
+
+  // ── HITL: Stop a paused test (close browser, abort run) ─────────────────
+  app.post('/:id/stop', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+
+      // Mark as failed immediately in DB
+      await prisma.test_runs.update({
+        where: { id },
+        data: { status: 'failed' },
+      }).catch(() => { /* non-fatal */ })
+
+      // If paused, resolve the gate with 'stop' so the worker exits
+      if (isPaused(id)) {
+        resolvePause(id, 'stop')
+      }
+
+      return reply.send({ ok: true, action: 'stop' })
     } catch (err: any) {
       if (err.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
       throw err

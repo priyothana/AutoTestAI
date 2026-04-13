@@ -12,7 +12,7 @@
  * No Redis round-trip needed — a simple in-memory Map is sufficient.
  */
 
-export type PauseAction = 'resume' | 'skip'
+export type PauseAction = 'resume' | 'skip' | 'stop'
 
 interface PauseEntry {
   resolve: (action: PauseAction) => void
@@ -45,7 +45,7 @@ export function waitForResume(
 }
 
 /**
- * Called by the resume API route.
+ * Called by the resume/stop API route.
  * Returns true if an execution was waiting, false if no pause was registered.
  */
 export function resolvePause(executionId: string, action: PauseAction): boolean {

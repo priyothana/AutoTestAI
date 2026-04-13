@@ -36,10 +36,10 @@ const log = createModuleLogger('execution-worker')
 
 // ─── Directory setup ──────────────────────────────────────────────────────────
 
-const BASE_DIR        = path.resolve(process.cwd(), 'static')
+const BASE_DIR = path.resolve(process.cwd(), 'static')
 const SCREENSHOTS_DIR = path.resolve(BASE_DIR, 'screenshots')
-const TRACES_DIR      = path.resolve(BASE_DIR, 'traces')
-const SESSIONS_DIR    = path.resolve(BASE_DIR, 'sessions')
+const TRACES_DIR = path.resolve(BASE_DIR, 'traces')
+const SESSIONS_DIR = path.resolve(BASE_DIR, 'sessions')
 
 for (const dir of [SCREENSHOTS_DIR, TRACES_DIR, SESSIONS_DIR]) {
   fs.mkdirSync(dir, { recursive: true })
@@ -63,8 +63,8 @@ async function saveSession(projectId: string, browserCtx: BrowserContext): Promi
     await prisma.projects.update({
       where: { id: projectId },
       data: {
-        ui_session_active:          true,
-        ui_session_source:          'login',
+        ui_session_active: true,
+        ui_session_source: 'login',
         ui_session_last_created_at: new Date(),
       },
     }).catch((e: unknown) => log.warn({ e }, '[SESSION] DB flag update failed (non-fatal)'))
@@ -89,6 +89,582 @@ const healingQueue = new Queue<HealingJob>(QUEUES.HEALING, getRedisOptions())
 // ─── Frame registry (per execution) ──────────────────────────────────────────
 // Maps executionId → active FrameLocator (set by switchframe action)
 const frameRegistry = new Map<string, FrameLocator>()
+
+// ─── SF Field Map (per execution) ────────────────────────────────────────────
+// Built after clicking New/Edit/Clone — maps {fieldLabel → fieldType}
+// Persists across steps within the same execution so the fill handler knows types.
+const sfFieldMapRegistry = new Map<string, Record<string, string>>()
+
+// ─── MCP Metadata Map (per execution) ────────────────────────────────────────
+// Loaded once at execution start from metadata_normalized table — maps {fieldLabel → metadata}
+const sfMetadataMapRegistry = new Map<string, Record<string, any>>()
+
+// ─── SF Lightning Engine — ported from Python salesforce_engine.py ────────────
+// These functions provide the critical runtime field type detection, modal
+// stabilization, and error handling that the Python engine used.
+
+/**
+ * Scan the current page/modal DOM and build a {label → fieldType} map.
+ * This is the KEY function that tells the fill engine what type each field is.
+ *
+ * Port of Python salesforce_engine.py lines 176–282.
+ */
+async function scanFieldMap(page: Page): Promise<Record<string, string>> {
+  try {
+    const fieldMap: Record<string, string> = await page.evaluate(() => {
+      const modal = document.querySelector(
+        '.slds-modal__content, records-record-edit-form, lightning-record-edit-form',
+      ) || document.body
+      const map: Record<string, string> = {}
+
+      // Scan lightning-input-field components
+      modal.querySelectorAll('lightning-input-field').forEach((field) => {
+        const label = field.querySelector('label, .slds-form-element__label, legend')
+        if (!label) return
+        const labelText = label.textContent?.trim() ?? ''
+        if (!labelText) return
+
+        // Detect field type from child components
+        if (field.querySelector('input[type="checkbox"], lightning-primitive-input-toggle')) {
+          map[labelText] = 'checkbox'
+        } else if (field.querySelector('lightning-datepicker')) {
+          map[labelText] = 'date'
+        } else if (field.querySelector('lightning-timepicker')) {
+          map[labelText] = 'time'
+        } else if (field.querySelector('lightning-dual-listbox')) {
+          map[labelText] = 'multipicklist'
+        } else if (field.querySelector('lightning-combobox')) {
+          map[labelText] = 'picklist'
+        } else if (field.querySelector('lightning-lookup, lightning-grouped-combobox, input[role="combobox"]')) {
+          map[labelText] = 'lookup'
+        } else if (field.querySelector('lightning-input-rich-text, [contenteditable="true"]')) {
+          map[labelText] = 'richtext'
+        } else if (field.querySelector('lightning-textarea, textarea')) {
+          map[labelText] = 'textarea'
+        } else if (field.querySelector('input[type="file"], lightning-file-upload')) {
+          map[labelText] = 'file'
+        } else {
+          map[labelText] = 'text'
+        }
+      })
+
+      // Scan standalone lightning components
+      const componentTags = [
+        'lightning-input', 'lightning-combobox', 'lightning-datepicker',
+        'lightning-timepicker', 'lightning-textarea', 'lightning-lookup',
+        'lightning-dual-listbox', 'lightning-input-rich-text',
+        'lightning-file-upload',
+      ]
+      componentTags.forEach((tag) => {
+        modal.querySelectorAll(tag).forEach((el) => {
+          const label = el.querySelector('label, .slds-form-element__label')
+          if (!label) return
+          const labelText = label.textContent?.trim() ?? ''
+          if (!labelText || map[labelText]) return
+
+          if (tag === 'lightning-datepicker') map[labelText] = 'date'
+          else if (tag === 'lightning-timepicker') map[labelText] = 'time'
+          else if (tag === 'lightning-combobox') map[labelText] = 'picklist'
+          else if (tag === 'lightning-lookup') map[labelText] = 'lookup'
+          else if (tag === 'lightning-textarea') map[labelText] = 'textarea'
+          else if (tag === 'lightning-dual-listbox') map[labelText] = 'multipicklist'
+          else if (tag === 'lightning-input-rich-text') map[labelText] = 'richtext'
+          else if (tag === 'lightning-file-upload') map[labelText] = 'file'
+          else map[labelText] = 'text'
+        })
+      })
+
+      // Scan .slds-form-element containers as fallback
+      modal.querySelectorAll('.slds-form-element').forEach((el) => {
+        const label = el.querySelector('label, .slds-form-element__label, legend')
+        if (!label) return
+        const labelText = label.textContent?.trim() ?? ''
+        if (!labelText || map[labelText]) return
+
+        if (el.querySelector('input[type="checkbox"], lightning-primitive-input-toggle')) {
+          map[labelText] = 'checkbox'
+        } else if (el.querySelector('input[type="date"], lightning-datepicker')) {
+          map[labelText] = 'date'
+        } else if (el.querySelector('lightning-timepicker')) {
+          map[labelText] = 'time'
+        } else if (el.querySelector('lightning-dual-listbox')) {
+          map[labelText] = 'multipicklist'
+        } else if (el.querySelector('select, lightning-combobox, [role="listbox"]')) {
+          map[labelText] = 'picklist'
+        } else if (el.querySelector('input[role="combobox"]')) {
+          map[labelText] = 'lookup'
+        } else if (el.querySelector('lightning-input-rich-text, [contenteditable="true"]')) {
+          map[labelText] = 'richtext'
+        } else if (el.querySelector('textarea')) {
+          map[labelText] = 'textarea'
+        } else if (el.querySelector('input[type="file"], lightning-file-upload')) {
+          map[labelText] = 'file'
+        } else {
+          map[labelText] = 'text'
+        }
+      })
+
+      return map
+    })
+    log.info(`[SF-ENGINE] 📋 Field map scanned: ${JSON.stringify(fieldMap)}`)
+    return fieldMap
+  } catch (e) {
+    log.warn({ e }, '[SF-ENGINE] Field map scan failed')
+    return {}
+  }
+}
+
+/**
+ * Scroll the modal container to bring a field label into view using JS.
+ * Port of Python salesforce_engine.py lines 594–625.
+ */
+async function scrollModalToField(page: Page, label: string): Promise<void> {
+  try {
+    const scrolled = await page.evaluate((labelText: string) => {
+      const modal = document.querySelector(
+        '.slds-modal__content, div.modal-body, records-record-edit-form',
+      )
+      if (!modal) return false
+      const labels = Array.from(modal.querySelectorAll(
+        'label, span.slds-form-element__label, legend, .test-id__field-label',
+      ))
+      const target = labels.find(
+        (l) => l.textContent && l.textContent.trim().includes(labelText),
+      )
+      if (target) {
+        target.scrollIntoView({ behavior: 'instant', block: 'center' })
+        return true
+      }
+      // Label not found — scroll to bottom to reveal lazy-loaded fields
+      ;(modal as HTMLElement).scrollTop = (modal as HTMLElement).scrollHeight
+      return false
+    }, label)
+    await page.waitForTimeout(500)
+    if (scrolled) {
+      log.info(`[SF-ENGINE] Scrolled modal to "${label}"`)
+    }
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Wait for all Salesforce Lightning spinners to disappear.
+ * Port of Python salesforce_engine.py lines 4202–4222.
+ */
+async function waitForSpinnerGone(page: Page, timeout = 15_000): Promise<void> {
+  const spinnerSel = 'lightning-spinner, .slds-spinner, .slds-spinner_container:not(.slds-hide)'
+  try {
+    const spinner = page.locator(spinnerSel)
+    if (await spinner.count() > 0) {
+      log.info('[SF-ENGINE] Spinner detected, waiting for it to clear...')
+      await spinner.first().waitFor({ state: 'hidden', timeout })
+      log.info('[SF-ENGINE] Spinner cleared')
+      await page.waitForTimeout(300)
+    }
+  } catch { /* spinner may have disappeared during check */ }
+}
+
+/**
+ * Wait for Salesforce modal to open, fields to render, and stabilize.
+ * Returns true if modal was detected.
+ * Port of Python salesforce_engine.py lines 119–169.
+ */
+async function waitForSFModal(page: Page): Promise<boolean> {
+  const modalSel =
+    'div[role="dialog"], .forceModal, .records-modal, .slds-modal, ' +
+    'records-record-edit-form, lightning-record-edit-form, section.slds-modal, ' +
+    'div.slds-modal__content'
+  try {
+    await page.locator(modalSel).first().waitFor({ state: 'visible', timeout: 15_000 })
+    log.info('[SF-ENGINE] Modal container detected')
+  } catch {
+    log.info('[SF-ENGINE] Modal container not detected within 15s')
+    return false
+  }
+
+  // Wait for form fields to render inside the modal
+  const fieldSel =
+    '.slds-form-element, lightning-input-field, lightning-input, ' +
+    'lightning-combobox, lightning-datepicker'
+  try {
+    await page.locator(fieldSel).first().waitFor({ state: 'visible', timeout: 15_000 })
+    log.info('[SF-ENGINE] Form fields detected in modal')
+  } catch {
+    log.info('[SF-ENGINE] Form fields not detected within 15s — continuing anyway')
+  }
+
+  // Stabilization wait — allow Lightning components to fully initialize
+  await page.waitForTimeout(800)
+  log.info('[SF-ENGINE] Modal stabilization complete')
+  return true
+}
+
+/**
+ * Install a MutationObserver to auto-dismiss "We hit a snag" error modals.
+ * Port of Python salesforce_engine.py lines 4004–4083.
+ */
+async function installErrorModalWatcher(page: Page): Promise<void> {
+  try {
+    await page.evaluate(() => {
+      if ((window as any).__autotest_error_watcher) return
+      const obs = new MutationObserver(() => {
+        // Dismiss uiPanel error dialogs
+        document.querySelectorAll('.uiPanel').forEach((panel) => {
+          const h = panel.querySelector('h2, [class*="title"]')
+          const t = (h?.textContent || '').toLowerCase()
+          if (t.includes('snag') || t.includes('error')) {
+            const btn = panel.querySelector('button.slds-modal__close') ||
+              panel.querySelector("button[title='Close']") ||
+              panel.querySelector("button[title='OK']") ||
+              panel.querySelector('button')
+            if (btn) (btn as HTMLElement).click()
+          }
+        })
+        // Dismiss uiModal--app-error
+        document.querySelectorAll('.uiModal--app-error').forEach((modal) => {
+          const btn = modal.querySelector('.modal-footer button') ||
+            modal.querySelector('button.slds-modal__close')
+          if (btn) (btn as HTMLElement).click()
+        })
+      })
+      obs.observe(document.body, { childList: true, subtree: true })
+      ;(window as any).__autotest_error_watcher = obs
+    })
+    log.info('[SF-ENGINE] Error modal watcher installed')
+  } catch (e) {
+    log.warn({ e }, '[SF-ENGINE] Failed to install error modal watcher')
+  }
+}
+
+/**
+ * Dismiss any visible Salesforce error modals.
+ * Port of Python salesforce_engine.py lines 4085–4200.
+ */
+async function dismissErrorModal(page: Page): Promise<void> {
+  try {
+    await page.evaluate(() => {
+      // Dismiss uiPanel error dialogs ('We hit a snag')
+      document.querySelectorAll('.uiPanel').forEach((panel) => {
+        const h = panel.querySelector('h2, [class*="title"]')
+        const t = (h?.textContent || '').toLowerCase()
+        if (t.includes('snag') || t.includes('error')) {
+          const btn = panel.querySelector('button.slds-modal__close') ||
+            panel.querySelector("button[title='Close']") ||
+            panel.querySelector("button[title='OK']") ||
+            panel.querySelector('button')
+          if (btn) (btn as HTMLElement).click()
+        }
+      })
+      // Dismiss uiModal--app-error
+      document.querySelectorAll('.uiModal--app-error').forEach((modal) => {
+        const btn = modal.querySelector('.modal-footer button') ||
+          modal.querySelector('button.slds-modal__close')
+        if (btn) (btn as HTMLElement).click()
+      })
+    })
+  } catch { /* non-fatal */ }
+}
+
+/**
+ * Handle Salesforce "Duplicate Rule" popup — click "Save Anyway".
+ * Port of Python salesforce_engine.py lines 4720+.
+ */
+async function handleDuplicatePopup(page: Page): Promise<void> {
+  try {
+    // Check for duplicate popup within 3s
+    const dupModal = page.locator(
+      'div.forceModalActionContainer:has-text("duplicate"), ' +
+      '[role="dialog"]:has-text("duplicate"), ' +
+      '.modal-footer:has-text("Save")',
+    ).first()
+    if (await dupModal.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      // Try "Save Anyway" or "Save" button
+      const saveBtn = page.locator(
+        'button:has-text("Save Anyway"), button:has-text("Save")',
+      ).last()
+      if (await saveBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await saveBtn.click()
+        log.info('[SF-ENGINE] ✅ Duplicate popup dismissed via "Save Anyway"')
+        await page.waitForTimeout(1_000)
+      }
+    }
+  } catch { /* no duplicate popup — continue */ }
+}
+
+/**
+ * Fuzzy-correct a label by scanning visible labels on the page.
+ * Port of Python salesforce_engine.py lines 1025–1064.
+ */
+async function correctLabel(page: Page, label: string): Promise<string> {
+  try {
+    const pageLabels: string[] = await page.evaluate(() => {
+      const root = document.querySelector(
+        '.slds-modal__content, records-record-edit-form',
+      ) || document.body
+      const labels = root.querySelectorAll(
+        'label, span.slds-form-element__label, legend',
+      )
+      return Array.from(labels)
+        .map((l) => l.textContent?.trim() ?? '')
+        .filter(Boolean)
+        .map((t) => t.replace(/^\*/, '').trim())
+    })
+    if (!pageLabels.length) return label
+
+    const labelWords = new Set(label.toLowerCase().split(/\s+/))
+    let bestMatch = label
+    let bestScore = 0
+
+    for (const pageLbl of pageLabels) {
+      const pageWords = new Set(pageLbl.toLowerCase().split(/\s+/))
+      if (!pageWords.size) continue
+      let overlap = 0
+      for (const w of labelWords) { if (pageWords.has(w)) overlap++ }
+      const total = Math.max(labelWords.size, pageWords.size)
+      const score = total > 0 ? overlap / total : 0
+      if (score > bestScore && score >= 0.5 && overlap >= 2) {
+        bestScore = score
+        bestMatch = pageLbl
+      }
+    }
+    if (bestMatch !== label) {
+      log.info(`[SF-ENGINE] Label corrected: "${label}" → "${bestMatch}"`)
+    }
+    return bestMatch
+  } catch {
+    return label
+  }
+}
+
+/**
+ * Real-time JS probe to detect the actual field type by inspecting DOM structure.
+ * Port of Python salesforce_engine.py lines 1066–1111.
+ */
+async function probeFieldTypeJS(page: Page, label: string): Promise<string | null> {
+  try {
+    return await page.evaluate((labelText: string) => {
+      const root = document.querySelector(
+        '.slds-modal__content, records-record-edit-form, lightning-record-edit-form',
+      ) || document.body
+      const labels = root.querySelectorAll(
+        'label, span.slds-form-element__label, legend, .test-id__field-label',
+      )
+      for (const lbl of Array.from(labels)) {
+        const txt = lbl.textContent?.trim()
+        if (!txt || !txt.includes(labelText)) continue
+        // Walk up to container
+        const container = lbl.closest(
+          'lightning-input-field, lightning-combobox, lightning-picklist, ' +
+          'lightning-grouped-combobox, .slds-form-element',
+        )
+        if (!container) continue
+        // Check for date FIRST (before combobox, since date inputs can have role=combobox)
+        if (container.querySelector('lightning-datepicker')) return 'date'
+        // Check for picklist indicators
+        if (container.querySelector('lightning-combobox, lightning-picklist, [role="listbox"]')) return 'picklist'
+        const btn = container.querySelector('button')
+        if (btn) {
+          const btnText = btn.textContent?.trim()
+          if (btnText === '--None--' || btnText === 'Select an Option' ||
+            btnText === 'None' || btn.getAttribute('aria-haspopup') === 'listbox') {
+            return 'picklist'
+          }
+        }
+        const combobox = container.querySelector('[role="combobox"], input[role="combobox"]')
+        if (combobox && !container.querySelector('lightning-datepicker')) return 'picklist'
+        if (container.querySelector('lightning-lookup')) return 'lookup'
+        if (container.querySelector('textarea, lightning-textarea')) return 'textarea'
+        return 'text'
+      }
+      return null
+    }, label)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Load MCP field metadata from metadata_normalized table for a project.
+ * Returns a map of {fieldLabel → {type, api_name, required, values, controllerName, ...}}.
+ * Port of Python salesforce_engine.py load_field_metadata().
+ */
+async function loadFieldMetadata(projectId: string): Promise<Record<string, any>> {
+  try {
+    const rows = await prisma.metadata_normalized.findMany({
+      where: {
+        project_id: projectId,
+        entity_type: 'field',
+      },
+      select: {
+        label: true,
+        object_name: true,
+        structured_json: true,
+      },
+    })
+
+    const metaMap: Record<string, any> = {}
+    for (const row of rows) {
+      const label = row.label?.trim()
+      if (!label) continue
+      const json = (row.structured_json ?? {}) as Record<string, any>
+      metaMap[label] = {
+        type: json.type ?? json.soap_type ?? '',
+        api_name: json.api_name ?? json.name ?? '',
+        required: json.required ?? json.nillable === false,
+        values: json.picklist_values ?? json.restrictedPicklistValues ?? [],
+        controllerName: json.controllerName ?? '',
+        object_name: row.object_name ?? '',
+      }
+    }
+    log.info(`[SF-ENGINE] Loaded ${Object.keys(metaMap).length} field metadata entries`)
+    return metaMap
+  } catch (e) {
+    log.warn({ e }, '[SF-ENGINE] Failed to load field metadata')
+    return {}
+  }
+}
+
+/**
+ * Resolve the field type for a given label using the 3-layer strategy:
+ * 1. Step-level sf_field_type (from AI generation)
+ * 2. DOM field map (from scanFieldMap after modal opens)
+ * 3. MCP metadata map (from DB)
+ * 4. Real-time JS DOM probe (last resort)
+ *
+ * Returns the resolved field type string.
+ */
+async function resolveFieldType(
+  page: Page,
+  label: string,
+  stepSfType: string | undefined,
+  executionId: string,
+): Promise<string> {
+  // Layer 1: Explicit sf_field_type from step
+  if (stepSfType && stepSfType !== 'text' && stepSfType !== 'unknown') {
+    log.info(`[SF-ENGINE] Field type for "${label}": "${stepSfType}" (from step metadata)`)
+    return stepSfType
+  }
+
+  // Layer 2: DOM field map
+  const fieldMap = sfFieldMapRegistry.get(executionId)
+  if (fieldMap) {
+    // Exact match
+    if (fieldMap[label]) {
+      log.info(`[SF-ENGINE] Field type for "${label}": "${fieldMap[label]}" (from DOM field map)`)
+      return fieldMap[label]
+    }
+    // Fuzzy match (case-insensitive partial)
+    for (const [mapLabel, mapType] of Object.entries(fieldMap)) {
+      if (label.toLowerCase().includes(mapLabel.toLowerCase()) ||
+        mapLabel.toLowerCase().includes(label.toLowerCase())) {
+        log.info(`[SF-ENGINE] Field type for "${label}": "${mapType}" (fuzzy DOM match via "${mapLabel}")`)
+        return mapType
+      }
+    }
+  }
+
+  // Layer 3: MCP metadata map
+  const metaMap = sfMetadataMapRegistry.get(executionId)
+  if (metaMap) {
+    let meta = metaMap[label]
+    if (!meta) {
+      // Case-insensitive partial match
+      for (const [metaLabel, metaInfo] of Object.entries(metaMap)) {
+        if (label.toLowerCase().includes(metaLabel.toLowerCase()) ||
+          metaLabel.toLowerCase().includes(label.toLowerCase())) {
+          meta = metaInfo
+          break
+        }
+      }
+    }
+    if (meta) {
+      const sfType = (meta.type ?? '').toLowerCase()
+      const typeMapping: Record<string, string> = {
+        picklist: 'picklist',
+        multipicklist: 'multipicklist',
+        combobox: 'picklist',
+        reference: 'lookup',
+        date: 'date',
+        datetime: 'date',
+        boolean: 'checkbox',
+        time: 'time',
+        textarea: 'text',
+        string: 'text',
+        email: 'text',
+        phone: 'text',
+        url: 'text',
+        currency: 'text',
+        double: 'text',
+        int: 'text',
+        percent: 'text',
+      }
+      const mapped = typeMapping[sfType] ?? 'text'
+      log.info(`[SF-ENGINE] Field type for "${label}": "${sfType}" → "${mapped}" (from MCP metadata)`)
+      return mapped
+    }
+  }
+
+  // Layer 4: Real-time JS DOM probe
+  const probed = await probeFieldTypeJS(page, label)
+  if (probed) {
+    log.info(`[SF-ENGINE] Field type for "${label}": "${probed}" (from JS DOM probe)`)
+    return probed
+  }
+
+  log.info(`[SF-ENGINE] Field type for "${label}": "text" (default — no detection matched)`)
+  return 'text'
+}
+
+/**
+ * Post-save error detection — checks main page AND all iframes for SF error messages.
+ * Port of Python salesforce_engine.py lines 1289–1354.
+ */
+async function detectPostSaveError(page: Page): Promise<string | null> {
+  const errorPatterns = [
+    'update failed', 'required field', 'first error:',
+    'error in expression', 'validation rule', 'review the following',
+    'field integrity exception', 'insufficient access',
+    'system.dmlexception', 'an error occurred',
+  ]
+
+  // Check all frames (main + child iframes)
+  try {
+    const frames = page.frames()
+    for (const frame of frames) {
+      try {
+        const frameText: string = await frame.evaluate(
+          () => document.body ? document.body.innerText : '',
+        ).catch(() => '')
+        const lower = frameText.toLowerCase()
+        for (const pat of errorPatterns) {
+          const idx = lower.indexOf(pat)
+          if (idx >= 0) {
+            return frameText.substring(Math.max(0, idx), idx + 300).trim()
+          }
+        }
+      } catch { continue }
+    }
+  } catch { /* ignore */ }
+
+  // Check SF-specific CSS error selectors on main page
+  const errSelectors = [
+    '.slds-notify--error', 'div[data-key="error"]',
+    '.slds-notify_alert[role="alert"]', '.pageLevelErrors',
+    '.forceFormPageError', '.inlineErrors', '.errorMsg',
+    '.slds-theme--error', 'div.slds-box.error',
+    'p.errorMsg', 'div.message.errorM3',
+  ]
+  for (const sel of errSelectors) {
+    try {
+      const loc = page.locator(sel).first()
+      if (await loc.isVisible({ timeout: 1_000 }).catch(() => false)) {
+        const txt = (await loc.textContent() ?? '').trim().substring(0, 300)
+        if (txt && txt.length > 5) return txt
+      }
+    } catch { continue }
+  }
+
+  return null
+}
 
 // ─── Playwright expression extractor ─────────────────────────────────────────
 
@@ -135,16 +711,28 @@ function extractLabelFromTarget(raw: string): string {
  * Generate candidate label variants to handle AI label ↔ SF UI label mismatches.
  *
  * Examples:
- *   "Account Type" → ["Account Type", "Type"]
- *   "Contact Phone" → ["Contact Phone", "Phone"]
+ *   "Account Type" → ["Account Type", "Account", "Type"]
+ *   "Account ID"    → ["Account ID", "Account"]  (NOT bare "ID" — too generic)
+ *   "Contact Phone" → ["Contact Phone", "Contact", "Phone"]
  *   "Type"          → ["Type"]
+ *
+ * Special rule: if the last word is a stop-word like "ID", "Name", "Number",
+ * we skip adding it as a standalone candidate to avoid matching unrelated fields.
  */
+const LOOKUP_LABEL_STOP_WORDS = new Set(['id', 'name', 'no', 'no.', 'number', '#'])
+
 function labelCandidates(label: string): string[] {
   const candidates = [label]
   const parts = label.trim().split(/\s+/)
   if (parts.length > 1) {
-    // Add the LAST word (e.g. "Type" from "Account Type")
-    candidates.push(parts[parts.length - 1])
+    const lastWord = parts[parts.length - 1]
+    const isStopWord = LOOKUP_LABEL_STOP_WORDS.has(lastWord.toLowerCase().replace(/\.$/, ''))
+    if (!isStopWord) {
+      // Add the LAST word (e.g. "Type" from "Account Type")
+      candidates.push(lastWord)
+    }
+    // Always add all-but-last (e.g. "Account" from "Account ID", "Account Type")
+    if (parts.length >= 2) candidates.push(parts.slice(0, -1).join(' '))
     // Add without the first word (e.g. "Type Standard" from "Account Type Standard")
     if (parts.length > 2) candidates.push(parts.slice(1).join(' '))
   }
@@ -338,7 +926,7 @@ async function selectSFPicklist(page: Page, rawLabel: string, optionValue: strin
   await page.evaluate((tag: string) => {
     document.querySelector(`[data-autotest-target="${tag}"]`)
       ?.removeAttribute('data-autotest-target')
-  }, picklistTagCleanup).catch(() => {})
+  }, picklistTagCleanup).catch(() => { })
 
   await page.waitForTimeout(500)
   log.info(`[SF-PICKLIST] ✅ Selected "${optionValue}" in "${fieldLabel}"`)
@@ -382,24 +970,94 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
       }
     }
 
-    // Strategy 2: XPath anchored on label → lightning-lookup → input
+    // Strategy 2: XPath anchored on label → lookup host → input
+    // Covers: lightning-lookup, c-lookup, combo-lookup, records-record-picker, and
+    // any parent with class slds-form-element that wraps an autocomplete input.
     if (!lookupInput) {
       const variants = labelCandidates(fieldLabel)
       for (const lbl of variants) {
         const xpLoc = page.locator(
+          // lightning-lookup (classic)
           `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup//input` +
           `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup//input` +
+          // c-lookup or custom lookup components
+          `|//label[contains(normalize-space(),"${lbl}")]/ancestor::c-lookup//input` +
+          `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::c-lookup//input` +
+          // records-record-picker (newer SF UI)
+          `|//label[contains(normalize-space(),"${lbl}")]/ancestor::records-record-picker//input` +
+          `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::records-record-picker//input` +
+          // Generic: label sibling div with text input
           `|//label[contains(normalize-space(),"${lbl}")]/following-sibling::div//input[@type="text"]` +
+          // Generic: slds-form-element ancestor with auto-complete input
+          `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::div[contains(@class,"slds-form-element")]//input[not(@type="hidden")]` +
+          // Placeholder fallback from label span
           `|//span[contains(normalize-space(),"${lbl}")]/following::input[@placeholder][1]`,
         ).first()
         if (await xpLoc.isVisible({ timeout: 1_000 }).catch(() => false)) {
           lookupInput = xpLoc
-          // Try to find scoped container from the found input
-          const lkContainer = page.locator(`xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup`).first()
-          if (await lkContainer.isVisible({ timeout: 500 }).catch(() => false)) {
-            lookupContainer = lkContainer
+          // Try to find scoped container (try multiple lookup host elements)
+          for (const host of ['lightning-lookup', 'c-lookup', 'records-record-picker', 'combo-lookup']) {
+            const lkContainer = page.locator(`xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::${host}`).first()
+            if (await lkContainer.isVisible({ timeout: 400 }).catch(() => false)) {
+              lookupContainer = lkContainer
+              break
+            }
           }
           break
+        }
+      }
+    }
+
+    // Strategy 3: JS full-page scan — last resort inside the poll loop.
+    // Scans ALL visible inputs with autocomplete/aria-autocomplete or that are
+    // inside any lookup-like host, then picks the one whose nearest label matches.
+    // This handles shadow-DOM-adjacent components where XPath can't cross boundaries.
+    if (!lookupInput) {
+      const variants = labelCandidates(fieldLabel)
+      const lookupTag = `sf-lookup-scan-${fieldLabel.replace(/\s+/g, '-').toLowerCase()}-${Date.now()}`
+      const found = await page.evaluate(([vars, tag]: [string[], string]) => {
+        // Gather candidate inputs: text inputs with autocomplete or inside a lookup-like ancestor
+        const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>(
+          'input[type="text"][autocomplete], input[autocomplete="off"], ' +
+          'input[aria-autocomplete], lightning-lookup input, c-lookup input, ' +
+          'records-record-picker input, [class*="lookup"] input[type="text"]'
+        )).filter(inp => (inp as HTMLElement).offsetParent !== null) // visible only
+
+        for (const inp of allInputs) {
+          // Walk ancestors to find a label
+          let el: Element | null = inp
+          let labelText = ''
+          for (let depth = 0; depth < 10 && el; depth++) {
+            el = el.parentElement
+            if (!el) break
+            const labelEl =
+              el.querySelector('label, .slds-form-element__label, legend') ??
+              el.closest('label')
+            if (labelEl) {
+              labelText = labelEl.textContent?.trim() ?? ''
+              break
+            }
+          }
+          // Also check aria-label on the input itself
+          if (!labelText) labelText = inp.getAttribute('aria-label') ?? inp.getAttribute('placeholder') ?? ''
+
+          if (vars.some(v => v && labelText.toLowerCase().includes(v.toLowerCase()))) {
+            inp.setAttribute('data-autotest-lookup-target', tag)
+            return true
+          }
+        }
+        return false
+      }, [variants, lookupTag] as [string[], string])
+
+      if (found) {
+        const scanned = page.locator(`[data-autotest-lookup-target="${lookupTag}"]`).first()
+        if (await scanned.isVisible({ timeout: 1_000 }).catch(() => false)) {
+          lookupInput = scanned
+          log.info(`[SF-LOOKUP] ✅ Strategy 3 (JS scan) found input for "${fieldLabel}"`)
+          // clean up the tag immediately
+          await page.evaluate((t: string) => {
+            document.querySelector(`[data-autotest-lookup-target="${t}"]`)?.removeAttribute('data-autotest-lookup-target')
+          }, lookupTag).catch(() => {})
         }
       }
     }
@@ -422,24 +1080,24 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
   // z-index and overlay interception entirely.
   const activateAndType = async (value: string) => {
     await lookupInput!.scrollIntoViewIfNeeded()
-    
+
     // JS-level focus so SF Aura/LWC event listeners fire inside a modal
     await lookupInput!.evaluate((el: HTMLElement) => {
       const input = el as HTMLInputElement
       input.focus()
       // Dispatch the events SF's LWC combobox uses to activate the lookup search
       input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
-      input.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true }))
-      input.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true }))
-      input.dispatchEvent(new FocusEvent('focus',     { bubbles: true }))
+      input.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
+      input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+      input.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
     })
     await page.waitForTimeout(300)
 
     // Programmatically select all text inside the input
-    await lookupInput!.evaluate((el: HTMLElement) => { 
-      (el as HTMLInputElement).select() 
+    await lookupInput!.evaluate((el: HTMLElement) => {
+      (el as HTMLInputElement).select()
     })
-    
+
     // Delete the selected text via keyboard event (this triggers React/Aura change trackers naturally)
     await page.keyboard.press('Backspace')
     await page.waitForTimeout(200)
@@ -466,7 +1124,7 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
     // Use Tab (not Escape) to blur the field — Escape clears in-progress lookup selections
     // and can revert values on adjacent fields via SF's form event handlers.
     log.warn(`[SF-LOOKUP] No dropdown on first attempt for "${fieldLabel}" — Tab-blurring then retrying`)
-    await page.keyboard.press('Tab').catch(() => {})
+    await page.keyboard.press('Tab').catch(() => { })
     await page.waitForTimeout(1_500)
     await activateAndType(searchValue)
     dropdownVisible = await scope.locator('[role="listbox"]').first()
@@ -487,7 +1145,7 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
 
     for (const opt of optionLocators) {
       if (await opt.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        await opt.scrollIntoViewIfNeeded().catch(() => {})
+        await opt.scrollIntoViewIfNeeded().catch(() => { })
         await opt.click()
         // Wait for the dropdown to close naturally after selection.
         // DO NOT press Escape here — SF Lightning combobox interprets Escape
@@ -526,7 +1184,7 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
 
     const firstOpt = (lookupContainer ?? page).locator('[role="option"]').first()
     if (await firstOpt.isVisible({ timeout: 3_000 }).catch(() => false)) {
-      await firstOpt.scrollIntoViewIfNeeded().catch(() => {})
+      await firstOpt.scrollIntoViewIfNeeded().catch(() => { })
       await firstOpt.click()
       await page.waitForTimeout(600)
       log.info(`[SF-LOOKUP] ✅ Selected first result via prefix "${prefix}"`)
@@ -539,15 +1197,15 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
   // or "Show All Results" link at the bottom of the dropdown. If so, click it and
   // delegate to the advanced search handler (which handles the modal).
   log.warn(`[SF-LOOKUP] Prefix retry failed. Attempting Advanced Search modal fallback for "${fieldLabel}"`)
-  
+
   // Find "Show All Results" or "Advanced Search" inside the listbox
   const advSearchBtn = (lookupContainer ?? page).locator(
     'button[title*="Advanced Search"], [data-value="actionAdvancedSearch"], lightning-base-combobox-item, .slds-listbox__item'
   ).filter({ hasText: /Show All|Advanced Search/i }).first()
-  
+
   if (await advSearchBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
     log.info(`[SF-LOOKUP] Found Advanced Search / Show All Results link. Clicking...`)
-    await advSearchBtn.click().catch(() => {})
+    await advSearchBtn.click().catch(() => { })
   } else {
     log.info(`[SF-LOOKUP] No Advanced Search link found. Pressing Enter to try to trigger it...`)
     await lookupInput.press('Enter')
@@ -556,34 +1214,310 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
   await page.waitForTimeout(1_000)
 
   // Verify if the Advanced Search Modal actually opened.
-  // IMPORTANT: We must NOT match the parent create/edit form modal!
-  // The parent modal also has [role="dialog"] and contains field placeholders
-  // like "Search Account's Warehouses..." which would match hasText: 'Search'.
-  // The real Advanced Search modal always contains a data table (role="grid" or <table>).
-  const advSearchModal = page.locator('[role="dialog"]').filter({ has: page.locator('table, [role="grid"]') }).first()
-  // Fallback: try dialog with a title/header containing "Search" (not just any "Search" text in a child)
-  const advSearchModalAlt = page.locator('[role="dialog"] header, [role="dialog"] h2, [role="dialog"] .slds-modal__header').filter({ hasText: 'Search' }).first()
+  //
+  // IMPORTANT: We cannot use '[role="dialog"] filter({has: table})' because the
+  // PARENT create/edit form modal ALSO has tables/grids. Instead, count the
+  // number of dialogs BEFORE clicking Advanced Search vs AFTER — if the count
+  // increased, a new modal opened and that is the Advanced Search dialog.
+  //
+  // Also check for the explicit heading text 'Advanced Search' which ONLY
+  // appears in the Advanced Search modal, not the form modal.
+  const dialogCountAfter = await page.locator('[role="dialog"]').count().catch(() => 0)
+  const advSearchByHeading = page.locator('[role="dialog"]').filter({
+    has: page.locator('h1, h2, .slds-modal__title').filter({ hasText: /^Advanced Search$/i })
+  }).first()
+  const advSearchByNewDialog = dialogCountAfter > 1
+    ? page.locator('[role="dialog"]').nth(dialogCountAfter - 1)  // newest dialog
+    : null
 
   const isAdvSearchOpen =
-    await advSearchModal.isVisible({ timeout: 4_000 }).catch(() => false) ||
-    await advSearchModalAlt.isVisible({ timeout: 1_000 }).catch(() => false)
+    await advSearchByHeading.isVisible({ timeout: 4_000 }).catch(() => false) ||
+    (advSearchByNewDialog ? await advSearchByNewDialog.isVisible({ timeout: 2_000 }).catch(() => false) : false)
 
   if (isAdvSearchOpen) {
-    log.info(`[SF-LOOKUP] Advanced Search modal detected (with table/grid). Delegating resolution...`)
+    log.info(`[SF-LOOKUP] Advanced Search modal detected (${dialogCountAfter} dialogs). Delegating...`)
     await selectSFLookupAdvanced(page, fieldLabel, searchValue, true)
     return
   }
 
-  throw new Error(`[SF-LOOKUP] Could not select "${searchValue}" in lookup "${fieldLabel}" — dropdown did not appear, no matching inline option found, and advanced search declined to open.`)
+  throw new Error(`[SF-LOOKUP] Could not select "${searchValue}" in lookup "${fieldLabel}" — no Advanced Search modal opened (${dialogCountAfter} dialogs on page).`)
 }
 
 
 // ─── SF Lookup Advanced Search ────────────────────────────────────────────────
 
 /**
+ * Waits for the DOM to stabilize by polling the count of matching elements.
+ * Returns only once the count remains constant for `stableMs` milliseconds.
+ *
+ * This is the KEY FIX for the "click does nothing" bug:
+ * Salesforce LWC re-renders the listbox 1-2 times after a search completes,
+ * so any reference acquired during re-render points to a detached (dead) node.
+ * Polling until the count stabilizes guarantees we only interact with the
+ * final, attached DOM nodes.
+ */
+async function waitForDOMStability(
+  locator: Locator,
+  { timeoutMs = 8_000, stableMs = 800, pollMs = 200 } = {},
+): Promise<number> {
+  const start = Date.now()
+  let lastCount = -1
+  let stableSince = Date.now()
+
+  while (Date.now() - start < timeoutMs) {
+    const currentCount = await locator.count().catch(() => 0)
+    if (currentCount !== lastCount) {
+      lastCount = currentCount
+      stableSince = Date.now()
+    } else if (currentCount > 0 && Date.now() - stableSince >= stableMs) {
+      return currentCount // stable!
+    }
+    await locator.page().waitForTimeout(pollMs)
+  }
+  return lastCount // timed out but return whatever we have
+}
+
+// ─── Advanced Search Radio Selector — simplified & robust for Spring '25+ ──
+
+/**
+ * Robust radio selection for Salesforce Advanced Search (Spring '25 / Summer '25+).
+ *
+ * Simplified to 4 clean strategies in priority order:
+ *   1. setChecked(true, { force: true }) — Playwright-recommended for radios.
+ *   2. check({ force: true }) — slightly different API path.
+ *   3. Click visible faux/label elements — manual visual path.
+ *   4. NUCLEAR JS — force .checked + full event dispatch for LWC.
+ *
+ * Captures a debug screenshot on failure for diagnostics.
+ *
+ * @returns true if a record was selected and the modal closed
+ */
+async function selectAdvancedSearchRadio(
+  page: Page,
+  modal: Locator,
+  searchValue: string,
+): Promise<boolean> {
+  log.info(`[ADV-RADIO] Starting selection for "${searchValue}"`)
+
+  // ── 1. Strong stability wait for results ─────────────────────────────────
+  try {
+    await modal.locator('table').first().waitFor({ state: 'visible', timeout: 15_000 })
+  } catch {
+    log.warn(`[ADV-RADIO] No results table in modal after 15s`)
+    return false
+  }
+
+  await page.waitForTimeout(1_500)
+
+  const rows = modal.locator('table tbody tr, [role="row"]')
+  const pollStart = Date.now()
+  let hasRows = false
+  while (Date.now() - pollStart < 12_000) {
+    if (await rows.count().catch(() => 0) > 0) { hasRows = true; break }
+    await page.waitForTimeout(300)
+  }
+  if (!hasRows) {
+    log.warn(`[ADV-RADIO] No rows appeared in table after 12s`)
+    return false
+  }
+
+  const stableCount = await waitForDOMStability(rows, {
+    timeoutMs: 12_000, stableMs: 1_000, pollMs: 200,
+  })
+  log.info(`[ADV-RADIO] Table stabilized with ${stableCount} rows`)
+
+  // ── 2. Find the best matching row ────────────────────────────────────────
+  let row = modal.locator('tr')
+    .filter({ hasText: searchValue })
+    .filter({ has: modal.locator('td:first-child') })
+    .first()
+
+  if (await row.count().catch(() => 0) === 0) {
+    log.warn(`[ADV-RADIO] No matching data row for "${searchValue}" — using first row`)
+    row = rows.first()
+  } else {
+    log.info(`[ADV-RADIO] Found data row matching "${searchValue}"`)
+  }
+
+  await row.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => { })
+  await page.waitForTimeout(800)
+
+  const radioInput = row.locator('input[type="radio"]').first()
+  let radioChecked = false
+
+  // ── Strategy 1: setChecked — Playwright-recommended ─────────────────────
+  try {
+    await radioInput.setChecked(true, { force: true, timeout: 8_000 })
+    if (await radioInput.isChecked().catch(() => false)) {
+      log.info(`[ADV-RADIO] ✅ S1: setChecked(true, force) succeeded`)
+      radioChecked = true
+    }
+  } catch (e) {
+    log.warn(`[ADV-RADIO] S1 setChecked failed: ${(e as Error).message}`)
+  }
+
+  // ── Strategy 2: check({ force }) fallback ───────────────────────────────
+  if (!radioChecked) {
+    try {
+      await radioInput.check({ force: true, timeout: 6_000 })
+      if (await radioInput.isChecked().catch(() => false)) {
+        log.info(`[ADV-RADIO] ✅ S2: check({ force }) succeeded`)
+        radioChecked = true
+      }
+    } catch (e) {
+      log.warn(`[ADV-RADIO] S2 check() failed: ${(e as Error).message}`)
+    }
+  }
+
+  // ── Strategy 3: Click visible faux + label ──────────────────────────────
+  if (!radioChecked) {
+    for (const sel of ['span.slds-radio_faux', 'span.slds-radio--faux', 'label.slds-radio__label', 'label[for]']) {
+      const visual = row.locator(sel).first()
+      if (await visual.count().catch(() => 0) > 0) {
+        await visual.click({ force: true, timeout: 4_000 }).catch(() => { })
+        await page.waitForTimeout(600)
+        if (await radioInput.isChecked().catch(() => false)) {
+          log.info(`[ADV-RADIO] ✅ S3: Clicked visual element: ${sel}`)
+          radioChecked = true
+          break
+        }
+      }
+    }
+    if (!radioChecked) log.warn(`[ADV-RADIO] S3 faux/label loop — none worked`)
+  }
+
+  // ── Strategy 4: NUCLEAR JS (bypasses all LWC interception) ──────────────
+  if (!radioChecked) {
+    try {
+      radioChecked = await page.evaluate((sv: string) => {
+        const dialog = document.querySelector('[role="dialog"]') as HTMLElement
+        if (!dialog) return false
+
+        const allRows = Array.from(dialog.querySelectorAll('tbody tr, [role="row"]'))
+        for (const r of allRows) {
+          if (!r.textContent?.includes(sv)) continue
+          const radio = r.querySelector('input[type="radio"]') as HTMLInputElement | null
+          if (!radio) continue
+
+          radio.checked = true
+          const opts = { bubbles: true, composed: true, cancelable: true }
+          radio.dispatchEvent(new Event('focusin', opts))
+          radio.dispatchEvent(new Event('focus', opts))
+          radio.dispatchEvent(new Event('input', opts))
+          radio.dispatchEvent(new Event('change', opts))
+          radio.dispatchEvent(new MouseEvent('click', opts))
+          return true
+        }
+        return false
+      }, searchValue)
+      if (radioChecked) log.info(`[ADV-RADIO] ✅ S4: Nuclear JS event dispatch succeeded`)
+    } catch (e) {
+      log.warn(`[ADV-RADIO] S4 nuclear JS failed: ${(e as Error).message}`)
+    }
+  }
+
+  // ── Final verification ───────────────────────────────────────────────────
+  if (!radioChecked) {
+    const anyChecked = await modal.locator('input[type="radio"]:checked').count().catch(() => 0)
+    if (anyChecked > 0) {
+      log.info(`[ADV-RADIO] Final check: found ${anyChecked} checked radio(s) — proceeding`)
+      radioChecked = true
+    }
+  }
+
+  if (!radioChecked) {
+    log.warn(`[ADV-RADIO] ⚠ All radio strategies failed for "${searchValue}"`)
+    const debugPath = path.join(SCREENSHOTS_DIR, `debug-radio-fail-${Date.now()}.png`)
+    await page.screenshot({ path: debugPath }).catch(() => { })
+    log.info(`[ADV-RADIO] Debug screenshot saved: ${debugPath}`)
+    return false
+  }
+
+  // ── 3. Critical wait — SF needs time to enable Select button ─────────────
+  log.info(`[ADV-RADIO] Radio selected ✅. Waiting 2.5s for Select button...`)
+  await page.waitForTimeout(2_500)
+
+  // ── 4. Click Select button ───────────────────────────────────────────────
+  let selectClicked = false
+  const selectLocators = [
+    page.getByRole('button', { name: /select/i }).filter({ hasText: /^Select$/i }),
+    modal.locator('button').filter({ hasText: /^Select$/ }),
+    page.locator('.slds-modal__footer button:has-text("Select")'),
+  ]
+
+  for (const loc of selectLocators) {
+    if (await loc.count().catch(() => 0) > 0) {
+      const btn = loc.first()
+      await btn.evaluate((b: HTMLElement) => {
+        (b as HTMLButtonElement).disabled = false
+        b.removeAttribute('disabled')
+      }).catch(() => { })
+      await btn.click({ force: true, timeout: 5_000 }).catch(() => { })
+      selectClicked = true
+      log.info(`[ADV-RADIO] ✅ Clicked Select button`)
+      break
+    }
+  }
+
+  // JS fallback
+  if (!selectClicked) {
+    try {
+      selectClicked = await page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[]
+        for (const b of btns) {
+          if (b.textContent?.trim() === 'Select' && b.offsetParent !== null) {
+            b.disabled = false
+            b.removeAttribute('disabled')
+            b.click()
+            return true
+          }
+        }
+        return false
+      })
+      if (selectClicked) log.info(`[ADV-RADIO] ✅ Select clicked via JS fallback`)
+    } catch (e) {
+      log.warn(`[ADV-RADIO] JS Select fallback failed: ${(e as Error).message}`)
+    }
+  }
+
+  if (!selectClicked) {
+    log.warn(`[ADV-RADIO] ⚠ Could not click Select button`)
+    return false
+  }
+
+  // ── 5. Verify modal closed ───────────────────────────────────────────────
+  await page.waitForTimeout(1_500)
+  const closed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
+    .then(() => true).catch(() => false)
+
+  if (!closed) {
+    const dialogCount = await page.locator('[role="dialog"]').count().catch(() => 0)
+    if (dialogCount <= 1) {
+      log.info(`[ADV-RADIO] ✅ Modal closed (dialog count dropped to ${dialogCount})`)
+      return true
+    }
+  }
+
+  log.info(`[ADV-RADIO] ${closed ? '✅' : '⚠'} After Select: modal closed=${closed}`)
+  return closed
+}
+
+
+/**
  * Opens the SF Lookup Advanced Search modal, searches, and clicks the matching row.
- * NOTE: This is only called for non-modal contexts (list views, record pages).
- * Do NOT add calls from inside create/edit form modals — the parent modal blocks clicks.
+ *
+ * Selection uses a 4-strategy cascade (tries each in order):
+ *
+ * | Strategy        | How it works                          | Why it helps                             |
+ * |-----------------|---------------------------------------|------------------------------------------|
+ * | 1. Keyboard     | ArrowDown → Enter                     | No click — bypasses overlay/stale issues |
+ * | 2. Fresh locator| Re-queries DOM right before clicking  | Never holds a stale reference            |
+ * | 3. JS dispatch  | dispatchEvent via page.evaluate       | Bypasses CSS pointer-events overlays     |
+ * | 4. Force click  | click({ force: true })                | Ignores visibility/intercept checks      |
+ *
+ * The key fix is waitForDOMStability() — it polls the option count every 200ms
+ * and only proceeds once the count has been stable for 500ms. This prevents
+ * clicking a node that's about to be detached by an LWC re-render.
  */
 async function selectSFLookupAdvanced(
   page: Page,
@@ -612,14 +1546,32 @@ async function selectSFLookupAdvanced(
   }
 
   // Wait for the advanced search modal.
-  // CRITICAL: Use .last() not .first() — when a WH CODE lookup opens Advanced Search
-  // from inside a create/edit form modal, there are TWO [role="dialog"] elements
-  // in lightning-overlay-container: (1) the parent form, (2) the Advanced Search modal.
-  // .first() picks the parent form, which is the WRONG modal.
-  // .last() picks the topmost (most recently opened) dialog = the Advanced Search.
-  const modal = page.locator('[role="dialog"]').filter({ hasText: /Advanced Search|Search/i }).last()
+  // IMPORTANT: The Advanced Search modal has an <h2> with text "Advanced Search".
+  // Using that heading as the anchor is the most reliable discriminator — it avoids
+  // accidentally matching the parent create/edit form which also has role="dialog".
+  //
+  // IMPROVED DETECTION (Spring '25+):
+  //   1. Heading-anchored: h1/h2/h3 with "Advanced Search" text (case-insensitive)
+  //   2. Dialog-level: filter dialog by hasText /Advanced Search/i
+  //   3. Fallback: topmost dialog (.last())
+  let modal = page.locator('[role="dialog"]').filter({
+    has: page.locator('h1, h2, h3, .modal-title, .slds-modal__header h2, .slds-modal__title').filter({ hasText: /Advanced Search/i })
+  }).first()
+
+  // If heading-anchored locator isn't visible, try dialog-level text filter
+  let modalByHeading = await modal.isVisible({ timeout: 4_000 }).catch(() => false)
+  if (!modalByHeading) {
+    log.info(`[SF-LOOKUP-ADV] Heading-anchored modal not found — trying dialog-level hasText filter`)
+    modal = page.locator('[role="dialog"]').filter({ hasText: /Advanced Search/i }).first()
+    modalByHeading = await modal.isVisible({ timeout: 2_000 }).catch(() => false)
+  }
+  if (!modalByHeading) {
+    log.warn(`[SF-LOOKUP-ADV] No Advanced Search heading/text detected — falling back to .last() dialog`)
+    modal = page.locator('[role="dialog"]').last()
+  }
+
   await modal.waitFor({ state: 'visible', timeout: 10_000 })
-  log.info(`[SF-LOOKUP-ADV] Modal is visible (using .last() for topmost dialog). Searching for "${searchValue}"...`)
+  log.info(`[SF-LOOKUP-ADV] Modal is visible (heading-matched=${modalByHeading}). Searching for "${searchValue}"...`)
 
   // ── Clear field and submit search ──────────────────────────────────────────
   // Use JS-level focus + fill instead of Playwright .click(), because the
@@ -660,312 +1612,494 @@ async function selectSFLookupAdvanced(
     log.warn(`[SF-LOOKUP-ADV] No search input found in modal — proceeding without re-search`)
   }
 
-  // ── Wait for results with retry polling (up to 10s) ───────────────────────
-  // SF Advanced Search modals can be slow to populate results — don't use a
-  // fixed 2s wait; instead poll until rows appear or timeout.
-  log.info(`[SF-LOOKUP-ADV] Waiting for result rows...`)
+  // ── Wait for search results to load + stabilize ──────────────────────────────
+  // After submitting the search, SF needs time to:
+  //   1. Fetch results from the server
+  //   2. Render the table (initial render)
+  //   3. LWC re-renders the table 1-2 times after search completes
+  // We wait for initial render, then poll for at least 1 row, then stabilize.
+  log.info(`[SF-LOOKUP-ADV] Waiting for results to load and stabilize...`)
+  await page.waitForTimeout(1_500)  // initial render time
 
-  // Build candidate locators ordered by specificity.
-  // Each fires independently so we don't miss results rendered in different layouts.
-  const candidateLocators = [
-    // Exact text match in table row
-    modal.locator('table tbody tr').filter({ hasText: searchValue }).first(),
-    // Exact text match in ARIA row
-    modal.locator('[role="row"]').filter({ hasText: searchValue }).first(),
-    // Partial match: first word of search value (e.g. "Account" from "Account Warehouse 1")
-    modal.locator('table tbody tr').filter({ hasText: searchValue.split(' ')[0] }).first(),
-    modal.locator('[role="row"]').filter({ hasText: searchValue.split(' ')[0] }).first(),
-    // Any table row (last resort)
-    modal.locator('table tbody tr').first(),
-    modal.locator('[role="row"]:not([role="row"] [role="row"])').nth(1), // skip header row
-  ]
-
-  let selectedRow: (typeof candidateLocators)[0] | null = null
+  // Poll until at least 1 result row appears (handles slow data loads)
+  const resultRowsLoc = modal.locator('table tbody tr, [role="row"]:not(:first-child)')
   const pollStart = Date.now()
-  const POLL_TIMEOUT = 10_000
+  let foundRows = false
+  while (Date.now() - pollStart < 15_000) {
+    const rc = await resultRowsLoc.count().catch(() => 0)
+    if (rc > 0) { foundRows = true; break }
+    await page.waitForTimeout(300)
+  }
+  if (foundRows) {
+    // Wait for row count to stabilize (prevents stale DOM node interactions)
+    const stableResultCount = await waitForDOMStability(resultRowsLoc, {
+      timeoutMs: 12_000, stableMs: 800, pollMs: 150,
+    })
+    log.info(`[SF-LOOKUP-ADV] Results stabilized: ${stableResultCount} rows`)
+  } else {
+    log.warn(`[SF-LOOKUP-ADV] No result rows appeared after 15s — proceeding anyway`)
+  }
 
-  while (!selectedRow && Date.now() - pollStart < POLL_TIMEOUT) {
-    for (const rowLoc of candidateLocators) {
-      try {
-        if (await rowLoc.isVisible({ timeout: 500 })) {
-          selectedRow = rowLoc
-          break
-        }
-      } catch { /* try next */ }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DOM DIAGNOSTICS — Capture the actual modal HTML structure so we can
+  // understand why strategies fail. This runs ONCE before any interactions.
+  // ═══════════════════════════════════════════════════════════════════════════
+  const diagnostics = await page.evaluate(() => {
+    try {
+      const dialogs = document.querySelectorAll('[role="dialog"]')
+      const info: Record<string, unknown> = {
+        totalDialogs: dialogs.length,
+      }
+
+      // Examine the last (topmost) dialog
+      const d = dialogs[dialogs.length - 1]
+      if (!d) return JSON.stringify(info)
+
+      // Check for iframes inside the dialog
+      const iframes = d.querySelectorAll('iframe')
+      info.iframeCount = iframes.length
+      if (iframes.length > 0) {
+        info.iframeSrcs = Array.from(iframes).map(f => f.src || f.getAttribute('src') || '(no src)')
+      }
+
+      // Count key interactive elements
+      info.radioInputs = d.querySelectorAll('input[type="radio"]').length
+      info.checkboxInputs = d.querySelectorAll('input[type="checkbox"]').length
+      info.buttons = Array.from(d.querySelectorAll('button')).map(b => b.textContent?.trim().slice(0, 30) || '')
+      info.links = d.querySelectorAll('a').length
+      info.tableTrs = d.querySelectorAll('table tbody tr').length
+      info.roleRows = d.querySelectorAll('[role="row"]').length
+
+      // SLDS faux elements
+      info.sldsFaux = d.querySelectorAll('span.slds-radio_faux, span.slds-radio--faux, span.slds-checkbox_faux').length
+
+      // Shadow DOM elements
+      let shadowHosts = 0
+      const allEls = d.querySelectorAll('*')
+      for (let i = 0; i < allEls.length; i++) {
+        if (allEls[i].shadowRoot) shadowHosts++
+      }
+      info.shadowHosts = shadowHosts
+
+      // Dump first 2000 chars of innerHTML to understand the structure
+      info.modalHTML = d.innerHTML.slice(0, 3000)
+
+      return JSON.stringify(info)
+    } catch (err) {
+      return `diagnostic-error: ${(err as Error).message}`
     }
-    if (!selectedRow) await page.waitForTimeout(600)
-  }
+  })
+  log.info(`[SF-LOOKUP-ADV] 🔍 DOM DIAGNOSTICS: ${diagnostics}`)
 
-  if (!selectedRow) {
-    // One last diagnostic: log what text is visible inside the modal
-    const modalText = await modal.textContent().catch(() => '<unable to read>')
-    log.error(`[SF-LOOKUP-ADV] Modal content (first 500 chars): ${modalText?.slice(0, 500)}`)
-    throw new Error(`[SF-LOOKUP-ADV] No result rows found for "${searchValue}" in Advanced Search modal`)
-  }
-
-  // ── Select the row: comprehensive cascade ──────────────────────────────────
-  //
-  // Why previous attempts failed:
-  //   1. Playwright .click() WITHOUT force:true → actionability check detects
-  //      the parent "New Contact" form modal's backdrop covering the Advanced
-  //      Search content → throws "element intercepted" → silently caught & skipped
-  //   2. page.mouse.click() at radio offsets → bounding box X is the row's left
-  //      edge INSIDE the scroll container, actual radio position varies by org
-  //   3. evaluate()-based JS events → blocked by Salesforce LWS sandbox
-  //
-  // Fix: force:true on ALL clicks + keyboard navigation as primary strategy.
-  // Keyboard events go directly to the focused element — completely immune to
-  // overlay/z-index interception, LWS, and coordinate miscalculation.
-  //
-  await selectedRow.scrollIntoViewIfNeeded().catch(() => {})
-  await page.waitForTimeout(400)  // allow SF animation to settle after results load
-
-  const selectBtn = modal.locator('button:has-text("Select"), button[title="Select"]').first()
+  // ── Detect iframes (SF Advanced Search often renders results in an iframe) ─
+  const modalFrames = modal.frameLocator('iframe')
+  let workingFrame: ReturnType<typeof modal.locator> | null = null
   let modalClosed = false
 
-  /** Click the Select button (forced, keyboard fallback) and wait for modal close. */
-  const clickSelectBtn = async (): Promise<boolean> => {
-    await selectBtn.scrollIntoViewIfNeeded().catch(() => {})
-    await page.waitForTimeout(200)
-    // Try mouse click at computed coordinates first
-    const selectBox = await selectBtn.boundingBox().catch(() => null)
-    if (selectBox) {
-      await page.mouse.click(
-        selectBox.x + selectBox.width / 2,
-        selectBox.y + selectBox.height / 2,
-      )
-      log.info(`[SF-LOOKUP-ADV] Mouse-clicked "Select" button`)
-    } else {
-      // force:true bypasses the "element covered" actionability check
-      await selectBtn.click({ force: true, timeout: 3_000 }).catch(() => {})
-      log.info(`[SF-LOOKUP-ADV] Force-clicked "Select" button`)
-    }
-    const closed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
-      .then(() => true).catch(() => false)
-    if (!closed) {
-      // Keyboard fallback: Tab to Select and Enter
-      await selectBtn.focus().catch(() => {})
-      await page.keyboard.press('Enter')
-      return modal.waitFor({ state: 'hidden', timeout: 4_000 }).then(() => true).catch(() => false)
-    }
-    return closed
-  }
+  // Check if results are inside an iframe
+  const iframeCount = await modal.locator('iframe').count().catch(() => 0)
+  log.info(`[SF-LOOKUP-ADV] Found ${iframeCount} iframe(s) in modal`)
 
-  /** True if Select button is now enabled (radio accepted by LWC). */
-  const isSelectEnabled = async (): Promise<boolean> => {
-    await selectBtn.scrollIntoViewIfNeeded().catch(() => {})
-    return selectBtn.isEnabled({ timeout: 2_500 }).catch(() => false)
-  }
-
-  // ── Strategy 1 (KEYBOARD): Tab + ArrowDown + Space ────────────────────────
-  // Keyboard events dispatch directly to whichever element has focus — completely
-  // immune to overlay/z-index interception. This is the most reliable strategy.
-  //
-  // After the search runs, the search input (or Search button) has focus.
-  // Tabbing moves focus into the results table; ArrowDown → first row;
-  // Space → checks the radio. Standard ARIA grid keyboard pattern.
-  log.info(`[SF-LOOKUP-ADV] Strategy 1: keyboard navigation (Tab→ArrowDown→Space)`)
-  try {
-    // Ensure modal has focus by force-clicking the header (header text is never covered)
-    const modalHeader = modal.locator('h2, .slds-modal__header, header').first()
-    await modalHeader.click({ force: true, timeout: 2_000 }).catch(() => {})
-    await page.waitForTimeout(200)
-
-    // Tab out of Search button → into the results table area
-    for (let t = 0; t < 5; t++) {
-      await page.keyboard.press('Tab')
-      await page.waitForTimeout(80)
-    }
-
-    // ArrowDown enters the first data row (ARIA grid pattern)
-    await page.keyboard.press('ArrowDown')
-    await page.waitForTimeout(300)
-
-    // Space checks the radio button on the focused row
-    await page.keyboard.press('Space')
-    await page.waitForTimeout(1_200)  // LWC needs time to propagate state
-
-    if (await isSelectEnabled()) {
-      log.info(`[SF-LOOKUP-ADV] Strategy 1 ✅ keyboard: "Select" enabled — clicking it`)
-      modalClosed = await clickSelectBtn()
-      if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 1 (keyboard) succeeded`)
-    } else {
-      // Try fewer tabs (some SF orgs need only 2-3 tabs to reach table)
-      for (let t = 0; t < 3; t++) {
-        await page.keyboard.press('Tab')
-        await page.waitForTimeout(80)
-      }
-      await page.keyboard.press('ArrowDown')
-      await page.waitForTimeout(300)
-      await page.keyboard.press('Space')
-      await page.waitForTimeout(1_200)
-      if (await isSelectEnabled()) {
-        log.info(`[SF-LOOKUP-ADV] Strategy 1b ✅ keyboard (short tab): "Select" enabled`)
-        modalClosed = await clickSelectBtn()
-        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 1b succeeded`)
-      } else {
-        log.warn(`[SF-LOOKUP-ADV] Strategy 1: "Select" still disabled after keyboard nav`)
-      }
-    }
-  } catch (e) {
-    log.warn(`[SF-LOOKUP-ADV] Strategy 1 keyboard error: ${(e as Error).message}`)
-  }
-
-  // ── Strategy 2: force-click the record-name <a> link ─────────────────────
-  // force:true bypasses Playwright's "element is covered" check — the previous
-  // fix used .click() without force which was silently throwing and skipping.
-  if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy 2: force .click() on record-name link`)
-    const nameLink = selectedRow.locator('a[data-recordid], a[href*="/lightning/r/"], a').first()
+  if (iframeCount > 0) {
+    // Results are INSIDE an iframe — this is why all strategies failed!
+    // None of them were switching frame context.
+    log.info(`[SF-LOOKUP-ADV] ⚡ Results are in an IFRAME — switching frame context`)
     try {
-      const nameLinkVisible = await nameLink.isVisible({ timeout: 2_000 }).catch(() => false)
-      if (nameLinkVisible) {
-        await nameLink.scrollIntoViewIfNeeded().catch(() => {})
-        await nameLink.click({ force: true, timeout: 5_000 })
-        log.info(`[SF-LOOKUP-ADV] Strategy 2: force-click dispatched on .link`)
-        modalClosed = await modal.waitFor({ state: 'hidden', timeout: 8_000 })
-          .then(() => true).catch(() => false)
-        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 2 succeeded`)
-        else log.warn(`[SF-LOOKUP-ADV] Strategy 2: modal did not close`)
-      } else {
-        log.warn(`[SF-LOOKUP-ADV] Strategy 2: no visible <a> link in selected row`)
-      }
-    } catch (e) {
-      log.warn(`[SF-LOOKUP-ADV] Strategy 2 failed: ${(e as Error).message}`)
-    }
-  }
+      const iframe = modalFrames.first()
+      // Try to find rows inside the iframe
+      const iframeRows = iframe.locator('table tbody tr, tr.dataRow, .x-grid-row')
+      const iframeRowCount = await iframeRows.count().catch(() => 0)
+      log.info(`[SF-LOOKUP-ADV] Found ${iframeRowCount} rows inside iframe`)
 
-  // ── Strategy 3: force-click the first <td> (radio host cell) ──────────────
-  // force:true lets CDP dispatch the event at the cell's center coordinates;
-  // browser hit-testing picks up the radio button inside the cell's shadow DOM.
-  if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy 3: force .click() on first <td>`)
-    try {
-      const firstCell = selectedRow.locator('td').first()
-      const cellVisible = await firstCell.isVisible({ timeout: 2_000 }).catch(() => false)
-      if (cellVisible) {
-        await firstCell.scrollIntoViewIfNeeded().catch(() => {})
-        await firstCell.click({ force: true, timeout: 4_000 })
-        log.info(`[SF-LOOKUP-ADV] Strategy 3: force-click on first td`)
-        await page.waitForTimeout(1_200)
-        if (await isSelectEnabled()) {
-          log.info(`[SF-LOOKUP-ADV] Strategy 3: "Select" enabled`)
-          modalClosed = await clickSelectBtn()
-          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 3 succeeded`)
-        } else {
-          log.warn(`[SF-LOOKUP-ADV] Strategy 3: "Select" still disabled`)
+      if (iframeRowCount > 0) {
+        // ── Strategy IFRAME-A: Click radio inside iframe ──────────────────
+        const iframeRadio = iframe.locator('input[type="radio"], span.slds-radio_faux, [role="radio"]').first()
+        if (await iframeRadio.isVisible({ timeout: 2_000 }).catch(() => false)) {
+          await iframeRadio.click({ force: true, timeout: 3_000 }).catch(() => { })
+          log.info(`[SF-LOOKUP-ADV] Clicked radio inside iframe`)
+          await page.waitForTimeout(1_000)
+        }
+
+        // ── Strategy IFRAME-B: Click the row or first link in iframe ──────
+        const iframeRow = iframeRows.filter({ hasText: searchValue }).first()
+        const iframeRowAlt = iframeRows.first()
+        const activeRow = await iframeRow.isVisible({ timeout: 1_000 }).catch(() => false)
+          ? iframeRow : iframeRowAlt
+
+        const iframeLink = activeRow.locator('a, th a').first()
+        if (await iframeLink.isVisible({ timeout: 1_500 }).catch(() => false)) {
+          await iframeLink.click({ force: true, timeout: 3_000 })
+          log.info(`[SF-LOOKUP-ADV] Clicked link inside iframe row`)
+          await page.waitForTimeout(2_000)
+          modalClosed = await modal.waitFor({ state: 'hidden', timeout: 6_000 })
+            .then(() => true).catch(() => false)
+          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ IFRAME link click succeeded`)
+        }
+
+        // ── Strategy IFRAME-C: Click the row itself ───────────────────────
+        if (!modalClosed) {
+          await activeRow.click({ force: true, timeout: 3_000 }).catch(() => { })
+          log.info(`[SF-LOOKUP-ADV] Clicked row inside iframe`)
+          await page.waitForTimeout(1_500)
+          modalClosed = await modal.waitFor({ state: 'hidden', timeout: 4_000 })
+            .then(() => true).catch(() => false)
+          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ IFRAME row click succeeded`)
         }
       }
     } catch (e) {
-      log.warn(`[SF-LOOKUP-ADV] Strategy 3 failed: ${(e as Error).message}`)
+      log.warn(`[SF-LOOKUP-ADV] iframe strategy error: ${(e as Error).message}`)
     }
   }
 
-  // ── Strategy 4: page.mouse.click() at row CENTER (x AND y midpoints) ──────
-  // Instead of guessing the radio column x-offset, click the full row center.
-  // Some SF Advanced Search implementations treat any row click as selection.
-  // Also separately tries specific radio-column positions (leftmost 40px of row).
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RESULT SELECTION — radio-first strategy for Spring '25 / Summer '25+
+  //
+  // In newer Lightning releases, the Advanced Search modal no longer makes
+  // the record name a clickable <a> link. The radio button is the ONLY
+  // reliable selection mechanism. We try radio FIRST, then fall back to
+  // link clicking for older orgs.
+  //
+  // CRITICAL: We track `selectionSucceeded` separately from `modalClosed`.
+  //   `modalClosed` becomes true when Escape closes the modal — but that does
+  //   NOT mean the field got a value. Only the strategies below set
+  //   `selectionSucceeded = true` on a REAL, verified selection.
+  // ═══════════════════════════════════════════════════════════════════════════
+  let selectionSucceeded = false
+
+  // ── Strategy 1 (PRIMARY): Row-based radio selection ──────────────────────
+  // This is the MOST RELIABLE method for current SF Lightning (Spring '25+).
+  // The selectAdvancedSearchRadio function uses 7 cascading strategies.
   if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy 4: page.mouse.click() at row center and radio positions`)
-    const rowBox = await selectedRow.boundingBox().catch(() => null)
-    if (rowBox) {
-      const midY = rowBox.y + rowBox.height / 2
-      const midX = rowBox.x + rowBox.width / 2
+    log.info(`[SF-LOOKUP-ADV] Strategy 1: Radio selection (primary — Spring '25+ compatible)`)
+    const radioResult = await selectAdvancedSearchRadio(page, modal, searchValue)
+    if (radioResult) {
+      modalClosed = true
+      selectionSucceeded = true
+      log.info(`[SF-LOOKUP-ADV] ✅ Strategy 1 (radio) succeeded`)
+    }
+  }
 
-      // First try clicking row center (some SF orgs select on any row click)
-      await page.mouse.click(midX, midY)
-      log.info(`[SF-LOOKUP-ADV] Strategy 4: click at row center (${midX.toFixed(0)}, ${midY.toFixed(0)})`)
-      await page.waitForTimeout(1_000)
+  // ── Strategy 2 (FALLBACK): Click result LINK directly ────────────────────
+  // For older SF orgs where the record name is still a clickable <a> link.
+  // DEMOTED from Strategy 1 because Spring '25+ removed clickable links.
+  if (!modalClosed && !selectionSucceeded) {
+    log.info(`[SF-LOOKUP-ADV] Strategy 2: Link click (fallback for older orgs)`)
+    const resultSelectors = [
+      `a:has-text("${searchValue}")`,
+      `th a:has-text("${searchValue}")`,
+      `td a:has-text("${searchValue}")`,
+      `[role="row"] a:has-text("${searchValue}")`,
+      `lightning-base-formatted-text:has-text("${searchValue}")`,
+    ]
 
-      if (await isSelectEnabled()) {
-        log.info(`[SF-LOOKUP-ADV] Strategy 4: "Select" enabled after row-center click`)
-        modalClosed = await clickSelectBtn()
-        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 4 (center) succeeded`)
-      }
+    for (const rs of resultSelectors) {
+      try {
+        const resultLoc = modal.locator(rs)
+        const count = await resultLoc.count().catch(() => 0)
+        if (count > 0) {
+          for (let i = 0; i < Math.min(count, 5); i++) {
+            if (await resultLoc.nth(i).isVisible({ timeout: 1_000 }).catch(() => false)) {
+              await resultLoc.nth(i).click({ timeout: 5_000 })
+              log.info(`[SF-LOOKUP-ADV] Clicked result link: ${rs} (item ${i})`)
+              await page.waitForTimeout(1_000)
 
-      // If row-center didn't work, try radio-column positions
-      if (!modalClosed) {
-        for (const xOffset of [12, 20, 24, 30, 36, 8]) {
-          const clickX = rowBox.x + xOffset
-          if (clickX < 0 || clickX > rowBox.x + rowBox.width) continue
-          await page.mouse.click(clickX, midY)
-          log.info(`[SF-LOOKUP-ADV] Strategy 4: click at x+${xOffset} (${clickX.toFixed(0)}, ${midY.toFixed(0)})`)
-          await page.waitForTimeout(1_000)
-          if (await isSelectEnabled()) {
-            log.info(`[SF-LOOKUP-ADV] Strategy 4: "Select" enabled at x+${xOffset}`)
-            modalClosed = await clickSelectBtn()
-            if (modalClosed) {
-              log.info(`[SF-LOOKUP-ADV] ✅ Strategy 4 (offset x+${xOffset}) succeeded`)
+              // Try clicking Select button (if present — some SF modals auto-close on link click)
+              try {
+                const selectBtn = modal.locator("button:has-text('Select')")
+                if (await selectBtn.count().catch(() => 0) > 0 &&
+                    await selectBtn.first().isVisible({ timeout: 2_000 }).catch(() => false)) {
+                  await selectBtn.first().click({ force: true, timeout: 3_000 })
+                  log.info(`[SF-LOOKUP-ADV] ✅ Clicked Select button after link click`)
+                }
+              } catch { /* Select button optional */ }
+
+              // Check if modal closed
+              await page.waitForTimeout(500)
+              modalClosed = await modal.waitFor({ state: 'hidden', timeout: 5_000 })
+                .then(() => true).catch(() => false)
+              if (modalClosed) {
+                selectionSucceeded = true
+                log.info(`[SF-LOOKUP-ADV] ✅ Strategy 2 (link click) succeeded — modal closed`)
+              }
               break
             }
           }
+          if (selectionSucceeded) break
         }
-      }
-    } else {
-      log.warn(`[SF-LOOKUP-ADV] Strategy 4: no bounding box — force-clicking row`)
-      await selectedRow.click({ force: true, timeout: 3_000 }).catch(() => {})
-      await page.waitForTimeout(1_200)
-      if (await isSelectEnabled()) {
-        log.info(`[SF-LOOKUP-ADV] Strategy 4 force: "Select" enabled`)
-        modalClosed = await clickSelectBtn()
-      }
+      } catch { continue }
     }
   }
 
-  // ── Strategy 5: Playwright dispatchEvent('click') on row & link ───────────
-  // locator.dispatchEvent() uses CDP Runtime.callFunctionOn which bypasses
-  // Playwright's actionability checks entirely (different code path from .click()).
-  if (!modalClosed) {
-    log.info(`[SF-LOOKUP-ADV] Strategy 5: dispatchEvent("click") via Playwright locator API`)
-    try {
-      // Try on the row itself
-      await selectedRow.dispatchEvent('click').catch(() => {})
-      await page.waitForTimeout(800)
-      if (await isSelectEnabled()) {
-        log.info(`[SF-LOOKUP-ADV] Strategy 5: "Select" enabled after row dispatchEvent`)
-        modalClosed = await clickSelectBtn()
-        if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 5 (row) succeeded`)
-      }
-      // Try on the first <a> if row didn't work
-      if (!modalClosed) {
-        const nameLink2 = selectedRow.locator('a').first()
-        if (await nameLink2.isVisible({ timeout: 1_000 }).catch(() => false)) {
-          await nameLink2.dispatchEvent('click').catch(() => {})
-          modalClosed = await modal.waitFor({ state: 'hidden', timeout: 5_000 })
-            .then(() => true).catch(() => false)
-          if (modalClosed) log.info(`[SF-LOOKUP-ADV] ✅ Strategy 5 (link) succeeded`)
-        }
-      }
-    } catch (e) {
-      log.warn(`[SF-LOOKUP-ADV] Strategy 5 failed: ${(e as Error).message}`)
+  // ── Strategy 3: RETRY radio selection (second attempt) ───────────────────
+  // If first radio attempt failed (possibly due to timing / partial DOM render),
+  // wait a bit longer and try again.
+  if (!modalClosed && !selectionSucceeded) {
+    log.warn(`[SF-LOOKUP-ADV] Strategy 3: Retrying radio selection (second attempt, longer wait)`)
+    await page.waitForTimeout(2_000)  // extra stabilization time
+    const radioRetry = await selectAdvancedSearchRadio(page, modal, searchValue)
+    if (radioRetry) {
+      modalClosed = true
+      selectionSucceeded = true
+      log.info(`[SF-LOOKUP-ADV] ✅ Strategy 3 (radio retry) succeeded`)
     }
   }
 
-  // ── Escalation: Escape key ────────────────────────────────────────────────
-  if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] All 5 strategies exhausted — pressing Escape to close modal`)
+  // ── FINAL SAFEGUARD: Escape + clear error for HITL pause ─────────────────
+  // If after 2 radio attempts + link click the selection still failed,
+  // press Escape to close the modal and throw a clear error so HITL
+  // pauses at THIS lookup step, not at Save.
+  if (!selectionSucceeded) {
+    log.warn(`[SF-LOOKUP-ADV] ⚠ ALL strategies failed (2x radio + link click). Pressing Escape...`)
     await page.keyboard.press('Escape')
-    modalClosed = await modal.waitFor({ state: 'hidden', timeout: 4_000 })
+    await page.waitForTimeout(1_000)
+    modalClosed = await modal.waitFor({ state: 'hidden', timeout: 5_000 })
       .then(() => true).catch(() => false)
-  }
 
-  // ── Last resort: forcibly remove ONLY the topmost dialog from DOM ───────
-  // Do NOT remove all dialogs — that destroys the parent create/edit form modal.
-  if (!modalClosed) {
-    log.warn(`[SF-LOOKUP-ADV] Modal STILL open — force-removing TOPMOST dialog only`)
-    await page.evaluate(() => {
-      const dialogs = document.querySelectorAll('lightning-overlay-container section[role="dialog"]')
-      const backdrops = document.querySelectorAll('lightning-overlay-container .slds-backdrop')
-      if (dialogs.length > 1) {
-        dialogs[dialogs.length - 1].remove()
-        if (backdrops.length > 0) backdrops[backdrops.length - 1].remove()
-      }
-    })
-    await page.waitForTimeout(500)
+    if (!modalClosed) {
+      // Force-close via DOM removal
+      log.warn(`[SF-LOOKUP-ADV] Modal STILL open after Escape — force-removing topmost dialog`)
+      await page.evaluate(() => {
+        const dialogs = document.querySelectorAll('lightning-overlay-container section[role="dialog"], [role="dialog"]')
+        const backdrops = document.querySelectorAll('lightning-overlay-container .slds-backdrop')
+        if (dialogs.length > 1) {
+          dialogs[dialogs.length - 1].remove()
+          if (backdrops.length > 0) backdrops[backdrops.length - 1].remove()
+        }
+      })
+      await page.waitForTimeout(500)
+    }
+
+    throw new Error(
+      `[SF-LOOKUP-ADV] Advanced Search FAILED to select "${searchValue}" — ` +
+      `all strategies exhausted (2x radio selection + link click fallback). ` +
+      `The lookup field is NOT populated. Manual intervention required.`
+    )
   }
 
   await page.waitForTimeout(800)
   log.info(`[SF-LOOKUP-ADV] ✅ Selected "${searchValue}" via advanced search`)
+}
+// ─── SF Lookup — Production-grade entry point ─────────────────────────────────
+
+/**
+ * Robust, production-grade lookup field handler for Salesforce Lightning.
+ *
+ * This is the PRIMARY entry point for `action: "lookup"` steps.
+ * It wraps the entire lookup selection flow with resilient error recovery:
+ *
+ *   1. Fill the lookup field with the search value (JS focus + pressSequentially
+ *      to bypass overlay interception).
+ *   2. Click the magnifying glass / search icon if present.
+ *   3. Wait for inline dropdown results.
+ *   4. If inline dropdown appears → try to click the correct result.
+ *   5. If inline fails → open Advanced Search modal.
+ *   6. In Advanced Search → search → wait for DOM stability (800ms) →
+ *      resilient 3-attempt click with fresh locators + force + dispatchEvent.
+ *
+ * The inline dropdown path delegates to selectSFLookup() which already has
+ * comprehensive handling. This wrapper adds:
+ *   • Explicit Advanced Search escalation if selectSFLookup throws
+ *   • Overlay dismissal before each attempt
+ *   • Clear logging for debugging
+ *
+ * Example step: {"action":"lookup","target":"Pay To","value":"Test Account - 1","locator_type":"label"}
+ *
+ * @param page       — Playwright page instance
+ * @param fieldLabel — The lookup field label (e.g. "Pay To", "Account Name")
+ * @param searchValue — The value to search for and select (e.g. "Test Account - 1")
+ */
+async function selectLookupValue(
+  page: Page,
+  fieldLabel: string,
+  searchValue: string,
+): Promise<void> {
+  const resolvedLabel = extractLabelFromTarget(fieldLabel)
+  if (resolvedLabel !== fieldLabel) {
+    log.info(`[SF-LOOKUP-VALUE] Resolved label: "${fieldLabel}" → "${resolvedLabel}"`)
+  }
+  log.info(`[SF-LOOKUP-VALUE] ═══ selectLookupValue("${resolvedLabel}", "${searchValue}") ═══`)
+
+  // ── Dismiss stale overlays before starting ──────────────────────────────
+  await dismissStaleOverlays(page)
+
+  // ── Attempt 1: Delegate to selectSFLookup (inline dropdown + auto Advanced Search fallback)
+  // selectSFLookup already has comprehensive handling for:
+  //   • Finding the lookup input (multi-strategy: container→input, XPath, label variants)
+  //   • Typing with JS focus (overlay-immune)
+  //   • Inline dropdown option clicking
+  //   • ArrowDown keyboard nav
+  //   • Prefix retry
+  //   • Automatic Advanced Search fallback (which now uses resilient 3-attempt clicking)
+  try {
+    await selectSFLookup(page, resolvedLabel, searchValue)
+    log.info(`[SF-LOOKUP-VALUE] ✅ selectSFLookup succeeded for "${searchValue}" in "${resolvedLabel}"`)
+    return
+  } catch (inlineErr) {
+    const errMsg = inlineErr instanceof Error ? inlineErr.message : String(inlineErr)
+    log.warn(`[SF-LOOKUP-VALUE] selectSFLookup failed: ${errMsg}`)
+    log.info(`[SF-LOOKUP-VALUE] Escalating to direct Advanced Search attempt...`)
+  }
+
+  // ── Attempt 2: Direct Advanced Search escalation ────────────────────────
+  // If selectSFLookup threw (e.g. couldn't find the input, or dropdown + adv search
+  // both failed in a way that didn't handle), we try Advanced Search one more time
+  // with a clean slate: dismiss overlays, re-find the input, type, trigger adv search.
+  await dismissStaleOverlays(page)
+  await page.waitForTimeout(1_000)
+
+  // Re-find the lookup input — use the same expanded strategies as selectSFLookup Strategy 2/3
+  const label = resolvedLabel
+  const variants = labelCandidates(label)
+  let lookupInput: Locator | null = null
+
+  for (const lbl of variants) {
+    const xpLoc = page.locator(
+      // lightning-lookup (classic)
+      `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup//input` +
+      `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup//input` +
+      // c-lookup / custom lookup components
+      `|//label[contains(normalize-space(),"${lbl}")]/ancestor::c-lookup//input` +
+      `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::c-lookup//input` +
+      // records-record-picker (newer SF UI)
+      `|//label[contains(normalize-space(),"${lbl}")]/ancestor::records-record-picker//input` +
+      `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::records-record-picker//input` +
+      // Generic: label sibling div with text input
+      `|//label[contains(normalize-space(),"${lbl}")]/following-sibling::div//input[@type="text"]` +
+      // Generic: slds-form-element ancestor with visible input
+      `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::div[contains(@class,"slds-form-element")]//input[not(@type="hidden")]`,
+    ).first()
+    if (await xpLoc.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      lookupInput = xpLoc
+      break
+    }
+  }
+
+  // sfFindFieldContainer fallback
+  if (!lookupInput) {
+    const container = await sfFindFieldContainer(page, label)
+    if (container) {
+      const inner = container.locator('input[type="text"], input:not([type="hidden"])').first()
+      if (await inner.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        lookupInput = inner
+      }
+    }
+  }
+
+  // JS full-page scan — last resort (mirrors Strategy 3 in selectSFLookup)
+  if (!lookupInput) {
+    const lookupTag2 = `sf-lv-scan-${label.replace(/\s+/g, '-').toLowerCase()}-${Date.now()}`
+    const found2 = await page.evaluate(([vars, tag]: [string[], string]) => {
+      const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>(
+        'input[type="text"][autocomplete], input[autocomplete="off"], ' +
+        'input[aria-autocomplete], lightning-lookup input, c-lookup input, ' +
+        'records-record-picker input, [class*="lookup"] input[type="text"]'
+      )).filter(inp => (inp as HTMLElement).offsetParent !== null)
+
+      for (const inp of allInputs) {
+        let el: Element | null = inp
+        let labelText = ''
+        for (let depth = 0; depth < 10 && el; depth++) {
+          el = el.parentElement
+          if (!el) break
+          const labelEl =
+            el.querySelector('label, .slds-form-element__label, legend') ??
+            el.closest('label')
+          if (labelEl) { labelText = labelEl.textContent?.trim() ?? ''; break }
+        }
+        if (!labelText) labelText = inp.getAttribute('aria-label') ?? inp.getAttribute('placeholder') ?? ''
+        if (vars.some(v => v && labelText.toLowerCase().includes(v.toLowerCase()))) {
+          inp.setAttribute('data-autotest-lookup-target', tag)
+          return true
+        }
+      }
+      return false
+    }, [variants, lookupTag2] as [string[], string])
+
+    if (found2) {
+      const scanned2 = page.locator(`[data-autotest-lookup-target="${lookupTag2}"]`).first()
+      if (await scanned2.isVisible({ timeout: 1_000 }).catch(() => false)) {
+        lookupInput = scanned2
+        log.info(`[SF-LOOKUP-VALUE] ✅ JS scan found input for "${label}"`)
+        await page.evaluate((t: string) => {
+          document.querySelector(`[data-autotest-lookup-target="${t}"]`)?.removeAttribute('data-autotest-lookup-target')
+        }, lookupTag2).catch(() => {})
+      }
+    }
+  }
+
+  if (!lookupInput) {
+    throw new Error(`[SF-LOOKUP-VALUE] Could not find lookup input for "${label}" — both inline and advanced search failed.`)
+  }
+
+  // Type the search value using JS focus (overlay-immune)
+  await lookupInput.scrollIntoViewIfNeeded()
+  await lookupInput.evaluate((el: HTMLElement) => {
+    const input = el as HTMLInputElement
+    input.focus()
+    input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+    input.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
+    input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    input.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
+  })
+  await page.waitForTimeout(300)
+  await lookupInput.evaluate((el: HTMLElement) => { (el as HTMLInputElement).select() })
+  await page.keyboard.press('Backspace')
+  await page.waitForTimeout(200)
+  await lookupInput.pressSequentially(searchValue, { delay: 90 })
+  await page.waitForTimeout(1_500)
+
+  // Count dialogs before pressing Enter — detect the Advanced Search modal
+  // as a NEW dialog (count increase), not by content filter which falsely
+  // matches the parent form modal.
+  const dialogCountBefore = await page.locator('[role="dialog"]').count().catch(() => 0)
+  await lookupInput.press('Enter')
+  await page.waitForTimeout(2_000)
+  const dialogCountNow = await page.locator('[role="dialog"]').count().catch(() => 0)
+
+  // Detect the Advanced Search modal:
+  // 1. New dialog appeared (count increased)
+  // 2. Heading-anchored: 'Advanced Search' in h1/h2
+  const advByHeading = page.locator('[role="dialog"]').filter({
+    has: page.locator('h1, h2, .slds-modal__title').filter({ hasText: /^Advanced Search$/i })
+  }).first()
+  const advByNew = dialogCountNow > dialogCountBefore
+    ? page.locator('[role="dialog"]').nth(dialogCountNow - 1)
+    : null
+
+  const isAdvOpen =
+    await advByHeading.isVisible({ timeout: 4_000 }).catch(() => false) ||
+    (advByNew ? await advByNew.isVisible({ timeout: 1_000 }).catch(() => false) : false)
+
+  if (isAdvOpen) {
+    log.info(`[SF-LOOKUP-VALUE] Advanced Search modal detected (${dialogCountNow} dialogs) — delegating to selectSFLookupAdvanced`)
+    await selectSFLookupAdvanced(page, label, searchValue, true)
+    log.info(`[SF-LOOKUP-VALUE] ✅ Advanced Search completed for "${searchValue}" in "${label}"`)
+  } else {
+    throw new Error(
+      `[SF-LOOKUP-VALUE] Could not select "${searchValue}" in lookup "${label}" — ` +
+      `Advanced Search modal did not open (dialogs before=${dialogCountBefore}, after=${dialogCountNow}).`
+    )
+  }
+
+  // ── Post-selection validation: verify the field is NOT showing a SF error ─
+  // SF Lightning shows: "Select an option from the picklist or remove the search term."
+  // when a lookup has unresolved typed text. If present, the value was NOT selected.
+  await page.waitForTimeout(1_000)  // Allow SF to render any validation errors
+  const sfValidationError = await page.locator(
+    // Scoped to common SF error containers
+    '.slds-form-element__help, .slds-has-error .slds-form-element__help, ' +
+    'p.slds-form-element__help, [class*="fieldLevelHelp"], .helpTextLink'
+  ).filter({ hasText: /select an option|remove the search term/i }).count().catch(() => 0)
+
+  if (sfValidationError > 0) {
+    throw new Error(
+      `[SF-LOOKUP-VALUE] Lookup field "${label}" shows SF validation error after selection attempt: ` +
+      `"Select an option from the picklist or remove the search term." ` +
+      `Value "${searchValue}" was NOT successfully bound to the field.`
+    )
+  }
+
+  log.info(`[SF-LOOKUP-VALUE] ✅ Field validation passed — "${searchValue}" is bound to "${label}"`)
 }
 
 
@@ -1057,7 +2191,7 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
   }
 
   log.info(`[SF-DATE] ✅ Found date input for "${fieldLabel}"`)
-  await dateInput.scrollIntoViewIfNeeded().catch(() => {})
+  await dateInput.scrollIntoViewIfNeeded().catch(() => { })
 
   // ── Helper: verify the date was accepted (field shows expected text) ─────
   const verifyDate = async (): Promise<boolean> => {
@@ -1089,7 +2223,7 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
     await page.waitForTimeout(300)
 
     // Close any datepicker popup that opened, then Tab to confirm
-    await page.keyboard.press('Escape').catch(() => {})
+    await page.keyboard.press('Escape').catch(() => { })
     await page.waitForTimeout(150)
     await page.keyboard.press('Tab')
     await page.waitForTimeout(500)
@@ -1113,7 +2247,7 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
     await page.waitForTimeout(100)
     await dateInput.pressSequentially(formatted, { delay: 60 })
     await page.waitForTimeout(300)
-    await page.keyboard.press('Escape').catch(() => {})
+    await page.keyboard.press('Escape').catch(() => { })
     await page.waitForTimeout(150)
     await page.keyboard.press('Tab')
     await page.waitForTimeout(500)
@@ -1131,11 +2265,11 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
   // Some datepicker variants accept a plain fill() after focus is established.
   log.info(`[SF-DATE] Strategy 3: forced focus + .fill()`)
   try {
-    await dateInput.focus().catch(() => {})
+    await dateInput.focus().catch(() => { })
     await page.waitForTimeout(200)
     await dateInput.fill(formatted, { timeout: 5_000 })
     await page.waitForTimeout(200)
-    await page.keyboard.press('Escape').catch(() => {})
+    await page.keyboard.press('Escape').catch(() => { })
     await page.waitForTimeout(150)
     await dateInput.press('Tab')
     await page.waitForTimeout(500)
@@ -1158,7 +2292,7 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
     if (box) {
       await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
     } else {
-      await dateInput.click({ force: true }).catch(() => {})
+      await dateInput.click({ force: true }).catch(() => { })
     }
     await page.waitForTimeout(200)
     await page.keyboard.press('Control+A')
@@ -1166,7 +2300,7 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
     await page.waitForTimeout(100)
     await page.keyboard.type(formatted, { delay: 60 })
     await page.waitForTimeout(300)
-    await page.keyboard.press('Escape').catch(() => {})
+    await page.keyboard.press('Escape').catch(() => { })
     await page.waitForTimeout(150)
     await page.keyboard.press('Tab')
     await page.waitForTimeout(500)
@@ -1186,27 +2320,27 @@ async function fillSFDate(page: Page, rawLabel: string, dateValue: string): Prom
 // ─── Smart locator resolver ───────────────────────────────────────────────────
 
 function resolveLocator(page: Page, step: StepData): Locator {
-  let target      = step.target ?? ''
+  let target = step.target ?? ''
   let locatorType = (step.locator_type ?? '').toLowerCase().trim()
-  const action    = (step.action || '').toLowerCase().replace(/[-_\s]/g, '')
+  const action = (step.action || '').toLowerCase().replace(/[-_\s]/g, '')
 
   // Unwrap Playwright expression strings (e.g. getByLabel('Type') → 'Type')
   const extracted = extractLabelFromTarget(target)
   if (extracted !== target) {
     const raw = step.target ?? ''
     const isRole = /^(?:page\.)?getByRole/i.test(raw)
-    
+
     // For getByRole strings, case 'role' needs to parse the full string, so DO NOT overwrite target
     if (!isRole) {
       target = extracted
     }
-    
+
     // Force the locator type based on the function used
-    if (/^(?:page\.)?getByLabel/i.test(raw))      locatorType = 'label'
-    else if (/^(?:page\.)?getByText/i.test(raw))   locatorType = 'text'
+    if (/^(?:page\.)?getByLabel/i.test(raw)) locatorType = 'label'
+    else if (/^(?:page\.)?getByText/i.test(raw)) locatorType = 'text'
     else if (/^(?:page\.)?getByPlaceholder/i.test(raw)) locatorType = 'placeholder'
-    else if (isRole)                               locatorType = 'role'
-    else if (/^(?:page\.)?getByTitle/i.test(raw))  locatorType = 'title'
+    else if (isRole) locatorType = 'role'
+    else if (/^(?:page\.)?getByTitle/i.test(raw)) locatorType = 'title'
     else if (/^(?:page\.)?getByAltText/i.test(raw)) locatorType = 'alt'
   }
 
@@ -1217,19 +2351,19 @@ function resolveLocator(page: Page, step: StepData): Locator {
 
   // Auto-detect locator_type from target pattern
   if (!locatorType || locatorType === 'css') {
-    if (/^role=\w+,\s*name=/.test(target))       locatorType = 'role'
-    else if (target.startsWith('label='))          { locatorType = 'label'; target = target.slice(6) }
-    else if (target.startsWith('text='))           { locatorType = 'text';  target = target.slice(5) }
+    if (/^role=\w+,\s*name=/.test(target)) locatorType = 'role'
+    else if (target.startsWith('label=')) { locatorType = 'label'; target = target.slice(6) }
+    else if (target.startsWith('text=')) { locatorType = 'text'; target = target.slice(5) }
     else if (!target.match(/[.#\[\]>:=]/) && target.length > 0) locatorType = 'label'
   }
 
   // Normalise AI-generated variants
-  if (['role_button','button_role','button','btn'].includes(locatorType)) {
+  if (['role_button', 'button_role', 'button', 'btn'].includes(locatorType)) {
     locatorType = 'role'
     if (!/^role=\w+,\s*name=/.test(target) && !target.includes(':')) target = `button:${target}`
   }
-  if (['field_label','get_by_label','by_label','field_name'].includes(locatorType)) locatorType = 'label'
-  if (['get_by_text','by_text','inner_text'].includes(locatorType))                 locatorType = 'text'
+  if (['field_label', 'get_by_label', 'by_label', 'field_name'].includes(locatorType)) locatorType = 'label'
+  if (['get_by_text', 'by_text', 'inner_text'].includes(locatorType)) locatorType = 'text'
   if (target.startsWith('getByRole(') || target.startsWith('page.getByRole(')) locatorType = 'role'
 
   switch (locatorType) {
@@ -1321,18 +2455,18 @@ async function dismissStaleOverlays(page: Page): Promise<void> {
 
 async function getFirstVisibleLocator(baseLocator: Locator, timeout = 15_000): Promise<Locator> {
   const startTime = Date.now()
-  
+
   while (Date.now() - startTime < timeout) {
     const count = await baseLocator.count()
     const globalLocators: Locator[] = []
-    
+
     for (let i = 0; i < count; i++) {
       const l = baseLocator.nth(i)
       if (await l.isVisible()) {
         const isGlobal = await l.evaluate(
           el => !!el.closest('one-app-nav-bar, .slds-global-header_container')
         ).catch(() => false)
-        
+
         if (!isGlobal) {
           return l // Priority match inside main content
         } else {
@@ -1340,13 +2474,13 @@ async function getFirstVisibleLocator(baseLocator: Locator, timeout = 15_000): P
         }
       }
     }
-    
+
     // If we only found elements in the global header, delay returning them
     // to give the SPA page content up to 3000ms to render a better match.
     if (globalLocators.length > 0 && Date.now() - startTime > 3_000) {
       return globalLocators[0]
     }
-    
+
     await baseLocator.page().waitForTimeout(400)
   }
   return baseLocator.first()
@@ -1405,12 +2539,26 @@ async function modalScopedResolve(page: Page, step: StepData): Promise<Locator> 
         for (let li = 0; li < labelCount; li++) {
           const labelLoc = allLabels.nth(li)
           if (!(await labelLoc.isVisible().catch(() => false))) continue
-          const inputType = await labelLoc.evaluate(
-            el => (el as HTMLInputElement).type?.toLowerCase() ?? '',
-          ).catch(() => '')
-          // Skip range sliders and hidden inputs
+          const [tagName, inputType] = await labelLoc.evaluate(
+            el => [(el as HTMLElement).tagName?.toUpperCase() ?? '', (el as HTMLInputElement).type?.toLowerCase() ?? ''],
+          ).catch(() => ['', ''])
+          // Skip range sliders, hidden inputs, and non-interactive elements
+          // (Salesforce uses aria-label on <button> picklist triggers and icon buttons
+          // that can match a field label — e.g. Company, Lead Source, etc.)
           if (inputType === 'range' || inputType === 'hidden') continue
-          log.info(`[MODAL-SCOPE] ✅ Found "${extracted}" inside modal via getByLabel("${lbl}") (nth ${li})`)
+          if (tagName === 'BUTTON') {
+            log.info(`[MODAL-SCOPE] ⏭ Skipping <button> matched by getByLabel("${lbl}") nth(${li}) — not a fill target`)
+            continue
+          }
+          // Skip <select> only when it is NOT a multi-select (multi-selects are our dual-listbox fallback)
+          if (tagName === 'SELECT' && !(labelLoc as any).multiple) {
+            const isMultiple = await labelLoc.evaluate(el => (el as HTMLSelectElement).multiple).catch(() => false)
+            if (!isMultiple) {
+              log.info(`[MODAL-SCOPE] ⏭ Skipping <select> matched by getByLabel("${lbl}") nth(${li})`)
+              continue
+            }
+          }
+          log.info(`[MODAL-SCOPE] ✅ Found "${extracted}" inside modal via getByLabel("${lbl}") (nth ${li}) [tag=${tagName}]`)
           return labelLoc
         }
       }
@@ -1442,15 +2590,28 @@ async function modalScopedResolve(page: Page, step: StepData): Promise<Locator> 
       for (let i = 0; i < count; i++) {
         const loc = candidate.nth(i)
         if (!(await loc.isVisible({ timeout: 1_500 }).catch(() => false))) continue
-        const inputType = await loc.evaluate(
-          el => (el as HTMLInputElement).type?.toLowerCase() ?? '',
-        ).catch(() => '')
-        if (inputType === 'range' || inputType === 'hidden') continue
+        const [pTagName, pInputType] = await loc.evaluate(
+          el => [(el as HTMLElement).tagName?.toUpperCase() ?? '', (el as HTMLInputElement).type?.toLowerCase() ?? ''],
+        ).catch(() => ['', ''])
+        if (pInputType === 'range' || pInputType === 'hidden') continue
+        // Skip buttons — SF renders aria-labeled buttons for picklist/lookup triggers
+        // that substring-match field names (e.g. "Company" button inside a compound field).
+        if (pTagName === 'BUTTON') {
+          log.info(`[PAGE-SCOPE] ⏭ Skipping <button> matched by getByLabel("${lbl}") nth(${i}) — not a fill target`)
+          continue
+        }
+        if (pTagName === 'SELECT') {
+          const isMultiple = await loc.evaluate(el => (el as HTMLSelectElement).multiple).catch(() => false)
+          if (!isMultiple) {
+            log.info(`[PAGE-SCOPE] ⏭ Skipping <select> matched by getByLabel("${lbl}") nth(${i})`)
+            continue
+          }
+        }
         const isGlobal = await loc.evaluate(
           el => !!el.closest('one-app-nav-bar, .slds-global-header_container'),
         ).catch(() => false)
         if (isGlobal) continue
-        log.info(`[PAGE-SCOPE] ✅ Found "${extracted}" page-wide via getByLabel("${lbl}") (nth ${i})`)
+        log.info(`[PAGE-SCOPE] ✅ Found "${extracted}" page-wide via getByLabel("${lbl}") (nth ${i}) [tag=${pTagName}]`)
         return loc
       }
     }
@@ -1472,10 +2633,10 @@ async function executeStep(
   projectId?: string,
   projectCategory?: string,
 ): Promise<ExecutionStepResult> {
-  const start  = Date.now()
+  const start = Date.now()
   const action = step.action.toLowerCase().replace(/[-_\s]/g, '')
   const target = step.target ?? ''
-  const value  = step.value  ?? ''
+  const value = step.value ?? ''
   let screenshotPath: string | null = null
 
   // Resolve active page context (may be inside an iframe)
@@ -1488,669 +2649,854 @@ async function executeStep(
   let lastStepError: Error | null = null
 
   for (let attempt = 1; attempt <= 2; attempt++) {
-  try {
-    switch (action) {
+    try {
+      switch (action) {
 
-      // ── Navigation ─────────────────────────────────────
-      case 'navigate':
-      case 'goto':
-      case 'open': {
-        const navUrl = value || target
-        if (!navUrl) { log.warn(`[EXEC] NAVIGATE step ${stepIndex + 1} has no URL — skipping`); break }
-        let resolvedUrl = navUrl
-        if (navUrl.startsWith('/')) {
-          try { resolvedUrl = `${new URL(page.url()).origin}${navUrl}` } catch { /* first step */ }
-        }
-        try {
-          await page.goto(resolvedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-        } catch (navErr: unknown) {
-          const msg = navErr instanceof Error ? navErr.message : String(navErr)
-          if (!msg.includes('ERR_ABORTED')) throw navErr
-          log.warn(`[EXEC] NAVIGATE: ERR_ABORTED ignored (SF SPA) at step ${stepIndex + 1}`)
-        }
-        // Clear frame context on navigation
-        frameRegistry.delete(executionId)
+        // ── Navigation ─────────────────────────────────────
+        case 'navigate':
+        case 'goto':
+        case 'open': {
+          const navUrl = value || target
+          if (!navUrl) { log.warn(`[EXEC] NAVIGATE step ${stepIndex + 1} has no URL — skipping`); break }
+          let resolvedUrl = navUrl
+          if (navUrl.startsWith('/')) {
+            try { resolvedUrl = `${new URL(page.url()).origin}${navUrl}` } catch { /* first step */ }
+          }
+          try {
+            await page.goto(resolvedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+          } catch (navErr: unknown) {
+            const msg = navErr instanceof Error ? navErr.message : String(navErr)
+            if (!msg.includes('ERR_ABORTED')) throw navErr
+            log.warn(`[EXEC] NAVIGATE: ERR_ABORTED ignored (SF SPA) at step ${stepIndex + 1}`)
+          }
+          // Clear frame context and field map on navigation
+          frameRegistry.delete(executionId)
+          sfFieldMapRegistry.delete(executionId)
 
-        // ── SF Session Guard ────────────────────────────────────────────
-        // Salesforce redirects expired sessions to /login with domcontentloaded
-        // appearing to "succeed". Detect this redirect and re-authenticate
-        // transparently before continuing to the next step.
-        if (projectCategory === 'salesforce' && projectId && browserCtx) {
-          // Increase settle wait to 4s — SF's inline login form renders AFTER
-          // domcontentloaded, sometimes taking 3-4s for the LWC shell to detect
-          // the expired session and swap in the login form.
-          await page.waitForTimeout(4_000)
-          const postNavUrl = page.url().toLowerCase()
+          // ── SF Session Guard ────────────────────────────────────────────
+          // Salesforce redirects expired sessions to /login with domcontentloaded
+          // appearing to "succeed". Detect this redirect and re-authenticate
+          // transparently before continuing to the next step.
+          if (projectCategory === 'salesforce' && projectId && browserCtx) {
+            // Increase settle wait to 4s — SF's inline login form renders AFTER
+            // domcontentloaded, sometimes taking 3-4s for the LWC shell to detect
+            // the expired session and swap in the login form.
+            await page.waitForTimeout(4_000)
+            const postNavUrl = page.url().toLowerCase()
 
-          // Check 1: URL-based detection
-          const isLoginUrl = postNavUrl.includes('/login')
-            || postNavUrl.includes('/authorize')
-            || postNavUrl.includes('secur/login')
+            // Check 1: URL-based detection
+            const isLoginUrl = postNavUrl.includes('/login')
+              || postNavUrl.includes('/authorize')
+              || postNavUrl.includes('secur/login')
 
-          // Check 2: DOM-based detection — SF renders the login form INLINE at
-          // the same URL when sessions expire, so URL checks miss it.
-          // Use 8s timeout to give the LWC shell enough time to show the form.
-          const hasLoginForm = !isLoginUrl && await page.locator(
-            'input[name="username"], input[id="username"], input[name="un"]',
-          ).first().isVisible({ timeout: 8_000 }).catch(() => false)
+            // Check 2: DOM-based detection — SF renders the login form INLINE at
+            // the same URL when sessions expire, so URL checks miss it.
+            // Use 8s timeout to give the LWC shell enough time to show the form.
+            const hasLoginForm = !isLoginUrl && await page.locator(
+              'input[name="username"], input[id="username"], input[name="un"]',
+            ).first().isVisible({ timeout: 8_000 }).catch(() => false)
 
-          if (isLoginUrl || hasLoginForm) {
-            log.warn(
-              `[EXEC] NAVIGATE step ${stepIndex + 1}: SF session expired ` +
-              `(${isLoginUrl ? 'login URL redirect' : 'inline login form detected'}). ` +
-              `Re-authenticating via JSForce...`,
-            )
-            invalidateConnection(projectId)
-            deleteSession(projectId)
-            await loginToSalesforce(page, browserCtx, projectId)
-            log.info(`[EXEC] Re-auth OK — retrying navigation to ${resolvedUrl}`)
-            try {
-              await page.goto(resolvedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-            } catch (retryErr: unknown) {
-              const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
-              if (!retryMsg.includes('ERR_ABORTED')) throw retryErr
+            if (isLoginUrl || hasLoginForm) {
+              log.warn(
+                `[EXEC] NAVIGATE step ${stepIndex + 1}: SF session expired ` +
+                `(${isLoginUrl ? 'login URL redirect' : 'inline login form detected'}). ` +
+                `Re-authenticating via JSForce...`,
+              )
+              invalidateConnection(projectId)
+              deleteSession(projectId)
+              await loginToSalesforce(page, browserCtx, projectId)
+              log.info(`[EXEC] Re-auth OK — retrying navigation to ${resolvedUrl}`)
+              try {
+                await page.goto(resolvedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+              } catch (retryErr: unknown) {
+                const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+                if (!retryMsg.includes('ERR_ABORTED')) throw retryErr
+              }
             }
           }
-        }
 
-        // SF Lightning post-navigate stabilization:
-        // domcontentloaded fires early but LWC/Aura components keep rendering.
-        // Wait until at least one form element or Lightning component is visible
-        // (up to 5s) so the next step doesn't hit an empty DOM.
-        if (resolvedUrl.includes('/lightning/')) {
-          await page.locator(
-            '.slds-form, lightning-input, lightning-combobox, lightning-lookup, input[class*="slds"], ' +
-            '.slds-table, .forceSalesPath, one-record-home-flexipage2, force-highlights-panel',
-          ).first().waitFor({ state: 'visible', timeout: 8_000 }).catch(() => {
-            // Page may not have a form (e.g. list views) — that's fine, continue
-          })
-        }
-        break
-      }
-
-      // ── Click ──────────────────────────────────────────
-      case 'click': {
-        if (activeFrame) {
-          const frameLoc = activeFrame.locator(target)
-          await frameLoc.waitFor({ state: 'visible', timeout: 15_000 })
-          await frameLoc.click()
-        } else {
-          // Modal-scoped: find the element inside an open modal first
-          const loc = await modalScopedResolve(page, step)
-          await loc.waitFor({ state: 'visible', timeout: 15_000 })
-          await loc.scrollIntoViewIfNeeded()
-          await loc.click({ timeout: 15_000 })
-        }
-        break
-      }
-
-      // ── Fill / Type ────────────────────────────────────
-      case 'type':
-      case 'fill':
-      case 'input': {
-        // SF date fields need special handling (lightning-datepicker, MM/DD/YYYY format)
-        if ((step as any).sf_field_type === 'date') {
-          await fillSFDate(page, target, value)
+          // SF Lightning post-navigate stabilization:
+          // domcontentloaded fires early but LWC/Aura components keep rendering.
+          // Wait until at least one form element or Lightning component is visible
+          // (up to 5s) so the next step doesn't hit an empty DOM.
+          if (resolvedUrl.includes('/lightning/')) {
+            await page.locator(
+              '.slds-form, lightning-input, lightning-combobox, lightning-lookup, input[class*="slds"], ' +
+              '.slds-table, .forceSalesPath, one-record-home-flexipage2, force-highlights-panel',
+            ).first().waitFor({ state: 'visible', timeout: 8_000 }).catch(() => {
+              // Page may not have a form (e.g. list views) — that's fine, continue
+            })
+          }
           break
         }
 
-        // Auto-detect date field: if the value looks like a date pattern, check
-        // whether the target field is a lightning-datepicker. If so, route to fillSFDate.
-        const looksLikeDate = /^\d{4}[/-]\d{2}[/-]\d{2}$|^\d{2}[/-]\d{2}[/-]\d{4}$/.test(value.trim())
-        if (looksLikeDate && !activeFrame) {
-          const resolvedForDate = extractLabelFromTarget(target)
-          const dateVariants = labelCandidates(resolvedForDate)
-          let isDatepicker = false
-          for (const lbl of dateVariants) {
-            isDatepicker = await page.locator(
-              `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-datepicker` +
-              `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-datepicker`,
-            ).first().isVisible({ timeout: 1_500 }).catch(() => false)
-            if (isDatepicker) break
+        // ── Click ──────────────────────────────────────────
+        case 'click': {
+          // Dismiss any lingering SF error modals before clicking
+          await dismissErrorModal(page)
+
+          if (activeFrame) {
+            const frameLoc = activeFrame.locator(target)
+            await frameLoc.waitFor({ state: 'visible', timeout: 15_000 })
+            await frameLoc.click()
+          } else {
+            // Modal-scoped: find the element inside an open modal first
+            const loc = await modalScopedResolve(page, step)
+            await loc.waitFor({ state: 'visible', timeout: 15_000 })
+            await loc.scrollIntoViewIfNeeded()
+            await loc.click({ timeout: 15_000 })
           }
-          if (isDatepicker) {
-            log.info(`[EXEC] Auto-detected lightning-datepicker for "${resolvedForDate}" — routing to fillSFDate`)
-            await fillSFDate(page, target, value)
-            break
-          }
-        }
 
-        if (activeFrame) {
-          const frameLoc = activeFrame.locator(target)
-          await frameLoc.waitFor({ state: 'visible', timeout: 12_000 })
-          await frameLoc.fill(value)
-        } else {
-          // Modal-scoped: find the input inside an open modal first
-          const loc = await modalScopedResolve(page, step)
-          await loc.waitFor({ state: 'visible', timeout: 15_000 })
-          try {
-            await loc.fill(value, { timeout: 10_000 })
-          } catch {
-            const inner = loc.locator('input:not([type="hidden"]):not([type="range"]), textarea').first()
-            if (await inner.isVisible({ timeout: 2_000 }).catch(() => false)) {
-              await inner.fill(value, { timeout: 10_000 })
-            } else {
-              // Try clicking + typing (contenteditable or rich text)
-              await loc.click()
-              await page.keyboard.type(value)
-            }
-          }
-        }
-        break
-      }
+          // ── Post-click intelligence (SF Lightning) ───────────────────
+          const targetLower = (target ?? '').toLowerCase()
 
+          // After clicking New/Edit/Clone: wait for modal, scan field map
+          if (['new', 'edit', 'create', 'clone', 'quick'].some((kw) => targetLower.includes(kw))) {
+            log.info(`[SF-ENGINE] Post-click: waiting for modal after "${target}"`)
 
-      // ── SELECT — SF-aware dispatcher ───────────────────
-      case 'select':
-      case 'selectoption': {
-        // Unwrap Playwright expression strings from target
-        // e.g. getByLabel('Type') → 'Type', getByRole('button',{name:'Save'}) → 'Save'
-        const resolvedTarget = extractLabelFromTarget(target)
-        if (resolvedTarget !== target) {
-          log.info(`[EXEC] SELECT: resolved target "${target}" → "${resolvedTarget}"`)
-        }
-
-        // ── Case: residual Playwright expression (no label extracted) ──
-        // Happens when AI emits e.g. getByRole('combobox') with no {name:'...'}.
-        // Execute the role/locator directly: click the first visible element,
-        // then pick the option from the dropdown that opens.
-        const stillPlaywrightExpr = /^(?:page\.)?getBy\w+\s*\(/.test(resolvedTarget)
-        if (stillPlaywrightExpr) {
-          log.info(`[EXEC] SELECT: target is a raw Playwright expression — direct role execution`)
-
-          // getByRole('combobox') → click it, then pick option
-          const roleOnlyMatch = resolvedTarget.match(
-            /^(?:page\.)?getByRole\s*\(\s*['"]([^'"]+)['"]\s*\)\s*$/,
-          )
-          // getByRole('combobox') → iterate ALL visible comboboxes, open each one,
-          // check if the target option value exists in its dropdown, and select it.
-          // This prevents blindly clicking the first combobox (e.g. Parent Account lookup)
-          // when the target value ('Customer') belongs to a different combobox (Type).
-          if (roleOnlyMatch) {
-            const role = roleOnlyMatch[1] as Parameters<Page['getByRole']>[0]
-            const allComboboxes = page.getByRole(role)
-            const count = await allComboboxes.count()
-            log.info(`[EXEC] SELECT: found ${count} visible "${role}" elements — probing for "${value}"`)
-
-            let selected = false
-            for (let ci = 0; ci < count; ci++) {
-              const cb = allComboboxes.nth(ci)
-              if (!(await cb.isVisible().catch(() => false))) continue
-
-              await cb.scrollIntoViewIfNeeded().catch(() => {})
-              await cb.click()
-              await page.waitForTimeout(600) // wait for dropdown to render
-
-              // Check if any [role="option"] containing the value is now visible
-              const matchingOpt = page.locator('[role="option"]').filter({ hasText: value })
-              const optCount = await matchingOpt.count()
-              let found = false
-              for (let oi = 0; oi < optCount; oi++) {
-                if (await matchingOpt.nth(oi).isVisible().catch(() => false)) {
-                  await matchingOpt.nth(oi).click()
-                  found = true
-                  break
-                }
+            const modalFound = await waitForSFModal(page)
+            if (modalFound) {
+              // Scan field map — this is the KEY step that enables correct fill routing
+              const fieldMap = await scanFieldMap(page)
+              if (Object.keys(fieldMap).length > 0) {
+                sfFieldMapRegistry.set(executionId, fieldMap)
+                log.info(`[SF-ENGINE] Field map stored for execution ${executionId}: ${Object.keys(fieldMap).length} fields`)
               }
 
-              if (found) {
-                log.info(`[EXEC] SELECT: ✅ found "${value}" in combobox #${ci + 1}`)
-                selected = true
-                await page.waitForTimeout(500)
+              // Wait for spinner to clear
+              await waitForSpinnerGone(page)
+            } else {
+              // Check for full-page record form (not a modal)
+              try {
+                await page.locator(
+                  'records-record-edit-form, lightning-record-edit-form, ' +
+                  '.slds-form, force-record-layout-section',
+                ).first().waitFor({ state: 'visible', timeout: 10_000 })
+                log.info('[SF-ENGINE] Full-page record form detected — scanning field map')
+                const fieldMap = await scanFieldMap(page)
+                if (Object.keys(fieldMap).length > 0) {
+                  sfFieldMapRegistry.set(executionId, fieldMap)
+                }
+              } catch {
+                await page.waitForTimeout(3_000)
+              }
+            }
+          }
+
+          // After clicking Save: check for errors, handle duplicates
+          if (targetLower.includes('save')) {
+            await waitForSpinnerGone(page)
+            await handleDuplicatePopup(page)
+            await page.waitForTimeout(3_000) // VF errors take 3-5s to appear
+
+            const saveError = await detectPostSaveError(page)
+            if (saveError) {
+              throw new Error(`Save FAILED — Salesforce error: ${saveError.substring(0, 300)}`)
+            }
+
+            // Check for success toast
+            try {
+              const toast = page.locator(
+                '.toastMessage, .forceToastMessage, .slds-notify__content, ' +
+                'div[data-key="success"], div[data-key="error"]',
+              ).first()
+              await toast.waitFor({ state: 'visible', timeout: 5_000 })
+              log.info('[SF-ENGINE] Toast notification detected after Save')
+            } catch { /* no toast — continue */ }
+          }
+
+          break
+        }
+
+        // ── Fill / Type — Universal SF-aware Dispatcher ────
+        // Port of Python salesforce_engine.py fill_field() + step dispatch logic.
+        // Uses the 3-layer field type resolution strategy:
+        //   1. Step-level sf_field_type (from AI generation)
+        //   2. DOM field map (from scanFieldMap after modal opens)
+        //   3. MCP metadata map (from DB)
+        //   4. Real-time JS DOM probe (last resort)
+        case 'type':
+        case 'fill':
+        case 'input': {
+          if (activeFrame) {
+            // Inside an iframe — use simple fill (VF page context)
+            const frameLoc = activeFrame.locator(target)
+            await frameLoc.waitFor({ state: 'visible', timeout: 12_000 })
+            await frameLoc.fill(value)
+            break
+          }
+
+          // Resolve the field label from Playwright expressions
+          const resolvedFillLabel = extractLabelFromTarget(target)
+          log.info(`[SF-ENGINE] fill/type: "${resolvedFillLabel}" = "${value}"`)
+
+          // Correct the label by fuzzy-matching against visible page labels
+          const correctedLabel = await correctLabel(page, resolvedFillLabel)
+          const fillLabel = correctedLabel !== resolvedFillLabel ? correctedLabel : resolvedFillLabel
+
+          // Scroll modal to bring field into view
+          await scrollModalToField(page, fillLabel)
+
+          // ── Resolve field type using 4-layer strategy ────────────────
+          const sfFillType = (step as any).sf_field_type as string | undefined
+          const resolvedType = await resolveFieldType(page, fillLabel, sfFillType, executionId)
+          log.info(`[SF-ENGINE] fill/type: "${fillLabel}" resolved type = "${resolvedType}"`)
+
+          // ── Route to specialized handler based on resolved type ──────
+          switch (resolvedType) {
+            case 'lookup':
+            case 'lookup_advanced':
+            case 'reference': {
+              log.info(`[SF-ENGINE] Routing "${fillLabel}" → selectSFLookup (type=${resolvedType})`)
+              await selectSFLookup(page, fillLabel, value)
+              break
+            }
+
+            case 'picklist':
+            case 'combobox': {
+              log.info(`[SF-ENGINE] Routing "${fillLabel}" → selectSFPicklist (type=${resolvedType})`)
+              await selectSFPicklist(page, fillLabel, value, executionId)
+              break
+            }
+
+            case 'multipicklist': {
+              log.info(`[SF-ENGINE] Routing "${fillLabel}" → selectSFPicklist multi-select (type=${resolvedType})`)
+              // Multi-select: split by semicolons and select each value
+              const multiValues = value.split(';').map((v) => v.trim()).filter(Boolean)
+              for (const mv of multiValues) {
+                await selectSFPicklist(page, fillLabel, mv, executionId)
+              }
+              break
+            }
+
+            case 'date':
+            case 'datetime': {
+              log.info(`[SF-ENGINE] Routing "${fillLabel}" → fillSFDate (type=${resolvedType})`)
+              await fillSFDate(page, fillLabel, value)
+              break
+            }
+
+            case 'checkbox':
+            case 'boolean': {
+              log.info(`[SF-ENGINE] Routing "${fillLabel}" → checkbox toggle (type=${resolvedType})`)
+              // Try lightning-input-field checkbox / toggle
+              const cbSelectors = [
+                `lightning-input-field:has-text("${fillLabel}") input[type="checkbox"]`,
+                `lightning-input:has-text("${fillLabel}") input[type="checkbox"]`,
+                `.slds-form-element:has-text("${fillLabel}") input[type="checkbox"]`,
+              ]
+              let cbHandled = false
+              for (const cbSel of cbSelectors) {
+                try {
+                  const cbLoc = page.locator(cbSel).first()
+                  if (await cbLoc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                    const shouldCheck = ['true', '1', 'yes', 'on'].includes(value.toLowerCase())
+                    if (shouldCheck) {
+                      await cbLoc.check({ timeout: 5_000 })
+                    } else {
+                      await cbLoc.uncheck({ timeout: 5_000 })
+                    }
+                    cbHandled = true
+                    log.info(`[SF-ENGINE] Checkbox "${fillLabel}" ${shouldCheck ? 'checked' : 'unchecked'} via ${cbSel}`)
+                    break
+                  }
+                } catch { continue }
+              }
+              if (!cbHandled) {
+                // Fallback: try getByLabel
+                try {
+                  const cbByLabel = page.getByLabel(fillLabel, { exact: false }).first()
+                  if (await cbByLabel.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                    const shouldCheck = ['true', '1', 'yes', 'on'].includes(value.toLowerCase())
+                    if (shouldCheck) await cbByLabel.check(); else await cbByLabel.uncheck()
+                    cbHandled = true
+                  }
+                } catch { /* try next */ }
+              }
+              if (!cbHandled) {
+                log.warn(`[SF-ENGINE] Checkbox handler failed for "${fillLabel}" — falling through to generic fill`)
+                // Fall through to generic text fill below
+                const loc = await modalScopedResolve(page, step)
+                await loc.waitFor({ state: 'visible', timeout: 15_000 })
+                await loc.click()
+                await page.keyboard.type(value)
+              }
+              break
+            }
+
+            default: {
+              // ── Generic text fill ──────────────────────────────────────
+              // Before filling, one final safety check: is the resolved
+              // element actually inside a lookup component?
+              const loc = await modalScopedResolve(page, step)
+              await loc.waitFor({ state: 'visible', timeout: 15_000 })
+
+              // POST-RESOLVE SAFETY NET: check if element is inside a lookup
+              const isInsideLookup = await loc.evaluate((el: Element) =>
+                !!el.closest('lightning-lookup, c-lookup, records-record-picker, lightning-grouped-combobox[class*="lookup"]'),
+              ).catch(() => false)
+
+              if (isInsideLookup) {
+                log.info(`[SF-ENGINE] POST-RESOLVE safety net: "${fillLabel}" is inside lookup. Routing to selectSFLookup.`)
+                await selectSFLookup(page, fillLabel, value)
                 break
               }
 
-              // Close this dropdown (wrong combobox) and try the next one
-              await page.keyboard.press('Escape')
-              await page.waitForTimeout(300)
+              // Check if element is inside a picklist/combobox
+              const isInsidePicklist = await loc.evaluate((el: Element) =>
+                !!el.closest('lightning-combobox, lightning-picklist'),
+              ).catch(() => false)
+
+              if (isInsidePicklist) {
+                log.info(`[SF-ENGINE] POST-RESOLVE safety net: "${fillLabel}" is inside picklist. Routing to selectSFPicklist.`)
+                await selectSFPicklist(page, fillLabel, value, executionId)
+                break
+              }
+
+              // Standard text fill with Tab commit (Lightning commit pattern)
+              try {
+                await loc.fill(value, { timeout: 10_000 })
+              } catch {
+                const inner = loc.locator('input:not([type="hidden"]):not([type="range"]), textarea').first()
+                if (await inner.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                  await inner.fill(value, { timeout: 10_000 })
+                } else {
+                  // Try clicking + typing (contenteditable or rich text)
+                  await loc.click()
+                  await page.keyboard.type(value)
+                }
+              }
+              // Press Tab to commit the value in Lightning
+              await page.keyboard.press('Tab')
+              await page.waitForTimeout(500)
+              break
+            }
+          }
+          break
+        }
+
+
+        // ── SELECT — SF-aware dispatcher ───────────────────
+        case 'select':
+        case 'selectoption': {
+          // Unwrap Playwright expression strings from target
+          // e.g. getByLabel('Type') → 'Type', getByRole('button',{name:'Save'}) → 'Save'
+          const resolvedTarget = extractLabelFromTarget(target)
+          if (resolvedTarget !== target) {
+            log.info(`[EXEC] SELECT: resolved target "${target}" → "${resolvedTarget}"`)
+          }
+
+          // ── Case: residual Playwright expression (no label extracted) ──
+          // Happens when AI emits e.g. getByRole('combobox') with no {name:'...'}.
+          // Execute the role/locator directly: click the first visible element,
+          // then pick the option from the dropdown that opens.
+          const stillPlaywrightExpr = /^(?:page\.)?getBy\w+\s*\(/.test(resolvedTarget)
+          if (stillPlaywrightExpr) {
+            log.info(`[EXEC] SELECT: target is a raw Playwright expression — direct role execution`)
+
+            // getByRole('combobox') → click it, then pick option
+            const roleOnlyMatch = resolvedTarget.match(
+              /^(?:page\.)?getByRole\s*\(\s*['"]([^'"]+)['"]\s*\)\s*$/,
+            )
+            // getByRole('combobox') → iterate ALL visible comboboxes, open each one,
+            // check if the target option value exists in its dropdown, and select it.
+            // This prevents blindly clicking the first combobox (e.g. Parent Account lookup)
+            // when the target value ('Customer') belongs to a different combobox (Type).
+            if (roleOnlyMatch) {
+              const role = roleOnlyMatch[1] as Parameters<Page['getByRole']>[0]
+              const allComboboxes = page.getByRole(role)
+              const count = await allComboboxes.count()
+              log.info(`[EXEC] SELECT: found ${count} visible "${role}" elements — probing for "${value}"`)
+
+              let selected = false
+              for (let ci = 0; ci < count; ci++) {
+                const cb = allComboboxes.nth(ci)
+                if (!(await cb.isVisible().catch(() => false))) continue
+
+                await cb.scrollIntoViewIfNeeded().catch(() => { })
+                await cb.click()
+                await page.waitForTimeout(600) // wait for dropdown to render
+
+                // Check if any [role="option"] containing the value is now visible
+                const matchingOpt = page.locator('[role="option"]').filter({ hasText: value })
+                const optCount = await matchingOpt.count()
+                let found = false
+                for (let oi = 0; oi < optCount; oi++) {
+                  if (await matchingOpt.nth(oi).isVisible().catch(() => false)) {
+                    await matchingOpt.nth(oi).click()
+                    found = true
+                    break
+                  }
+                }
+
+                if (found) {
+                  log.info(`[EXEC] SELECT: ✅ found "${value}" in combobox #${ci + 1}`)
+                  selected = true
+                  await page.waitForTimeout(500)
+                  break
+                }
+
+                // Close this dropdown (wrong combobox) and try the next one
+                await page.keyboard.press('Escape')
+                await page.waitForTimeout(300)
+              }
+
+              if (selected) break
+
+              // None of the comboboxes had the option — last resort: try SF picklist handler
+              log.warn(`[EXEC] SELECT: no combobox contained "${value}", falling back to SF picklist`)
+              await selectSFPicklist(page, '', value, executionId)
+              break
             }
 
-            if (selected) break
-
-            // None of the comboboxes had the option — last resort: try SF picklist handler
-            log.warn(`[EXEC] SELECT: no combobox contained "${value}", falling back to SF picklist`)
+            // Any other residual expr: fall through to picklist with an empty label
+            // Mode C (full-page combobox scan) will handle it
             await selectSFPicklist(page, '', value, executionId)
             break
           }
 
-          // Any other residual expr: fall through to picklist with an empty label
-          // Mode C (full-page combobox scan) will handle it
-          await selectSFPicklist(page, '', value, executionId)
+          const sfType = (step as any).sf_field_type as string | undefined
+
+          if (sfType === 'lookup' || sfType === 'lookup_advanced') {
+            await selectSFLookup(page, resolvedTarget, value)
+          } else if (sfType === 'date') {
+            await fillSFDate(page, resolvedTarget, value)
+          } else {
+            // Check if there's a lightning-lookup ancestor (use contains() for label variants)
+            const ltVariants = labelCandidates(resolvedTarget)
+            let isLookup = false
+            for (const lbl of ltVariants) {
+              isLookup = await page.locator(
+                `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup` +
+                `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup`,
+              ).first().isVisible({ timeout: 1_500 }).catch(() => false)
+              if (isLookup) break
+            }
+
+            if (isLookup) {
+              await selectSFLookup(page, resolvedTarget, value)
+            } else {
+              // Default: SF picklist (handles native <select>, lightning-combobox, full scan)
+              await selectSFPicklist(page, resolvedTarget, value, executionId)
+            }
+          }
           break
         }
 
-        const sfType = (step as any).sf_field_type as string | undefined
-
-        if (sfType === 'lookup' || sfType === 'lookup_advanced') {
-          await selectSFLookup(page, resolvedTarget, value)
-        } else if (sfType === 'date') {
-          await fillSFDate(page, resolvedTarget, value)
-        } else {
-          // Check if there's a lightning-lookup ancestor (use contains() for label variants)
-          const ltVariants = labelCandidates(resolvedTarget)
-          let isLookup = false
-          for (const lbl of ltVariants) {
-            isLookup = await page.locator(
-              `xpath=//label[contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup` +
-              `|//span[contains(@class,"slds-form-element__label") and contains(normalize-space(),"${lbl}")]/ancestor::lightning-lookup`,
-            ).first().isVisible({ timeout: 1_500 }).catch(() => false)
-            if (isLookup) break
-          }
-
-          if (isLookup) {
-            await selectSFLookup(page, resolvedTarget, value)
-          } else {
-            // Default: SF picklist (handles native <select>, lightning-combobox, full scan)
-            await selectSFPicklist(page, resolvedTarget, value, executionId)
-          }
+        // ── SF Lookup (explicit action) ────────────────────
+        // Routes through selectLookupValue() which wraps the entire
+        // lookup flow with robust Advanced Search fallback and
+        // resilient 3-attempt result clicking.
+        case 'lookup':
+        case 'sflookup': {
+          await selectLookupValue(page, target, value)
+          break
         }
-        break
-      }
 
-      // ── SF Lookup (explicit action) ────────────────────
-      case 'lookup':
-      case 'sflookup': {
-        await selectSFLookup(page, target, value)
-        break
-      }
+        // ── SF Picklist (explicit action) ──────────────────
+        case 'picklist':
+        case 'sfpicklist': {
+          await selectSFPicklist(page, target, value, executionId)
+          break
+        }
 
-      // ── SF Picklist (explicit action) ──────────────────
-      case 'picklist':
-      case 'sfpicklist': {
-        await selectSFPicklist(page, target, value, executionId)
-        break
-      }
+        // ── SF Date ────────────────────────────────────────
+        case 'date':
+        case 'sfdate':
+        case 'setdate': {
+          await fillSFDate(page, target, value)
+          break
+        }
 
-      // ── SF Date ────────────────────────────────────────
-      case 'date':
-      case 'sfdate':
-      case 'setdate': {
-        await fillSFDate(page, target, value)
-        break
-      }
+        // ── SF Record Type Selection ────────────────────────
+        // Handles the record type selection dialog that Salesforce Lightning
+        // shows before the create form when an object has multiple record types.
+        // target = exact record type Name (e.g. "Damage", "Stock In")
+        case 'selectrecordtype':
+        case 'select_record_type':
+        case 'chooserecordtype': {
+          const rtName = target.trim()
+          log.info(`[SF-RT] Selecting record type "${rtName}"`)
 
-      // ── SF Record Type Selection ────────────────────────
-      // Handles the record type selection dialog that Salesforce Lightning
-      // shows before the create form when an object has multiple record types.
-      // target = exact record type Name (e.g. "Damage", "Stock In")
-      case 'selectrecordtype':
-      case 'select_record_type':
-      case 'chooserecordtype': {
-        const rtName = target.trim()
-        log.info(`[SF-RT] Selecting record type "${rtName}"`)
+          // ── Helper: attempt to click a record type tile ─────────────────
+          const trySelectRTTile = async (): Promise<boolean> => {
+            // Data-value variants: SF sometimes uses developerName (spaces→underscores)
+            const rtNormUnderscore = rtName.replace(/\s+/g, '_')
+            const rtNormSpace = rtName.replace(/_+/g, ' ')
 
-        // ── Helper: attempt to click a record type tile ─────────────────
-        const trySelectRTTile = async (): Promise<boolean> => {
-          // Data-value variants: SF sometimes uses developerName (spaces→underscores)
-          const rtNormUnderscore = rtName.replace(/\s+/g, '_')
-          const rtNormSpace      = rtName.replace(/_+/g, ' ')
+            // Strategy 1a: [data-value="Damage"] exact
+            // Strategy 1b: [data-value="Damage_Type"] (underscore variant)
+            // Strategy 1c: [data-value] case-insensitive via XPath attr match
+            for (const dv of [rtName, rtNormUnderscore, rtNormSpace]) {
+              const loc = page.locator(`[data-value="${dv}"]`).first()
+              if (await loc.isVisible({ timeout: 1_500 }).catch(() => false)) {
+                await loc.scrollIntoViewIfNeeded().catch(() => { })
+                await loc.click()
+                log.info(`[SF-RT] ✅ Selected via data-value="${dv}"`)
+                await page.waitForTimeout(500)
+                return true
+              }
+            }
 
-          // Strategy 1a: [data-value="Damage"] exact
-          // Strategy 1b: [data-value="Damage_Type"] (underscore variant)
-          // Strategy 1c: [data-value] case-insensitive via XPath attr match
-          for (const dv of [rtName, rtNormUnderscore, rtNormSpace]) {
-            const loc = page.locator(`[data-value="${dv}"]`).first()
-            if (await loc.isVisible({ timeout: 1_500 }).catch(() => false)) {
-              await loc.scrollIntoViewIfNeeded().catch(() => {})
-              await loc.click()
-              log.info(`[SF-RT] ✅ Selected via data-value="${dv}"`)
+            // Strategy 2: radio label text — case-insensitive via filter
+            const allLabels = page.locator(
+              'input[type="radio"] + label, ' +
+              '.slds-visual-picker__figure, ' +
+              'span.slds-radio__label, ' +
+              '.flowRuntimeRadio .slds-form-element__label',
+            )
+            const labelCount = await allLabels.count()
+            for (let i = 0; i < labelCount; i++) {
+              const lbl = allLabels.nth(i)
+              if (!await lbl.isVisible().catch(() => false)) continue
+              const text = (await lbl.textContent() ?? '').trim()
+              if (text.toLowerCase() === rtName.toLowerCase()) {
+                await lbl.scrollIntoViewIfNeeded().catch(() => { })
+                await lbl.click()
+                log.info(`[SF-RT] ✅ Selected via label text match "${text}"`)
+                await page.waitForTimeout(500)
+                return true
+              }
+            }
+
+            // Strategy 3: dialog getByText case-insensitive
+            const rtNameRegex = new RegExp(`^${rtName}$`, 'i')
+            const inDialog = page.locator('[role="dialog"]').getByText(rtNameRegex).first()
+            if (await inDialog.isVisible({ timeout: 1_500 }).catch(() => false)) {
+              await inDialog.scrollIntoViewIfNeeded().catch(() => { })
+              await inDialog.click()
+              log.info(`[SF-RT] ✅ Selected via dialog regex match`)
               await page.waitForTimeout(500)
               return true
             }
+
+            // Strategy 4: page-wide text match (full-page RT selector, not a dialog)
+            const pageWide = page.getByText(rtNameRegex).first()
+            if (await pageWide.isVisible({ timeout: 1_500 }).catch(() => false)) {
+              await pageWide.scrollIntoViewIfNeeded().catch(() => { })
+              await pageWide.click()
+              log.info(`[SF-RT] ✅ Selected via page-wide regex match`)
+              await page.waitForTimeout(500)
+              return true
+            }
+
+            return false
           }
 
-          // Strategy 2: radio label text — case-insensitive via filter
-          const allLabels = page.locator(
-            'input[type="radio"] + label, ' +
-            '.slds-visual-picker__figure, ' +
-            'span.slds-radio__label, ' +
-            '.flowRuntimeRadio .slds-form-element__label',
+          // ── Phase 1: try to find the RT dialog as-is ────────────────────
+          // Wait up to 8s for either an RT dialog or visual picker tiles
+          await page.waitForSelector(
+            '[role="dialog"]:has([data-value]), ' +
+            '[data-value], ' +
+            '.slds-visual-picker, ' +
+            '.flowRuntimeRadio',
+            { timeout: 8_000 },
+          ).catch(() => {
+            log.warn(`[SF-RT] RT dialog not found within 8s — will check if wrong form is open`)
+          })
+
+          if (await trySelectRTTile()) break
+
+          // ── Phase 2: Recovery — SF may have auto-opened the default RT form ──
+          // This happens when the user navigated to /new instead of the list view,
+          // and their SF profile has a default record type set.
+          // Fix: cancel/close the current form and navigate to the object list,
+          // then click New to force the RT selection dialog.
+          log.warn(`[SF-RT] RT dialog not interactable — checking if wrong form is open`)
+
+          // Log what data-value tiles ARE visible for debugging
+          const visibleTiles = await page.locator('[data-value]').evaluateAll(
+            (els) => els.map((e) => e.getAttribute('data-value') ?? '').filter(Boolean),
           )
-          const labelCount = await allLabels.count()
-          for (let i = 0; i < labelCount; i++) {
-            const lbl = allLabels.nth(i)
-            if (!await lbl.isVisible().catch(() => false)) continue
-            const text = (await lbl.textContent() ?? '').trim()
-            if (text.toLowerCase() === rtName.toLowerCase()) {
-              await lbl.scrollIntoViewIfNeeded().catch(() => {})
-              await lbl.click()
-              log.info(`[SF-RT] ✅ Selected via label text match "${text}"`)
-              await page.waitForTimeout(500)
-              return true
+          if (visibleTiles.length > 0) {
+            log.info(`[SF-RT] Visible data-value tiles: ${JSON.stringify(visibleTiles)}`)
+          }
+
+          // Check if we're currently on a create form (a form was already opened)
+          const isFormOpen = await page.locator(
+            '.slds-form, lightning-input, lightning-combobox, force-record-edit-row'
+          ).first().isVisible({ timeout: 2_000 }).catch(() => false)
+
+          if (isFormOpen) {
+            log.info(`[SF-RT] Create form is already open (wrong RT). Cancelling to retry from list view...`)
+
+            // Click Cancel to dismiss the current form
+            const cancelBtn = page.locator('[role="button"]:has-text("Cancel"), button:has-text("Cancel")')
+              .or(page.getByRole('button', { name: 'Cancel' })).first()
+            if (await cancelBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
+              await cancelBtn.click()
+              await page.waitForTimeout(1_500)
+            }
+
+            // Navigate to the object list view to trigger the proper RT selection flow
+            const currentUrl = page.url()
+            const objectMatch = currentUrl.match(/\/lightning\/o\/([^/]+)/)
+            if (objectMatch) {
+              const objApiName = objectMatch[1]
+              const listUrl = `/lightning/o/${objApiName}/list`
+              log.info(`[SF-RT] Navigating to list view: ${listUrl}`)
+              await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+              await page.waitForTimeout(2_500)
+
+              // Click the New button from the list view — this ALWAYS shows the RT dialog
+              const newBtn = page.getByRole('button', { name: 'New' }).first()
+              await newBtn.waitFor({ state: 'visible', timeout: 10_000 })
+              await newBtn.click()
+              log.info(`[SF-RT] Clicked New from list view — waiting for RT dialog`)
+              await page.waitForTimeout(2_000)
+
+              // Retry selecting the record type
+              if (await trySelectRTTile()) break
             }
           }
 
-          // Strategy 3: dialog getByText case-insensitive
-          const rtNameRegex = new RegExp(`^${rtName}$`, 'i')
-          const inDialog = page.locator('[role="dialog"]').getByText(rtNameRegex).first()
-          if (await inDialog.isVisible({ timeout: 1_500 }).catch(() => false)) {
-            await inDialog.scrollIntoViewIfNeeded().catch(() => {})
-            await inDialog.click()
-            log.info(`[SF-RT] ✅ Selected via dialog regex match`)
-            await page.waitForTimeout(500)
-            return true
+          // Log all visible RT labels for debugging
+          const visibleLabels = await page.locator(
+            'input[type="radio"] + label, .slds-visual-picker__figure, span.slds-radio__label'
+          ).evaluateAll((els) => els.map((e) => e.textContent?.trim() ?? ''))
+          log.error(`[SF-RT] All strategies failed for "${rtName}". Visible tiles: ${JSON.stringify(visibleTiles)}, Visible labels: ${JSON.stringify(visibleLabels)}`)
+
+          throw new Error(`[SF-RT] Could not select record type "${rtName}" — no matching tile found. Available: ${JSON.stringify([...visibleTiles, ...visibleLabels])}`)
+        }
+
+        // ── Checkbox ───────────────────────────────────────
+        case 'check':
+        case 'checkbox': {
+          const loc = await getFirstVisibleLocator(resolveLocator(page, step))
+          await loc.waitFor({ state: 'visible', timeout: 10_000 })
+          await loc.check({ timeout: 10_000 })
+          break
+        }
+
+        case 'uncheck': {
+          const loc = await getFirstVisibleLocator(resolveLocator(page, step))
+          await loc.waitFor({ state: 'visible', timeout: 10_000 })
+          await loc.uncheck({ timeout: 10_000 })
+          break
+        }
+
+        // ── Hover ──────────────────────────────────────────
+        case 'hover': {
+          const loc = await getFirstVisibleLocator(resolveLocator(page, step))
+          await loc.waitFor({ state: 'visible', timeout: 10_000 })
+          await loc.hover({ timeout: 10_000 })
+          break
+        }
+
+        // ── Keyboard ───────────────────────────────────────
+        case 'press':
+        case 'keyboard': {
+          await page.keyboard.press(value || target)
+          break
+        }
+
+        // ── Wait ───────────────────────────────────────────
+        case 'wait':
+        case 'waitfor': {
+          if (/^\d+$/.test(value)) {
+            await page.waitForTimeout(parseInt(value, 10))
+          } else {
+            await page.waitForSelector(value || target, { timeout: 30_000 })
           }
-
-          // Strategy 4: page-wide text match (full-page RT selector, not a dialog)
-          const pageWide = page.getByText(rtNameRegex).first()
-          if (await pageWide.isVisible({ timeout: 1_500 }).catch(() => false)) {
-            await pageWide.scrollIntoViewIfNeeded().catch(() => {})
-            await pageWide.click()
-            log.info(`[SF-RT] ✅ Selected via page-wide regex match`)
-            await page.waitForTimeout(500)
-            return true
-          }
-
-          return false
+          break
         }
 
-        // ── Phase 1: try to find the RT dialog as-is ────────────────────
-        // Wait up to 8s for either an RT dialog or visual picker tiles
-        await page.waitForSelector(
-          '[role="dialog"]:has([data-value]), ' +
-          '[data-value], ' +
-          '.slds-visual-picker, ' +
-          '.flowRuntimeRadio',
-          { timeout: 8_000 },
-        ).catch(() => {
-          log.warn(`[SF-RT] RT dialog not found within 8s — will check if wrong form is open`)
-        })
-
-        if (await trySelectRTTile()) break
-
-        // ── Phase 2: Recovery — SF may have auto-opened the default RT form ──
-        // This happens when the user navigated to /new instead of the list view,
-        // and their SF profile has a default record type set.
-        // Fix: cancel/close the current form and navigate to the object list,
-        // then click New to force the RT selection dialog.
-        log.warn(`[SF-RT] RT dialog not interactable — checking if wrong form is open`)
-
-        // Log what data-value tiles ARE visible for debugging
-        const visibleTiles = await page.locator('[data-value]').evaluateAll(
-          (els) => els.map((e) => e.getAttribute('data-value') ?? '').filter(Boolean),
-        )
-        if (visibleTiles.length > 0) {
-          log.info(`[SF-RT] Visible data-value tiles: ${JSON.stringify(visibleTiles)}`)
-        }
-
-        // Check if we're currently on a create form (a form was already opened)
-        const isFormOpen = await page.locator(
-          '.slds-form, lightning-input, lightning-combobox, force-record-edit-row'
-        ).first().isVisible({ timeout: 2_000 }).catch(() => false)
-
-        if (isFormOpen) {
-          log.info(`[SF-RT] Create form is already open (wrong RT). Cancelling to retry from list view...`)
-
-          // Click Cancel to dismiss the current form
-          const cancelBtn = page.locator('[role="button"]:has-text("Cancel"), button:has-text("Cancel")')
-            .or(page.getByRole('button', { name: 'Cancel' })).first()
-          if (await cancelBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
-            await cancelBtn.click()
-            await page.waitForTimeout(1_500)
-          }
-
-          // Navigate to the object list view to trigger the proper RT selection flow
-          const currentUrl = page.url()
-          const objectMatch = currentUrl.match(/\/lightning\/o\/([^/]+)/)
-          if (objectMatch) {
-            const objApiName = objectMatch[1]
-            const listUrl = `/lightning/o/${objApiName}/list`
-            log.info(`[SF-RT] Navigating to list view: ${listUrl}`)
-            await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-            await page.waitForTimeout(2_500)
-
-            // Click the New button from the list view — this ALWAYS shows the RT dialog
-            const newBtn = page.getByRole('button', { name: 'New' }).first()
-            await newBtn.waitFor({ state: 'visible', timeout: 10_000 })
-            await newBtn.click()
-            log.info(`[SF-RT] Clicked New from list view — waiting for RT dialog`)
-            await page.waitForTimeout(2_000)
-
-            // Retry selecting the record type
-            if (await trySelectRTTile()) break
-          }
-        }
-
-        // Log all visible RT labels for debugging
-        const visibleLabels = await page.locator(
-          'input[type="radio"] + label, .slds-visual-picker__figure, span.slds-radio__label'
-        ).evaluateAll((els) => els.map((e) => e.textContent?.trim() ?? ''))
-        log.error(`[SF-RT] All strategies failed for "${rtName}". Visible tiles: ${JSON.stringify(visibleTiles)}, Visible labels: ${JSON.stringify(visibleLabels)}`)
-
-        throw new Error(`[SF-RT] Could not select record type "${rtName}" — no matching tile found. Available: ${JSON.stringify([...visibleTiles, ...visibleLabels])}`)
-      }
-
-      // ── Checkbox ───────────────────────────────────────
-      case 'check':
-      case 'checkbox': {
-        const loc = await getFirstVisibleLocator(resolveLocator(page, step))
-        await loc.waitFor({ state: 'visible', timeout: 10_000 })
-        await loc.check({ timeout: 10_000 })
-        break
-      }
-
-      case 'uncheck': {
-        const loc = await getFirstVisibleLocator(resolveLocator(page, step))
-        await loc.waitFor({ state: 'visible', timeout: 10_000 })
-        await loc.uncheck({ timeout: 10_000 })
-        break
-      }
-
-      // ── Hover ──────────────────────────────────────────
-      case 'hover': {
-        const loc = await getFirstVisibleLocator(resolveLocator(page, step))
-        await loc.waitFor({ state: 'visible', timeout: 10_000 })
-        await loc.hover({ timeout: 10_000 })
-        break
-      }
-
-      // ── Keyboard ───────────────────────────────────────
-      case 'press':
-      case 'keyboard': {
-        await page.keyboard.press(value || target)
-        break
-      }
-
-      // ── Wait ───────────────────────────────────────────
-      case 'wait':
-      case 'waitfor': {
-        if (/^\d+$/.test(value)) {
-          await page.waitForTimeout(parseInt(value, 10))
-        } else {
-          await page.waitForSelector(value || target, { timeout: 30_000 })
-        }
-        break
-      }
-
-      // ── Assert ─────────────────────────────────────────
-      case 'assert':
-      case 'assertvisible':
-      case 'asserttext': {
-        const loc = await getFirstVisibleLocator(resolveLocator(page, step))
-        await loc.waitFor({ state: 'visible', timeout: 10_000 })
-        if (value) {
-          const text = await loc.textContent()
-          if (!text?.includes(value)) {
-            throw new Error(`Assertion failed: "${target}" text "${text}" does not contain "${value}"`)
-          }
-        }
-        break
-      }
-
-      case 'asserturl': {
-        const currentUrl = page.url()
-        if (!currentUrl.includes(target)) {
-          throw new Error(`URL assertion failed: "${currentUrl}" does not contain "${target}"`)
-        }
-        break
-      }
-
-      // ── Assert Toast (validation rule / flow / trigger) ─
-      case 'asserttoast':
-      case 'asserterror':
-      case 'assertsuccess': {
-        // SF Lightning renders toasts in several different DOM structures depending
-        // on the page type (Aura, LWC, Experience Cloud, etc.).
-        // We try them all and take whichever appears first.
-        const toastSelectors = [
-          '.slds-notify .slds-notify__content',           // Classic/Aura toast
-          '[data-key="success"] .toastMessage',           // LWC success toast
-          '[data-key="error"] .toastMessage',             // LWC error toast
-          '[data-key="warning"] .toastMessage',           // LWC warning toast
-          '[data-key="info"] .toastMessage',              // LWC info toast
-          '.forceActionsText',                            // force:showToast legacy
-          'force-toast .toastMessage',                   // web component variant
-          '.toastMessage',                                // catch-all
-          'lightning-toast .slds-notify__content',        // LWC lightning-toast
-          '[role="status"]',                              // ARIA role fallback
-        ]
-        const toastLoc = page.locator(toastSelectors.join(', ')).first()
-
-        let toastText: string | null = null
-        try {
-          await toastLoc.waitFor({ state: 'visible', timeout: 15_000 })
-          toastText = await toastLoc.textContent()
-        } catch {
-          // Toast may have already auto-dismissed (SF toasts last ~3s).
-          // Fall back: check if the page title/URL indicates a successful save.
-          const pageText = await page.title().catch(() => '')
-          const url = page.url()
+        // ── Assert ─────────────────────────────────────────
+        case 'assert':
+        case 'assertvisible':
+        case 'asserttext': {
+          const loc = await getFirstVisibleLocator(resolveLocator(page, step))
+          await loc.waitFor({ state: 'visible', timeout: 10_000 })
           if (value) {
-            const lv = value.toLowerCase()
-            if (pageText.toLowerCase().includes(lv) || url.toLowerCase().includes('view')) {
-              log.info(`[EXEC] Toast auto-dismissed but page title/URL confirms save: "${pageText}"`)
-              break
+            const text = await loc.textContent()
+            if (!text?.includes(value)) {
+              throw new Error(`Assertion failed: "${target}" text "${text}" does not contain "${value}"`)
             }
           }
-          throw new Error(`Toast not found after 15s and no page-state fallback matched.`)
+          break
         }
 
-        if (value && toastText && !toastText.toLowerCase().includes(value.toLowerCase())) {
-          throw new Error(`Toast assertion failed: got "${toastText?.trim()}", expected to contain "${value}"`)
+        case 'asserturl': {
+          const currentUrl = page.url()
+          if (!currentUrl.includes(target)) {
+            throw new Error(`URL assertion failed: "${currentUrl}" does not contain "${target}"`)
+          }
+          break
         }
-        log.info(`[EXEC] Toast assertion passed: "${toastText?.trim()}"`)
-        break
+
+        // ── Assert Toast (validation rule / flow / trigger) ─
+        case 'asserttoast':
+        case 'asserterror':
+        case 'assertsuccess': {
+          // SF Lightning renders toasts in several different DOM structures depending
+          // on the page type (Aura, LWC, Experience Cloud, etc.).
+          // We try them all and take whichever appears first.
+          const toastSelectors = [
+            '.slds-notify .slds-notify__content',           // Classic/Aura toast
+            '[data-key="success"] .toastMessage',           // LWC success toast
+            '[data-key="error"] .toastMessage',             // LWC error toast
+            '[data-key="warning"] .toastMessage',           // LWC warning toast
+            '[data-key="info"] .toastMessage',              // LWC info toast
+            '.forceActionsText',                            // force:showToast legacy
+            'force-toast .toastMessage',                   // web component variant
+            '.toastMessage',                                // catch-all
+            'lightning-toast .slds-notify__content',        // LWC lightning-toast
+            '.slds-notify[role="status"] .slds-notify__content', // Scoped ARIA status (actual toast only)
+          ]
+          const toastLoc = page.locator(toastSelectors.join(', ')).first()
+
+          let toastText: string | null = null
+          try {
+            await toastLoc.waitFor({ state: 'visible', timeout: 15_000 })
+            toastText = await toastLoc.textContent()
+          } catch {
+            // Toast may have already auto-dismissed (SF toasts last ~3s).
+            // Fall back: check if the page title/URL indicates a successful save.
+            const pageText = await page.title().catch(() => '')
+            const url = page.url()
+            if (value) {
+              const lv = value.toLowerCase()
+              // Match only definitive record view URLs: /lightning/r/{ObjectId}/view
+              const isRecordViewUrl = /\/lightning\/r\/[a-zA-Z0-9]+\/view/i.test(url)
+              if (pageText.toLowerCase().includes(lv) || isRecordViewUrl) {
+                log.info(`[EXEC] Toast auto-dismissed but page title/URL confirms save: "${pageText}"`)
+                break
+              }
+            }
+            throw new Error(`Toast not found after 15s and no page-state fallback matched.`)
+          }
+
+          if (value) {
+            if (!toastText || !toastText.trim()) {
+              throw new Error(`Toast assertion failed: toast element found but had no text content. Expected to contain "${value}"`)
+            }
+            if (!toastText.toLowerCase().includes(value.toLowerCase())) {
+              throw new Error(`Toast assertion failed: got "${toastText.trim()}", expected to contain "${value}"`)
+            }
+          }
+          log.info(`[EXEC] Toast assertion passed: "${toastText?.trim()}"`)
+          break
+        }
+
+
+        // ── URL Navigate (flow / VF page URL) ─────────────
+        case 'navigateflow':
+        case 'runflow':
+        case 'trigger': {
+          // Navigate to a Salesforce Flow URL or record page to trigger flow/trigger
+          const flowUrl = value || target
+          await page.goto(flowUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+          await page.waitForTimeout(2_000)
+          break
+        }
+
+        // ── VF Page / iframe support ───────────────────────
+        case 'switchframe':
+        case 'switchtoframe':
+        case 'enterframe': {
+          // target = iframe name, title attribute, or CSS selector of iframe
+          let frameLocator: FrameLocator
+          if (target.match(/[.#\[>]/)) {
+            frameLocator = page.frameLocator(target)
+          } else {
+            // Try name first, then title partial match
+            frameLocator = page.frameLocator(`iframe[name="${target}"], iframe[title*="${target}"]`)
+          }
+          // Verify frame is accessible
+          await frameLocator.locator('body').waitFor({ state: 'attached', timeout: 10_000 })
+          frameRegistry.set(executionId, frameLocator)
+          log.info(`[EXEC] Switched to frame "${target}" for execution ${executionId}`)
+          break
+        }
+
+        case 'exitframe':
+        case 'switchtoparent': {
+          frameRegistry.delete(executionId)
+          log.info(`[EXEC] Exited frame context for execution ${executionId}`)
+          break
+        }
+
+        // ── Scroll ─────────────────────────────────────────
+        case 'scroll': {
+          if (target) {
+            await (await getFirstVisibleLocator(resolveLocator(page, step))).scrollIntoViewIfNeeded()
+          } else {
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+          }
+          break
+        }
+
+        // ── Explicit screenshot ────────────────────────────
+        case 'screenshot': {
+          const ssFile = `step-${stepIndex}-explicit-${Date.now()}.png`
+          const ssPath = path.join(screenshotsDir, ssFile)
+          await page.screenshot({ path: ssPath, fullPage: false })
+          screenshotPath = `/screenshots/${executionId}/${ssFile}`
+          break
+        }
+
+        // ── Clear cookies ──────────────────────────────────
+        case 'clearcookies': {
+          await page.context().clearCookies()
+          break
+        }
+
+        // ── Unknown action ─────────────────────────────────
+        default: {
+          log.warn(`[EXEC] Unknown action "${step.action}" at step ${stepIndex + 1} — skipping`)
+          return {
+            step: stepIndex + 1, action: step.action, target: target || null, value: value || null,
+            status: 'skipped', message: `Unknown action "${step.action}" — skipped`,
+            duration_ms: Date.now() - start, screenshot_path: null, error: null,
+          }
+        }
       }
 
+      // Auto-screenshot on last step
+      if (isLastStep && action !== 'screenshot') {
+        const ssFile = `step-${stepIndex + 1}-FINAL-${Date.now()}.png`
+        const ssAbsPath = path.join(screenshotsDir, ssFile)
+        try {
+          await page.screenshot({ path: ssAbsPath, fullPage: false })
+          screenshotPath = `/screenshots/${executionId}/${ssFile}`
+        } catch { /* non-fatal */ }
+      }
 
-      // ── URL Navigate (flow / VF page URL) ─────────────
-      case 'navigateflow':
-      case 'runflow':
-      case 'trigger': {
-        // Navigate to a Salesforce Flow URL or record page to trigger flow/trigger
-        const flowUrl = value || target
-        await page.goto(flowUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      return {
+        step: stepIndex + 1, action: step.action, target: target || null, value: value || null,
+        status: 'passed', message: `Step ${stepIndex + 1} passed`,
+        duration_ms: Date.now() - start, screenshot_path: screenshotPath, error: null,
+      }
+
+    } catch (err: unknown) {
+      lastStepError = err instanceof Error ? err : new Error(String(err))
+
+      if (attempt < 2) {
+        log.warn(
+          `[EXEC] ⚠️  Step ${stepIndex + 1} ("${step.action}") failed on attempt ${attempt} — ` +
+          `retrying in 2s after DOM reset. Error: ${lastStepError.message}`,
+        )
+        // Reset DOM state: dismiss any lingering overlays/modals that caused the failure
+        await dismissStaleOverlays(page).catch(() => { })
         await page.waitForTimeout(2_000)
-        break
+        // Continue to attempt 2
+        continue
       }
 
-      // ── VF Page / iframe support ───────────────────────
-      case 'switchframe':
-      case 'switchtoframe':
-      case 'enterframe': {
-        // target = iframe name, title attribute, or CSS selector of iframe
-        let frameLocator: FrameLocator
-        if (target.match(/[.#\[>]/)) {
-          frameLocator = page.frameLocator(target)
-        } else {
-          // Try name first, then title partial match
-          frameLocator = page.frameLocator(`iframe[name="${target}"], iframe[title*="${target}"]`)
-        }
-        // Verify frame is accessible
-        await frameLocator.locator('body').waitFor({ state: 'attached', timeout: 10_000 })
-        frameRegistry.set(executionId, frameLocator)
-        log.info(`[EXEC] Switched to frame "${target}" for execution ${executionId}`)
-        break
-      }
-
-      case 'exitframe':
-      case 'switchtoparent': {
-        frameRegistry.delete(executionId)
-        log.info(`[EXEC] Exited frame context for execution ${executionId}`)
-        break
-      }
-
-      // ── Scroll ─────────────────────────────────────────
-      case 'scroll': {
-        if (target) {
-          await (await getFirstVisibleLocator(resolveLocator(page, step))).scrollIntoViewIfNeeded()
-        } else {
-          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
-        }
-        break
-      }
-
-      // ── Explicit screenshot ────────────────────────────
-      case 'screenshot': {
-        const ssFile = `step-${stepIndex}-explicit-${Date.now()}.png`
-        const ssPath = path.join(screenshotsDir, ssFile)
-        await page.screenshot({ path: ssPath, fullPage: false })
-        screenshotPath = `/screenshots/${executionId}/${ssFile}`
-        break
-      }
-
-      // ── Clear cookies ──────────────────────────────────
-      case 'clearcookies': {
-        await page.context().clearCookies()
-        break
-      }
-
-      // ── Unknown action ─────────────────────────────────
-      default: {
-        log.warn(`[EXEC] Unknown action "${step.action}" at step ${stepIndex + 1} — skipping`)
-        return {
-          step: stepIndex + 1, action: step.action, target: target || null, value: value || null,
-          status: 'skipped', message: `Unknown action "${step.action}" — skipped`,
-          duration_ms: Date.now() - start, screenshot_path: null, error: null,
-        }
-      }
-    }
-
-    // Auto-screenshot on last step
-    if (isLastStep && action !== 'screenshot') {
-      const ssFile    = `step-${stepIndex + 1}-FINAL-${Date.now()}.png`
-      const ssAbsPath = path.join(screenshotsDir, ssFile)
+      // All attempts exhausted — capture failure screenshot and return failed result
+      const errMsg = lastStepError.message
+      const failSsFile = `step-${stepIndex + 1}-FAILED-${Date.now()}.png`
       try {
-        await page.screenshot({ path: ssAbsPath, fullPage: false })
-        screenshotPath = `/screenshots/${executionId}/${ssFile}`
-      } catch { /* non-fatal */ }
+        await page.screenshot({ path: path.join(screenshotsDir, failSsFile), fullPage: false })
+        screenshotPath = `/screenshots/${executionId}/${failSsFile}`
+      } catch { /* ignore */ }
+
+      return {
+        step: stepIndex + 1, action: step.action, target: target || null, value: value || null,
+        status: 'failed', message: `Step ${stepIndex + 1} failed (2 attempts): ${errMsg}`,
+        duration_ms: Date.now() - start, screenshot_path: screenshotPath, error: errMsg,
+      }
     }
-
-    return {
-      step: stepIndex + 1, action: step.action, target: target || null, value: value || null,
-      status: 'passed', message: `Step ${stepIndex + 1} passed`,
-      duration_ms: Date.now() - start, screenshot_path: screenshotPath, error: null,
-    }
-
-  } catch (err: unknown) {
-    lastStepError = err instanceof Error ? err : new Error(String(err))
-
-    if (attempt < 2) {
-      log.warn(
-        `[EXEC] ⚠️  Step ${stepIndex + 1} ("${step.action}") failed on attempt ${attempt} — ` +
-        `retrying in 2s after DOM reset. Error: ${lastStepError.message}`,
-      )
-      // Reset DOM state: dismiss any lingering overlays/modals that caused the failure
-      await dismissStaleOverlays(page).catch(() => {})
-      await page.waitForTimeout(2_000)
-      // Continue to attempt 2
-      continue
-    }
-
-    // All attempts exhausted — capture failure screenshot and return failed result
-    const errMsg     = lastStepError.message
-    const failSsFile = `step-${stepIndex + 1}-FAILED-${Date.now()}.png`
-    try {
-      await page.screenshot({ path: path.join(screenshotsDir, failSsFile), fullPage: false })
-      screenshotPath = `/screenshots/${executionId}/${failSsFile}`
-    } catch { /* ignore */ }
-
-    return {
-      step: stepIndex + 1, action: step.action, target: target || null, value: value || null,
-      status: 'failed', message: `Step ${stepIndex + 1} failed (2 attempts): ${errMsg}`,
-      duration_ms: Date.now() - start, screenshot_path: screenshotPath, error: errMsg,
-    }
-  }
   } // end retry loop
 
   // Should never reach here — the loop always returns inside try or catch
@@ -2176,9 +3522,9 @@ async function isSalesforceLoginPage(page: Page): Promise<boolean> {
 }
 
 async function loginToSalesforce(
-  page:       Page,
+  page: Page,
   browserCtx: BrowserContext,
-  projectId:  string,
+  projectId: string,
 ): Promise<void> {
   log.info(`[EXEC-SF] Getting JSForce connection for project ${projectId}...`)
   try {
@@ -2190,7 +3536,7 @@ async function loginToSalesforce(
 
     log.info('[EXEC-SF] Attempting silent login via frontdoor.jsp (attempt 1)')
 
-    const instanceUrl  = conn.instanceUrl.startsWith('http')
+    const instanceUrl = conn.instanceUrl.startsWith('http')
       ? conn.instanceUrl
       : `https://${conn.instanceUrl}`
     const frontdoorUrl = `${instanceUrl}/secur/frontdoor.jsp?sid=${conn.accessToken}`
@@ -2209,7 +3555,7 @@ async function loginToSalesforce(
     log.warn('[EXEC-SF] frontdoor.jsp showed login page (URL or DOM). Invalidating token and retrying...')
     invalidateConnection(projectId)
     const freshConn = await getConnection(projectId)
-    const freshUrl   = `${freshConn.instanceUrl}/secur/frontdoor.jsp?sid=${freshConn.accessToken}`
+    const freshUrl = `${freshConn.instanceUrl}/secur/frontdoor.jsp?sid=${freshConn.accessToken}`
 
     await page.goto(freshUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 })
     await page.waitForTimeout(3_000)
@@ -2233,10 +3579,10 @@ async function loginToSalesforce(
 // ─── WebApp login ─────────────────────────────────────────────────────────────
 
 async function loginToWebApp(
-  page:       Page,
+  page: Page,
   browserCtx: BrowserContext,
-  context:    ExecutionJob['context'],
-  projectId:  string,
+  context: ExecutionJob['context'],
+  projectId: string,
 ): Promise<void> {
   if (!context.webLoginUrl || !context.webUsername || !context.webPassword) {
     log.info('[EXEC-WEB] No web credentials — skipping login'); return
@@ -2245,16 +3591,16 @@ async function loginToWebApp(
   const strategy = context.webLoginStrategy ?? 'form'
 
   if (strategy === 'basic_auth') {
-    const url     = new URL(context.webLoginUrl)
-    url.username  = context.webUsername
-    url.password  = context.webPassword
+    const url = new URL(context.webLoginUrl)
+    url.username = context.webUsername
+    url.password = context.webPassword
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 })
     await saveSession(projectId, browserCtx)
     return
   }
 
   await page.goto(context.webLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-  const emailInput    = page.locator('input[type="email"], input[name*="user"], input[name*="email"]').first()
+  const emailInput = page.locator('input[type="email"], input[name*="user"], input[name*="email"]').first()
   const passwordInput = page.locator('input[type="password"]').first()
 
   try {
@@ -2262,7 +3608,7 @@ async function loginToWebApp(
     await emailInput.fill(context.webUsername)
     await passwordInput.fill(context.webPassword)
     await page.keyboard.press('Enter')
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => {})
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => { })
     log.info('[EXEC-WEB] ✅ Form login submitted')
     await saveSession(projectId, browserCtx)
   } catch {
@@ -2421,28 +3767,33 @@ async function injectPauseOverlay(
         document.getElementById('autotest-pause-overlay')?.remove()
         // Clear stale signals
         document.body.removeAttribute('data-autotest-hitl-action')
-        try { sessionStorage.removeItem('autotest-hitl-action') } catch {}
+        try { sessionStorage.removeItem('autotest-hitl-action') } catch { }
 
         const TIMEOUT_SECS = Math.floor(timeoutMs / 1000)
         const overlay = document.createElement('div')
         overlay.id = 'autotest-pause-overlay'
-        overlay.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:auto'
+        overlay.style.cssText = 'position:fixed;top:auto;bottom:24px;right:24px;left:auto;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:auto'
 
         const tgt = stepTarget ? stepTarget.replace(/</g, '&lt;') : stepAction
         const val = stepValue ? stepValue.replace(/</g, '&lt;') : ''
         const errTxt = (errorMsg || 'Failed \u2014 please complete this step manually.').replace(/</g, '&lt;')
 
         // ── Overlay HTML ────────────────────────────────────────────────
-        // Resume/Skip are <a> tags targeting a hidden <iframe>.
+        // Resume/Skip/Stop are <a> tags targeting a hidden <iframe>.
         // Clicking a native link is pure HTML — no JS event handlers needed.
         // Playwright's page.route() intercepts the iframe request at CDP level.
         overlay.innerHTML = `<div id="autotest-pause-card" style="background:linear-gradient(135deg,#1a1f2e 0%,#232941 100%);border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:28px 32px;width:420px;box-shadow:0 32px 80px rgba(0,0,0,0.6);position:relative;pointer-events:auto">
-          <style>@keyframes at-slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}} #autotest-pause-card{animation:at-slide .3s ease both} #autotest-pause-card a.at-btn:hover{filter:brightness(1.15)} #autotest-pause-card a.at-btn:active{transform:scale(.97);opacity:.8}</style>
-          <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
-            <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#f59e0b,#fbbf24);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">\u23F8</div>
-            <div>
+          <style>@keyframes at-slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}} #autotest-pause-card{animation:at-slide .3s ease both} #autotest-pause-card a.at-btn:hover{filter:brightness(1.15)} #autotest-pause-card a.at-btn:active{transform:scale(.97);opacity:.8} #autotest-drag-handle:hover{background:rgba(255,255,255,0.06);border-radius:8px}</style>
+          <div id="autotest-drag-handle" style="display:flex;align-items:center;gap:10px;margin-bottom:16px;cursor:grab;user-select:none;-webkit-user-select:none;padding:4px 0;touch-action:none" title="Drag to move">
+            <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#f59e0b,#fbbf24);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;pointer-events:none">\u23F8</div>
+            <div style="flex:1;pointer-events:none">
               <div style="color:#fff;font-size:16px;font-weight:700">Test Paused</div>
               <div style="color:#94a3b8;font-size:11px">AutoTest AI \u2022 Human-in-the-Loop</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:3px;padding:4px;opacity:0.4;flex-shrink:0;pointer-events:none" title="Drag to move">
+              <div style="display:flex;gap:3px"><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div></div>
+              <div style="display:flex;gap:3px"><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div></div>
+              <div style="display:flex;gap:3px"><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div></div>
             </div>
           </div>
           <div style="height:1px;background:rgba(255,255,255,0.08);margin-bottom:16px"></div>
@@ -2460,16 +3811,75 @@ async function injectPauseOverlay(
           <iframe name="autotest-hitl-frame" style="display:none;width:0;height:0;border:none;position:absolute" aria-hidden="true"></iframe>
           <input type="checkbox" id="autotest-resume-chk" style="display:none;position:absolute" aria-hidden="true">
           <input type="checkbox" id="autotest-skip-chk" style="display:none;position:absolute" aria-hidden="true">
-          <div style="display:flex;gap:10px">
+          <input type="checkbox" id="autotest-stop-chk" style="display:none;position:absolute" aria-hidden="true">
+          <div style="display:flex;gap:10px;margin-bottom:10px">
             <a id="autotest-resume-btn" class="at-btn" href="/autotest-hitl-signal?action=resume" target="autotest-hitl-frame" style="flex:1;padding:12px 0;border-radius:10px;border:none;cursor:pointer;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:14px;font-weight:700;box-shadow:0 4px 12px rgba(34,197,94,.3);transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;display:block;user-select:none;-webkit-user-select:none;line-height:1.2">\u25B6 Resume</a>
             <a id="autotest-skip-btn" class="at-btn" href="/autotest-hitl-signal?action=skip" target="autotest-hitl-frame" style="flex:1;padding:12px 0;border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);color:#cbd5e1;font-size:14px;font-weight:600;transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;display:block;user-select:none;-webkit-user-select:none;line-height:1.2">\u23ED Skip Step</a>
           </div>
+          <a id="autotest-stop-btn" class="at-btn" href="/autotest-hitl-signal?action=stop" target="autotest-hitl-frame" style="display:block;width:100%;padding:10px 0;border-radius:10px;cursor:pointer;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:13px;font-weight:700;transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;user-select:none;-webkit-user-select:none;line-height:1.2;box-sizing:border-box">\u23F9 Stop Testing</a>
           <div style="margin-top:12px;text-align:center">
-            <span style="color:#475569;font-size:11px">Auto-timeout in </span><span id="autotest-timer" style="color:#64748b;font-size:11px;font-weight:600">${Math.floor(TIMEOUT_SECS/60)}:${String(TIMEOUT_SECS%60).padStart(2,'0')}</span>
+            <span style="color:#475569;font-size:11px">Auto-timeout in </span><span id="autotest-timer" style="color:#64748b;font-size:11px;font-weight:600">${Math.floor(TIMEOUT_SECS / 60)}:${String(TIMEOUT_SECS % 60).padStart(2, '0')}</span>
           </div>
         </div>`
 
         document.body.appendChild(overlay)
+
+        // ── Drag-to-move logic (Pointer Capture API) ─────────────────────────
+        // Uses setPointerCapture so ALL pointer events route directly to the
+        // drag handle element — no document-level listeners needed.
+        // Immune to Salesforce LWS which blocks document.addEventListener.
+        try {
+          const dh = document.getElementById('autotest-drag-handle')
+          if (dh) {
+            let _dragging = false
+            let _pid = -1
+            let _sx = 0, _sy = 0, _sl = 0, _st = 0
+
+            dh.addEventListener('pointerdown', (e: PointerEvent) => {
+              if (e.button !== 0) return
+              // Convert bottom/right anchoring to top/left on first drag
+              if (overlay.style.bottom !== 'auto') {
+                const r = overlay.getBoundingClientRect()
+                overlay.style.bottom = 'auto'
+                overlay.style.right = 'auto'
+                overlay.style.left = r.left + 'px'
+                overlay.style.top = r.top + 'px'
+              }
+              dh.setPointerCapture(e.pointerId)
+              _dragging = true
+              _pid = e.pointerId
+              _sx = e.clientX
+              _sy = e.clientY
+              _sl = parseInt(overlay.style.left || '0', 10)
+              _st = parseInt(overlay.style.top || '0', 10)
+              dh.style.cursor = 'grabbing'
+              e.preventDefault()
+              e.stopPropagation()
+            })
+
+            dh.addEventListener('pointermove', (e: PointerEvent) => {
+              if (!_dragging || e.pointerId !== _pid) return
+              const dx = e.clientX - _sx
+              const dy = e.clientY - _sy
+              const mxL = window.innerWidth - overlay.offsetWidth - 4
+              const mxT = window.innerHeight - overlay.offsetHeight - 4
+              overlay.style.left = Math.max(4, Math.min(_sl + dx, mxL)) + 'px'
+              overlay.style.top = Math.max(4, Math.min(_st + dy, mxT)) + 'px'
+            })
+
+            dh.addEventListener('pointerup', (e: PointerEvent) => {
+              if (!_dragging || e.pointerId !== _pid) return
+              _dragging = false
+              try { dh.releasePointerCapture(e.pointerId) } catch (_) { }
+              dh.style.cursor = 'grab'
+            })
+
+            dh.addEventListener('lostpointercapture', () => {
+              _dragging = false
+              dh.style.cursor = 'grab'
+            })
+          }
+        } catch (_dragErr) { /* drag setup non-fatal */ }
 
         // Countdown timer
         let remaining = TIMEOUT_SECS
@@ -2493,21 +3903,22 @@ async function injectPauseOverlay(
           const card = document.getElementById('autotest-pause-card') as HTMLElement | null
           if (card) { card.style.opacity = '0.6'; card.style.pointerEvents = 'none' }
           // Check hidden checkbox for DOM poll detection
-          const chkId = action === 'resume' ? 'autotest-resume-chk' : 'autotest-skip-chk'
+          const chkId = action === 'resume' ? 'autotest-resume-chk' : action === 'skip' ? 'autotest-skip-chk' : 'autotest-stop-chk'
           const chk = document.getElementById(chkId) as HTMLInputElement | null
           if (chk) chk.checked = true
           // exposeFunction channel
-          try { if (typeof (window as any).__autotestHitlSignal === 'function') { (window as any).__autotestHitlSignal(action) } } catch {}
+          try { if (typeof (window as any).__autotestHitlSignal === 'function') { (window as any).__autotestHitlSignal(action) } } catch { }
           // DOM attribute
           document.body.setAttribute('data-autotest-hitl-action', action)
           // sessionStorage
-          try { sessionStorage.setItem('autotest-hitl-action', action) } catch {}
+          try { sessionStorage.setItem('autotest-hitl-action', action) } catch { }
         }
 
         // Attach JS event handlers as ADDITIONAL channels (may fail in LWS — non-fatal)
         try {
           const resumeBtn = overlay.querySelector('#autotest-resume-btn')
           const skipBtn = overlay.querySelector('#autotest-skip-btn')
+          const stopBtn = overlay.querySelector('#autotest-stop-btn')
           if (resumeBtn) {
             resumeBtn.addEventListener('click', (e) => {
               e.stopPropagation(); e.stopImmediatePropagation()
@@ -2518,6 +3929,12 @@ async function injectPauseOverlay(
             skipBtn.addEventListener('click', (e) => {
               e.stopPropagation(); e.stopImmediatePropagation()
               handleAction('skip', 'autotest-skip-btn')
+            }, { capture: true })
+          }
+          if (stopBtn) {
+            stopBtn.addEventListener('click', (e) => {
+              e.stopPropagation(); e.stopImmediatePropagation()
+              handleAction('stop', 'autotest-stop-btn')
             }, { capture: true })
           }
         } catch { /* LWS may block addEventListener — the <a>+iframe channel handles it */ }
@@ -2556,13 +3973,19 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
   // Clear any stale frame context
   frameRegistry.delete(executionId)
 
-  let browser:        Browser | null        = null
+  let browser: Browser | null = null
   let browserContext: BrowserContext | null = null
-  let page:           Page | null           = null
+  let page: Page | null = null
 
-  const stepResults: ExecutionStepResult[]       = []
+  // ── Browser-closed-by-user flag ───────────────────────────────────────────
+  // When the user closes the testing browser window manually, Playwright fires
+  // the 'close' event on the Page. We capture this and check it at the start
+  // of each step so the execution loop exits cleanly instead of re-opening.
+  let userClosedBrowser = false
+
+  const stepResults: ExecutionStepResult[] = []
   let finalStatus: 'PASSED' | 'FAILED' | 'ERROR' = 'PASSED'
-  let errorMessage: string | null                 = null
+  let errorMessage: string | null = null
 
   const execScreenDir = path.join(SCREENSHOTS_DIR, executionId)
   fs.mkdirSync(execScreenDir, { recursive: true })
@@ -2576,7 +3999,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     )
     if (isInteractive) log.info(`[EXEC] 🖥️  Interactive (headed) browser launched for ${executionId}`)
 
-    const traceFile  = path.join(TRACES_DIR, `${executionId}.zip`)
+    const traceFile = path.join(TRACES_DIR, `${executionId}.zip`)
     const useSession = context.useSessionReuse !== false && !!projectId
     const hasSession = useSession && sessionExists(projectId)
 
@@ -2594,8 +4017,8 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
       log.info(`[SESSION] Loading stored session for project ${projectId}`)
       try {
         browserContext = await browser.newContext({
-          storageState:      getSessionPath(projectId),
-          viewport:          { width: 1280, height: 800 },
+          storageState: getSessionPath(projectId),
+          viewport: { width: 1280, height: 800 },
           ignoreHTTPSErrors: true,
         })
         await browserContext.tracing.start({ screenshots: true, snapshots: true })
@@ -2615,6 +4038,28 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     // No page.evaluate needed here — border will show on the first real page load.
     if (isInteractive && browserContext) {
       await setupBrowserStateBorder(browserContext)
+    }
+
+    // ── Wire up browser/page close detection ─────────────────────────────
+    // If user closes the testing browser window, set userClosedBrowser = true.
+    // The step loop checks this flag before each step and exits immediately.
+    if (isInteractive && page) {
+      page.on('close', () => {
+        log.warn(`[EXEC] ⚠️  Testing browser window CLOSED by user — aborting execution ${executionId}`)
+        userClosedBrowser = true
+      })
+    }
+    if (isInteractive && browserContext) {
+      browserContext.on('page', (newPage) => {
+        if (userClosedBrowser) return  // already flagged
+        newPage.on('close', () => {
+          const allPages = browserContext?.pages() ?? []
+          if (allPages.length === 0) {
+            log.warn(`[EXEC] ⚠️  All browser pages closed — aborting execution ${executionId}`)
+            userClosedBrowser = true
+          }
+        })
+      })
     }
 
     // ── Login / session-validation phase ─────────────────────────
@@ -2644,19 +4089,56 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     }
 
     // ── Step execution phase ──────────────────────────────────────
-    let firstFailedLocator:     string | null = null
+    let firstFailedLocator: string | null = null
     let failedScreenshotBase64: string | null = null
-    let failedHtmlSnippet:      string | null = null
+    let failedHtmlSnippet: string | null = null
+
+    // ── SF Lightning Engine: Load metadata + install watchers ────
+    if (context.projectCategory === 'salesforce' && projectId) {
+      // Load MCP field metadata from metadata_normalized table
+      try {
+        const metaMap = await loadFieldMetadata(projectId)
+        if (Object.keys(metaMap).length > 0) {
+          sfMetadataMapRegistry.set(executionId, metaMap)
+        }
+      } catch (metaErr) {
+        log.warn({ metaErr }, '[SF-ENGINE] Failed to load field metadata (non-fatal)')
+      }
+
+      // Install persistent error modal auto-dismisser
+      if (page) {
+        await installErrorModalWatcher(page).catch(() => { /* non-fatal */ })
+      }
+    }
 
     // ── HITL: Mutable resolve reference for signal channels ────
-    let hitlSettleFn: ((action: 'resume' | 'skip') => void) | null = null
+    let hitlSettleFn: ((action: 'resume' | 'skip' | 'stop') => void) | null = null
     let hitlRouteRegistered = false
     let hitlFnExposed = false
 
     for (let i = 0; i < context.steps.length; i++) {
-      const step       = context.steps[i]
+      // ── Check if user closed the testing window ──────────────────────
+      if (userClosedBrowser) {
+        log.warn(`[EXEC] Browser closed by user — stopping at step ${i + 1}/${context.steps.length}`)
+        finalStatus = 'FAILED'
+        errorMessage = 'Test aborted: user closed the testing browser window'
+        stepResults.push({
+          step: i + 1,
+          action: 'SYSTEM',
+          target: null,
+          value: null,
+          status: 'failed',
+          message: 'Testing browser window was closed by user',
+          duration_ms: 0,
+          screenshot_path: null,
+          error: 'Browser closed by user',
+        })
+        break
+      }
+
+      const step = context.steps[i]
       const isLastStep = i === context.steps.length - 1
-      const result     = await executeStep(
+      const result = await executeStep(
         page!, step, i, isLastStep, execScreenDir, executionId,
         browserContext ?? undefined,
         projectId,
@@ -2693,11 +4175,11 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                   const url = new URL(route.request().url())
                   const action = url.searchParams.get('action')
                   log.info(`[HITL] ⚡ CDP route intercepted: action="${action}"`)
-                  if (hitlSettleFn && (action === 'resume' || action === 'skip')) {
-                    hitlSettleFn(action as 'resume' | 'skip')
+                  if (hitlSettleFn && (action === 'resume' || action === 'skip' || action === 'stop')) {
+                    hitlSettleFn(action as 'resume' | 'skip' | 'stop')
                   }
                   await route.fulfill({ status: 200, contentType: 'text/plain', body: 'ok' })
-                } catch { await route.abort().catch(() => {}) }
+                } catch { await route.abort().catch(() => { }) }
               })
               hitlRouteRegistered = true
               log.info('[HITL] ✅ CDP route registered for /autotest-hitl-signal')
@@ -2711,8 +4193,8 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             try {
               await page.exposeFunction('__autotestHitlSignal', (action: string) => {
                 log.info(`[HITL] ⚡ exposeFunction channel fired: action="${action}"`)
-                if (hitlSettleFn && (action === 'resume' || action === 'skip')) {
-                  hitlSettleFn(action as 'resume' | 'skip')
+                if (hitlSettleFn && (action === 'resume' || action === 'skip' || action === 'stop')) {
+                  hitlSettleFn(action as 'resume' | 'skip' | 'stop')
                 }
               })
               hitlFnExposed = true
@@ -2753,24 +4235,24 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           }
           page.on('load', reInjectOverlay)
 
-          let pauseAction: 'resume' | 'skip' = 'resume'
+          let pauseAction: 'resume' | 'skip' | 'stop' = 'resume'
           try {
             // Quad-channel HITL gate — whichever fires first wins:
             //   Channel 0 (iframe link) — <a href> targeting hidden iframe, intercepted by page.route(). Pure HTML, no JS needed.
             //   Channel 1 (exposeFunc)  — window.__autotestHitlSignal() calls Node.js directly. Survives navigation.
             //   Channel 2 (DOM poll)    — polls checkbox state + data-autotest-hitl-action every 500ms.
             //   Channel 3 (dashboard)   — waitForResume() resolves on POST /api/v1/test-runs/:id/resume.
-            pauseAction = await new Promise<'resume' | 'skip'>((resolve, reject) => {
+            pauseAction = await new Promise<'resume' | 'skip' | 'stop'>((resolve, reject) => {
               const deadline = Date.now() + pauseTimeoutMs
               let settled = false
 
-              function settle(action: 'resume' | 'skip') {
+              function settle(action: 'resume' | 'skip' | 'stop') {
                 if (settled) return
                 settled = true
                 hitlPauseSettled = true
                 hitlSettleFn = null
                 clearInterval(pollInterval)
-                try { page?.off('load', reInjectOverlay) } catch {}
+                try { page?.off('load', reInjectOverlay) } catch { }
                 resolve(action)
               }
 
@@ -2795,19 +4277,21 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                     // Check hidden checkboxes (set by JS handlers)
                     const resumeChk = document.getElementById('autotest-resume-chk') as HTMLInputElement | null
                     const skipChk = document.getElementById('autotest-skip-chk') as HTMLInputElement | null
+                    const stopChk = document.getElementById('autotest-stop-chk') as HTMLInputElement | null
                     if (resumeChk?.checked) return 'resume'
                     if (skipChk?.checked) return 'skip'
+                    if (stopChk?.checked) return 'stop'
                     // Check DOM attribute + sessionStorage
                     const a = document.body.getAttribute('data-autotest-hitl-action')
-                              || sessionStorage.getItem('autotest-hitl-action')
+                      || sessionStorage.getItem('autotest-hitl-action')
                     if (a) {
                       document.body.removeAttribute('data-autotest-hitl-action')
-                      try { sessionStorage.removeItem('autotest-hitl-action') } catch {}
+                      try { sessionStorage.removeItem('autotest-hitl-action') } catch { }
                     }
                     return a
                   })
                   consecutivePollErrors = 0
-                  if (action === 'resume' || action === 'skip') settle(action)
+                  if (action === 'resume' || action === 'skip' || action === 'stop') settle(action as 'resume' | 'skip' | 'stop')
                 } catch {
                   consecutivePollErrors++
                   if (consecutivePollErrors >= MAX_POLL_ERRORS) {
@@ -2819,17 +4303,46 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             })
 
             resolvePause(executionId, pauseAction)
-            await prisma.test_runs.update({ where: { id: executionId }, data: { status: 'running' } }).catch(() => {})
+            if (pauseAction !== 'stop') {
+              await prisma.test_runs.update({ where: { id: executionId }, data: { status: 'running' } }).catch(() => { })
+            }
             log.info(`[HITL] User chose: "${pauseAction}" for step ${i + 1}`)
           } catch {
             log.warn(`[HITL] Pause timed out for step ${i + 1} — marking as failed and stopping`)
             hitlPauseSettled = true
             hitlSettleFn = null
-            try { page.off('load', reInjectOverlay) } catch {}
+            try { page.off('load', reInjectOverlay) } catch { }
             await removePauseOverlay(page)
             await setBrowserState(page, 'failed')
             finalStatus = 'FAILED'
             firstFailedLocator = step.target ?? ''
+            break
+          }
+
+          // ── Handle stop: close browser and abort run ────────────────────
+          if (pauseAction === 'stop') {
+            log.warn(`[HITL] User clicked Stop at step ${i + 1} — aborting run and closing browser`)
+            hitlPauseSettled = true
+            hitlSettleFn = null
+            try { page.off('load', reInjectOverlay) } catch { }
+            // Mark result as stopped
+            stepResults[stepResults.length - 1] = {
+              ...result, status: 'failed',
+              message: `Step ${i + 1} stopped by user — test aborted`, error: 'User stopped the test',
+            }
+            finalStatus = 'FAILED'
+            errorMessage = 'Test stopped by user'
+            firstFailedLocator = step.target ?? ''
+            // Set failed border, then close browser
+            await setBrowserState(page, 'failed').catch(() => {})
+            await page.waitForTimeout(800).catch(() => {})
+            userClosedBrowser = true  // prevent further steps
+            // Close the browser gracefully
+            try {
+              await browser?.close()
+            } catch (closeErr) {
+              log.warn({ closeErr }, '[HITL] Could not close browser on stop (non-fatal)')
+            }
             break
           }
 
@@ -2838,11 +4351,16 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           await setBrowserState(page, 'running')
 
           if (pauseAction === 'skip') {
+            // A skipped step means the test cannot be fully verified — mark as failed
+            finalStatus = 'FAILED'
+            if (!firstFailedLocator) {
+              firstFailedLocator = step.target ?? ''
+            }
             stepResults[stepResults.length - 1] = {
               ...result, status: 'skipped',
               message: `Step ${i + 1} skipped by user (interactive mode)`, error: null,
             }
-            log.info(`[HITL] Step ${i + 1} skipped — continuing to step ${i + 2}`)
+            log.info(`[HITL] Step ${i + 1} skipped — finalStatus set to FAILED, continuing to step ${i + 2}`)
             continue
           }
 
@@ -2887,25 +4405,25 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     if (isInteractive && page) {
       await setBrowserState(page, finalStatus === 'PASSED' ? 'passed' : 'failed')
       // Wait for the 400ms CSS transition to fully settle before screenshotting
-      await page.waitForTimeout(600).catch(() => {})
+      await page.waitForTimeout(600).catch(() => { })
 
       // ── Capture the authoritative RESULT screenshot with border visible ──
-      const resultStatus   = finalStatus === 'PASSED' ? 'PASSED' : 'FAILED'
-      const resultSsFile   = `result-${resultStatus}-${Date.now()}.png`
+      const resultStatus = finalStatus === 'PASSED' ? 'PASSED' : 'FAILED'
+      const resultSsFile = `result-${resultStatus}-${Date.now()}.png`
       const resultSsAbsPath = path.join(execScreenDir, resultSsFile)
       try {
         await page.screenshot({ path: resultSsAbsPath, fullPage: false })
         // Inject it as the last step so it wins the lastScreenshot pick below
         stepResults.push({
-          step:            stepResults.length + 1,
-          action:          'RESULT_SCREENSHOT',
-          target:          null,
-          value:           null,
-          status:          finalStatus === 'PASSED' ? 'passed' : 'failed',
-          message:         `Final result screenshot — ${resultStatus}`,
-          duration_ms:     0,
+          step: stepResults.length + 1,
+          action: 'RESULT_SCREENSHOT',
+          target: null,
+          value: null,
+          status: finalStatus === 'PASSED' ? 'passed' : 'failed',
+          message: `Final result screenshot — ${resultStatus}`,
+          duration_ms: 0,
           screenshot_path: `/screenshots/${executionId}/${resultSsFile}`,
-          error:           null,
+          error: null,
         })
         log.info(`[EXEC] 📸 Result screenshot captured with ${resultStatus} border: ${resultSsFile}`)
       } catch (ssErr) {
@@ -2913,7 +4431,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
       }
 
       // Brief pause so the user can see the final result color
-      await page.waitForTimeout(2400).catch(() => {})
+      await page.waitForTimeout(2400).catch(() => { })
     }
 
     // ── Stop trace ────────────────────────────────────────────────
@@ -2924,56 +4442,58 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     if (finalStatus === 'FAILED' && firstFailedLocator !== null) {
       await healingQueue.add('heal', {
         executionId,
-        testRunId:        executionId,
+        testRunId: executionId,
         testCaseId,
         projectId,
-        failedLocator:    firstFailedLocator,
+        failedLocator: firstFailedLocator,
         screenshotBase64: failedScreenshotBase64 ?? '',
-        htmlSnippet:      failedHtmlSnippet ?? '',
-        logs:             stepResults as unknown as Record<string, unknown>[],
-        steps:            context.steps,
+        htmlSnippet: failedHtmlSnippet ?? '',
+        logs: stepResults as unknown as Record<string, unknown>[],
+        steps: context.steps,
       }, { attempts: 2, backoff: { type: 'exponential', delay: 3000 } })
       log.info(`[EXEC] Healing job enqueued for ${executionId}`)
     }
 
   } catch (err: unknown) {
     log.error({ err }, `[EXEC] Fatal error in execution ${executionId}`)
-    finalStatus  = 'ERROR'
+    finalStatus = 'ERROR'
     errorMessage = err instanceof Error ? err.message : String(err)
     stepResults.push({
-      step:            stepResults.length + 1,
-      action:          'SYSTEM',
-      target:          null,
-      value:           null,
-      status:          'failed',
-      message:         `Fatal execution error: ${errorMessage}`,
-      duration_ms:     Date.now() - startTime,
+      step: stepResults.length + 1,
+      action: 'SYSTEM',
+      target: null,
+      value: null,
+      status: 'failed',
+      message: `Fatal execution error: ${errorMessage}`,
+      duration_ms: Date.now() - startTime,
       screenshot_path: null,
-      error:           errorMessage,
+      error: errorMessage,
     })
   } finally {
     frameRegistry.delete(executionId)
+    sfFieldMapRegistry.delete(executionId)
+    sfMetadataMapRegistry.delete(executionId)
     clearPause(executionId)  // clean up HITL pause gate if still pending
     try { await browserContext?.close() } catch { /* ignore */ }
-    try { await browser?.close()        } catch { /* ignore */ }
+    try { await browser?.close() } catch { /* ignore */ }
   }
 
   // ── Write final result to test_runs ──────────────────────────
-  const durationMs     = Date.now() - startTime
+  const durationMs = Date.now() - startTime
   const lastScreenshot = stepResults.slice().reverse().find((s) => s.screenshot_path)?.screenshot_path ?? null
-  const testRunStatus  =
+  const testRunStatus =
     finalStatus === 'PASSED' ? 'passed'
-    : finalStatus === 'FAILED' ? 'failed'
-    : 'error'
+      : finalStatus === 'FAILED' ? 'failed'
+        : 'error'
 
   try {
     await prisma.test_runs.update({
       where: { id: executionId },
       data: {
-        status:          testRunStatus,
-        result:          testRunStatus,
-        logs:            stepResults as unknown as object[],
-        duration:        durationMs / 1000,
+        status: testRunStatus,
+        result: testRunStatus,
+        logs: stepResults as unknown as object[],
+        duration: durationMs / 1000,
         screenshot_path: lastScreenshot,
       },
     })
@@ -3011,9 +4531,9 @@ const worker = new Worker<ExecutionJob>(
   },
 )
 
-worker.on('completed', (job)      => log.info(`[EXEC] Job ${job.id} completed`))
-worker.on('failed',    (job, err) => log.error({ err }, `[EXEC] Job ${job?.id} failed: ${err.message}`))
-worker.on('error',     (err)      => log.error({ err }, '[EXEC] Worker error'))
+worker.on('completed', (job) => log.info(`[EXEC] Job ${job.id} completed`))
+worker.on('failed', (job, err) => log.error({ err }, `[EXEC] Job ${job?.id} failed: ${err.message}`))
+worker.on('error', (err) => log.error({ err }, '[EXEC] Worker error'))
 
 log.info('🔧 Execution worker started — Playwright headless runner active (SF Lightning full support)')
 

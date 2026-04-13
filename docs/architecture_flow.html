@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AutoTest AI — Architecture Overview</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #07090f;
+      --surface:   #0e1118;
+      --card:      #131720;
+      --border:    rgba(255,255,255,0.07);
+      --accent1:   #6366f1;   /* indigo  */
+      --accent2:   #22d3ee;   /* cyan    */
+      --accent3:   #f59e0b;   /* amber   */
+      --accent4:   #10b981;   /* emerald */
+      --accent5:   #ec4899;   /* pink    */
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── STAR / GRID BACKGROUND ───────────────── */
+    body::before {
+      content:'';
+      position:fixed;inset:0;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% 10%,  rgba(99,102,241,.12) 0%, transparent 60%),
+        radial-gradient(ellipse 70% 60% at 80% 80%,  rgba(34,211,238,.08) 0%, transparent 60%);
+      pointer-events:none;z-index:0;
+    }
+    body::after {
+      content:'';
+      position:fixed;inset:0;
+      background-image:
+        linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 60px 60px;
+      pointer-events:none;z-index:0;
+    }
+
+    /* ── HEADER ──────────────────────────────── */
+    header {
+      position:relative;z-index:10;
+      text-align:center;
+      padding: 56px 24px 36px;
+    }
+    .badge {
+      display:inline-block;
+      background: linear-gradient(135deg, rgba(99,102,241,.25), rgba(34,211,238,.15));
+      border: 1px solid rgba(99,102,241,.4);
+      color: var(--accent2);
+      font-size: .7rem;
+      font-weight: 700;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      padding: 6px 18px;
+      border-radius: 999px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      font-size: clamp(2rem, 5vw, 3.6rem);
+      font-weight: 900;
+      line-height: 1.1;
+      background: linear-gradient(135deg, #fff 30%, var(--accent2) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 16px;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 1.05rem;
+      max-width: 580px;
+      margin: 0 auto;
+      line-height: 1.7;
+    }
+
+    /* ── TECH PILLS ─────────────────────────── */
+    .tech-row {
+      display:flex;flex-wrap:wrap;gap:10px;justify-content:center;
+      margin: 28px auto 0; max-width:720px;
+    }
+    .tech-pill {
+      display:flex;align-items:center;gap:8px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 7px 16px;
+      font-size:.78rem;font-weight:600;
+      transition: transform .2s, border-color .2s;
+      cursor:default;
+    }
+    .tech-pill:hover { transform:translateY(-2px); }
+    .tech-pill .dot { width:8px;height:8px;border-radius:50%; }
+
+    /* ── SECTION HEADINGS ─────────────────── */
+    .section {
+      position:relative;z-index:10;
+      max-width:1200px;margin:0 auto;
+      padding: 20px 24px 48px;
+    }
+    .section-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 28px;
+      display:flex;align-items:center;gap:12px;
+    }
+    .section-title::before {
+      content:'';flex:1;height:1px;background:var(--border);
+    }
+    .section-title::after {
+      content:'';flex:1;height:1px;background:var(--border);
+    }
+
+    /* ── FLOW DIAGRAM ─────────────────────── */
+    .flow-wrapper {
+      position:relative;z-index:10;
+      max-width:1200px;margin:0 auto;
+      padding: 0 24px 60px;
+    }
+
+    /* ── ROWS ─────────────────────────────── */
+    .flow-row {
+      display:flex;align-items:stretch;gap:0;
+      justify-content:center;margin-bottom:0;
+    }
+
+    /* ── NODES ─────────────────────────────── */
+    .node {
+      position:relative;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px 20px 20px;
+      flex:1;
+      min-width:160px;max-width:220px;
+      transition: transform .25s, box-shadow .25s, border-color .25s;
+      cursor:default;
+      text-align:center;
+    }
+    .node:hover {
+      transform:translateY(-6px);
+      box-shadow: 0 20px 60px rgba(0,0,0,.5);
+    }
+    /* accent top bar */
+    .node::before {
+      content:'';
+      position:absolute;top:0;left:16px;right:16px;height:3px;
+      border-radius:0 0 4px 4px;
+      background: var(--node-color, var(--accent1));
+    }
+    .node.glow:hover { box-shadow: 0 0 40px var(--node-color, var(--accent1)), 0 20px 60px rgba(0,0,0,.5); }
+    .node-icon {
+      font-size: 2rem;margin-bottom:10px;
+      display:block;
+    }
+    .node-title {
+      font-size:.85rem;font-weight:700;
+      margin-bottom:6px;
+      color:#fff;
+    }
+    .node-sub {
+      font-size:.7rem;color:var(--muted);line-height:1.5;
+    }
+    .node-tag {
+      display:inline-block;margin-top:10px;
+      background:rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.1);
+      border-radius:999px;
+      font-size:.62rem;font-weight:700;
+      padding:3px 10px;letter-spacing:.06em;
+      color: var(--node-color, var(--accent1));
+    }
+
+    /* ── CONNECTORS ─────────────────────────── */
+    .connector-h {
+      display:flex;align-items:center;
+      padding: 0 4px;flex-shrink:0;width:40px;
+    }
+    .connector-h svg { width:100%;height:24px; }
+
+    .connector-v {
+      display:flex;justify-content:center;
+      height:40px;align-items:stretch;
+    }
+    .connector-v svg { height:100%;width:40px; }
+
+    /* ── LAYER BANDS ──────────────────────── */
+    .layer-band {
+      background: rgba(255,255,255,.02);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px 20px;
+      margin-bottom: 10px;
+    }
+    .layer-label {
+      font-size:.68rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+      color: var(--layer-color, var(--muted));
+      margin-bottom:20px;text-align:center;
+    }
+
+    /* ── FEATURE CARDS ──────────────────── */
+    .feature-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
+      gap:20px;
+      position:relative;z-index:10;
+      max-width:1200px;margin:0 auto;
+      padding:0 24px 60px;
+    }
+    .feature-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px 24px;
+      transition: transform .25s, box-shadow .25s, border-color .25s;
+    }
+    .feature-card:hover {
+      transform:translateY(-4px);
+      box-shadow: 0 16px 50px rgba(0,0,0,.4);
+      border-color: rgba(255,255,255,.14);
+    }
+    .fc-header {
+      display:flex;align-items:center;gap:14px;margin-bottom:14px;
+    }
+    .fc-icon {
+      width:44px;height:44px;border-radius:12px;
+      display:flex;align-items:center;justify-content:center;
+      font-size:1.3rem;flex-shrink:0;
+    }
+    .fc-title { font-size:.95rem;font-weight:700;color:#fff; }
+    .fc-subtitle { font-size:.72rem;color:var(--muted);margin-top:2px; }
+    .fc-body { font-size:.78rem;color:var(--muted);line-height:1.65; }
+    .fc-tags { display:flex;flex-wrap:wrap;gap:6px;margin-top:14px; }
+    .fc-tag {
+      font-size:.63rem;font-weight:600;letter-spacing:.05em;
+      padding:4px 10px;border-radius:999px;
+      border:1px solid;
+    }
+
+    /* ── FLOW DETAIL ─────────────────────── */
+    .flow-detail {
+      position:relative;z-index:10;max-width:1200px;margin:0 auto;padding:0 24px 60px;
+    }
+    .pipeline-row {
+      display:flex;align-items:center;gap:0;overflow-x:auto;
+      padding-bottom:8px;
+    }
+    .pipe-step {
+      display:flex;flex-direction:column;align-items:center;
+      min-width:130px;flex:1;
+      text-align:center;
+    }
+    .pipe-bubble {
+      width:64px;height:64px;border-radius:50%;
+      display:flex;align-items:center;justify-content:center;
+      font-size:1.5rem;
+      border:2px solid rgba(255,255,255,.12);
+      background: var(--card);
+      position:relative;z-index:1;
+      transition: transform .2s;
+    }
+    .pipe-step:hover .pipe-bubble { transform:scale(1.12); }
+    .pipe-label { font-size:.72rem;font-weight:600;margin-top:10px;color:#fff; }
+    .pipe-sublabel { font-size:.62rem;color:var(--muted);margin-top:3px; }
+    .pipe-arrow {
+      flex-shrink:0;padding:0 4px;display:flex;align-items:center;
+    }
+    .pipe-arrow svg { width:32px;height:20px; }
+
+    /* ── STATS BAR ──────────────────────── */
+    .stats-bar {
+      position:relative;z-index:10;max-width:900px;margin:0 auto 60px;
+      padding:0 24px;
+      display:flex;flex-wrap:wrap;gap:16px;justify-content:center;
+    }
+    .stat-card {
+      background:var(--card);border:1px solid var(--border);
+      border-radius:14px;padding:20px 28px;
+      text-align:center;min-width:140px;flex:1;
+    }
+    .stat-number { font-size:2rem;font-weight:800; }
+    .stat-label  { font-size:.72rem;color:var(--muted);margin-top:4px; }
+
+    /* ── SCOPE SECTION ──────────────────── */
+    .scope-wrapper {
+      position:relative;z-index:10;
+      max-width:1200px;margin:0 auto;
+      padding:0 24px 60px;
+      display:grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap:20px;
+    }
+    .scope-card {
+      border-radius:20px;
+      padding:28px 24px;
+      border:1px solid;
+      position:relative;
+      overflow:hidden;
+      transition:transform .25s,box-shadow .25s;
+    }
+    .scope-card:hover { transform:translateY(-5px); }
+    .scope-card::before {
+      content:'';
+      position:absolute;top:0;left:0;right:0;height:4px;
+    }
+    .scope-card.overall {
+      background:rgba(99,102,241,.06);
+      border-color:rgba(99,102,241,.25);
+    }
+    .scope-card.overall::before { background:linear-gradient(90deg,#6366f1,#a78bfa); }
+    .scope-card.current {
+      background:rgba(16,185,129,.07);
+      border-color:rgba(16,185,129,.35);
+      box-shadow:0 0 30px rgba(16,185,129,.1);
+    }
+    .scope-card.current::before { background:linear-gradient(90deg,#10b981,#22d3ee); }
+    .scope-card.in-progress {
+      background:rgba(59,130,246,.07);
+      border-color:rgba(59,130,246,.35);
+    }
+    .scope-card.in-progress::before { background:linear-gradient(90deg,#3b82f6,#8b5cf6); }
+    .scope-card.future {
+      background:rgba(245,158,11,.05);
+      border-color:rgba(245,158,11,.2);
+    }
+    .scope-card.future::before { background:linear-gradient(90deg,#f59e0b,#fb923c); }
+    .scope-heading {
+      display:flex;align-items:center;gap:10px;
+      margin-bottom:18px;
+    }
+    .scope-badge {
+      font-size:.6rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+      padding:4px 12px;border-radius:999px;
+    }
+    .scope-badge.overall { background:rgba(99,102,241,.2);color:#a78bfa; }
+    .scope-badge.current { background:rgba(16,185,129,.2);color:#10b981; }
+    .scope-badge.in-progress { background:rgba(59,130,246,.2);color:#60a5fa; }
+    .scope-badge.future  { background:rgba(245,158,11,.2);color:#f59e0b; }
+    .scope-title {
+      font-size:1rem;font-weight:700;color:#fff;
+    }
+    .scope-items {
+      list-style:none;
+      display:flex;flex-direction:column;gap:10px;
+    }
+    .scope-item {
+      display:flex;align-items:flex-start;gap:12px;
+      background:rgba(255,255,255,.04);
+      border:1px solid rgba(255,255,255,.06);
+      border-radius:12px;
+      padding:12px 14px;
+    }
+    .scope-item-icon { font-size:1.2rem;flex-shrink:0; }
+    .scope-item-name { font-size:.82rem;font-weight:600;color:#e2e8f0; }
+    .scope-item-sub  { font-size:.68rem;color:var(--muted);margin-top:2px; }
+    .scope-item.active {
+      background:rgba(16,185,129,.1);
+      border-color:rgba(16,185,129,.3);
+    }
+    .scope-item.coming {
+      opacity:.6;
+    }
+    .coming-tag {
+      display:inline-block;margin-top:4px;
+      font-size:.6rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+      color:#f59e0b;background:rgba(245,158,11,.15);
+      border:1px solid rgba(245,158,11,.3);
+      border-radius:999px;padding:2px 8px;
+    }
+    @media (max-width:800px) {
+      .scope-wrapper { grid-template-columns:1fr; }
+    }
+
+    /* ── ARROW SVG helpers ─────────────── */
+    .arr { stroke:var(--muted);stroke-width:1.5;fill:none; }
+    .arr-head { fill:var(--muted); }
+
+    /* ── FOOTER ─────────────────────────── */
+    footer {
+      position:relative;z-index:10;
+      text-align:center;padding:32px 24px;
+      border-top:1px solid var(--border);
+      color:var(--muted);font-size:.78rem;
+    }
+
+    /* ── ANIMATION ─────────────────────── */
+    @keyframes fadeUp {
+      from { opacity:0;transform:translateY(24px); }
+      to   { opacity:1;transform:translateY(0); }
+    }
+    .anim { animation: fadeUp .6s ease both; }
+    .anim-d1 { animation-delay:.1s; }
+    .anim-d2 { animation-delay:.2s; }
+    .anim-d3 { animation-delay:.3s; }
+    .anim-d4 { animation-delay:.4s; }
+    .anim-d5 { animation-delay:.5s; }
+    .anim-d6 { animation-delay:.6s; }
+
+    @keyframes pulse-ring {
+      0%   { box-shadow: 0 0 0 0 rgba(99,102,241,.5); }
+      70%  { box-shadow: 0 0 0 12px rgba(99,102,241,0); }
+      100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+    }
+    .pulse { animation: pulse-ring 2s ease infinite; }
+
+    /* ── RESPONSIVE ─────────────────────── */
+    @media (max-width:700px) {
+      .flow-row { flex-direction:column;align-items:center; }
+      .connector-h { display:none; }
+      .pipeline-row { flex-direction:column;align-items:center; }
+      .pipe-arrow { transform:rotate(90deg); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══════════ HEADER ══════════ -->
+<header class="anim">
+  <div class="badge">Director Overview · April 2026</div>
+  <h1>AutoTest AI<br>Architecture Overview</h1>
+  <p class="subtitle">An intelligent, no-code test automation platform powered by AI, RAG, MCP, and vector search — built for Salesforce Lightning and modern web apps.</p>
+  <div class="tech-row">
+    <div class="tech-pill" style="--c:#6366f1"><span class="dot" style="background:#6366f1"></span>Next.js 15 + React 19</div>
+    <div class="tech-pill" style="--c:#22d3ee"><span class="dot" style="background:#22d3ee"></span>Node.js / Fastify</div>
+    <div class="tech-pill" style="--c:#f59e0b"><span class="dot" style="background:#f59e0b"></span>TypeScript / Prisma</div>
+    <div class="tech-pill" style="--c:#10b981"><span class="dot" style="background:#10b981"></span>PostgreSQL 16</div>
+    <div class="tech-pill" style="--c:#ec4899"><span class="dot" style="background:#ec4899"></span>Redis + BullMQ</div>
+    <div class="tech-pill" style="--c:#a78bfa"><span class="dot" style="background:#a78bfa"></span>Playwright</div>
+    <div class="tech-pill" style="--c:#fb923c"><span class="dot" style="background:#fb923c"></span>OpenAI + Claude</div>
+  </div>
+</header>
+
+<!-- ══════════ STATS BAR ══════════ -->
+<div class="stats-bar anim anim-d1">
+  <div class="stat-card">
+    <div class="stat-number" style="color:#6366f1">3</div>
+    <div class="stat-label">Core AI Techniques<br>(RAG · MCP · Self-Heal)</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-number" style="color:#22d3ee">2</div>
+    <div class="stat-label">LLM Providers<br>(OpenAI · Anthropic)</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-number" style="color:#10b981">5</div>
+    <div class="stat-label">Metadata Synchronization<br>(Extract→Embed→Retrieve)</div>
+  </div>
+</div>
+
+<!-- ══════════ SECTION : SCOPE ══════════ -->
+<div class="section anim anim-d2" style="padding-bottom:20px">
+  <div class="section-title">Application Scope</div>
+</div>
+
+<div class="scope-wrapper anim anim-d2">
+
+  <!-- OVERALL SCOPE -->
+  <div class="scope-card overall">
+    <div class="scope-heading">
+      <span class="scope-badge overall">Overall Scope</span>
+    </div>
+    <div class="scope-title" style="margin-bottom:16px">Platforms AutoTest AI Can Support</div>
+    <ul class="scope-items">
+      <li class="scope-item">
+        <span class="scope-item-icon">🌐</span>
+        <div>
+          <div class="scope-item-name">Web Application</div>
+          <div class="scope-item-sub">Any modern web app</div>
+        </div>
+      </li>
+      <li class="scope-item">
+        <span class="scope-item-icon">📱</span>
+        <div>
+          <div class="scope-item-name">Mobile App</div>
+          <div class="scope-item-sub">iOS / Android</div>
+        </div>
+      </li>
+      <li class="scope-item">
+        <span class="scope-item-icon">🔌</span>
+        <div>
+          <div class="scope-item-name">API Service</div>
+          <div class="scope-item-sub">REST / GraphQL</div>
+        </div>
+      </li>
+      <li class="scope-item">
+        <span class="scope-item-icon">☁️</span>
+        <div>
+          <div class="scope-item-name">Salesforce</div>
+          <div class="scope-item-sub">SF Org + Metadata</div>
+        </div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- CURRENT SCOPE -->
+  <div class="scope-card current">
+    <div class="scope-heading">
+      <span class="scope-badge current">✅ Current Scope</span>
+    </div>
+    <div class="scope-title" style="margin-bottom:16px">Fully Implemented &amp; Live</div>
+    <ul class="scope-items">
+      <li class="scope-item active">
+        <span class="scope-item-icon">☁️</span>
+        <div>
+          <div class="scope-item-name">Salesforce</div>
+          <div class="scope-item-sub">SF Org + Metadata — MCP connected, RAG-powered test generation, Playwright execution, Self-Healing &amp; HITL</div>
+        </div>
+      </li>
+    </ul>
+    <div style="margin-top:20px;padding:14px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:12px;font-size:.72rem;color:var(--muted);line-height:1.6">
+      🟢 <strong style="color:#10b981">End-to-end pipeline live:</strong> Metadata Sync → Vector Embeddings → RAG → LLM Test Generation → Playwright Execution → HITL → Self-Healing
+    </div>
+  </div>
+
+  <!-- IN PROGRESS -->
+  <div class="scope-card in-progress">
+    <div class="scope-heading">
+      <span class="scope-badge in-progress">🔄 In Progress</span>
+    </div>
+    <div class="scope-title" style="margin-bottom:16px">Currently Building</div>
+    <ul class="scope-items">
+      <li class="scope-item coming">
+        <span class="scope-item-icon">🌐</span>
+        <div>
+          <div class="scope-item-name">Web Application</div>
+          <div class="scope-item-sub">Playwright-based site crawler for auto-metadata extraction &amp; test generation</div>
+          <span class="coming-tag" style="color:#60a5fa;background:rgba(59,130,246,.15);border-color:rgba(59,130,246,.3);">In Progress</span>
+        </div>
+      </li>
+    </ul>
+  </div>
+
+  <!-- FUTURE SCOPE -->
+  <div class="scope-card future">
+    <div class="scope-heading">
+      <span class="scope-badge future">🔭 Future Scope</span>
+    </div>
+    <div class="scope-title" style="margin-bottom:16px">On the Roadmap</div>
+    <ul class="scope-items">
+      <li class="scope-item coming">
+        <span class="scope-item-icon">📱</span>
+        <div>
+          <div class="scope-item-name">Mobile App</div>
+          <div class="scope-item-sub">iOS / Android via Appium integration</div>
+          <span class="coming-tag">Roadmap</span>
+        </div>
+      </li>
+      <li class="scope-item coming">
+        <span class="scope-item-icon">🔌</span>
+        <div>
+          <div class="scope-item-name">API Service</div>
+          <div class="scope-item-sub">REST / GraphQL contract testing &amp; AI-generated API test suites</div>
+          <span class="coming-tag">Roadmap</span>
+        </div>
+      </li>
+    </ul>
+  </div>
+
+</div><!-- /scope-wrapper -->
+
+<!-- ══════════ SECTION : SYSTEM LAYERS ══════════ -->
+<div class="section anim anim-d2">
+  <div class="section-title">System Layers</div>
+</div>
+
+<div class="flow-wrapper anim anim-d2">
+
+  <!-- ROW 1 : User & Frontend -->
+  <div class="layer-band" style="--layer-color:#6366f1;">
+    <div class="layer-label" style="color:#6366f1">① Presentation Layer — Next.js 15 Frontend</div>
+    <div class="flow-row">
+
+      <div class="node glow" style="--node-color:#6366f1">
+        <span class="node-icon">🧑‍💻</span>
+        <div class="node-title">Test Manager / QA</div>
+        <div class="node-sub">Logs in, creates projects, writes test descriptions in plain English</div>
+        <span class="node-tag">USER</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24" xmlns="http://www.w3.org/2000/svg">
+          <line x1="0" y1="12" x2="30" y2="12" class="arr"/>
+          <polygon points="30,8 40,12 30,16" class="arr-head"/>
+        </svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#6366f1">
+        <span class="node-icon">🖥️</span>
+        <div class="node-title">Dashboard UI</div>
+        <div class="node-sub">Projects · Test Cases · Execution · Reports · Integrations</div>
+        <span class="node-tag">NEXT.JS 15</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#6366f1">
+        <span class="node-icon">📝</span>
+        <div class="node-title">Test Case Editor</div>
+        <div class="node-sub">Readable View · Step Editor · AI Generate button · HITL overlay</div>
+        <span class="node-tag">NO-CODE</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#6366f1">
+        <span class="node-icon">🔴</span>
+        <div class="node-title">Live Execution View</div>
+        <div class="node-sub">Real-time step logs · Pass / Fail badges · Pause &amp; Stop controls</div>
+        <span class="node-tag">REAL-TIME</span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Vertical connector -->
+  <div class="connector-v">
+    <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" style="margin:auto">
+      <line x1="20" y1="0" x2="20" y2="30" class="arr"/>
+      <polygon points="16,28 20,40 24,28" class="arr-head"/>
+    </svg>
+  </div>
+
+  <!-- ROW 2 : API Gateway -->
+  <div class="layer-band" style="--layer-color:#22d3ee;">
+    <div class="layer-label" style="color:#22d3ee">② API Gateway — Node.js / Fastify (port 4000)</div>
+    <div class="flow-row">
+
+      <div class="node glow" style="--node-color:#22d3ee">
+        <span class="node-icon">🔐</span>
+        <div class="node-title">Auth Module</div>
+        <div class="node-sub">JWT login · sign-up · session management</div>
+        <span class="node-tag">JWT</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#22d3ee">
+        <span class="node-icon">🗂️</span>
+        <div class="node-title">Project &amp; Test API</div>
+        <div class="node-sub">CRUD for projects · test cases · environments</div>
+        <span class="node-tag">FASTIFY</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow pulse" style="--node-color:#22d3ee">
+        <span class="node-icon">⚙️</span>
+        <div class="node-title">Test Generation API</div>
+        <div class="node-sub">Receives description → triggers RAG → calls LLM → returns steps</div>
+        <span class="node-tag">RAG-POWERED</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#22d3ee">
+        <span class="node-icon">▶️</span>
+        <div class="node-title">Execution API</div>
+        <div class="node-sub">Enqueues runs · streams logs via SSE · handles HITL pause gate</div>
+        <span class="node-tag">BULLMQ</span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Vertical connector -->
+  <div class="connector-v">
+    <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" style="margin:auto">
+      <line x1="20" y1="0" x2="20" y2="30" class="arr"/>
+      <polygon points="16,28 20,40 24,28" class="arr-head"/>
+    </svg>
+  </div>
+
+  <!-- ROW 3 : Execution Engine -->
+  <div class="layer-band" style="--layer-color:#a78bfa;">
+    <div class="layer-label" style="color:#a78bfa">③ Execution Engine — Playwright Worker (BullMQ)</div>
+    <div class="flow-row">
+
+      <div class="node glow" style="--node-color:#a78bfa">
+        <span class="node-icon">🌐</span>
+        <div class="node-title">Playwright Browser</div>
+        <div class="node-sub">Chromium headless/headed · Lightning DOM navigation · Iframe-aware</div>
+        <span class="node-tag">PLAYWRIGHT</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#a78bfa">
+        <span class="node-icon">⚡</span>
+        <div class="node-title">Salesforce Engine</div>
+        <div class="node-sub">JSforce · field-type dispatcher · lookup / picklist / HITL cascade</div>
+        <span class="node-tag">JSFORCE</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#a78bfa">
+        <span class="node-icon">🙋</span>
+        <div class="node-title">HITL Pause Gate</div>
+        <div class="node-sub">Injects draggable overlay in browser · waits for human Continue / Skip / Stop</div>
+        <span class="node-tag">HUMAN-IN-LOOP</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#a78bfa">
+        <span class="node-icon">🩺</span>
+        <div class="node-title">Self-Healing AI</div>
+        <div class="node-sub">Detects failures · fetches MCP metadata · calls Claude · returns corrected steps</div>
+        <span class="node-tag">AI HEAL</span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Vertical connector -->
+  <div class="connector-v">
+    <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" style="margin:auto">
+      <line x1="20" y1="0" x2="20" y2="30" class="arr"/>
+      <polygon points="16,28 20,40 24,28" class="arr-head"/>
+    </svg>
+  </div>
+
+  <!-- ROW 4 : AI Intelligence Pipeline -->
+  <div class="layer-band" style="--layer-color:#f59e0b;">
+    <div class="layer-label" style="color:#f59e0b">④ AI Intelligence Pipeline — RAG · Vector DB · MCP</div>
+    <div class="flow-row">
+
+      <div class="node glow" style="--node-color:#f59e0b">
+        <span class="node-icon">🔗</span>
+        <div class="node-title">MCP Server</div>
+        <div class="node-sub">Model Context Protocol · connects AI to live Salesforce org · SOQL / describe / SOSL</div>
+        <span class="node-tag">MCP</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#f59e0b">
+        <span class="node-icon">🧩</span>
+        <div class="node-title">Metadata Normalizer</div>
+        <div class="node-sub">Raw SF metadata → structured JSON (objects · fields · flows · LWCs · validation rules)</div>
+        <span class="node-tag">NORMALIZE</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#f59e0b">
+        <span class="node-icon">🧬</span>
+        <div class="node-title">Embedding Service</div>
+        <div class="node-sub">OpenAI text-embedding-3-small · chunks metadata · stores vectors in PostgreSQL</div>
+        <span class="node-tag">VECTOR DB</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#f59e0b">
+        <span class="node-icon">🔍</span>
+        <div class="node-title">RAG Retrieval</div>
+        <div class="node-sub">Cosine similarity search · top-K chunks → injected into LLM prompt as grounded context</div>
+        <span class="node-tag">RAG</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#f59e0b">
+        <span class="node-icon">🤖</span>
+        <div class="node-title">LLM (GPT / Claude)</div>
+        <div class="node-sub">Generates accurate org-specific test steps from enriched context</div>
+        <span class="node-tag">AI</span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Vertical connector -->
+  <div class="connector-v">
+    <svg viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" style="margin:auto">
+      <line x1="20" y1="0" x2="20" y2="30" class="arr"/>
+      <polygon points="16,28 20,40 24,28" class="arr-head"/>
+    </svg>
+  </div>
+
+  <!-- ROW 5 : Data & Infra -->
+  <div class="layer-band" style="--layer-color:#10b981;">
+    <div class="layer-label" style="color:#10b981">⑤ Data &amp; Infrastructure</div>
+    <div class="flow-row">
+
+      <div class="node glow" style="--node-color:#10b981">
+        <span class="node-icon">🐘</span>
+        <div class="node-title">PostgreSQL 16</div>
+        <div class="node-sub">Projects · test cases · integrations · vector_embeddings table (pgvector-compatible)</div>
+        <span class="node-tag">RELATIONAL + VECTOR</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#10b981">
+        <span class="node-icon">⚡</span>
+        <div class="node-title">Redis + BullMQ</div>
+        <div class="node-sub">Async job queue for test runs · prevents server blocking · concurrency control</div>
+        <span class="node-tag">QUEUE</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#10b981">
+        <span class="node-icon">☁️</span>
+        <div class="node-title">Salesforce Org</div>
+        <div class="node-sub">Lightning UI · REST / Tooling API · SOQL · Metadata API (via MCP &amp; JSforce)</div>
+        <span class="node-tag">EXTERNAL</span>
+      </div>
+
+      <div class="connector-h">
+        <svg viewBox="0 0 40 24"><line x1="0" y1="12" x2="30" y2="12" class="arr"/><polygon points="30,8 40,12 30,16" class="arr-head"/></svg>
+      </div>
+
+      <div class="node glow" style="--node-color:#10b981">
+        <span class="node-icon">🐳</span>
+        <div class="node-title">Docker Compose</div>
+        <div class="node-sub">Frontend · Node.js API service · PostgreSQL · Redis — all containerised</div>
+        <span class="node-tag">INFRA</span>
+      </div>
+
+    </div>
+  </div>
+
+</div><!-- /flow-wrapper -->
+
+
+<!-- ══════════ SECTION : KEY AI APPROACHES ══════════ -->
+<div class="section anim anim-d3">
+  <div class="section-title">Key AI Approaches — In Plain Terms</div>
+</div>
+
+<div class="feature-grid anim anim-d3">
+
+  <!-- RAG -->
+  <div class="feature-card">
+    <div class="fc-header">
+      <div class="fc-icon" style="background:rgba(245,158,11,.15)">🔍</div>
+      <div>
+        <div class="fc-title">RAG — Retrieval-Augmented Generation</div>
+        <div class="fc-subtitle">Smart context injection before AI generation</div>
+      </div>
+    </div>
+    <div class="fc-body">
+      Before asking the AI to generate test steps, the system <strong>searches your Salesforce metadata</strong> (stored as vectors) for the most relevant information — required fields, picklist values, validation rules, and past execution patterns. This context is injected into the prompt so the AI produces <strong>org-specific, accurate steps</strong> rather than generic ones.
+    </div>
+    <div class="fc-tags">
+      <span class="fc-tag" style="color:#f59e0b;border-color:rgba(245,158,11,.3)">OpenAI Embeddings</span>
+      <span class="fc-tag" style="color:#f59e0b;border-color:rgba(245,158,11,.3)">Cosine Similarity</span>
+      <span class="fc-tag" style="color:#f59e0b;border-color:rgba(245,158,11,.3)">Top-K Search</span>
+    </div>
+  </div>
+
+  <!-- MCP -->
+  <div class="feature-card">
+    <div class="fc-header">
+      <div class="fc-icon" style="background:rgba(99,102,241,.15)">🔗</div>
+      <div>
+        <div class="fc-title">MCP — Model Context Protocol</div>
+        <div class="fc-subtitle">AI ↔ Salesforce live data bridge</div>
+      </div>
+    </div>
+    <div class="fc-body">
+      MCP is a standardised protocol that lets the AI model <strong>talk directly to Salesforce</strong> in real time. It enables the system to query live records, describe objects, run SOQL, and fetch lookup candidates at runtime. During <strong>Self-Healing</strong>, MCP fetches fresh field metadata so Claude can generate corrected test steps that work on the actual org.
+    </div>
+    <div class="fc-tags">
+      <span class="fc-tag" style="color:#6366f1;border-color:rgba(99,102,241,.3)">simple-salesforce</span>
+      <span class="fc-tag" style="color:#6366f1;border-color:rgba(99,102,241,.3)">SOQL / SOSL</span>
+      <span class="fc-tag" style="color:#6366f1;border-color:rgba(99,102,241,.3)">Tooling API</span>
+    </div>
+  </div>
+
+  <!-- Vector DB -->
+  <div class="feature-card">
+    <div class="fc-header">
+      <div class="fc-icon" style="background:rgba(34,211,238,.15)">🧬</div>
+      <div>
+        <div class="fc-title">Vector Database</div>
+        <div class="fc-subtitle">Semantic memory for metadata</div>
+      </div>
+    </div>
+    <div class="fc-body">
+      Salesforce object metadata (fields, types, picklists, validation rules, flows, LWCs) is converted into <strong>numeric vectors</strong> using OpenAI's embedding model and stored in PostgreSQL. When a tester describes a test, the system finds <strong>semantically similar</strong> metadata — not just keyword matches — enabling accurate, context-aware test generation.
+    </div>
+    <div class="fc-tags">
+      <span class="fc-tag" style="color:#22d3ee;border-color:rgba(34,211,238,.3)">PostgreSQL vectors</span>
+      <span class="fc-tag" style="color:#22d3ee;border-color:rgba(34,211,238,.3)">text-embedding-3-small</span>
+      <span class="fc-tag" style="color:#22d3ee;border-color:rgba(34,211,238,.3)">Chunked storage</span>
+    </div>
+  </div>
+
+  <!-- Self-Healing -->
+  <div class="feature-card">
+    <div class="fc-header">
+      <div class="fc-icon" style="background:rgba(236,72,153,.15)">🩺</div>
+      <div>
+        <div class="fc-title">AI Self-Healing</div>
+        <div class="fc-subtitle">Tests that fix themselves after failure</div>
+      </div>
+    </div>
+    <div class="fc-body">
+      When a test fails due to a Salesforce application error (missing required field, validation rule, modal overlay), the system <strong>automatically detects the failure pattern</strong>, fetches live field metadata via MCP, and calls Claude to generate a <strong>corrected set of steps</strong>. The QA can then apply or tweak the fix interactively.
+    </div>
+    <div class="fc-tags">
+      <span class="fc-tag" style="color:#ec4899;border-color:rgba(236,72,153,.3)">Claude Sonnet</span>
+      <span class="fc-tag" style="color:#ec4899;border-color:rgba(236,72,153,.3)">Error pattern scan</span>
+      <span class="fc-tag" style="color:#ec4899;border-color:rgba(236,72,153,.3)">Interactive edit</span>
+    </div>
+  </div>
+
+  <!-- HITL -->
+  <div class="feature-card">
+    <div class="fc-header">
+      <div class="fc-icon" style="background:rgba(167,139,250,.15)">🙋</div>
+      <div>
+        <div class="fc-title">HITL — Human In The Loop</div>
+        <div class="fc-subtitle">Human oversight during automation</div>
+      </div>
+    </div>
+    <div class="fc-body">
+      If a step fails and requires human judgement, an <strong>in-browser draggable overlay</strong> pauses the Playwright session and prompts the tester to Continue manually, Skip the step, or Stop the run entirely. After the human acts, execution resumes — combining automation speed with human accuracy.
+    </div>
+    <div class="fc-tags">
+      <span class="fc-tag" style="color:#a78bfa;border-color:rgba(167,139,250,.3)">Pause Gate</span>
+      <span class="fc-tag" style="color:#a78bfa;border-color:rgba(167,139,250,.3)">Browser inject</span>
+      <span class="fc-tag" style="color:#a78bfa;border-color:rgba(167,139,250,.3)">Continue/Skip/Stop</span>
+    </div>
+  </div>
+
+  <!-- Execution Learning -->
+  <div class="feature-card">
+    <div class="fc-header">
+      <div class="fc-icon" style="background:rgba(16,185,129,.15)">📚</div>
+      <div>
+        <div class="fc-title">Execution Learning</div>
+        <div class="fc-subtitle">System gets smarter with every run</div>
+      </div>
+    </div>
+    <div class="fc-body">
+      Every successful and failed test run is <strong>captured, vectorised, and stored</strong>. The RAG retrieval pipeline then includes these "execution patterns" alongside raw metadata. Over time, the AI learns which locators work, which field orders matter, and which patterns to avoid — improving future generation accuracy automatically.
+    </div>
+    <div class="fc-tags">
+      <span class="fc-tag" style="color:#10b981;border-color:rgba(16,185,129,.3)">Feedback loop</span>
+      <span class="fc-tag" style="color:#10b981;border-color:rgba(16,185,129,.3)">Pattern vectors</span>
+      <span class="fc-tag" style="color:#10b981;border-color:rgba(16,185,129,.3)">Continuous improvement</span>
+    </div>
+  </div>
+
+</div>
+
+
+<!-- ══════════ METADATA SYNC PIPELINE ══════════ -->
+<div class="section anim anim-d4">
+  <div class="section-title">Metadata Sync Pipeline — Step by Step</div>
+</div>
+
+<div class="flow-detail anim anim-d4">
+  <div class="layer-band" style="--layer-color:#f59e0b">
+    <div class="layer-label" style="color:#f59e0b">Triggered once when a Salesforce org is connected — runs in background</div>
+    <div class="pipeline-row">
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(245,158,11,.4);box-shadow:0 0 20px rgba(245,158,11,.2)">🔗</div>
+        <div class="pipe-label">1. Connect</div>
+        <div class="pipe-sublabel">User enters SF credentials via Environment Wizard or Integration tab</div>
+      </div>
+
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(99,102,241,.4);box-shadow:0 0 20px rgba(99,102,241,.2)">📦</div>
+        <div class="pipe-label">2. Extract Raw</div>
+        <div class="pipe-sublabel">SalesforceMetadataExtractor pulls objects, fields, flows, LWCs via REST API</div>
+      </div>
+
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(34,211,238,.4);box-shadow:0 0 20px rgba(34,211,238,.2)">🧩</div>
+        <div class="pipe-label">3. Normalize</div>
+        <div class="pipe-sublabel">MetadataNormalizer converts raw JSON → clean structured format</div>
+      </div>
+
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(16,185,129,.4);box-shadow:0 0 20px rgba(16,185,129,.2)">🏗️</div>
+        <div class="pipe-label">4. Domain Model</div>
+        <div class="pipe-sublabel">DomainModelBuilder infers entity relationships &amp; testing rules</div>
+      </div>
+
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(245,158,11,.4);box-shadow:0 0 20px rgba(245,158,11,.2)">🧬</div>
+        <div class="pipe-label">5. Embed</div>
+        <div class="pipe-sublabel">EmbeddingService → OpenAI text-embedding-3-small → stored in PostgreSQL</div>
+      </div>
+
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(236,72,153,.4);box-shadow:0 0 20px rgba(236,72,153,.2)">✅</div>
+        <div class="pipe-label">6. Ready</div>
+        <div class="pipe-sublabel">RAG is live — every AI generation now uses your org's real metadata</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+
+<!-- ══════════ TEST EXECUTION PIPELINE ══════════ -->
+<div class="section anim anim-d5">
+  <div class="section-title">End-to-End Test Execution Flow</div>
+</div>
+
+<div class="flow-detail anim anim-d5">
+  <div class="layer-band" style="--layer-color:#a78bfa">
+    <div class="layer-label" style="color:#a78bfa">From "Run Test" click to final Pass/Fail report</div>
+    <div class="pipeline-row">
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(99,102,241,.4)">▶️</div>
+        <div class="pipe-label">Run Test</div>
+        <div class="pipe-sublabel">Frontend calls API → BullMQ job enqueued</div>
+      </div>
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(167,139,250,.4)">🌐</div>
+        <div class="pipe-label">Browser Launch</div>
+        <div class="pipe-sublabel">Playwright opens Chromium · Salesforce login via session token</div>
+      </div>
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(245,158,11,.4)">🎯</div>
+        <div class="pipe-label">Step Execution</div>
+        <div class="pipe-sublabel">Each step dispatched: fill · click · lookup · wait · assert</div>
+      </div>
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(236,72,153,.4)">❓</div>
+        <div class="pipe-label">Failure?</div>
+        <div class="pipe-sublabel">Error pattern detected → HITL pause OR Self-Heal triggered</div>
+      </div>
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(16,185,129,.4)">📊</div>
+        <div class="pipe-label">Report</div>
+        <div class="pipe-sublabel">Pass/Fail per step · screenshots · logs stored in DB</div>
+      </div>
+      <div class="pipe-arrow"><svg viewBox="0 0 32 20"><line x1="0" y1="10" x2="22" y2="10" class="arr"/><polygon points="22,6 32,10 22,14" class="arr-head"/></svg></div>
+
+      <div class="pipe-step">
+        <div class="pipe-bubble" style="border-color:rgba(99,102,241,.4)">🔄</div>
+        <div class="pipe-label">Learn</div>
+        <div class="pipe-sublabel">Execution patterns vectorised for future RAG context improvement</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+
+<!-- ══════════ FOOTER ══════════ -->
+<footer class="anim anim-d6">
+  AutoTest AI · Confidential · Director Overview · April 2026 &nbsp;|&nbsp;
+  Built with Next.js · Node.js / Fastify · TypeScript · Playwright · OpenAI · Anthropic Claude · PostgreSQL · Redis · Docker
+</footer>
+
+<script>
+  // Staggered entrance for flow rows on scroll
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.style.opacity = '1';
+        e.target.style.transform = 'translateY(0)';
+      }
+    });
+  }, { threshold: 0.1 });
+
+  document.querySelectorAll('.layer-band, .feature-card, .stat-card').forEach((el, i) => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(28px)';
+    el.style.transition = `opacity .55s ease ${i * 0.07}s, transform .55s ease ${i * 0.07}s`;
+    observer.observe(el);
+  });
+</script>
+</body>
+</html>
