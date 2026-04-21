@@ -65,6 +65,13 @@ export const ConnectProjectSchema = z.object({
   username: z.string().optional(),
   password: z.string().optional(),
   login_strategy: z.string().default('form').optional(),
+  
+  // Web App Metadata Sync Config
+  sitemap_url: z.string().optional(),
+  max_crawl_pages: z.number().optional(),
+  key_routes: z.array(z.string()).optional(),
+  enable_deep_crawl: z.boolean().optional(),
+  
   // API authentication
   api_key: z.string().optional(),
   bearer_token: z.string().optional(),
@@ -80,6 +87,7 @@ export const SalesforceCredentialsSchema = z.object({
   login_url: z.string().url('Instance URL must be a valid URL').default('https://login.salesforce.com').optional(),
   sf_username: z.string().optional().nullable(),
   sf_password: z.string().optional().nullable(),
+  sf_security_token: z.string().optional().nullable(),
 })
 
 /** Matches Python: IntegrationStatusResponse */

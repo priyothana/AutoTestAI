@@ -16,9 +16,14 @@
  *   POST   /api/v1/projects/:id/connect
  *   DELETE /api/v1/projects/:id/disconnect
  *   POST   /api/v1/projects/:id/save-sf-credentials
+ *   POST   /api/v1/projects/:id/save-web-credentials
  *   GET    /api/v1/projects/:id/integration-status
  *   GET    /api/v1/integrations/salesforce/auth-url
  *   GET    /api/v1/integrations/salesforce/callback
+ *
+ * Web App Metadata Sync:
+ *   POST   /api/v1/projects/:id/sync-webapp-metadata  ← Playwright crawler pipeline
+ *   GET    /api/v1/projects/:id/sync-status           ← Live progress polling for UI
  *
  * Jira:
  *   POST   /api/v1/jira/connect
@@ -40,6 +45,13 @@ import {
   JiraProjectConfigSchema,
 } from './project.schema.js'
 import * as svc from './project.service.js'
+import { syncWebappMetadata } from '../webapp/webapp.service.js'
+import {
+  extractTestData,
+  storeUploadedTestData,
+  getTestData,
+} from '../webapp/webapp-test-data.service.js'
+import prisma from '../../shared/db/prisma.js'
 
 /** Tiny helper — re-throw platform errors as Fastify HTTP replies */
 function handleErr(err: any, reply: any) {
@@ -161,12 +173,20 @@ export async function projectRoutes(app: FastifyInstance) {
         if (!body.base_url) {
           return reply.status(400).send({ detail: 'base_url is required for web_app' })
         }
+        const authConfig = {
+          sitemap_url: body.sitemap_url ?? null,
+          max_crawl_pages: body.max_crawl_pages ?? 30,
+          key_routes: body.key_routes ?? [],
+          enable_deep_crawl: body.enable_deep_crawl ?? false,
+        }
+
         const integration = await svc.createWebIntegration(
           id,
           body.base_url,
           body.username ?? null,
           body.password ?? null,
           body.login_strategy ?? 'form',
+          authConfig
         )
         return reply.send({
           status: 'connected',
@@ -222,6 +242,182 @@ export async function projectRoutes(app: FastifyInstance) {
     }
   })
 
+  // ── Web App Metadata Sync ─────────────────────────────────────────────────
+  // POST /api/v1/projects/:id/sync-webapp-metadata
+  // Enqueues a Playwright crawl + normalize + domain-build + embed job on the
+  // metadata-sync-queue (same worker, different pipeline branch).
+  // Returns immediately with status='queued' or 'completed' (inline fallback).
+  app.post('/projects/:id/sync-webapp-metadata', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const result = await syncWebappMetadata(id)
+      return reply.send(result)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // GET /api/v1/projects/:id/sync-status
+  // Lightweight polling endpoint used by the frontend to track live metadata
+  // sync progress. Returns current DB counts for all 4 pipeline stages plus
+  // an inferred "active_stage", crawl progress info, and last_synced_at.
+  app.get('/projects/:id/sync-status', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+
+      const [rawCount, normalizedCount, domainCount, embeddingCount, integration] = await Promise.all([
+        prisma.metadata_raw_store.count({ where: { project_id: id } }),
+        prisma.metadata_normalized.count({ where: { project_id: id } }),
+        prisma.domain_models.count({ where: { project_id: id } }),
+        prisma.vector_embeddings.count({ where: { project_id: id } }),
+        prisma.project_integrations.findFirst({ where: { project_id: id } }),
+      ])
+
+      // Infer which stage is active based on which counts have non-zero values.
+      // Stage progresses: 1 (crawl) → 2 (normalize) → 3 (domain) → 4 (embed) → done
+      let active_stage: number | null = null
+      if (embeddingCount > 0) active_stage = null   // all done
+      else if (domainCount > 0) active_stage = 4     // generating embeddings
+      else if (normalizedCount > 0) active_stage = 3 // building domain models
+      else if (rawCount > 0) active_stage = 2        // normalizing
+      else active_stage = 1                          // crawling (nothing in DB yet)
+
+      // ── Crawl state (incremental progress) ──────────────────────────────────
+      let has_more_pages = false
+      let crawled_so_far = 0
+      let total_discovered = 0
+      let progress_message: string | null = null
+
+      if (integration?.auth_config && typeof integration.auth_config === 'object') {
+        const conf = integration.auth_config as Record<string, any>
+        const crawlState = conf.crawl_state as {
+          visitedUrls?: string[]
+          pendingUrls?: string[]
+          totalDiscoveredPages?: number
+          runCount?: number
+        } | null | undefined
+
+        if (crawlState && typeof crawlState === 'object') {
+          crawled_so_far    = crawlState.visitedUrls?.length ?? 0
+          const pending     = crawlState.pendingUrls?.length ?? 0
+          total_discovered  = crawlState.totalDiscoveredPages ?? (crawled_so_far + pending)
+          has_more_pages    = pending > 0
+
+          if (has_more_pages) {
+            progress_message = `Crawled ${crawled_so_far} of ${total_discovered} pages — continuing automatically…`
+          } else if (crawled_so_far > 0) {
+            progress_message = `Crawl complete — ${crawled_so_far} pages discovered and extracted`
+          }
+        }
+      }
+
+      // Fall back to raw_count from DB if crawl_state hasn't been set yet
+      if (crawled_so_far === 0 && rawCount > 0) {
+        // Approximate from the raw store page count
+        const rawRow = await prisma.metadata_raw_store.findFirst({
+          where: { project_id: id, metadata_type: 'webpage' },
+          select: { raw_json: true },
+        })
+        if (rawRow?.raw_json) {
+          const rd = rawRow.raw_json as { pages?: unknown[] }
+          crawled_so_far = rd.pages?.length ?? 0
+        }
+      }
+
+      return reply.send({
+        raw_count:          rawCount,
+        normalized_count:   normalizedCount,
+        domain_model_count: domainCount,
+        embedding_count:    embeddingCount,
+        active_stage,
+        last_synced_at:     integration?.last_synced_at?.toISOString() ?? null,
+        sync_error:         integration?.sync_error ?? null,
+        // ── Crawl progress ──────────────────────────────────────
+        has_more_pages,
+        crawled_so_far,
+        total_discovered,
+        progress_message,
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // ── Phase 2: Test Data Routes ────────────────────────────────────────────────
+
+  // GET /api/v1/projects/:id/test-data
+  // Returns all test-data entities for the project (name, count, source, sample records)
+  app.get('/projects/:id/test-data', async (request, reply) => {
+    try {
+      const { id }  = request.params as { id: string }
+      const entities = await getTestData(id)
+      return reply.send({ entities })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // POST /api/v1/projects/:id/test-data/extract
+  // Triggers OpenAPI probe (Tier 1) + Playwright UI scraping (Tier 2).
+  // Returns 202 immediately — Playwright takes 30-60s so we run it in background.
+  // Poll GET /test-data for results.
+  app.post('/projects/:id/test-data/extract', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const log    = request.log
+
+      // Fire extraction as background task so HTTP response is immediate
+      setImmediate(async () => {
+        try {
+          log.info(`[EXTRACT] Background extraction started for project ${id}`)
+          const count = await extractTestData(id)
+          log.info(`[EXTRACT] Background extraction complete — ${count} entities for project ${id}`)
+        } catch (bgErr) {
+          log.error({ err: bgErr }, `[EXTRACT] Background extraction failed for project ${id}`)
+        }
+      })
+
+      return reply.status(202).send({
+        success: true,
+        status:  'started',
+        message: 'Extraction started — scraping your app in the background. Check back in 30-60 seconds.',
+        polling_hint: `GET /api/v1/projects/${id}/test-data`,
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+
+
+
+  // POST /api/v1/projects/:id/test-data/upload
+  // Accepts { data: { Entity: [records…] } } and upserts with source='user_upload'.
+  // User-uploaded records always win over scraped data.
+  app.post('/projects/:id/test-data/upload', async (request, reply) => {
+    try {
+      const { id }  = request.params as { id: string }
+      const body    = request.body as { data?: Record<string, Record<string, unknown>[]> }
+
+      if (!body?.data || typeof body.data !== 'object' || Array.isArray(body.data)) {
+        return reply.status(400).send({
+          detail: 'Invalid payload. Expected: { "data": { "EntityName": [{ field: value,… }] } }',
+        })
+      }
+
+      const result = await storeUploadedTestData(id, body.data)
+      return reply.send({
+        success:         true,
+        entities_stored: result.entitiesStored,
+        total_records:   result.totalRecords,
+        preview:         result.preview,
+        message:         `Uploaded ${result.entitiesStored} entities with ${result.totalRecords} total records`,
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
   // POST /api/v1/projects/:id/save-sf-credentials  →  200 + {success, environmentId, message}
   app.post('/projects/:id/save-sf-credentials', async (request, reply) => {
     try {
@@ -257,7 +453,12 @@ export async function projectRoutes(app: FastifyInstance) {
           const { default: jsforce } = await import('jsforce')
           const loginUrl = body.login_url ?? 'https://login.salesforce.com'
           const conn = new jsforce.Connection({ loginUrl })
-          await conn.login(body.sf_username, body.sf_password)
+
+          // JSForce requires password = password + securityToken (concatenated, no separator)
+          const securityToken: string = body.sf_security_token ?? ''
+          const passwordWithToken = body.sf_password + securityToken
+
+          await conn.login(body.sf_username, passwordWithToken)
         } catch (jsErr: any) {
           const msg: string = (jsErr?.message ?? String(jsErr)).toLowerCase()
 
@@ -300,6 +501,29 @@ export async function projectRoutes(app: FastifyInstance) {
         redirect_uri: integration.salesforce_redirect_uri,
         login_url: integration.salesforce_login_url,
       })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // POST /api/v1/projects/:id/save-web-credentials  →  200 + {success, message}
+  // Saves/updates login credentials for a web_app integration without full reconnect.
+  app.post('/projects/:id/save-web-credentials', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = request.body as {
+        login_url?: string
+        username?: string
+        password?: string
+        login_strategy?: string
+      }
+      await svc.saveWebAppCredentials(id, {
+        login_url: body.login_url,
+        username: body.username,
+        password: body.password,
+        login_strategy: body.login_strategy,
+      })
+      return reply.send({ success: true, message: 'Web app credentials saved successfully' })
     } catch (err: any) {
       return handleErr(err, reply)
     }
