@@ -36,7 +36,24 @@ const formSchema = z.object({
     name: z.string().min(2, "Name must be at least 2 characters"),
     description: z.string().optional(),
     type: z.enum(["WEB", "MOBILE", "API", "SALESFORCE"]),
-    baseUrl: z.string().url("Must be a valid URL").optional().or(z.literal("")),
+    baseUrl: z.string().optional().or(z.literal("")),
+}).superRefine((data, ctx) => {
+    // Base URL is required for all non-Salesforce types
+    if (data.type !== "SALESFORCE") {
+        if (!data.baseUrl || !data.baseUrl.trim()) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Base URL is required",
+                path: ["baseUrl"],
+            })
+        } else if (!/^https?:\/\/.+/.test(data.baseUrl)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Must be a valid URL starting with http:// or https://",
+                path: ["baseUrl"],
+            })
+        }
+    }
 })
 
 export default function CreateProjectPage() {
@@ -45,14 +62,44 @@ export default function CreateProjectPage() {
     const [currentStep, setCurrentStep] = useState(1)
     const [createdProjectId, setCreatedProjectId] = useState<string | null>(null)
     const [isCreating, setIsCreating] = useState(false)
+    // Edit mode: set when arriving via ?edit=<id> so we update instead of create
+    const [editProjectId, setEditProjectId] = useState<string | null>(null)
+    const [isEditMode, setIsEditMode] = useState(false)
 
-    // If arriving from ?connect=<id>, skip straight to the Connect step
+    // On mount: handle ?connect=<id> (Salesforce reconnect) and ?edit=<id> (web app reconnect)
     useEffect(() => {
         const connectId = searchParams.get("connect")
+        const editId = searchParams.get("edit")
+
         if (connectId) {
+            // Salesforce reconnect — jump straight to Connect step
             setCreatedProjectId(connectId)
             form.setValue("type", "SALESFORCE")
             setCurrentStep(5)
+            return
+        }
+
+        if (editId) {
+            // Web App reconnect — load existing project, pre-fill, skip to Connect step
+            setEditProjectId(editId)
+            setCreatedProjectId(editId)
+            setIsEditMode(true)
+            fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${editId}`)
+                .then((r) => r.json())
+                .then((project) => {
+                    form.setValue("name", project.name ?? "")
+                    form.setValue("description", project.description ?? "")
+                    const typeKey = Object.entries(TYPE_TO_CATEGORY).find(
+                        ([, cat]) => cat === project.category
+                    )?.[0] as "WEB" | "MOBILE" | "API" | "SALESFORCE" | undefined
+                    form.setValue("type", typeKey ?? "WEB")
+                    form.setValue("baseUrl", project.base_url ?? "")
+                    setCurrentStep(5)
+                })
+                .catch(() => {
+                    toast.error("Failed to load project for editing")
+                })
+            return
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
@@ -63,6 +110,14 @@ export default function CreateProjectPage() {
     const [webPassword, setWebPassword] = useState("")
     const [loginStrategy, setLoginStrategy] = useState("form")
     const [showPassword, setShowPassword] = useState(false)
+    // Inline error shown below the web app form when validation or API fails
+    const [webConnectError, setWebConnectError] = useState<string | null>(null)
+
+    // Web App Metadata Sync Settings
+    const [sitemapUrl, setSitemapUrl] = useState("")
+    const [maxCrawlPages, setMaxCrawlPages] = useState<number>(30)
+    const [keyRoutesRaw, setKeyRoutesRaw] = useState("")
+    const [enableDeepCrawl, setEnableDeepCrawl] = useState(false)
 
     // Salesforce — unified credentials (Connected App + MCP, single form)
     const [sfUsername, setSfUsername] = useState("")
@@ -112,31 +167,51 @@ export default function CreateProjectPage() {
     const onSubmit = async (values: z.infer<typeof formSchema>) => {
         setIsCreating(true)
         try {
-            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    name: values.name,
-                    description: values.description || "",
-                    type: values.type,
-                    category: TYPE_TO_CATEGORY[values.type] || "webapp",
-                    base_url: values.baseUrl || "",
-                    status: "Active",
-                    tags: [],
-                }),
-            })
-
-            if (!response.ok) {
-                const err = await response.json().catch(() => ({}))
-                throw new Error(err.detail || "Failed to create project")
+            if (isEditMode && editProjectId) {
+                // ── EDIT MODE: update the existing project ─────────────────────
+                const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${editProjectId}`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        name: values.name,
+                        description: values.description || "",
+                        type: values.type,
+                        category: TYPE_TO_CATEGORY[values.type] || "webapp",
+                        base_url: values.baseUrl || "",
+                    }),
+                })
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}))
+                    throw new Error(err.detail || "Failed to update project")
+                }
+                toast.success("Environment updated! Now connect your application.")
+                setCurrentStep(5)
+            } else {
+                // ── CREATE MODE: create a new project ─────────────────────────
+                const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        name: values.name,
+                        description: values.description || "",
+                        type: values.type,
+                        category: TYPE_TO_CATEGORY[values.type] || "webapp",
+                        base_url: values.baseUrl || "",
+                        status: "Active",
+                        tags: [],
+                    }),
+                })
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}))
+                    throw new Error(err.detail || "Failed to create project")
+                }
+                const data = await response.json()
+                setCreatedProjectId(data.id)
+                toast.success("Environment created! Now connect your application.")
+                setCurrentStep(5)
             }
-
-            const data = await response.json()
-            setCreatedProjectId(data.id)
-            toast.success("Environment created! Now connect your application.")
-            setCurrentStep(5)
         } catch (error: any) {
-            toast.error(error.message || "Failed to create environment")
+            toast.error(error.message || "Failed to save environment")
         } finally {
             setIsCreating(false)
         }
@@ -144,8 +219,21 @@ export default function CreateProjectPage() {
 
     const handleConnectWebApp = async () => {
         if (!createdProjectId) return
+        setWebConnectError(null)
+
         const baseUrl = form.getValues("baseUrl")
-        if (!baseUrl) { toast.error("Base URL is required"); return }
+
+        // ── Client-side validation ─────────────────────────────────
+        const errors: string[] = []
+        if (!baseUrl || !baseUrl.trim()) errors.push("Base URL is required to connect your web app.")
+        if (loginStrategy !== "none") {
+            if (!webUsername.trim()) errors.push("Username / Email is required.")
+            if (!webPassword) errors.push("Password is required.")
+        }
+        if (errors.length > 0) {
+            setWebConnectError(errors.join(" "))
+            return
+        }
 
         setConnectLoading(true)
         try {
@@ -158,16 +246,21 @@ export default function CreateProjectPage() {
                     username: webUsername || null,
                     password: webPassword || null,
                     login_strategy: loginStrategy,
+                    sitemap_url: sitemapUrl || undefined,
+                    max_crawl_pages: maxCrawlPages,
+                    key_routes: keyRoutesRaw ? keyRoutesRaw.split('\n').map(r => r.trim()).filter(Boolean) : [],
+                    enable_deep_crawl: enableDeepCrawl,
                 }),
             })
             if (!response.ok) {
                 const err = await response.json().catch(() => ({}))
-                throw new Error(err.detail || "Failed to connect")
+                setWebConnectError(err.detail || "Connection failed. Please check your credentials and Base URL.")
+                return
             }
             toast.success("Web application connected successfully!")
             setTimeout(() => router.push(`/dashboard/projects/${createdProjectId}`), 1000)
         } catch (error: any) {
-            toast.error(error.message || "Connection failed")
+            setWebConnectError(error.message || "Connection failed. Please try again.")
         } finally {
             setConnectLoading(false)
         }
@@ -210,6 +303,7 @@ export default function CreateProjectPage() {
                         login_url: sfLoginUrl,
                         sf_username: sfUsername,
                         sf_password: sfPassword,
+                        sf_security_token: sfSecurityToken,
                     }),
                 },
             )
@@ -386,10 +480,29 @@ export default function CreateProjectPage() {
     }
 
     const nextStep = async () => {
+        // Step 3: manually validate Base URL before triggering Zod
+        // (superRefine runs on the full object so we need the type value available)
+        if (currentStep === 3) {
+            const type = form.getValues("type")
+            const baseUrl = form.getValues("baseUrl")
+            if (type !== "SALESFORCE") {
+                if (!baseUrl || !baseUrl.trim()) {
+                    form.setError("baseUrl", { type: "manual", message: "Base URL is required" })
+                    return
+                }
+                if (!/^https?:\/\/.+/.test(baseUrl)) {
+                    form.setError("baseUrl", { type: "manual", message: "Must be a valid URL starting with http:// or https://" })
+                    return
+                }
+                form.clearErrors("baseUrl")
+            }
+            setCurrentStep((prev) => Math.min(prev + 1, steps.length))
+            return
+        }
+
         let fieldsToValidate: any[] = []
         if (currentStep === 1) fieldsToValidate = ["name", "description"]
         if (currentStep === 2) fieldsToValidate = ["type"]
-        if (currentStep === 3) fieldsToValidate = ["baseUrl"]
         const isValid = await form.trigger(fieldsToValidate)
         if (isValid) setCurrentStep((prev) => Math.min(prev + 1, steps.length))
     }
@@ -409,8 +522,14 @@ export default function CreateProjectPage() {
     return (
         <div className="max-w-3xl mx-auto py-10">
             <div className="mb-8">
-                <h1 className="text-3xl font-bold mb-2">Create New Environment</h1>
-                <p className="text-muted-foreground">Follow the wizard to set up your new testing environment.</p>
+                <h1 className="text-3xl font-bold mb-2">
+                    {isEditMode ? "Reconnect Environment" : "Create New Environment"}
+                </h1>
+                <p className="text-muted-foreground">
+                    {isEditMode
+                        ? "Update your environment details and reconnect your web application."
+                        : "Follow the wizard to set up your new testing environment."}
+                </p>
             </div>
 
             {/* Progress Steps */}
@@ -502,13 +621,17 @@ export default function CreateProjectPage() {
                                 <FormField control={form.control} name="baseUrl" render={({ field }) => (
                                     <FormItem>
                                         <FormLabel>
-                                            {selectedType === "SALESFORCE" ? "Salesforce Instance URL (Optional)" : "Base URL (Optional)"}
+                                            {selectedType === "SALESFORCE"
+                                                ? "Salesforce Instance URL (Optional)"
+                                                : <span>Base URL <span className="text-red-500">*</span></span>}
                                         </FormLabel>
                                         <FormControl>
                                             <Input placeholder={selectedType === "SALESFORCE" ? "https://myorg.lightning.force.com" : "https://example.com"} {...field} />
                                         </FormControl>
                                         <CardDescription>
-                                            {selectedType === "SALESFORCE" ? "Will be set automatically during OAuth if left empty." : "The default URL for your tests to run against."}
+                                            {selectedType === "SALESFORCE"
+                                                ? "Will be set automatically during OAuth if left empty."
+                                                : "The root URL your tests will run against. e.g. https://app.example.com"}
                                         </CardDescription>
                                         <FormMessage />
                                     </FormItem>
@@ -544,10 +667,22 @@ export default function CreateProjectPage() {
                                                 <Link2 className="h-5 w-5 text-blue-600" />
                                                 <h3 className="font-semibold text-blue-700 dark:text-blue-400">Web Application Credentials</h3>
                                             </div>
+
+                                            {/* Inline error banner */}
+                                            {webConnectError && (
+                                                <div className="flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 dark:bg-red-950/30 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+                                                    <svg className="mt-0.5 h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+                                                    <span>{webConnectError}</span>
+                                                </div>
+                                            )}
+
                                             <div className="grid gap-4">
                                                 <div>
                                                     <label className="text-sm font-medium mb-1 block">Base URL</label>
                                                     <Input value={form.getValues("baseUrl") || ""} disabled className="bg-gray-100" />
+                                                    {!form.getValues("baseUrl") && (
+                                                        <p className="text-xs text-red-600 mt-1">⚠ Base URL was not set. Go back to step 3 to enter it.</p>
+                                                    )}
                                                 </div>
                                                 <div>
                                                     <label className="text-sm font-medium mb-1 block">Login Strategy</label>
@@ -575,6 +710,41 @@ export default function CreateProjectPage() {
                                                         </div>
                                                     </>
                                                 )}
+                                            </div>
+
+                                            <div className="mt-8 border-t border-blue-200/50 dark:border-blue-800/50 pt-6">
+                                                <div className="flex items-center gap-2 mb-4">
+                                                    <Zap className="h-5 w-5 text-blue-600" />
+                                                    <h3 className="font-semibold text-blue-700 dark:text-blue-400">Metadata Extractor Settings</h3>
+                                                </div>
+                                                <div className="grid gap-4">
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">Sitemap URL (Optional)</label>
+                                                        <Input placeholder="e.g. https://example.com/sitemap.xml (auto-detected if empty)" value={sitemapUrl} onChange={(e) => setSitemapUrl(e.target.value)} />
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">Max Crawl Pages</label>
+                                                        <Input type="number" min={1} max={500} value={maxCrawlPages} onChange={(e) => setMaxCrawlPages(Number(e.target.value))} />
+                                                        <p className="text-xs text-muted-foreground mt-1">Limits the number of pages processed (Default: 30).</p>
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-sm font-medium mb-1 block">Key Routes (1 per line)</label>
+                                                        <Textarea placeholder="/login&#10;/dashboard&#10;/settings" value={keyRoutesRaw} onChange={(e) => setKeyRoutesRaw(e.target.value)} />
+                                                        <p className="text-xs text-muted-foreground mt-1">Paths that MUST be extracted even if not found in the sitemap.</p>
+                                                    </div>
+                                                    <div className="flex items-center space-x-2 mt-2">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            id="deepCrawl" 
+                                                            checked={enableDeepCrawl} 
+                                                            onChange={(e) => setEnableDeepCrawl(e.target.checked)}
+                                                            className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-600"
+                                                        />
+                                                        <label htmlFor="deepCrawl" className="text-sm font-medium leading-none">
+                                                            Enable Deep UI Crawl (Follow unmapped links)
+                                                        </label>
+                                                    </div>
+                                                </div>
                                             </div>
                                         </div>
                                     )}
@@ -914,7 +1084,9 @@ export default function CreateProjectPage() {
                     )}
                     {currentStep === 4 && (
                         <Button onClick={form.handleSubmit(onSubmit)} disabled={isCreating} className="bg-green-600 hover:bg-green-700">
-                            {isCreating ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" />Creating...</>) : (<>Create Environment <ChevronRight className="ml-2 h-4 w-4" /></>)}
+                            {isCreating
+                                ? (<><Loader2 className="mr-2 h-4 w-4 animate-spin" />{isEditMode ? "Updating..." : "Creating..."}</> )
+                                : (<>{isEditMode ? "Update Environment" : "Create Environment"} <ChevronRight className="ml-2 h-4 w-4" /></>)}
                         </Button>
                     )}
                     {currentStep === 5 && (

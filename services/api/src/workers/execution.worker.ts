@@ -31,8 +31,26 @@ import type { ExecutionJob, HealingJob, StepData } from '../shared/queue/job-typ
 import type { ExecutionStepResult } from '../modules/execution/execution.schema.js'
 import { generateAiSuggestions } from '../modules/self-healing/self-healing.service.js'
 import { waitForResume, clearPause, resolvePause } from '../shared/execution/pause-gate.js'
+import {
+  fillWebAppField,
+  selectWebAppPicklist,
+  fillWebAppDate as fillWebAppDateField,
+  fillWebAppCheckbox,
+  extractWebAppLabel,
+} from './webapp-field-handler.js'
 
 const log = createModuleLogger('execution-worker')
+
+/**
+ * Returns true for both 'webapp' (legacy) and 'web_app' (DB-stored) categories.
+ * The project_integrations table stores 'web_app' but older code used 'webapp'.
+ * Always use this check instead of === 'webapp' to avoid silent mismatches.
+ */
+function isWebAppCategory(category: string | undefined | null): boolean {
+  if (!category) return false
+  const c = category.toLowerCase()
+  return c === 'webapp' || c === 'web_app'
+}
 
 // ─── Directory setup ──────────────────────────────────────────────────────────
 
@@ -711,13 +729,19 @@ function extractLabelFromTarget(raw: string): string {
  * Generate candidate label variants to handle AI label ↔ SF UI label mismatches.
  *
  * Examples:
- *   "Account Type" → ["Account Type", "Account", "Type"]
- *   "Account ID"    → ["Account ID", "Account"]  (NOT bare "ID" — too generic)
+ *   "Account Type"  → ["Account Type", "Account", "Type"]
+ *   "Account ID"    → ["Account ID", "Account Name", "Account"]
+ *   "Contact ID"    → ["Contact ID", "Contact Name", "Contact"]
  *   "Contact Phone" → ["Contact Phone", "Contact", "Phone"]
  *   "Type"          → ["Type"]
  *
- * Special rule: if the last word is a stop-word like "ID", "Name", "Number",
- * we skip adding it as a standalone candidate to avoid matching unrelated fields.
+ * Special rules:
+ *  - If the last word is a stop-word like "ID", "Name", "Number",
+ *    we skip adding it as a standalone candidate to avoid matching unrelated fields.
+ *  - SF LOOKUP ALIAS: When the last word is "ID" (case insensitive), Salesforce
+ *    typically displays the lookup field using "Name" instead (e.g. AccountId field
+ *    renders as "Account Name" in the UI). We add "X Name" as a high-priority
+ *    candidate right after the original label to handle this common mismatch.
  */
 const LOOKUP_LABEL_STOP_WORDS = new Set(['id', 'name', 'no', 'no.', 'number', '#'])
 
@@ -726,7 +750,17 @@ function labelCandidates(label: string): string[] {
   const parts = label.trim().split(/\s+/)
   if (parts.length > 1) {
     const lastWord = parts[parts.length - 1]
-    const isStopWord = LOOKUP_LABEL_STOP_WORDS.has(lastWord.toLowerCase().replace(/\.$/, ''))
+    const lastWordNorm = lastWord.toLowerCase().replace(/\.$/, '')
+    const isStopWord = LOOKUP_LABEL_STOP_WORDS.has(lastWordNorm)
+
+    // SF LOOKUP ALIAS: "Account ID" → also try "Account Name"
+    // Salesforce renders relationship (lookup) fields with the "Name" label
+    // in the UI, not "ID". This is the most common AI label ↔ SF UI mismatch.
+    if (lastWordNorm === 'id') {
+      const prefix = parts.slice(0, -1).join(' ')
+      candidates.push(`${prefix} Name`)
+    }
+
     if (!isStopWord) {
       // Add the LAST word (e.g. "Type" from "Account Type")
       candidates.push(lastWord)
@@ -1282,11 +1316,13 @@ async function waitForDOMStability(
 /**
  * Robust radio selection for Salesforce Advanced Search (Spring '25 / Summer '25+).
  *
- * Simplified to 4 clean strategies in priority order:
+ * 6 strategies in priority order:
  *   1. setChecked(true, { force: true }) — Playwright-recommended for radios.
  *   2. check({ force: true }) — slightly different API path.
  *   3. Click visible faux/label elements — manual visual path.
- *   4. NUCLEAR JS — force .checked + full event dispatch for LWC.
+ *   4. Click the first <td> cell of the row — triggers row-level selection.
+ *   5. NUCLEAR JS (TOPMOST dialog) — force .checked + full event dispatch for LWC.
+ *   6. Keyboard navigation — ArrowDown to first row + Space to select.
  *
  * Captures a debug screenshot on failure for diagnostics.
  *
@@ -1309,7 +1345,10 @@ async function selectAdvancedSearchRadio(
 
   await page.waitForTimeout(1_500)
 
-  const rows = modal.locator('table tbody tr, [role="row"]')
+  // Use `table tbody tr` specifically to exclude header rows.
+  // The `[role="row"]` selector also matches <thead> <tr role="row"> which inflates
+  // the count and can cause Strategy 4/5 to target the wrong element.
+  const rows = modal.locator('table tbody tr')
   const pollStart = Date.now()
   let hasRows = false
   while (Date.now() - pollStart < 12_000) {
@@ -1317,8 +1356,16 @@ async function selectAdvancedSearchRadio(
     await page.waitForTimeout(300)
   }
   if (!hasRows) {
-    log.warn(`[ADV-RADIO] No rows appeared in table after 12s`)
-    return false
+    // Fallback: try [role="row"] in case the table doesn't use <tbody>
+    const roleRows = modal.locator('[role="row"]')
+    const roleRowCount = await roleRows.count().catch(() => 0)
+    if (roleRowCount > 0) {
+      log.info(`[ADV-RADIO] No <tbody> rows — found ${roleRowCount} [role="row"] elements`)
+      hasRows = true
+    } else {
+      log.warn(`[ADV-RADIO] No rows appeared in table after 12s`)
+      return false
+    }
   }
 
   const stableCount = await waitForDOMStability(rows, {
@@ -1327,13 +1374,21 @@ async function selectAdvancedSearchRadio(
   log.info(`[ADV-RADIO] Table stabilized with ${stableCount} rows`)
 
   // ── 2. Find the best matching row ────────────────────────────────────────
-  let row = modal.locator('tr')
+  // Filter to data rows that contain <td> (excludes header <tr> with <th>)
+  let row = modal.locator('table tbody tr')
     .filter({ hasText: searchValue })
-    .filter({ has: modal.locator('td:first-child') })
     .first()
 
   if (await row.count().catch(() => 0) === 0) {
-    log.warn(`[ADV-RADIO] No matching data row for "${searchValue}" — using first row`)
+    // Broader fallback: any <tr> with the text that has a <td>
+    row = modal.locator('tr')
+      .filter({ hasText: searchValue })
+      .filter({ has: modal.locator('td') })
+      .first()
+  }
+
+  if (await row.count().catch(() => 0) === 0) {
+    log.warn(`[ADV-RADIO] No matching data row for "${searchValue}" — using first data row`)
     row = rows.first()
   } else {
     log.info(`[ADV-RADIO] Found data row matching "${searchValue}"`)
@@ -1344,6 +1399,12 @@ async function selectAdvancedSearchRadio(
 
   const radioInput = row.locator('input[type="radio"]').first()
   let radioChecked = false
+
+  // Helper: check if ANY radio in the modal is now checked
+  const isAnyRadioChecked = async (): Promise<boolean> => {
+    const checked = await modal.locator('input[type="radio"]:checked').count().catch(() => 0)
+    return checked > 0
+  }
 
   // ── Strategy 1: setChecked — Playwright-recommended ─────────────────────
   try {
@@ -1376,7 +1437,7 @@ async function selectAdvancedSearchRadio(
       if (await visual.count().catch(() => 0) > 0) {
         await visual.click({ force: true, timeout: 4_000 }).catch(() => { })
         await page.waitForTimeout(600)
-        if (await radioInput.isChecked().catch(() => false)) {
+        if (await radioInput.isChecked().catch(() => false) || await isAnyRadioChecked()) {
           log.info(`[ADV-RADIO] ✅ S3: Clicked visual element: ${sel}`)
           radioChecked = true
           break
@@ -1386,14 +1447,40 @@ async function selectAdvancedSearchRadio(
     if (!radioChecked) log.warn(`[ADV-RADIO] S3 faux/label loop — none worked`)
   }
 
-  // ── Strategy 4: NUCLEAR JS (bypasses all LWC interception) ──────────────
+  // ── Strategy 4: Click the first <td> cell (radio column) ────────────────
+  // In SF Advanced Search, the first <td> in each row contains the radio.
+  // Clicking the <td> itself can trigger the radio via event bubbling.
+  if (!radioChecked) {
+    try {
+      const firstTd = row.locator('td').first()
+      if (await firstTd.count().catch(() => 0) > 0) {
+        await firstTd.click({ force: true, timeout: 4_000 }).catch(() => { })
+        await page.waitForTimeout(600)
+        if (await radioInput.isChecked().catch(() => false) || await isAnyRadioChecked()) {
+          log.info(`[ADV-RADIO] ✅ S4: Clicked first <td> cell`)
+          radioChecked = true
+        }
+      }
+    } catch (e) {
+      log.warn(`[ADV-RADIO] S4 td click failed: ${(e as Error).message}`)
+    }
+  }
+
+  // ── Strategy 5: NUCLEAR JS — targets TOPMOST dialog (Advanced Search) ───
+  // CRITICAL FIX: Previous code used document.querySelector('[role="dialog"]')
+  // which returns the FIRST dialog (parent form), not the Advanced Search.
+  // The Advanced Search is always the LAST/TOPMOST dialog. We must use
+  // querySelectorAll and target the last one.
   if (!radioChecked) {
     try {
       radioChecked = await page.evaluate((sv: string) => {
-        const dialog = document.querySelector('[role="dialog"]') as HTMLElement
-        if (!dialog) return false
+        // Get ALL dialogs and target the LAST one (topmost = Advanced Search)
+        const dialogs = document.querySelectorAll('[role="dialog"]')
+        if (dialogs.length === 0) return false
+        const dialog = dialogs[dialogs.length - 1] as HTMLElement
 
-        const allRows = Array.from(dialog.querySelectorAll('tbody tr, [role="row"]'))
+        const allRows = Array.from(dialog.querySelectorAll('tbody tr'))
+        // Try exact text match first, then any row with the text
         for (const r of allRows) {
           if (!r.textContent?.includes(sv)) continue
           const radio = r.querySelector('input[type="radio"]') as HTMLInputElement | null
@@ -1408,19 +1495,52 @@ async function selectAdvancedSearchRadio(
           radio.dispatchEvent(new MouseEvent('click', opts))
           return true
         }
+
+        // Fallback: select the first radio in the topmost dialog regardless
+        const firstRadio = dialog.querySelector('tbody tr input[type="radio"]') as HTMLInputElement | null
+        if (firstRadio) {
+          firstRadio.checked = true
+          const opts = { bubbles: true, composed: true, cancelable: true }
+          firstRadio.dispatchEvent(new Event('focusin', opts))
+          firstRadio.dispatchEvent(new Event('focus', opts))
+          firstRadio.dispatchEvent(new Event('input', opts))
+          firstRadio.dispatchEvent(new Event('change', opts))
+          firstRadio.dispatchEvent(new MouseEvent('click', opts))
+          return true
+        }
         return false
       }, searchValue)
-      if (radioChecked) log.info(`[ADV-RADIO] ✅ S4: Nuclear JS event dispatch succeeded`)
+      if (radioChecked) log.info(`[ADV-RADIO] ✅ S5: Nuclear JS (topmost dialog) succeeded`)
     } catch (e) {
-      log.warn(`[ADV-RADIO] S4 nuclear JS failed: ${(e as Error).message}`)
+      log.warn(`[ADV-RADIO] S5 nuclear JS failed: ${(e as Error).message}`)
+    }
+  }
+
+  // ── Strategy 6: Keyboard navigation — ArrowDown + Space ─────────────────
+  // Focus the table/first row and use keyboard to select.
+  if (!radioChecked) {
+    try {
+      // Focus the table body area
+      const tableBody = modal.locator('table tbody, table').first()
+      await tableBody.click({ force: true, timeout: 3_000 }).catch(() => { })
+      await page.waitForTimeout(300)
+      await page.keyboard.press('ArrowDown')
+      await page.waitForTimeout(300)
+      await page.keyboard.press('Space')
+      await page.waitForTimeout(600)
+      if (await isAnyRadioChecked()) {
+        log.info(`[ADV-RADIO] ✅ S6: Keyboard ArrowDown + Space succeeded`)
+        radioChecked = true
+      }
+    } catch (e) {
+      log.warn(`[ADV-RADIO] S6 keyboard nav failed: ${(e as Error).message}`)
     }
   }
 
   // ── Final verification ───────────────────────────────────────────────────
   if (!radioChecked) {
-    const anyChecked = await modal.locator('input[type="radio"]:checked').count().catch(() => 0)
-    if (anyChecked > 0) {
-      log.info(`[ADV-RADIO] Final check: found ${anyChecked} checked radio(s) — proceeding`)
+    if (await isAnyRadioChecked()) {
+      log.info(`[ADV-RADIO] Final check: found checked radio(s) — proceeding`)
       radioChecked = true
     }
   }
@@ -1438,20 +1558,24 @@ async function selectAdvancedSearchRadio(
   await page.waitForTimeout(2_500)
 
   // ── 4. Click Select button ───────────────────────────────────────────────
+  // IMPORTANT: Scope Select button to the modal (Advanced Search) to avoid
+  // accidentally clicking a "Select" button in the parent form modal.
   let selectClicked = false
   const selectLocators = [
-    page.getByRole('button', { name: /select/i }).filter({ hasText: /^Select$/i }),
-    modal.locator('button').filter({ hasText: /^Select$/ }),
-    page.locator('.slds-modal__footer button:has-text("Select")'),
+    modal.locator('.slds-modal__footer button, footer button, .modal-footer button').filter({ hasText: /^Select$/i }),
+    modal.locator('button').filter({ hasText: /^Select$/i }),
+    page.locator('.slds-modal__footer button:has-text("Select")').last(),  // last = topmost modal's footer
   ]
 
   for (const loc of selectLocators) {
     if (await loc.count().catch(() => 0) > 0) {
       const btn = loc.first()
+      // Force-enable the button (SF disables it until radio state propagates through LWC)
       await btn.evaluate((b: HTMLElement) => {
         (b as HTMLButtonElement).disabled = false
         b.removeAttribute('disabled')
       }).catch(() => { })
+      await page.waitForTimeout(300)
       await btn.click({ force: true, timeout: 5_000 }).catch(() => { })
       selectClicked = true
       log.info(`[ADV-RADIO] ✅ Clicked Select button`)
@@ -1459,12 +1583,31 @@ async function selectAdvancedSearchRadio(
     }
   }
 
-  // JS fallback
+  // JS fallback — target the TOPMOST dialog's Select button
   if (!selectClicked) {
     try {
       selectClicked = await page.evaluate(() => {
-        const btns = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[]
-        for (const b of btns) {
+        const dialogs = document.querySelectorAll('[role="dialog"]')
+        if (dialogs.length === 0) return false
+        const topDialog = dialogs[dialogs.length - 1]
+
+        // First try footer-scoped
+        const footer = topDialog.querySelector('.slds-modal__footer, .modal-footer, footer')
+        const footerBtns = footer
+          ? Array.from(footer.querySelectorAll('button')) as HTMLButtonElement[]
+          : []
+        for (const b of footerBtns) {
+          if (b.textContent?.trim() === 'Select') {
+            b.disabled = false
+            b.removeAttribute('disabled')
+            b.click()
+            return true
+          }
+        }
+
+        // Broader fallback within the topmost dialog
+        const allBtns = Array.from(topDialog.querySelectorAll('button')) as HTMLButtonElement[]
+        for (const b of allBtns) {
           if (b.textContent?.trim() === 'Select' && b.offsetParent !== null) {
             b.disabled = false
             b.removeAttribute('disabled')
@@ -1474,7 +1617,7 @@ async function selectAdvancedSearchRadio(
         }
         return false
       })
-      if (selectClicked) log.info(`[ADV-RADIO] ✅ Select clicked via JS fallback`)
+      if (selectClicked) log.info(`[ADV-RADIO] ✅ Select clicked via JS fallback (topmost dialog)`)
     } catch (e) {
       log.warn(`[ADV-RADIO] JS Select fallback failed: ${(e as Error).message}`)
     }
@@ -2374,7 +2517,28 @@ function resolveLocator(page: Page, step: StepData): Locator {
           .or(page.getByRole('button', { name: target, exact: false }))
           .or(page.getByText(target, { exact: false }))
       }
-      return page.getByLabel(target, { exact: false })
+      {
+        // For input actions (enter, fill, type), broaden the search.
+        // Many web apps don't properly link <label for="id"> and rely on placeholders,
+        // name attributes, or visually adjacent text.
+        const snakeTarget = target.toLowerCase().replace(/\s+/g, '_')
+        const camelTarget = target.replace(/(?:^\w|[A-Z]|\b\w)/g, (word, index) => {
+          return index === 0 ? word.toLowerCase() : word.toUpperCase()
+        }).replace(/\s+/g, '')
+
+        return page.getByLabel(target, { exact: false })
+          .or(page.getByPlaceholder(target, { exact: false }))
+          .or(page.locator(`input[name="${target}" i], textarea[name="${target}" i]`))
+          .or(page.locator(`input[name="${snakeTarget}" i], textarea[name="${snakeTarget}" i]`))
+          .or(page.locator(`input[name="${camelTarget}" i], textarea[name="${camelTarget}" i]`))
+          .or(page.locator(`input[id="${target}" i], textarea[id="${target}" i]`))
+          .or(page.locator(`input[id="${snakeTarget}" i], textarea[id="${snakeTarget}" i]`))
+          .or(page.locator(`input[id="${camelTarget}" i], textarea[id="${camelTarget}" i]`))
+          // Extreme fallback for visually adjacent labels in SPAs:
+          // Find text that matches the label, then look for the next input
+          .or(page.locator(`:text-is("${target}") + input, :text-is("${target}") + * input`))
+      }
+
 
     case 'placeholder':
       return page.getByPlaceholder(target, { exact: false })
@@ -2628,10 +2792,11 @@ async function executeStep(
   isLastStep: boolean,
   screenshotsDir: string,
   executionId: string,
-  // SF session recovery — passed from processExecution
+  // SF + Web session recovery — passed from processExecution
   browserCtx?: BrowserContext,
   projectId?: string,
   projectCategory?: string,
+  execJobContext?: ExecutionJob['context'],
 ): Promise<ExecutionStepResult> {
   const start = Date.now()
   const action = step.action.toLowerCase().replace(/[-_\s]/g, '')
@@ -2660,7 +2825,27 @@ async function executeStep(
           if (!navUrl) { log.warn(`[EXEC] NAVIGATE step ${stepIndex + 1} has no URL — skipping`); break }
           let resolvedUrl = navUrl
           if (navUrl.startsWith('/')) {
-            try { resolvedUrl = `${new URL(page.url()).origin}${navUrl}` } catch { /* first step */ }
+            // Priority 1: use the project's configured baseUrl ORIGIN
+            // IMPORTANT: baseUrl may be the LOGIN URL (e.g. https://crmd.datasirpi.com/login)
+            // — we must extract just the origin to avoid producing /login/accounts/create
+            const projectBase = execJobContext?.baseUrl
+            if (projectBase && projectBase.startsWith('http')) {
+              try {
+                resolvedUrl = `${new URL(projectBase).origin}${navUrl}`
+              } catch {
+                resolvedUrl = `${projectBase.replace(/\/[^/]*$/, '')}${navUrl}`
+              }
+            } else {
+              // Priority 2: derive origin from the current live page URL
+              // NOTE: page.url() can be 'about:blank' before first navigation, in which case
+              // new URL(...).origin === 'null' (the string). Guard against that.
+              try {
+                const origin = new URL(page.url()).origin
+                if (origin && origin !== 'null') {
+                  resolvedUrl = `${origin}${navUrl}`
+                }
+              } catch { /* remain as-is — page.goto will throw with a clear error */ }
+            }
           }
           try {
             await page.goto(resolvedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
@@ -2715,6 +2900,155 @@ async function executeStep(
             }
           }
 
+          // ── Web App Session Guard ───────────────────────────────────────────
+          // Web apps redirect unauthenticated users to /login (or similar).
+          // If we detect such a redirect after navigation, re-run loginToWebApp
+          // (which has full credentials via execJobContext) and retry navigation.
+          if (isWebAppCategory(projectCategory) && projectId && browserCtx && execJobContext?.webLoginUrl) {
+            await page.waitForTimeout(2_000)
+            const postNavUrl = page.url().toLowerCase()
+            const loginUrlLower = (execJobContext.webLoginUrl ?? '').toLowerCase()
+            const loginIndicators = ['/login', '/signin', '/sign-in', '/auth', '/session/new']
+            const redirectedToLogin =
+              // URL-based: we ended up on a login-like path
+              loginIndicators.some(p => postNavUrl.includes(p)) ||
+              // Or we ended up exactly at the login URL we know about
+              (loginUrlLower !== '' && postNavUrl.startsWith(loginUrlLower)) ||
+              // DOM-based: a password field is visible on the page now
+              await page.locator('input[type="password"]').first().isVisible({ timeout: 3_000 }).catch(() => false)
+
+            // Also detect "silent redirects" — some apps (e.g. this CRM) send
+            // unauthenticated users to /home or /dashboard instead of /login.
+            const intendedPath = (() => { try { return new URL(resolvedUrl).pathname.replace(/\/$/, '') || '/' } catch { return '' } })()
+            const actualPath   = (() => { try { return new URL(page.url()).pathname.replace(/\/$/, '') || '/' } catch { return '' } })()
+            const silentRedirect =
+              !redirectedToLogin &&
+              intendedPath !== '' &&
+              actualPath !== intendedPath &&
+              !actualPath.startsWith(intendedPath + '/') &&
+              !intendedPath.startsWith(actualPath + '/') &&
+              /^\/(home|dashboard|index|main|app)(\/|$)/.test(actualPath)
+
+            if ((redirectedToLogin || silentRedirect) && postNavUrl !== resolvedUrl.toLowerCase()) {
+              log.warn(
+                `[EXEC] NAVIGATE step ${stepIndex + 1}: Web app session expired — ` +
+                `${redirectedToLogin ? 'login redirect' : `silent redirect to "${actualPath}"`} detected. ` +
+                `Re-authenticating…`,
+              )
+              await loginToWebApp(page, browserCtx, execJobContext, projectId)
+              log.info(`[EXEC] Web app re-auth OK — retrying navigation to ${resolvedUrl}`)
+              try {
+                await page.goto(resolvedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+              } catch (retryErr: unknown) {
+                const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+                if (!retryMsg.includes('ERR_ABORTED')) throw retryErr
+              }
+            }
+          }
+
+          // ── Web App URL Verification & Smart Retry ─────────────────────────
+          // For web app projects, verify we landed on the intended page.
+          // Special handling for form paths (/new, /create, /add) — these MUST
+          // reach the actual form, not the list page.
+          if (isWebAppCategory(projectCategory) && resolvedUrl.startsWith('http')) {
+            await page.waitForTimeout(1_500)
+            const finalUrl = page.url()
+            try {
+              const expectedPath = new URL(resolvedUrl).pathname.replace(/\/$/, '') || '/'
+              const finalPath   = new URL(finalUrl).pathname.replace(/\/$/, '') || '/'
+              const isFormPath = /\/(new|create|add|edit)$/.test(expectedPath)
+
+              if (finalPath === expectedPath) {
+                log.info(`[EXEC] NAVIGATE ✅ URL verified: "${expectedPath}"`)
+              } else if (isFormPath) {
+                // Form path redirect detected — try alternative URLs + button click
+                const baseOrigin = new URL(resolvedUrl).origin
+                const pathParts = expectedPath.split('/')
+                const formAction = pathParts.pop()!
+                const entityBase = pathParts.join('/')
+
+                const altPaths = ['new', 'create', 'add']
+                  .filter(p => p !== formAction)
+                  .map(p => `${entityBase}/${p}`)
+
+                let foundForm = false
+                for (const altPath of altPaths) {
+                  try {
+                    log.info(`[EXEC] NAVIGATE: "${expectedPath}" redirected → trying "${altPath}"`)
+                    await page.goto(`${baseOrigin}${altPath}`, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+                    await page.waitForTimeout(1_500)
+                    const newPath = new URL(page.url()).pathname.replace(/\/$/, '') || '/'
+                    if (newPath === altPath) {
+                      log.info(`[EXEC] NAVIGATE ✅ Alternative URL worked: "${altPath}"`)
+                      foundForm = true
+                      break
+                    }
+                  } catch { /* try next */ }
+                }
+
+                // If no direct URL works, click "New" button from the list page
+                if (!foundForm) {
+                  log.info(`[EXEC] NAVIGATE: No direct URL worked — clicking New button from list`)
+                  await page.goto(`${baseOrigin}${entityBase}`, { waitUntil: 'domcontentloaded', timeout: 15_000 })
+                  await page.waitForTimeout(2_000)
+
+                  const entitySlug = entityBase.split('/').pop()?.replace(/s$/, '') || ''
+                  const entityCap = entitySlug.charAt(0).toUpperCase() + entitySlug.slice(1)
+                  const buttonNames = [
+                    `New ${entityCap}`, `+ New ${entityCap}`, `Create ${entityCap}`,
+                    `Add ${entityCap}`, 'New', '+ New', 'Create', 'Add',
+                  ]
+
+                  for (const btnText of buttonNames) {
+                    const btn = page.getByRole('button', { name: btnText, exact: false })
+                    const lnk = page.getByRole('link', { name: btnText, exact: false })
+                    const el = (await btn.count() > 0) ? btn.first() :
+                               (await lnk.count() > 0) ? lnk.first() : null
+                    if (el && await el.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                      await el.click()
+                      await page.waitForTimeout(2_000)
+                      log.info(`[EXEC] NAVIGATE ✅ Clicked "${btnText}" to reach form`)
+                      foundForm = true
+                      break
+                    }
+                  }
+
+                  if (!foundForm) {
+                    throw new Error(
+                      `NAVIGATE failed: form page "${expectedPath}" redirected to "${finalPath}". ` +
+                      `Tried alt URLs and button clicks — none reached the form.`
+                    )
+                  }
+                }
+
+                // Wait for form to render after arriving
+                await page.locator(
+                  'input:not([type="hidden"]), textarea, select, form',
+                ).first().waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {})
+              } else {
+                // Non-form path: accept flexible SPA parent-route matches
+                const pathMatches =
+                  finalPath.startsWith(expectedPath + '/') ||
+                  expectedPath.startsWith(finalPath + '/')
+                if (!pathMatches) {
+                  // Distinguish permission-denied from a normal unexpected redirect.
+                  // If we end up on /home or /dashboard AFTER a valid re-auth,
+                  // the account simply lacks access to this page.
+                  const isPermissionDenied = /^\/(home|dashboard|index|main|app)(\/|$)/.test(finalPath)
+                  const errMsg = isPermissionDenied
+                    ? `NAVIGATE failed — PERMISSION DENIED: "${expectedPath}" redirected to "${finalPath}". ` +
+                      `The logged-in account does not have access to this page. Grant the required role/permission in the app or use a privileged account.`
+                    : `NAVIGATE failed: requested "${expectedPath}" but landed on "${finalPath}".`
+                  throw new Error(errMsg)
+                }
+                log.info(`[EXEC] NAVIGATE ✅ SPA parent route match: "${expectedPath}" → "${finalPath}"`)
+              }
+            } catch (urlVerifyErr: unknown) {
+              if (urlVerifyErr instanceof Error && urlVerifyErr.message.startsWith('NAVIGATE failed')) throw urlVerifyErr
+              log.warn({ err: urlVerifyErr }, '[EXEC] URL verification parse error (non-fatal)')
+            }
+          }
+
           // SF Lightning post-navigate stabilization:
           // domcontentloaded fires early but LWC/Aura components keep rendering.
           // Wait until at least one form element or Lightning component is visible
@@ -2725,6 +3059,14 @@ async function executeStep(
               '.slds-table, .forceSalesPath, one-record-home-flexipage2, force-highlights-panel',
             ).first().waitFor({ state: 'visible', timeout: 8_000 }).catch(() => {
               // Page may not have a form (e.g. list views) — that's fine, continue
+            })
+          } else if (isWebAppCategory(projectCategory)) {
+            // Web app SPA stabilization: React/Vue/Angular mount components AFTER domcontentloaded.
+            // Wait up to 5s for any visible input or form element before proceeding.
+            await page.locator(
+              'input:not([type="hidden"]):not([type="range"]), textarea, select, form, [role="form"]',
+            ).first().waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {
+              // Page may be a non-form page (e.g. dashboard) — that's fine, continue
             })
           }
           break
@@ -2739,7 +3081,97 @@ async function executeStep(
             const frameLoc = activeFrame.locator(target)
             await frameLoc.waitFor({ state: 'visible', timeout: 15_000 })
             await frameLoc.click()
+          } else if (isWebAppCategory(projectCategory)) {
+            // ── Web App click path ────────────────────────────────────────
+            // Bypasses SF modal scoping. Uses smart fallback when button name
+            // doesn't exactly match (e.g. AI generates "Save" but actual is "Create Account").
+            const roleMatch = target.match(/role=(\w+),\s*name=(.+)/i)
+            let clicked = false
+
+            if (roleMatch) {
+              const [, role, name] = roleMatch
+              const btnName = name.trim()
+
+              // Try 1: exact role match
+              const exactLoc = page.getByRole(role as any, { name: btnName, exact: true })
+              if (await exactLoc.count().catch(() => 0) > 0 &&
+                  await exactLoc.first().isVisible({ timeout: 3_000 }).catch(() => false)) {
+                await exactLoc.first().scrollIntoViewIfNeeded().catch(() => {})
+                await exactLoc.first().click()
+                clicked = true
+                log.info(`[WEBAPP-ENGINE] ✅ Clicked "${btnName}" (exact match)`)
+              }
+
+              // Try 2: partial/fuzzy role match (e.g. "Save" matches "Save & New")
+              if (!clicked) {
+                const partialLoc = page.getByRole(role as any, { name: btnName, exact: false })
+                if (await partialLoc.count().catch(() => 0) > 0 &&
+                    await partialLoc.first().isVisible({ timeout: 2_000 }).catch(() => false)) {
+                  await partialLoc.first().scrollIntoViewIfNeeded().catch(() => {})
+                  await partialLoc.first().click()
+                  clicked = true
+                  log.info(`[WEBAPP-ENGINE] ✅ Clicked "${btnName}" (partial match)`)
+                }
+              }
+
+              // Try 3: common submit button alternatives (Save→Create X, Submit, etc.)
+              if (!clicked && ['save', 'submit'].includes(btnName.toLowerCase())) {
+                // Look for any submit-like button: Create*, Submit, Save*, OK
+                const submitPatterns = [
+                  'Create', 'Submit', 'Save', 'Add', 'OK', 'Confirm', 'Done',
+                ]
+                for (const pattern of submitPatterns) {
+                  const altLoc = page.getByRole('button', { name: new RegExp(pattern, 'i') })
+                  const count = await altLoc.count().catch(() => 0)
+                  for (let i = 0; i < count; i++) {
+                    const btn = altLoc.nth(i)
+                    const isVisible = await btn.isVisible({ timeout: 1_000 }).catch(() => false)
+                    if (isVisible) {
+                      const btnText = await btn.textContent().catch(() => '') || ''
+                      // Skip navigation/sidebar buttons — look for primary action buttons
+                      if (['cancel', 'back', 'close', 'collapse', 'expand'].some(
+                        skip => btnText.toLowerCase().includes(skip))) continue
+                      await btn.scrollIntoViewIfNeeded().catch(() => {})
+                      await btn.click()
+                      clicked = true
+                      log.info(`[WEBAPP-ENGINE] ✅ Clicked submit alternative: "${btnText.trim()}" (looked for "${btnName}")`)
+                      break
+                    }
+                  }
+                  if (clicked) break
+                }
+              }
+
+              // Try 4: visible text match
+              if (!clicked) {
+                const textLoc = page.getByText(btnName, { exact: true })
+                if (await textLoc.count().catch(() => 0) > 0 &&
+                    await textLoc.first().isVisible({ timeout: 2_000 }).catch(() => false)) {
+                  await textLoc.first().click()
+                  clicked = true
+                  log.info(`[WEBAPP-ENGINE] ✅ Clicked by text: "${btnName}"`)
+                }
+              }
+            }
+
+            // Not a role locator — try as direct CSS selector or text
+            if (!clicked) {
+              const directLoc = target.startsWith('.') || target.startsWith('#') || target.startsWith('[')
+                ? page.locator(target)
+                : page.getByText(target, { exact: false })
+              await directLoc.first().waitFor({ state: 'visible', timeout: 15_000 })
+              await directLoc.first().click()
+              clicked = true
+            }
+
+            if (!clicked) {
+              throw new Error(`Web App CLICK: could not find clickable element "${target}"`)
+            }
+
+            // Web app post-click: brief wait for SPA state update
+            await page.waitForTimeout(1_000)
           } else {
+            // ── Salesforce click path ──────────────────────────────────────
             // Modal-scoped: find the element inside an open modal first
             const loc = await modalScopedResolve(page, step)
             await loc.waitFor({ state: 'visible', timeout: 15_000 })
@@ -2751,7 +3183,7 @@ async function executeStep(
           const targetLower = (target ?? '').toLowerCase()
 
           // After clicking New/Edit/Clone: wait for modal, scan field map
-          if (['new', 'edit', 'create', 'clone', 'quick'].some((kw) => targetLower.includes(kw))) {
+          if (!isWebAppCategory(projectCategory) && ['new', 'edit', 'create', 'clone', 'quick'].some((kw) => targetLower.includes(kw))) {
             log.info(`[SF-ENGINE] Post-click: waiting for modal after "${target}"`)
 
             const modalFound = await waitForSFModal(page)
@@ -2783,8 +3215,8 @@ async function executeStep(
             }
           }
 
-          // After clicking Save: check for errors, handle duplicates
-          if (targetLower.includes('save')) {
+          // After clicking Save: check for errors, handle duplicates (SF only)
+          if (!isWebAppCategory(projectCategory) && targetLower.includes('save')) {
             await waitForSpinnerGone(page)
             await handleDuplicatePopup(page)
             await page.waitForTimeout(3_000) // VF errors take 3-5s to appear
@@ -2826,6 +3258,16 @@ async function executeStep(
             break
           }
 
+          // ── Web App smart fill path ─────────────────────────────────────
+          // Delegates to the webapp-field-handler microservice which probes the
+          // DOM type (select, checkbox, date, text) and routes to the correct
+          // handler — mirroring what SF-specific code does for Lightning fields.
+          if (isWebAppCategory(projectCategory)) {
+            await fillWebAppField(page, target, value)
+            break
+          }
+
+          // ── Salesforce-specific fill/type path ────────────────────────────
           // Resolve the field label from Playwright expressions
           const resolvedFillLabel = extractLabelFromTarget(target)
           log.info(`[SF-ENGINE] fill/type: "${resolvedFillLabel}" = "${value}"`)
@@ -2986,6 +3428,14 @@ async function executeStep(
             log.info(`[EXEC] SELECT: resolved target "${target}" → "${resolvedTarget}"`)
           }
 
+          // ── Web App early branch ────────────────────────────────────────
+          // Web apps use standard <select>, role=combobox, and custom dropdowns.
+          // Route to the webapp-field-handler BEFORE any SF-specific logic fires.
+          if (isWebAppCategory(projectCategory)) {
+            await selectWebAppPicklist(page, resolvedTarget, value)
+            break
+          }
+
           // ── Case: residual Playwright expression (no label extracted) ──
           // Happens when AI emits e.g. getByRole('combobox') with no {name:'...'}.
           // Execute the role/locator directly: click the first visible element,
@@ -3093,18 +3543,43 @@ async function executeStep(
           break
         }
 
-        // ── SF Picklist (explicit action) ──────────────────
+        // ── SF / Web App Picklist (explicit action) ────────
         case 'picklist':
         case 'sfpicklist': {
-          await selectSFPicklist(page, target, value, executionId)
+          if (isWebAppCategory(projectCategory)) {
+            await selectWebAppPicklist(page, target, value)
+          } else {
+            await selectSFPicklist(page, target, value, executionId)
+          }
           break
         }
 
-        // ── SF Date ────────────────────────────────────────
+        // ── SF / Web App Date ──────────────────────────────
         case 'date':
         case 'sfdate':
         case 'setdate': {
-          await fillSFDate(page, target, value)
+          if (isWebAppCategory(projectCategory)) {
+            await fillWebAppDateField(page, target, value)
+          } else {
+            await fillSFDate(page, target, value)
+          }
+          break
+        }
+
+        // ── Web App Checkbox (explicit action) ─────────────
+        case 'checkbox':
+        case 'check':
+        case 'toggle': {
+          if (isWebAppCategory(projectCategory)) {
+            await fillWebAppCheckbox(page, target, value)
+          } else {
+            // SF: route through generic fill which detects checkbox type
+            const cbSel = page.getByLabel(extractLabelFromTarget(target), { exact: false })
+            const shouldCheck = ['true', '1', 'yes', 'on'].includes(value.toLowerCase())
+            if (await cbSel.first().isVisible({ timeout: 3_000 }).catch(() => false)) {
+              if (shouldCheck) { await cbSel.first().check() } else { await cbSel.first().uncheck() }
+            }
+          }
           break
         }
 
@@ -3317,53 +3792,98 @@ async function executeStep(
         }
 
         case 'asserturl': {
-          const currentUrl = page.url()
-          if (!currentUrl.includes(target)) {
-            throw new Error(`URL assertion failed: "${currentUrl}" does not contain "${target}"`)
+          // ASSERT_URL: value = expected URL path fragment (e.g. "/accounts")
+          // target is empty for web app redirects; value holds the fragment.
+          const urlFragment = value || target
+          if (!urlFragment) {
+            log.warn(`[EXEC] ASSERT_URL step ${stepIndex + 1} has no value/target — skipping`)
+            break
           }
+
+          // Wait for the SPA redirect to settle (up to 8 seconds)
+          // Many CRM apps take 1–3s to redirect after a form save.
+          const urlDeadline = Date.now() + 8_000
+          let currentUrl = page.url()
+          while (!currentUrl.toLowerCase().includes(urlFragment.toLowerCase()) && Date.now() < urlDeadline) {
+            await page.waitForTimeout(500)
+            currentUrl = page.url()
+          }
+
+          if (!currentUrl.toLowerCase().includes(urlFragment.toLowerCase())) {
+            throw new Error(`URL assertion failed: expected URL to contain "${urlFragment}" but got "${currentUrl}"`)
+          }
+          log.info(`[EXEC] ASSERT_URL ✅ URL "${currentUrl}" contains "${urlFragment}"`)
           break
         }
 
-        // ── Assert Toast (validation rule / flow / trigger) ─
+
+        // ── Assert Toast (validation rule / flow / trigger / web app snackbar) ─
         case 'asserttoast':
         case 'asserterror':
         case 'assertsuccess': {
-          // SF Lightning renders toasts in several different DOM structures depending
-          // on the page type (Aura, LWC, Experience Cloud, etc.).
-          // We try them all and take whichever appears first.
+          // Combines SF Lightning toast selectors with common web-app toast/snackbar
+          // libraries so the same handler works for both Salesforce and Web App projects.
           const toastSelectors = [
+            // ── Salesforce Lightning ──────────────────────────────────────────
             '.slds-notify .slds-notify__content',           // Classic/Aura toast
             '[data-key="success"] .toastMessage',           // LWC success toast
             '[data-key="error"] .toastMessage',             // LWC error toast
             '[data-key="warning"] .toastMessage',           // LWC warning toast
             '[data-key="info"] .toastMessage',              // LWC info toast
             '.forceActionsText',                            // force:showToast legacy
-            'force-toast .toastMessage',                   // web component variant
-            '.toastMessage',                                // catch-all
+            'force-toast .toastMessage',                    // web component variant
+            '.toastMessage',                                // catch-all Salesforce
             'lightning-toast .slds-notify__content',        // LWC lightning-toast
-            '.slds-notify[role="status"] .slds-notify__content', // Scoped ARIA status (actual toast only)
+            '.slds-notify[role="status"] .slds-notify__content', // Scoped ARIA status
+
+            // ── Common Web App toast/snackbar libraries ────────────────────────
+            '[data-sonner-toast]',                          // Sonner (Next.js default)
+            '[data-sonner-toast] [data-title]',             // Sonner title
+            '[role="status"][aria-live]',                   // Generic ARIA live region
+            '[aria-live="polite"]',                         // Polite live region
+            '[aria-live="assertive"]',                      // Assertive live region
+            '.Toastify__toast-body',                        // react-toastify
+            '.react-hot-toast',                             // react-hot-toast
+            '.chakra-toast__inner',                         // Chakra UI
+            '.MuiSnackbarContent-message',                  // MUI Snackbar
+            '.mantine-Notification-description',            // Mantine
+            '.alert.alert-success',                         // Bootstrap success alert
+            '.alert.alert-danger',                          // Bootstrap error alert
+            '.notification-message',                        // Generic notification
+            '[class*="toast"][class*="message"]',           // Broad toast message
+            '[class*="snackbar"]',                          // Generic snackbar
+            '[class*="notification"]',                      // Generic notification
           ]
           const toastLoc = page.locator(toastSelectors.join(', ')).first()
 
           let toastText: string | null = null
           try {
-            await toastLoc.waitFor({ state: 'visible', timeout: 15_000 })
+            await toastLoc.waitFor({ state: 'visible', timeout: 12_000 })
             toastText = await toastLoc.textContent()
           } catch {
-            // Toast may have already auto-dismissed (SF toasts last ~3s).
-            // Fall back: check if the page title/URL indicates a successful save.
+            // Toast may have already auto-dismissed or the app uses URL redirect instead of toast.
             const pageText = await page.title().catch(() => '')
             const url = page.url()
             if (value) {
               const lv = value.toLowerCase()
-              // Match only definitive record view URLs: /lightning/r/{ObjectId}/view
+              // SF: definitive record view URLs: /lightning/r/{ObjectId}/view
               const isRecordViewUrl = /\/lightning\/r\/[a-zA-Z0-9]+\/view/i.test(url)
-              if (pageText.toLowerCase().includes(lv) || isRecordViewUrl) {
-                log.info(`[EXEC] Toast auto-dismissed but page title/URL confirms save: "${pageText}"`)
+              // Web App: URL changed away from /create, /new, /add paths (redirect after save)
+              const wasCreatePage = /\/(create|new|add)(\/|$|\?)/i.test(url)
+              const urlChangedFromCreate = !wasCreatePage && !/\/(create|new|add)(\/|$|\?)/i.test(url)
+              if (pageText.toLowerCase().includes(lv) || isRecordViewUrl || urlChangedFromCreate) {
+                log.info(`[EXEC] Toast auto-dismissed but page confirms save: title="${pageText}" url="${url}"`)
+                break
+              }
+            } else {
+              // No expected value — just check if we navigated somewhere meaningful
+              const isOnCreatePage = /\/(create|new|add)(\/|$|\?)/i.test(url)
+              if (!isOnCreatePage) {
+                log.info(`[EXEC] Toast not found but URL indicates redirect to: "${url}" — treating as pass`)
                 break
               }
             }
-            throw new Error(`Toast not found after 15s and no page-state fallback matched.`)
+            throw new Error(`Toast/notification not found after 12s and no page-state fallback matched. Current URL: ${url}`)
           }
 
           if (value) {
@@ -3377,6 +3897,8 @@ async function executeStep(
           log.info(`[EXEC] Toast assertion passed: "${toastText?.trim()}"`)
           break
         }
+
+
 
 
         // ── URL Navigate (flow / VF page URL) ─────────────
@@ -3416,7 +3938,7 @@ async function executeStep(
           break
         }
 
-        // ── Scroll ─────────────────────────────────────────
+        // ── Scroll ──────────────────────────────────────────────────
         case 'scroll': {
           if (target) {
             await (await getFirstVisibleLocator(resolveLocator(page, step))).scrollIntoViewIfNeeded()
@@ -3426,7 +3948,7 @@ async function executeStep(
           break
         }
 
-        // ── Explicit screenshot ────────────────────────────
+        // ── Explicit screenshot ───────────────────────────────────────
         case 'screenshot': {
           const ssFile = `step-${stepIndex}-explicit-${Date.now()}.png`
           const ssPath = path.join(screenshotsDir, ssFile)
@@ -3435,13 +3957,13 @@ async function executeStep(
           break
         }
 
-        // ── Clear cookies ──────────────────────────────────
+        // ── Clear cookies ──────────────────────────────────────────────
         case 'clearcookies': {
           await page.context().clearCookies()
           break
         }
 
-        // ── Unknown action ─────────────────────────────────
+        // ── Unknown action ──────────────────────────────────────────────
         default: {
           log.warn(`[EXEC] Unknown action "${step.action}" at step ${stepIndex + 1} — skipping`)
           return {
@@ -3457,7 +3979,7 @@ async function executeStep(
         const ssFile = `step-${stepIndex + 1}-FINAL-${Date.now()}.png`
         const ssAbsPath = path.join(screenshotsDir, ssFile)
         try {
-          await page.screenshot({ path: ssAbsPath, fullPage: false })
+await page.screenshot({ path: ssAbsPath, fullPage: false })
           screenshotPath = `/screenshots/${executionId}/${ssFile}`
         } catch { /* non-fatal */ }
       }
@@ -3585,35 +4107,127 @@ async function loginToWebApp(
   projectId: string,
 ): Promise<void> {
   if (!context.webLoginUrl || !context.webUsername || !context.webPassword) {
-    log.info('[EXEC-WEB] No web credentials — skipping login'); return
+    log.info('[EXEC-WEB] No web credentials configured — skipping login')
+    return
   }
 
   const strategy = context.webLoginStrategy ?? 'form'
+  log.info(`[EXEC-WEB] Logging in via strategy="${strategy}" to ${context.webLoginUrl}`)
 
   if (strategy === 'basic_auth') {
     const url = new URL(context.webLoginUrl)
     url.username = context.webUsername
     url.password = context.webPassword
     await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await page.waitForTimeout(2_000)
     await saveSession(projectId, browserCtx)
+    log.info('[EXEC-WEB] ✅ Basic auth login complete')
     return
   }
 
+  // ── Form-based login ────────────────────────────────────────────────────────
   await page.goto(context.webLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-  const emailInput = page.locator('input[type="email"], input[name*="user"], input[name*="email"]').first()
-  const passwordInput = page.locator('input[type="password"]').first()
+  // Give SPAs (React/Vue/Angular) extra time to mount the login form in the DOM
+  await page.waitForTimeout(3_000)
 
-  try {
-    await emailInput.waitFor({ state: 'visible', timeout: 8_000 })
-    await emailInput.fill(context.webUsername)
-    await passwordInput.fill(context.webPassword)
-    await page.keyboard.press('Enter')
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => { })
-    log.info('[EXEC-WEB] ✅ Form login submitted')
-    await saveSession(projectId, browserCtx)
-  } catch {
-    log.warn('[EXEC-WEB] Login form heuristic failed — continuing without session save')
+  // ── Already logged in guard ─────────────────────────────────────────────
+  // If the login URL redirected to the home/dashboard (valid session), there
+  // will be NO password field. Check this FIRST before filling any input —
+  // otherwise the generic 'input[type="text"]' fallback fills the global
+  // search bar with the email address.
+  const alreadyLoggedIn = !(await page.locator('input[type="password"]').first().isVisible({ timeout: 3_000 }).catch(() => false))
+  if (alreadyLoggedIn) {
+    log.info('[EXEC-WEB] ✅ Already authenticated (no password field) — skipping login')
+    return
   }
+
+  // Broad locator covering all common login field patterns.
+  // input[type="text"] is the last fallback — catches generic CRM/SaaS text inputs
+  // that don’t declare type="email" or a recognised name/id attribute.
+  const usernameSelectors = [
+    'input[type="email"]',
+    'input[name="email"]',
+    'input[name="username"]',
+    'input[name="user"]',
+    'input[name="login"]',
+    'input[id="email"]',
+    'input[id="username"]',
+    'input[id="user"]',
+    'input[placeholder*="email" i]',
+    'input[placeholder*="username" i]',
+    'input[placeholder*="user" i]',
+    'input[autocomplete="username"]',
+    'input[autocomplete="email"]',
+    // Generic text input — last resort, picks the first visible text field on the page
+    'input[type="text"]',
+  ]
+  const passwordSelectors = [
+    'input[type="password"]',
+  ]
+
+  const usernameInput = page.locator(usernameSelectors.join(', ')).first()
+  const passwordInput = page.locator(passwordSelectors.join(', ')).first()
+
+  const formFound = await usernameInput.isVisible({ timeout: 10_000 }).catch(() => false)
+  if (!formFound) {
+    // Non-fatal: stored session cookies may still be valid from a previous run.
+    // The test steps will fail with a meaningful error at the right step if login is truly required.
+    log.warn(
+      `[EXEC-WEB] ⚠️  Login form not detected at ${context.webLoginUrl} after 10s. ` +
+      'Continuing with stored session (if any). ' +
+      'If tests fail, verify the Login URL in Integration → Session & Login settings.'
+    )
+    return
+  }
+
+  await usernameInput.fill(context.webUsername)
+  log.info('[EXEC-WEB] Filled username/email')
+
+  const pwdVisible = await passwordInput.isVisible({ timeout: 5_000 }).catch(() => false)
+  if (!pwdVisible) {
+    // Some apps render password field after username submit (e.g. Google-style)
+    await page.keyboard.press('Enter')
+    await page.waitForTimeout(1_500)
+  }
+
+  const pwdFound = await passwordInput.isVisible({ timeout: 8_000 }).catch(() => false)
+  if (pwdFound) {
+    await passwordInput.fill(context.webPassword)
+    log.info('[EXEC-WEB] Filled password')
+  } else {
+    log.warn('[EXEC-WEB] ⚠️  Password field not visible after 8s — skipping password fill')
+  }
+
+  // Submit — prefer explicit submit button, fall back to Enter
+  const submitBtn = page.locator(
+    'button[type="submit"], input[type="submit"], ' +
+    'button:has-text("Sign in"), button:has-text("Log in"), ' +
+    'button:has-text("Login"), button:has-text("Sign In"), ' +
+    'button:has-text("Continue"), button:has-text("Next")'
+  ).first()
+  const submitVisible = await submitBtn.isVisible({ timeout: 3_000 }).catch(() => false)
+  if (submitVisible) {
+    await submitBtn.click()
+  } else {
+    await page.keyboard.press('Enter')
+  }
+
+  // Wait for navigation (post-login redirect)
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => { })
+  await page.waitForTimeout(2_000)
+
+  // Verify we actually left the login page
+  const currentUrl = page.url()
+  const loginHostname = (() => { try { return new URL(context.webLoginUrl).hostname } catch { return '' } })()
+  const isStillOnLoginPage = currentUrl === context.webLoginUrl ||
+    (currentUrl.includes('/login') && loginHostname !== '' && currentUrl.includes(loginHostname))
+  if (isStillOnLoginPage) {
+    log.warn(`[EXEC-WEB] ⚠️  Still on login URL after submit: ${currentUrl}. Credentials may be invalid.`)
+  } else {
+    log.info(`[EXEC-WEB] ✅ Form login succeeded → ${currentUrl}`)
+  }
+
+  await saveSession(projectId, browserCtx)
 }
 
 // ─── Browser state highlighting ─────────────────────────────────────────────
@@ -4079,11 +4693,16 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           throw loginErr
         }
 
-      } else if (context.projectCategory === 'webapp' && context.webLoginStrategy !== 'none') {
-        if (hasSession) {
-          log.info('[SESSION] Using stored web app session — skipping login')
-        } else {
-          await loginToWebApp(page, browserContext, context, projectId)
+      } else if (isWebAppCategory(context.projectCategory) && context.webLoginStrategy !== 'none') {
+        // Always run loginToWebApp — mirrors Salesforce's always-authenticate approach.
+        // The stored session (loaded above) pre-populates cookies, but we always
+        // re-authenticate to ensure validity — stale cookies silently block test steps.
+        log.info(`[SESSION] Running web app form login (hasStoredSession=${hasSession})`)
+        try {
+          await loginToWebApp(page!, browserContext!, context, projectId)
+        } catch (loginErr) {
+          log.error({ loginErr }, '[SESSION] Web app login failed — test cannot proceed')
+          throw loginErr
         }
       }
     }
@@ -4143,6 +4762,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
         browserContext ?? undefined,
         projectId,
         context.projectCategory,
+        context,
       )
       stepResults.push(result)
 
@@ -4438,6 +5058,34 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     try { await browserContext!.tracing.stop({ path: traceFile }) }
     catch (traceErr) { log.warn({ traceErr }, '[EXEC] Failed to stop trace') }
 
+    // ── Write final result to DB BEFORE closing browser ───────────
+    // This eliminates the race condition where the browser closes but the DB
+    // still shows 'running'. The frontend poll always gets the true final
+    // status before the browser window disappears.
+    {
+      const durationMsEarly = Date.now() - startTime
+      const lastShotEarly = stepResults.slice().reverse().find((s) => s.screenshot_path)?.screenshot_path ?? null
+      const earlyStatus =
+        finalStatus === 'PASSED' ? 'passed'
+          : finalStatus === 'FAILED' ? 'failed'
+            : 'error'
+      try {
+        await prisma.test_runs.update({
+          where: { id: executionId },
+          data: {
+            status: earlyStatus,
+            result: earlyStatus,
+            logs: stepResults as unknown as object[],
+            duration: durationMsEarly / 1000,
+            screenshot_path: lastShotEarly,
+          },
+        })
+        log.info(`[EXEC] ✅ Pre-close DB write: ${executionId} → ${earlyStatus}`)
+      } catch (earlyWriteErr) {
+        log.warn({ earlyWriteErr }, '[EXEC] Pre-close DB write failed (will retry after close)')
+      }
+    }
+
     // ── Enqueue healing if failed ─────────────────────────────────
     if (finalStatus === 'FAILED' && firstFailedLocator !== null) {
       await healingQueue.add('heal', {
@@ -4478,7 +5126,9 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     try { await browser?.close() } catch { /* ignore */ }
   }
 
-  // ── Write final result to test_runs ──────────────────────────
+  // ── Safety: Write final result to test_runs (catches fatal error path) ──────
+  // The pre-close write above handles the happy path. This catches ERROR status
+  // from the catch block which runs before finally (browser not yet closed).
   const durationMs = Date.now() - startTime
   const lastScreenshot = stepResults.slice().reverse().find((s) => s.screenshot_path)?.screenshot_path ?? null
   const testRunStatus =

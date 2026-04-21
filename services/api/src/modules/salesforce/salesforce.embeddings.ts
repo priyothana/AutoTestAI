@@ -16,6 +16,7 @@
 import { OpenAI } from 'openai'
 import prisma from '../../shared/db/prisma.js'
 import { createModuleLogger } from '../../shared/logger/index.js'
+import { RecursiveCharacterTextSplitter } from '../../shared/utils/text-splitter.js'
 
 const log = createModuleLogger('sf-embeddings')
 
@@ -136,6 +137,11 @@ export async function generateEmbeddings(projectId: string): Promise<number> {
   }
 
   const chunks: Chunk[] = []
+  
+  const textSplitter = new RecursiveCharacterTextSplitter({
+    chunkSize: MAX_CHUNK_CHARS,
+    chunkOverlap: 200,
+  })
 
   // ── from metadata_normalized ────────────────────────────────────────────
   const normalizedRows = await prisma.metadata_normalized.findMany({
@@ -153,12 +159,16 @@ export async function generateEmbeddings(projectId: string): Promise<number> {
       const baseUrl = String(data['base_url'] ?? '')
 
       if (pages.length === 0) {
-        chunks.push({
-          sourceId:   record.id,
-          sourceType: 'webapp_page',
-          chunkType:  'webapp_metadata',
-          text:       `WebApp metadata for ${baseUrl}: 0 pages crawled`.slice(0, MAX_CHUNK_CHARS),
-        })
+        const baseText = `WebApp metadata for ${baseUrl}: 0 pages crawled`
+        const splitText = textSplitter.splitText(baseText)
+        for (const split of splitText) {
+          chunks.push({
+            sourceId:   record.id,
+            sourceType: 'webapp_page',
+            chunkType:  'webapp_metadata',
+            text:       split,
+          })
+        }
       } else {
         for (const page of pages) {
           const path     = String(page['path']  ?? '/')
@@ -183,24 +193,30 @@ export async function generateEmbeddings(projectId: string): Promise<number> {
 
           const chunkText = lines.join('\n').trim()
           if (chunkText) {
-            chunks.push({
-              sourceId:   record.id,
-              sourceType: 'webapp_page',
-              chunkType:  'webapp_metadata',
-              text:       chunkText.slice(0, MAX_CHUNK_CHARS),
-            })
+            const splitText = textSplitter.splitText(chunkText)
+            for (const split of splitText) {
+              chunks.push({
+                sourceId:   record.id,
+                sourceType: 'webapp_page',
+                chunkType:  'webapp_metadata',
+                text:       split,
+              })
+            }
           }
         }
       }
     } else {
       const text = metadataToText(data, record.entity_type, record.object_name)
       if (text) {
-        chunks.push({
-          sourceId:   record.id,
-          sourceType: record.entity_type,
-          chunkType:  'metadata',
-          text:       text.slice(0, MAX_CHUNK_CHARS),
-        })
+        const splitText = textSplitter.splitText(text)
+        for (const split of splitText) {
+          chunks.push({
+            sourceId:   record.id,
+            sourceType: record.entity_type,
+            chunkType:  'metadata',
+            text:       split,
+          })
+        }
       }
     }
   }
@@ -216,12 +232,15 @@ export async function generateEmbeddings(projectId: string): Promise<number> {
     const rules   = (Array.isArray(record.testing_rules) ? record.testing_rules : []) as Record<string, unknown>[]
     const text    = domainToText(record.entity_name, actions, rules)
     if (text) {
-      chunks.push({
-        sourceId:   record.id,
-        sourceType: 'domain_model',
-        chunkType:  'metadata',
-        text:       text.slice(0, MAX_CHUNK_CHARS),
-      })
+      const splitText = textSplitter.splitText(text)
+      for (const split of splitText) {
+        chunks.push({
+          sourceId:   record.id,
+          sourceType: 'domain_model',
+          chunkType:  'metadata',
+          text:       split,
+        })
+      }
     }
   }
 

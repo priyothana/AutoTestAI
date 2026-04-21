@@ -127,10 +127,14 @@ export async function enqueueExecution(data: ExecuteRequest): Promise<{ executio
   const useSessionReuse = settings?.use_session_reuse ?? true
   const isLoginTest = detectLoginTest(testCase.name, steps)
 
+  const rawCategory = (testCase.project.category ?? 'webapp').toLowerCase()
+  // DB stores 'web_app'; ExecutionContext accepts both 'web_app' and 'webapp'
+  const projectCategory = rawCategory as ExecutionContext['projectCategory']
+
   const context: ExecutionContext = {
     baseUrl: testCase.project.base_url ?? '',
     steps,
-    projectCategory: (testCase.project.category as ExecutionContext['projectCategory']) ?? 'webapp',
+    projectCategory,
     integrationStatus: (integration?.status as ExecutionContext['integrationStatus']) ?? 'disconnected',
     useSessionReuse,
     isLoginTest,
@@ -149,7 +153,10 @@ export async function enqueueExecution(data: ExecuteRequest): Promise<{ executio
       } else if (integration.category === 'web_app') {
         if (integration.username) context.webUsername = fernetDecrypt(integration.username)
         if (integration.password) context.webPassword = fernetDecrypt(integration.password)
-        context.webLoginUrl = integration.base_url ?? undefined
+        // Prefer a dedicated login URL stored in auth_config.login_url (e.g. /login path).
+        // Falls back to integration.base_url if no specific login URL is configured.
+        const authCfg = (integration.auth_config as Record<string, any> | null) ?? {}
+        context.webLoginUrl = authCfg.login_url ?? integration.base_url ?? undefined
         context.webLoginStrategy = (integration.login_strategy as ExecutionContext['webLoginStrategy']) ?? 'form'
       }
     } catch (err) {

@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { Plus, Search, Play, Edit, MoreVertical, FileText, Loader2 } from "lucide-react"
+import { Plus, Search, Play, Edit, MoreVertical, FileText, Loader2, Trash2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -87,6 +87,25 @@ export default function TestsPage() {
         } catch (error) {
             console.error("Run error:", error)
             toast.error("Failed to start test execution")
+        }
+    }
+
+    const handleDeleteTest = async (e: React.MouseEvent, testId: string) => {
+        e.stopPropagation()
+        if (!window.confirm("Are you sure you want to delete this test case? This action cannot be undone.")) return
+        try {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/${testId}`, {
+                method: "DELETE",
+            })
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}))
+                throw new Error(errorData.detail || `Failed to delete test (${response.status})`)
+            }
+            setTests((prev) => prev.filter((t) => t.id !== testId))
+            toast.success("Test case deleted successfully.")
+        } catch (error: any) {
+            console.error("Delete error:", error)
+            toast.error(error.message || "Failed to delete test case.")
         }
     }
 
@@ -193,15 +212,12 @@ export default function TestsPage() {
                                             <button
                                                 className="opacity-0 group-hover:opacity-100 transition-opacity duration-150
                                                            px-2 py-1 text-xs rounded
-                                                           bg-transparent hover:bg-green-50
-                                                           text-green-600 border border-green-200"
-                                                onClick={(e) => {
-                                                    e.stopPropagation()
-                                                    handleRunTest(test.id)
-                                                }}
+                                                           bg-transparent hover:bg-red-50
+                                                           text-red-600 border border-red-200"
+                                                onClick={(e) => handleDeleteTest(e, test.id)}
                                             >
-                                                <Play className="inline h-3 w-3 mr-1" />
-                                                Run
+                                                <Trash2 className="inline h-3 w-3 mr-1" />
+                                                Delete
                                             </button>
                                             <DropdownMenu>
                                                 <DropdownMenuTrigger asChild>
@@ -225,7 +241,12 @@ export default function TestsPage() {
                                                         <Play className="mr-2 h-4 w-4" /> Run
                                                     </DropdownMenuItem>
                                                     <DropdownMenuSeparator />
-                                                    <DropdownMenuItem className="text-red-500">Delete</DropdownMenuItem>
+                                                    <DropdownMenuItem
+                                                        className="text-red-500 cursor-pointer"
+                                                        onClick={(e) => handleDeleteTest(e as any, test.id)}
+                                                    >
+                                                        Delete
+                                                    </DropdownMenuItem>
                                                 </DropdownMenuContent>
                                             </DropdownMenu>
                                         </div>

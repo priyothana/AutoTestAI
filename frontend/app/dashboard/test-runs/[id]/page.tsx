@@ -1,6 +1,6 @@
 "use client"
 
-import { use, useEffect, useState } from "react"
+import { use, useEffect, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { ArrowLeft, Clock, CheckCircle2, XCircle, Loader2, Info } from "lucide-react"
 import { format } from "date-fns"
@@ -39,19 +39,8 @@ export default function TestRunDetailsPage({ params }: { params: Promise<{ id: s
 
     const [run, setRun] = useState<TestRun | null>(null)
     const [loading, setLoading] = useState(true)
-
-    useEffect(() => {
-        fetchRun()
-
-        // Poll for updates if still running
-        const interval = setInterval(() => {
-            if (run && (run.status === "running" || run.status === "pending")) {
-                fetchRun()
-            }
-        }, 2000)
-
-        return () => clearInterval(interval)
-    }, [id, run?.status])
+    const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+    const isPollingRef = useRef(true)
 
     const fetchRun = async () => {
         try {
@@ -59,6 +48,15 @@ export default function TestRunDetailsPage({ params }: { params: Promise<{ id: s
             if (response.ok) {
                 const data = await response.json()
                 setRun(data)
+                // Stop polling once we reach a terminal status
+                const terminalStatuses = ["passed", "failed", "error", "cancelled"]
+                if (terminalStatuses.includes(data.status)) {
+                    isPollingRef.current = false
+                    if (intervalRef.current) {
+                        clearInterval(intervalRef.current)
+                        intervalRef.current = null
+                    }
+                }
             } else {
                 toast.error("Failed to load execution details")
             }
@@ -68,6 +66,26 @@ export default function TestRunDetailsPage({ params }: { params: Promise<{ id: s
             setLoading(false)
         }
     }
+
+    useEffect(() => {
+        isPollingRef.current = true
+        fetchRun()
+
+        // Poll every 2s — interval always fetches; fetchRun self-terminates on terminal status
+        intervalRef.current = setInterval(() => {
+            if (isPollingRef.current) {
+                fetchRun()
+            }
+        }, 2000)
+
+        return () => {
+            isPollingRef.current = false
+            if (intervalRef.current) {
+                clearInterval(intervalRef.current)
+                intervalRef.current = null
+            }
+        }
+    }, [id])
 
     if (loading) {
         return (

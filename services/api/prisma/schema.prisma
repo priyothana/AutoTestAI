@@ -57,6 +57,7 @@ model projects {
   vector_embeddings    vector_embeddings[]
   rag_query_logs       rag_query_logs[]
   execution_learnings  execution_learnings[]
+  web_test_data        web_test_data[]
 }
 
 // ─── Environments ────────────────────────────────────────────────
@@ -316,4 +317,22 @@ model executions {
   completed_at    DateTime? @db.Timestamptz()
 
   test_case       test_cases? @relation(fields: [test_case_id], references: [id])
+}
+
+// ─── Web Test Data ───────────────────────────────────────────────
+// Stores real entity records extracted from the crawled web app.
+// source: 'ui_scraping' (Tier 1 automatic) | 'user_upload' (Tier 2 manual)
+model web_test_data {
+  id                String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id        String   @db.Uuid
+  entity_name       String   @db.VarChar(255)
+  records           Json     @default("[]")
+  source            String   @default("ui_scraping") @db.VarChar(20)
+  record_count      Int      @default(0)
+  last_extracted_at DateTime @default(now()) @db.Timestamptz()
+
+  project           projects @relation(fields: [project_id], references: [id], onDelete: Cascade)
+
+  @@unique([project_id, entity_name])
+  @@map("web_test_data")
 }

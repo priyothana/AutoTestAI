@@ -107,7 +107,10 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     }
     const [readableSteps, setReadableSteps] = useState<ReadableStep[]>([])
     const [isHumanizing, setIsHumanizing] = useState(false)
-    const [showReadableView, setShowReadableView] = useState(true)
+    // null = auto (show readable when available), 'readable' = user chose readable, 'editor' = user explicitly chose editor
+    const [viewPreference, setViewPreference] = useState<'readable' | 'editor' | null>(
+        isInternalNew ? null : null   // always start as null (auto); readable is the default when steps arrive
+    )
 
     useEffect(() => {
         setHasMounted(true)
@@ -115,7 +118,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const fetchProjects = async () => {
         try {
-            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`)
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects`)
             if (response.ok) {
                 const data = await response.json()
                 const projectsList = Array.isArray(data) ? data : (data.items || [])
@@ -142,7 +145,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 let lastRunLogs: any[] = []
                 try {
                     const runsRes = await fetch(
-                        `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/?test_case_id=${currentId}&limit=1`
+                        `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs?test_case_id=${currentId}&limit=1`
                     )
                     if (runsRes.ok) {
                         const runsData = await runsRes.json()
@@ -164,31 +167,35 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     }
                 } catch { /* non-critical */ }
 
-                // Auto-fetch readable steps so Readable View is ready by default
+                // ── Step 1: Show readable view INSTANTLY from local transform ──────
                 if (loadedSteps.length > 0) {
-                    try {
-                        setIsHumanizing(true)
-                        const humanRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ steps: loadedSteps, provider: "claude" })
-                        })
-                        if (humanRes.ok) {
-                            const humanData = await humanRes.json()
-                            let freshSteps: any[] = humanData.readable_steps || []
-                            // Merge last run logs if available
+                    const localReadable = generateLocalReadableSteps(loadedSteps)
+                    const previewSteps = lastRunLogs.length > 0
+                        ? mergeExecutionIntoReadableSteps(localReadable, lastRunLogs)
+                        : localReadable
+                    setReadableSteps(previewSteps)
+                    setViewPreference(prev => prev === 'editor' ? 'editor' : 'readable')
+
+                    // ── Step 2: Silently enhance with AI in the background ────────────
+                    fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ steps: loadedSteps, provider: "claude" })
+                    })
+                        .then(r => r.ok ? r.json() : null)
+                        .then(humanData => {
+                            if (!humanData?.readable_steps?.length) return
+                            let finalSteps: ReadableStep[] = humanData.readable_steps
                             if (lastRunLogs.length > 0) {
-                                freshSteps = mergeExecutionIntoReadableSteps(freshSteps, lastRunLogs)
+                                finalSteps = mergeExecutionIntoReadableSteps(finalSteps, lastRunLogs)
                             }
-                            setReadableSteps(freshSteps)
-                            setShowReadableView(true)
-                        }
-                    } catch {
-                        // Non-critical — fall back to editor view silently
-                        setShowReadableView(false)
-                    } finally {
-                        setIsHumanizing(false)
-                    }
+                            // Only update if still in readable mode
+                            setViewPreference(prev => {
+                                if (prev !== 'editor') setReadableSteps(finalSteps)
+                                return prev
+                            })
+                        })
+                        .catch(() => { /* non-critical — local preview already shown */ })
                 }
             }
         } catch (error) {
@@ -272,17 +279,15 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     if (humanRes.ok) {
                         const humanData = await humanRes.json()
                         setReadableSteps(humanData.readable_steps || [])
-                        setShowReadableView(true)
-                    } else {
-                        setShowReadableView(false)
+                        // Always default to readable view after generation
+                        setViewPreference('readable')
                     }
+                    // If fetch fails, leave current preference — editor shows as fallback
                 } catch {
-                    setShowReadableView(false)
+                    // Non-critical
                 } finally {
                     setIsHumanizing(false)
                 }
-            } else {
-                setShowReadableView(false)
             }
         } catch (error: any) {
             console.error("Generation error:", error)
@@ -448,11 +453,23 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         // Merge execution results into the readable steps table
                         if (statusData.logs?.length > 0) {
                             setReadableSteps(prev => mergeExecutionIntoReadableSteps(prev, statusData.logs))
-                            setShowReadableView(true)
+                            // Only switch to readable if user hasn't explicitly chosen editor
+                            setViewPreference(prev => prev === 'editor' ? 'editor' : 'readable')
                         }
 
                         if (status === "passed") {
-                            toast.success(`Test Passed! (${statusData.duration?.toFixed(1) || 0}s)`, { id: runToastId })
+                            toast.success(
+                                <div className="flex flex-col gap-1">
+                                    <span>✅ Test Passed! ({statusData.duration?.toFixed(1) || 0}s)</span>
+                                    <a
+                                        href={`/dashboard/test-runs/${runData.id}`}
+                                        className="text-xs text-green-100 underline"
+                                    >
+                                        View full execution log →
+                                    </a>
+                                </div>,
+                                { id: runToastId, duration: 8000 }
+                            )
                             setTestStatus("passed")
                         } else {
                             toast.error(`Test ${status} – View details below`, { id: runToastId })
@@ -628,6 +645,66 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         setSteps(prev => prev.map(s => s.id === id ? { ...s, [field]: value } : s))
     }
 
+    // ── Instantly convert raw steps to readable format (no API call) ────
+    // Used as the immediate display while the AI humanize call runs in background.
+    const generateLocalReadableSteps = (rawSteps: TestStep[]): ReadableStep[] => {
+        return rawSteps.map(step => {
+            const action = step.action?.toUpperCase() || ''
+            const target = step.target || ''
+            const value  = step.value  || ''
+
+            let test_step = ''
+            let expected_result = ''
+
+            switch (action) {
+                case 'NAVIGATE':
+                    test_step = `Navigate to ${value || target || 'the page'}`
+                    expected_result = 'Page loads successfully'
+                    break
+                case 'CLICK':
+                    test_step = `Click on "${target || 'element'}"${value ? ` (${value})` : ''}`
+                    expected_result = 'Element responds to the click'
+                    break
+                case 'TYPE':
+                    test_step = `Enter "${value}" into ${target || 'field'}`
+                    expected_result = `The field displays "${value}"`
+                    break
+                case 'ASSERT_TEXT':
+                    test_step = `Verify that "${value}" is visible${target ? ` on ${target}` : ''}`
+                    expected_result = `Text "${value}" is present on the page`
+                    break
+                case 'WAIT':
+                    test_step = `Wait for ${target || value || 'the element'} to be ready`
+                    expected_result = 'Element / condition is satisfied'
+                    break
+                case 'SELECT':
+                    test_step = `Select "${value}" from ${target || 'dropdown'}`
+                    expected_result = `"${value}" is selected`
+                    break
+                case 'HOVER':
+                    test_step = `Hover over ${target || 'element'}`
+                    expected_result = 'Hover state is applied'
+                    break
+                case 'SCROLL':
+                    test_step = `Scroll ${value || 'down'} on ${target || 'the page'}`
+                    expected_result = 'Page / element scrolls'
+                    break
+                default:
+                    test_step = [action, target, value].filter(Boolean).join(' ')
+                    expected_result = 'Step completes successfully'
+            }
+
+            return {
+                test_step,
+                test_data: value || '—',
+                expected_result,
+                actual_result: '—',
+                status: '—',
+                comments: '—',
+            }
+        })
+    }
+
     // ── Merge execution logs into readable steps ──────────────────────
     // Called after run completes. Maps each log entry (1-based step index)
     // to the corresponding readable step and fills actual_result / status / comments.
@@ -670,12 +747,19 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const handleHumanizeSteps = async () => {
         if (steps.length === 0) return
 
-        // Toggle off if already showing readable view
-        if (showReadableView) {
-            setShowReadableView(false)
+        // If currently showing readable view → switch to editor view
+        if (viewPreference !== 'editor') {
+            setViewPreference('editor')
             return
         }
 
+        // User is switching back to readable view — fetch if not already available
+        if (readableSteps.length > 0) {
+            setViewPreference('readable')
+            return
+        }
+
+        // No readable steps yet — fetch them
         setIsHumanizing(true)
         try {
             const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/tests/humanize-steps`, {
@@ -697,7 +781,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             }
 
             setReadableSteps(freshSteps)
-            setShowReadableView(true)
+            setViewPreference('readable')
         } catch (error: any) {
             console.error("Humanize error:", error)
             toast.error("Failed to generate readable steps")
@@ -998,28 +1082,28 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         <CardAction>
                             <div className="flex items-center gap-2">
                                 <Button
-                                    variant={showReadableView ? "ghost" : "default"}
+                                    variant={viewPreference === 'editor' ? "default" : "ghost"}
                                     size="sm"
                                     onClick={handleHumanizeSteps}
                                     disabled={steps.length === 0 || isHumanizing}
-                                    className={showReadableView
-                                        ? "text-gray-600 hover:text-gray-800 hover:bg-gray-100"
-                                        : "bg-indigo-600 hover:bg-indigo-700 text-white"}
+                                    className={viewPreference === 'editor'
+                                        ? "bg-indigo-600 hover:bg-indigo-700 text-white"
+                                        : "text-gray-600 hover:text-gray-800 hover:bg-gray-100"}
                                 >
                                     {isHumanizing ? (
                                         <>
                                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                                             Loading...
                                         </>
-                                    ) : showReadableView ? (
-                                        <>
-                                            <Code2 className="mr-2 h-4 w-4" />
-                                            Editor View
-                                        </>
-                                    ) : (
+                                    ) : viewPreference === 'editor' ? (
                                         <>
                                             <BookOpen className="mr-2 h-4 w-4" />
                                             Readable View
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Code2 className="mr-2 h-4 w-4" />
+                                            Editor View
                                         </>
                                     )}
                                 </Button>
@@ -1091,7 +1175,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     </CardHeader>
                     <CardContent className="pt-4">
                         {isHumanizing ? (
-                            /* ── Loading skeleton — shown while humanize-steps is in progress ── */
+                            /* ── Loading skeleton — only shown while explicit humanize toggle is in progress ── */
                             <div className="space-y-3 animate-pulse">
                                 <div className="flex items-center gap-2 mb-3">
                                     <Loader2 className="h-4 w-4 text-indigo-500 animate-spin" />
@@ -1122,7 +1206,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                     </table>
                                 </div>
                             </div>
-                        ) : showReadableView && readableSteps.length > 0 ? (
+                        ) : viewPreference !== 'editor' && readableSteps.length > 0 ? (
                             /* ── Readable View — Structured Table ── */
                             <div className="space-y-3">
                                 <div className="flex items-center gap-2 mb-1">

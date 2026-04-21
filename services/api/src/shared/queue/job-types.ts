@@ -20,7 +20,8 @@ export interface ExecutionContext {
   steps: StepData[]
 
   // Project
-  projectCategory: 'webapp' | 'salesforce' | 'api' | 'other'
+  // 'webapp' is the legacy value; DB stores 'web_app' — both must be accepted
+  projectCategory: 'webapp' | 'web_app' | 'salesforce' | 'api' | 'other'
   integrationStatus: 'connected' | 'disconnected' | 'error' | 'syncing'
 
   // Session
@@ -98,10 +99,40 @@ export interface CrawlerJob {
   }
 }
 
+/**
+ * Crawl state persisted in auth_config.crawl_state between incremental BullMQ runs.
+ * Allows the crawler to resume across multiple 50-page job batches.
+ */
+export interface CrawlState {
+  /** Fully visited + extracted URLs (do not revisit unless thin-metadata) */
+  visitedUrls: string[]
+  /** Discovered but not-yet-visited URLs — consumed in the next run */
+  pendingUrls: string[]
+  /** Total unique URLs discovered across all runs (visited + pending) */
+  totalDiscoveredPages: number
+  /** ISO timestamp of the last completed run */
+  lastRunAt: string
+  /** How many incremental runs have completed */
+  runCount: number
+}
+
 /** Metadata-sync queue — consumed by metadata-sync.worker.ts */
 export interface MetadataSyncJob {
   /** UUID of the project whose metadata should be synced */
   projectId: string
   /** Who triggered the sync — 'manual' from the UI, 'auto' from connection flow */
   triggeredBy: 'manual' | 'auto'
+  /**
+   * Integration category — routes the worker to the correct pipeline branch.
+   * 'salesforce' → JSforce extraction → normalize → domain → embed
+   * 'web_app'    → Playwright crawler → normalize → domain → embed
+   * Omitting defaults to 'salesforce' for backward compatibility.
+   */
+  category?: 'salesforce' | 'web_app'
+  /**
+   * Set to true by the worker when auto-re-enqueueing a continuation crawl run.
+   * When true, only Stage 1 (crawl) runs — stages 2-4 are deferred until the
+   * crawl is fully complete (pendingUrls is empty).
+   */
+  isContinuation?: boolean
 }

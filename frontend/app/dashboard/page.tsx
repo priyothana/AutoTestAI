@@ -87,7 +87,7 @@ export default function DashboardPage() {
         // Fetch projects for save
         const fetchProjects = async () => {
             try {
-                const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/`)
+                const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects`)
                 if (res?.ok) setProjects(await res.json())
             } catch { }
         }

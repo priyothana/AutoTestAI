@@ -189,6 +189,52 @@ export async function hardDeleteProject(projectId: string) {
 // ─── Integration Management ──────────────────────────────────────
 
 /**
+ * Update login credentials for an existing web_app integration.
+ * Called by POST /api/v1/projects/:id/save-web-credentials.
+ * Credentials are Fernet-encrypted before storage.
+ * Stores the login_url inside auth_config so it can be read separately
+ * from the crawl base_url.
+ */
+export async function saveWebAppCredentials(
+  projectId: string,
+  data: {
+    login_url?: string
+    username?: string
+    password?: string
+    login_strategy?: string
+  },
+): Promise<void> {
+  const existing = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+  if (!existing) {
+    throw { statusCode: 404, message: 'No integration found for this project. Connect first.' }
+  }
+
+  const updateData: Record<string, any> = {}
+
+  if (data.username !== undefined && data.username !== '') {
+    updateData.username = fernetEncrypt(data.username)
+  }
+  if (data.password !== undefined && data.password !== '') {
+    updateData.password = fernetEncrypt(data.password)
+  }
+  if (data.login_strategy !== undefined) {
+    updateData.login_strategy = data.login_strategy
+  }
+  if (data.login_url !== undefined) {
+    // Merge login_url into auth_config (preserve existing crawler settings)
+    const existingCfg = (existing.auth_config as Record<string, any>) ?? {}
+    updateData.auth_config = { ...existingCfg, login_url: data.login_url }
+  }
+
+  await prisma.project_integrations.update({
+    where: { id: existing.id },
+    data: updateData,
+  })
+}
+
+/**
  * Create or update a web_app integration for a project.
  * Credentials are Fernet-encrypted before storage.
  * Called by POST /api/v1/projects/:id/integrations (category=web_app).
@@ -199,6 +245,7 @@ export async function createWebIntegration(
   username: string | null,
   password: string | null,
   loginStrategy: string,
+  authConfig?: Record<string, any>,
 ) {
   const encUsername = username ? fernetEncrypt(username) : null
   const encPassword = password ? fernetEncrypt(password) : null
@@ -218,6 +265,7 @@ export async function createWebIntegration(
         username: encUsername,
         password: encPassword,
         login_strategy: loginStrategy,
+        ...(authConfig && { auth_config: authConfig }),
       },
     })
   }
@@ -231,6 +279,7 @@ export async function createWebIntegration(
       username: encUsername,
       password: encPassword,
       login_strategy: loginStrategy,
+      auth_config: authConfig ?? {},
     },
   })
 }
@@ -394,6 +443,21 @@ export async function getIntegrationStatus(projectId: string) {
 
   const syncCounts = await getSyncCounts(projectId)
 
+  // For web_app integrations, expose the decrypted username and stored login_url
+  // so the Integration tab can pre-populate the Session & Login form automatically.
+  // Password is intentionally never returned.
+  let webCredentials: { username: string | null; login_url: string | null } | null = null
+  if (integration.category === 'web_app') {
+    const decryptedUsername = integration.username
+      ? (() => { try { return fernetDecrypt(integration.username) } catch { return null } })()
+      : null
+    const authCfg = (integration.auth_config as Record<string, any>) ?? {}
+    webCredentials = {
+      username: decryptedUsername,
+      login_url: authCfg.login_url ?? null,
+    }
+  }
+
   return {
     id: integration.id,
     project_id: integration.project_id,
@@ -411,6 +475,7 @@ export async function getIntegrationStatus(projectId: string) {
     sync_error: integration.sync_error,
     sync_counts: syncCounts,
     ui_session: sessionStatus,
+    web_credentials: webCredentials,
     created_at: integration.created_at?.toISOString() ?? null,
     updated_at: integration.updated_at?.toISOString() ?? null,
   }
