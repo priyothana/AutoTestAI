@@ -42,6 +42,8 @@ import { selfHealingRoutes } from './modules/self-healing/self-healing.routes.js
 import { generationRoutes }  from './modules/test-generation/generation.routes.js'
 import { executionRoutes }   from './modules/execution/execution.routes.js'
 import { notificationRoutes } from './modules/notification/notification.routes.js'
+import { testCaseGeneratorRoutes } from './modules/test-case-generator/test-case-generator.routes.js'
+import { startTestCaseGenerationWorker } from './modules/test-case-generator/test-case-generator.service.js'
 import prisma from './shared/db/prisma.js'
 import { redisConnection, getRedisOptions } from './shared/queue/connection.js'
 import { QUEUES } from './shared/queue/queues.js'
@@ -139,7 +141,13 @@ const httpLogger = pinoHttp({
 
 // ─── Build Fastify app ───────────────────────────────────────────────────────
 export async function buildApp() {
-  const app = Fastify({ logger: false, ignoreTrailingSlash: true })
+  const app = Fastify({
+    logger: false,
+    ignoreTrailingSlash: true,
+    // Raise body limit to 10 MB to allow BRD / existing-tests document uploads.
+    // Default is 1 MB which silently 413s large document payloads.
+    bodyLimit: 10 * 1024 * 1024,  // 10 MB
+  })
 
   // Attach pino-http as a global hook
   app.addHook('onRequest', (req, reply, done) => {
@@ -200,9 +208,10 @@ export async function buildApp() {
     { name: 'salesforce',   fn: salesforceRoutes as never,   prefix: '/api/v1' },
     { name: 'healing',      fn: healingRoutes as never,      prefix: '/api/v1' },
     { name: 'self-healing', fn: selfHealingRoutes as never,  prefix: '/api/v1' },
-    { name: 'generation',   fn: generationRoutes as never,   prefix: '/api/v1' },
-    { name: 'execution',    fn: executionRoutes as never,    prefix: '/api/v1' },
-    { name: 'notification', fn: notificationRoutes as never, prefix: '/api/v1' },
+    { name: 'generation',           fn: generationRoutes as never,           prefix: '/api/v1' },
+    { name: 'execution',            fn: executionRoutes as never,            prefix: '/api/v1' },
+    { name: 'notification',         fn: notificationRoutes as never,         prefix: '/api/v1' },
+    { name: 'test-case-generator',  fn: testCaseGeneratorRoutes as never,    prefix: '/api/v1' },
   ]
 
   for (const mod of modules) {
@@ -341,10 +350,18 @@ async function main() {
     .then(() => console.log('[STARTUP] ✅ Healing worker started'))
     .catch((e: Error) => console.warn('[STARTUP] ⚠️  Healing worker failed to start:', e.message))
 
-  // ── Auto-start the notification worker ───────────────────────────────────
+  // ── Auto-start the notification worker ───────────────────────────────────────
   import('./workers/notification.worker.js')
     .then(() => console.log('[STARTUP] ✅ Notification worker started'))
     .catch((e: Error) => console.warn('[STARTUP] ⚠️  Notification worker failed to start:', e.message))
+
+  // ── Auto-start the test-case-generation worker ───────────────────────────────────────
+  try {
+    startTestCaseGenerationWorker()
+    console.log('[STARTUP] ✅ Test-case-generation worker started')
+  } catch (e) {
+    console.warn('[STARTUP] ⚠️  Test-case-generation worker failed to start:', (e as Error).message)
+  }
 }
 
 main()

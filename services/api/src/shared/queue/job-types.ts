@@ -116,6 +116,28 @@ export interface CrawlState {
   runCount: number
 }
 
+/** Test-Case Generation queue — consumed by test-case-generator.worker.ts */
+export interface TestCaseGenerationJob {
+  /** UUID of the project to generate test cases for */
+  projectId: string
+  /** User-supplied name for the generated test suite (default: auto-timestamp) */
+  suiteName?: string
+  /** Max number of test cases to generate */
+  count: number
+  /** Optional focus areas e.g. ['CRUD', 'Edge Cases', 'Negative Testing'] */
+  focusAreas: string[]
+  /** Base64-encoded BRD / Functional Spec document content (optional) */
+  brdContent?: string
+  /** Base64-encoded existing test cases document content (optional) */
+  existingTestsContent?: string
+  /** Whether to pull Jira stories from the connected board */
+  useJira: boolean
+  /** Job status — updated by the worker */
+  status?: 'queued' | 'running' | 'completed' | 'failed'
+  /** Error message if failed */
+  errorMessage?: string
+}
+
 /** Metadata-sync queue — consumed by metadata-sync.worker.ts */
 export interface MetadataSyncJob {
   /** UUID of the project whose metadata should be synced */

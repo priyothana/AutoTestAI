@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation"
 import {
     ArrowLeft, Loader2, Settings, FileText, BarChart3, Link2,
     Cloud, Globe, Check, X, RefreshCw, Unplug, Plug, AlertCircle,
-    Key, Server, ExternalLink, Clock, Database, Search, Plus, Trash2, Edit, Play, Zap
+    Key, Server, ExternalLink, Clock, Database, Search, Plus, Trash2, Edit, Play, Zap, Sparkles
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -13,6 +13,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { toast } from "sonner"
 import Link from "next/link"
+import GenerateTestCasesTab from "@/components/projects/GenerateTestCasesTab"
 
 interface Project {
     id: string
@@ -967,6 +968,9 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                         <TabsTrigger value="mcp-ops"><Database className="mr-2 h-4 w-4" /> MCP Operations</TabsTrigger>
                     )}
                     <TabsTrigger value="settings"><Settings className="mr-2 h-4 w-4" /> Jira Integration</TabsTrigger>
+                    <TabsTrigger value="generate" className="bg-gradient-to-r from-violet-50 to-purple-50 dark:from-violet-950/30 dark:to-purple-950/30 data-[state=active]:from-violet-100 data-[state=active]:to-purple-100">
+                        <Sparkles className="mr-2 h-4 w-4 text-violet-500" /> Generate Test Cases
+                    </TabsTrigger>
                 </TabsList>
 
                 {/* Overview Tab */}
@@ -2239,6 +2243,16 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                             )}
                         </CardContent>
                     </Card>
+                </TabsContent>
+
+                {/* Generate Test Cases Tab */}
+                <TabsContent value="generate" className="space-y-4">
+                    <GenerateTestCasesTab
+                        projectId={id}
+                        projectName={project.name}
+                        jiraConfigured={!!(jiraConfig?.configured)}
+                        metadataSynced={!!(integration?.sync_counts && integration.sync_counts.embedding_count > 0)}
+                    />
                 </TabsContent>
             </Tabs>
         </div>

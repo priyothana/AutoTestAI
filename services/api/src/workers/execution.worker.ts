@@ -1050,30 +1050,37 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
       const variants = labelCandidates(fieldLabel)
       const lookupTag = `sf-lookup-scan-${fieldLabel.replace(/\s+/g, '-').toLowerCase()}-${Date.now()}`
       const found = await page.evaluate(([vars, tag]: [string[], string]) => {
-        // Gather candidate inputs: text inputs with autocomplete or inside a lookup-like ancestor
+        // EXPANDED: Gather ALL visible text inputs — not just SF-specific ones.
+        // Custom CRM comboboxes use plain <input type="text"> without autocomplete.
         const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>(
-          'input[type="text"][autocomplete], input[autocomplete="off"], ' +
-          'input[aria-autocomplete], lightning-lookup input, c-lookup input, ' +
-          'records-record-picker input, [class*="lookup"] input[type="text"]'
+          'input[type="text"], input[type="search"], input:not([type]), textarea, ' +
+          'input[autocomplete], input[aria-autocomplete], ' +
+          'lightning-lookup input, c-lookup input, ' +
+          'records-record-picker input, [class*="lookup"] input, ' +
+          '[class*="search"] input, [class*="combobox"] input, [class*="select"] input'
         )).filter(inp => (inp as HTMLElement).offsetParent !== null) // visible only
 
         for (const inp of allInputs) {
           // Walk ancestors to find a label
           let el: Element | null = inp
           let labelText = ''
-          for (let depth = 0; depth < 10 && el; depth++) {
+          for (let depth = 0; depth < 15 && el; depth++) {
             el = el.parentElement
             if (!el) break
             const labelEl =
-              el.querySelector('label, .slds-form-element__label, legend') ??
+              el.querySelector('label, .slds-form-element__label, legend, [class*="label"]') ??
               el.closest('label')
             if (labelEl) {
               labelText = labelEl.textContent?.trim() ?? ''
               break
             }
           }
-          // Also check aria-label on the input itself
-          if (!labelText) labelText = inp.getAttribute('aria-label') ?? inp.getAttribute('placeholder') ?? ''
+          // Also check aria-label and placeholder on the input itself
+          if (!labelText) {
+            labelText = inp.getAttribute('aria-label') ??
+                        inp.getAttribute('placeholder') ??
+                        inp.getAttribute('name') ?? ''
+          }
 
           if (vars.some(v => v && labelText.toLowerCase().includes(v.toLowerCase()))) {
             inp.setAttribute('data-autotest-lookup-target', tag)
@@ -1093,6 +1100,20 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
             document.querySelector(`[data-autotest-lookup-target="${t}"]`)?.removeAttribute('data-autotest-lookup-target')
           }, lookupTag).catch(() => {})
         }
+      }
+    }
+
+    // Strategy 4: Custom combobox — locate by placeholder text matching field label.
+    // Many non-SF CRM apps render lookup fields as plain inputs with descriptive
+    // placeholders like "Search and select an account" — no SF-specific wrappers.
+    if (!lookupInput) {
+      const variants = labelCandidates(fieldLabel)
+      const placeholderLoc = page.locator(
+        variants.map(v => `input[placeholder*="${v}" i], input[placeholder*="select" i][placeholder*="${v.split(' ')[0]}" i]`).join(', ')
+      ).first()
+      if (await placeholderLoc.isVisible({ timeout: 1_000 }).catch(() => false)) {
+        lookupInput = placeholderLoc
+        log.info(`[SF-LOOKUP] ✅ Strategy 4 (placeholder match) found input for "${fieldLabel}"`)
       }
     }
 
@@ -1147,47 +1168,115 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
   // ── Try 1: full value ─────────────────────────────────────────────
   await activateAndType(searchValue)
 
-  // ── Wait for autocomplete dropdown — scoped to lightning-lookup ────
+  // ── Wait for autocomplete dropdown ────────────────────────────────
+  // Supports both SF ARIA-based dropdowns and custom CRM combobox dropdowns.
   const scope = lookupContainer ?? page
-  let dropdownVisible = await scope.locator('[role="listbox"]').first()
-    .isVisible({ timeout: 8_000 }).catch(() => false)
+
+  // Comprehensive dropdown selectors — ordered from most specific (SF) to generic (custom CRM)
+  const DROPDOWN_SELECTORS = [
+    '[role="listbox"]',                               // SF Lightning / ARIA standard
+    '[role="combobox"] + ul',                         // Standard combobox pattern
+    'ul[class*="dropdown"]', 'ul[class*="suggest"]',  // Generic list dropdowns
+    'ul[class*="option"]', 'ul[class*="result"]',
+    'div[class*="dropdown"]:not([class*="button"])',  // Div-based dropdowns
+    'div[class*="suggest"]', 'div[class*="result"]',
+    'div[class*="option-list"]', 'div[class*="menu"]',
+    '.slds-listbox', '.slds-dropdown',                // SLDS utility classes
+  ]
+
+  // Helper: find first visible dropdown container after typing
+  const findDropdown = async (): Promise<Locator | null> => {
+    for (const sel of DROPDOWN_SELECTORS) {
+      const loc = scope.locator(sel).first()
+      if (await loc.isVisible({ timeout: 500 }).catch(() => false)) {
+        return loc
+      }
+    }
+    // Also try page-level (in case scoped lookup container is wrong)
+    for (const sel of DROPDOWN_SELECTORS) {
+      const loc = page.locator(sel).first()
+      if (await loc.isVisible({ timeout: 300 }).catch(() => false)) {
+        return loc
+      }
+    }
+    return null
+  }
+
+  let dropdownContainer = await (async () => {
+    // Wait up to 8s for a dropdown to appear
+    const deadline = Date.now() + 8_000
+    while (Date.now() < deadline) {
+      const dd = await findDropdown()
+      if (dd) return dd
+      await page.waitForTimeout(200)
+    }
+    return null
+  })()
+
+  let dropdownVisible = !!dropdownContainer
 
   if (!dropdownVisible) {
     // ── Retry: previous lookup's overlay may still be intercepting ─────
-    // Wait for any lingering overlay to close, then retry.
-    // Use Tab (not Escape) to blur the field — Escape clears in-progress lookup selections
-    // and can revert values on adjacent fields via SF's form event handlers.
     log.warn(`[SF-LOOKUP] No dropdown on first attempt for "${fieldLabel}" — Tab-blurring then retrying`)
     await page.keyboard.press('Tab').catch(() => { })
     await page.waitForTimeout(1_500)
     await activateAndType(searchValue)
-    dropdownVisible = await scope.locator('[role="listbox"]').first()
-      .isVisible({ timeout: 8_000 }).catch(() => false)
+    dropdownContainer = await (async () => {
+      const deadline = Date.now() + 8_000
+      while (Date.now() < deadline) {
+        const dd = await findDropdown()
+        if (dd) return dd
+        await page.waitForTimeout(200)
+      }
+      return null
+    })()
+    dropdownVisible = !!dropdownContainer
   }
 
-  if (dropdownVisible) {
+  if (dropdownVisible && dropdownContainer) {
     log.info(`[SF-LOOKUP] Dropdown appeared for "${searchValue}"`)
 
-    // Try to find a matching option (scoped)
-    const optionLocators = [
-      scope.locator('[role="option"]').filter({ hasText: searchValue }).first(),
-      scope.locator('.slds-listbox__item').filter({ hasText: searchValue }).first(),
-      scope.getByRole('option', { name: searchValue }).first(),
-      scope.getByRole('option', { name: new RegExp(searchValue.split(' ')[0], 'i') }).first(),
-      scope.locator('[role="option"]').first(),  // last resort: first available option
+    // Comprehensive option selectors — SF ARIA + custom CRM list items
+    const OPTION_SELECTORS = [
+      `[role="option"]`,
+      `.slds-listbox__item`,
+      `li[class*="option"]`, `li[class*="result"]`, `li[class*="item"]`,
+      `li`, // generic list items
+      `div[class*="option"]`, `div[class*="item"]`, `div[class*="result"]`,
     ]
 
-    for (const opt of optionLocators) {
-      if (await opt.isVisible({ timeout: 2_000 }).catch(() => false)) {
-        await opt.scrollIntoViewIfNeeded().catch(() => { })
-        await opt.click()
-        // Wait for the dropdown to close naturally after selection.
-        // DO NOT press Escape here — SF Lightning combobox interprets Escape
-        // as "revert selection" which undoes the click and leaves only typed text,
-        // producing the "Select an option from the picklist" validation error.
-        await page.waitForTimeout(1_500)
-        log.info(`[SF-LOOKUP] ✅ Selected "${searchValue}" via inline dropdown`)
-        return
+    for (const sel of OPTION_SELECTORS) {
+      const allOpts = dropdownContainer.locator(sel)
+      const count = await allOpts.count().catch(() => 0)
+      if (count === 0) continue
+
+      // Try to find one matching the search value
+      const matchingOpt = allOpts.filter({ hasText: searchValue }).first()
+      const firstWord = searchValue.split(' ')[0]
+      const partialOpt = allOpts.filter({ hasText: firstWord }).first()
+      const firstOpt = allOpts.first()
+
+      for (const opt of [matchingOpt, partialOpt, firstOpt]) {
+        if (await opt.isVisible({ timeout: 1_000 }).catch(() => false)) {
+          await opt.scrollIntoViewIfNeeded().catch(() => { })
+          await opt.click({ force: true })
+          await page.waitForTimeout(1_500)
+          // Verify the input was populated (field value changed)
+          const inputVal = await lookupInput.inputValue().catch(() => '')
+          if (inputVal && inputVal !== searchValue) {
+            // Input changed — value was populated by selection
+            log.info(`[SF-LOOKUP] ✅ Selected "${searchValue}" via inline dropdown (${sel})`)
+            return
+          }
+          // For custom comboboxes: input may be cleared and a chip/tag added
+          // Check if dropdown closed as sign of success
+          const ddStillVisible = await dropdownContainer!.isVisible({ timeout: 500 }).catch(() => false)
+          if (!ddStillVisible) {
+            log.info(`[SF-LOOKUP] ✅ Dropdown closed after click — treating as success (${sel})`)
+            return
+          }
+          break
+        }
       }
     }
     log.warn(`[SF-LOOKUP] Dropdown was visible but no option matched "${searchValue}"`)

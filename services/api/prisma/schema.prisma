@@ -41,6 +41,10 @@ model projects {
   ui_session_active          Boolean   @default(false)
   ui_session_last_created_at DateTime? @db.Timestamptz()
   ui_session_source          String?   @db.VarChar(20)
+  brd_filename               String?   @db.VarChar(255)
+  brd_content                String?   @db.Text
+  existing_tests_filename    String?   @db.VarChar(255)
+  existing_tests_content     String?   @db.Text
   created_at                 DateTime  @default(now()) @db.Timestamptz()
   updated_at                 DateTime  @default(now()) @updatedAt @db.Timestamptz()
 

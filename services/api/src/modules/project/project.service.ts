@@ -886,3 +886,138 @@ export async function getJiraStories(projectId: string) {
     issues,
   }
 }
+
+// ─── BRD Persistence ─────────────────────────────────────────────
+
+/**
+ * Save (or overwrite) a BRD document for a project.
+ * Content is stored as plain text in the projects table.
+ * Max 200 KB to prevent runaway storage — callers must pre-truncate if needed.
+ */
+export async function saveBrd(
+  projectId: string,
+  filename: string,
+  content: string,
+): Promise<void> {
+  const project = await prisma.projects.findUnique({ where: { id: projectId } })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+
+  // Guard: 200 KB limit (safety net — frontend already limits to 50 KB for generation)
+  const MAX_BYTES = 200_000
+  const truncated = Buffer.byteLength(content, 'utf8') > MAX_BYTES
+    ? content.slice(0, MAX_BYTES)
+    : content
+
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: {
+      brd_filename: filename.slice(0, 255),
+      brd_content: truncated,
+    },
+  })
+
+  log.info({ projectId, filename, bytes: truncated.length }, 'BRD saved')
+}
+
+/**
+ * Retrieve stored BRD metadata + content for a project.
+ * Returns null when no BRD is attached.
+ */
+export async function getBrd(
+  projectId: string,
+): Promise<{ filename: string; content: string; bytes: number } | null> {
+  const project = await prisma.projects.findUnique({
+    where: { id: projectId },
+    select: { brd_filename: true, brd_content: true },
+  })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+  if (!project.brd_filename || !project.brd_content) return null
+
+  return {
+    filename: project.brd_filename,
+    content: project.brd_content,
+    bytes: Buffer.byteLength(project.brd_content, 'utf8'),
+  }
+}
+
+/**
+ * Remove the stored BRD from a project.
+ */
+export async function deleteBrd(projectId: string): Promise<void> {
+  const project = await prisma.projects.findUnique({ where: { id: projectId } })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: { brd_filename: null, brd_content: null },
+  })
+
+  log.info({ projectId }, 'BRD removed')
+}
+
+// ─── Existing Tests Persistence ──────────────────────────────────
+
+/**
+ * Save (or overwrite) an existing test cases document for a project.
+ * Max 200 KB — callers must pre-truncate if needed.
+ */
+export async function saveExistingTests(
+  projectId: string,
+  filename: string,
+  content: string,
+): Promise<void> {
+  const project = await prisma.projects.findUnique({ where: { id: projectId } })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+
+  const MAX_BYTES = 200_000
+  const truncated = Buffer.byteLength(content, 'utf8') > MAX_BYTES
+    ? content.slice(0, MAX_BYTES)
+    : content
+
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: {
+      existing_tests_filename: filename.slice(0, 255),
+      existing_tests_content:  truncated,
+    },
+  })
+
+  log.info({ projectId, filename, bytes: truncated.length }, 'Existing tests doc saved')
+}
+
+/**
+ * Retrieve stored existing-tests doc for a project.
+ * Returns null when no doc is attached.
+ */
+export async function getExistingTests(
+  projectId: string,
+): Promise<{ filename: string; content: string; bytes: number } | null> {
+  const project = await prisma.projects.findUnique({
+    where: { id: projectId },
+    select: { existing_tests_filename: true, existing_tests_content: true },
+  })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+  if (!project.existing_tests_filename || !project.existing_tests_content) return null
+
+  return {
+    filename: project.existing_tests_filename,
+    content:  project.existing_tests_content,
+    bytes:    Buffer.byteLength(project.existing_tests_content, 'utf8'),
+  }
+}
+
+/**
+ * Remove the stored existing-tests doc from a project.
+ */
+export async function deleteExistingTests(projectId: string): Promise<void> {
+  const project = await prisma.projects.findUnique({ where: { id: projectId } })
+  if (!project) throw { statusCode: 404, message: 'Project not found' }
+
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: { existing_tests_filename: null, existing_tests_content: null },
+  })
+
+  log.info({ projectId }, 'Existing tests doc removed')
+}
+

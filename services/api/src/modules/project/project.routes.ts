@@ -53,6 +53,7 @@ import {
 } from '../webapp/webapp-test-data.service.js'
 import prisma from '../../shared/db/prisma.js'
 
+
 /** Tiny helper — re-throw platform errors as Fastify HTTP replies */
 function handleErr(err: any, reply: any) {
   if (err?.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
@@ -629,4 +630,93 @@ export async function projectRoutes(app: FastifyInstance) {
       return handleErr(err, reply)
     }
   })
+
+  // ─── BRD Persistence Routes ──────────────────────────────────────
+
+  // POST /api/v1/projects/:id/brd  →  200 + {success}
+  // Body: { filename: string, content: string }
+  app.post('/projects/:id/brd', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = request.body as { filename?: string; content?: string }
+
+      if (!body?.filename || !body?.content) {
+        return reply.status(400).send({ detail: 'filename and content are required' })
+      }
+
+      await svc.saveBrd(id, body.filename, body.content)
+      return reply.send({ success: true, filename: body.filename, bytes: Buffer.byteLength(body.content, 'utf8') })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // GET /api/v1/projects/:id/brd  →  200 + {filename, content, bytes} | 200 + {attached: false}
+  app.get('/projects/:id/brd', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const brd = await svc.getBrd(id)
+      if (!brd) return reply.send({ attached: false })
+      return reply.send({ attached: true, ...brd })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+
+  // DELETE /api/v1/projects/:id/brd  →  200 + {success}
+  app.delete('/projects/:id/brd', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      await svc.deleteBrd(id)
+      return reply.send({ success: true })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // ─── Existing Tests Persistence Routes ───────────────────────────
+
+  // POST /api/v1/projects/:id/existing-tests  →  200 + {success}
+  // Body: { filename: string, content: string }
+  app.post('/projects/:id/existing-tests', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = request.body as { filename?: string; content?: string }
+
+      if (!body?.filename || !body?.content) {
+        return reply.status(400).send({ detail: 'filename and content are required' })
+      }
+
+      await svc.saveExistingTests(id, body.filename, body.content)
+      return reply.send({ success: true, filename: body.filename, bytes: Buffer.byteLength(body.content, 'utf8') })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // GET /api/v1/projects/:id/existing-tests  →  200 + {filename, content, bytes} | {attached: false}
+  app.get('/projects/:id/existing-tests', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const doc = await svc.getExistingTests(id)
+      if (!doc) return reply.send({ attached: false })
+      return reply.send({ attached: true, ...doc })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // DELETE /api/v1/projects/:id/existing-tests  →  200 + {success}
+  app.delete('/projects/:id/existing-tests', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      await svc.deleteExistingTests(id)
+      return reply.send({ success: true })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
 }
+
+
