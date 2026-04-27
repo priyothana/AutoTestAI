@@ -424,6 +424,56 @@ NEVER generate steps for fields that are NOT in the FIELD MANIFEST.
 // CRM-style CRUD forms, SPAs, and standard HTML form elements.
 
 const WEB_APP_RAG_SYSTEM_PROMPT = `
+🚨🚨🚨 STOP — READ THIS ENTIRE BLOCK BEFORE WRITING A SINGLE STEP 🚨🚨🚨
+================================================================================
+⚠️  STRICT MANDATORY RULES — VIOLATION PRODUCES AN INVALID, REJECTED OUTPUT  ⚠️
+================================================================================
+
+RULE 1 — REQUIRED FIELDS ARE NON-NEGOTIABLE:
+  When the test case contains "Create", "New", "Add", or "With Required Fields":
+  a) You MUST identify the target entity (e.g. "Opportunity").
+  b) You MUST read the MANDATORY CHECKLIST block below in the APPLICATION METADATA.
+  c) You MUST generate a step for EVERY field listed as 🔥 REQUIRED LOOKUP or [REQUIRED].
+  d) ANY output that is missing a required field is COMPLETELY INVALID and will be rejected.
+
+RULE 2 — LOOKUP FIELDS ARE ALWAYS REQUIRED (never skip):
+  Lookup/reference fields like "Account", "Contact", "Owner", "Parent" are MANDATORY.
+  Use action: "LOOKUP" with a real value from REAL ENTITY RECORDS.
+  If no real value is available, use a plausible fallback like "Acme Corp" for Account.
+  ❌ NEVER skip a lookup field. The form WILL REFUSE TO SAVE without it.
+
+RULE 3 — BUTTON NAME MUST BE EXACT (never use generic "Save"):
+  The submit button name is shown in the metadata as [SUBMIT BUTTON].
+  Copy that name EXACTLY into the CLICK step target.
+  ❌ NEVER use "Save", "Submit", "OK" unless that is the EXACT name in the metadata.
+  ❌ NEVER combine entity name with test data (e.g. "Create Tara" is WRONG).
+  ✅ CORRECT: target: "Create Opportunity"  (copied from [SUBMIT BUTTON] in metadata)
+
+RULE 4 — VALIDATE BEFORE OUTPUTTING:
+  Before outputting the JSON, mentally verify:
+  ✓ Every 🔥 REQUIRED LOOKUP field has a LOOKUP step
+  ✓ Every [REQUIRED] input/select field has a TYPE/SELECT step
+  ✓ The CLICK step target matches the [SUBMIT BUTTON] name exactly
+  ✓ The button is NOT a generic name like "Save" or "Submit" unless confirmed by metadata
+  If any check fails → add the missing step before outputting.
+
+FAILURE EXAMPLE — INVALID OUTPUT (for "Create Opportunity With Required Fields"):
+  ❌ Step 1: NAVIGATE /opportunities/new
+  ❌ Step 2: TYPE "Opportunity Name" → "New Business Deal"  ← missing Account
+  ❌ Step 3: CLICK "Save"   ← wrong button name + missing Account = REJECTED
+
+CORRECT EXAMPLE — VALID OUTPUT:
+  ✅ Step 1: NAVIGATE /opportunities/new
+  ✅ Step 2: LOOKUP "Account" → "Acme Corp"  ← 🔥 REQUIRED LOOKUP, must NOT be skipped
+  ✅ Step 3: TYPE "Opportunity Name" → "New Business Deal 2026"
+  ✅ Step 4: TYPE "Close Date" → "06/30/2026"
+  ✅ Step 5: CLICK "Create Opportunity"  ← EXACT button name from [SUBMIT BUTTON]
+  ✅ Step 6: ASSERT_URL → "/opportunities"
+
+================================================================================
+🚨🚨🚨 END OF MANDATORY RULES BLOCK 🚨🚨🚨
+================================================================================
+
 You are an expert QA Automation Engineer specialized in Playwright test automation for modern web applications.
 
 This is a METADATA-DRIVEN + REAL-DATA GENERATION MODE.
@@ -441,6 +491,48 @@ CRITICAL RULES:
 - For SELECT (dropdown) steps: you MUST use a value from [VALID OPTIONS] listed in the metadata. NEVER invent a picklist value. If no options are listed, OMIT the SELECT step.
 
 -------------------------
+ENTITY METADATA PRE-FLIGHT (MANDATORY — do this before writing ANY step)
+-------------------------
+Before generating a SINGLE step:
+
+STEP A — Identify PRIMARY ENTITY from the test case name (e.g. "Opportunity", "Account", "Contact").
+STEP B — Find the MANDATORY CHECKLIST in the APPLICATION METADATA block below.
+          The checklist shows every required field with 🔥 REQUIRED LOOKUP or [REQUIRED] tags.
+STEP C — Count how many required fields are in the checklist. Your steps MUST cover all of them.
+STEP D — Note the [SUBMIT BUTTON] name. Copy it EXACTLY into the CLICK step.
+STEP E — Write the steps array only after steps A–D are complete.
+
+-------------------------
+CRUD-ACTION GUARD (READ BEFORE GENERATING ANY STEPS)
+-------------------------
+The test prompt determines which action type you must perform. Read it carefully:
+
+• If prompt contains CREATE / ADD / NEW / REGISTER / SUBMIT / "WITH REQUIRED FIELDS"  →  TEST TYPE = CREATE
+  ✅ Correct flow: NAVIGATE to create/new page → fill ALL [REQUIRED] fields → CLICK submit button → ASSERT_URL
+  ⛔ WRONG: DO NOT type into search boxes, filter dropdowns, or assert list content
+  ⛔ WRONG: DO NOT navigate to the list page and stop — you must open the CREATE FORM
+  ⛔ WRONG: DO NOT omit any [REQUIRED] field — including required LOOKUP fields
+
+  🔴 SPECIAL RULE — "WITH REQUIRED FIELDS" in test name:
+  When the test case name or description contains the phrase "With Required Fields" or "Required Fields",
+  you MUST include a step for EVERY SINGLE [REQUIRED] field shown in the metadata — no exceptions.
+  Required LOOKUP fields (like Account, Contact, Owner) MUST use a LOOKUP action with a real value.
+
+• If prompt contains SEARCH / FIND / FILTER / LOOK UP / QUERY  →  TEST TYPE = SEARCH
+  ✅ Correct flow: NAVIGATE to list page → TYPE into search box → ASSERT_TEXT for result
+  ⛔ WRONG: DO NOT fill a create form for a search test
+
+• If prompt contains UPDATE / EDIT / MODIFY / CHANGE  →  TEST TYPE = UPDATE
+  ✅ Correct flow: find existing record → open edit form → change field → save
+
+• If prompt contains DELETE / REMOVE / ARCHIVE  →  TEST TYPE = DELETE
+  ✅ Correct flow: find existing record → delete it → assert it is gone
+
+CRITICAL: The user's TEST TYPE dictates the entire step sequence.
+If the metadata context shows BOTH list-page fields (search box, filter dropdowns) AND create-form fields,
+you MUST use the create-form fields for a CREATE test, and IGNORE the list-page search/filter fields.
+
+-------------------------
 APPLICATION METADATA
 (Exact pages, fields, locators, and sample values derived from your web application)
 -------------------------
@@ -450,6 +542,8 @@ APPLICATION METADATA
 MANDATORY FIELD RULES
 -------------------------
 1. Fill EVERY field tagged [REQUIRED] — the test WILL FAIL without them.
+   ‼ This includes LOOKUP fields (e.g. Account, Contact, Owner). A required LOOKUP field MUST use the LOOKUP action.
+   ‼ Do NOT skip a [REQUIRED] field just because it is a lookup or reference type — use a real value from REAL ENTITY RECORDS.
 2. For TYPE fields: use the ⚡ SAMPLE VALUE shown beside each field.
 3. For SELECT (dropdown) fields: use the ⚡ USE value shown, which is always from [VALID OPTIONS].
    - NEVER use a value that is NOT in the [VALID OPTIONS] list — the test WILL FAIL with an invalid option.
@@ -465,7 +559,14 @@ FIELD ACTION MAPPING
 tag: input   → action: TYPE    (locator_type: "label" or "placeholder")
 tag: select  → action: SELECT  (use the exact option text shown in [VALID OPTIONS])
 tag: checkbox→ action: CHECKBOX (value: "true" or "false")
+tag: lookup  → action: LOOKUP  (locator_type: "label" | value: a real record name from REAL ENTITY RECORDS)
 button       → action: CLICK   (locator_type: "role")
+
+⚠ LOOKUP FIELDS (critical — these are required references to other entities):
+   - Any [REQUIRED] field that references another entity (e.g. "Account", "Contact", "Owner") MUST use the LOOKUP action.
+   - The value MUST be a real record name from REAL ENTITY RECORDS (e.g. an actual account name, not "Test Account").
+   - If no real value is available, use a plausible name such as "Acme Corp" for Account or "John Smith" for Contact.
+   - NEVER skip a required lookup field — the form will refuse to save without it.
 
 ⛔ SKIP fields: Any field marked with "⛔ SKIP" in the metadata has NO known valid options in the database.
    - You MUST omit that SELECT step entirely — do NOT generate it even if the user's prompt mentions a value for it.
@@ -477,8 +578,10 @@ SUBMIT BUTTON RULES (CRITICAL)
 - The "Submit Buttons" section in the metadata lists the EXACT button names available on each page.
 - For CLICK steps that submit a form, you MUST use the EXACT locator string from the "Submit Buttons" section.
 - NEVER use generic names like "Submit", "Save", or "OK" unless that is the EXACT button name shown in the metadata.
-- Example: if metadata shows  locator: "Create Campaign"  locator_type: "role"  — your CLICK step MUST have target: "Create Campaign", locator_type: "role".
-- If no Submit Buttons section is present for a page, infer the button name from the page title (e.g. page "New Campaign" → button "Create Campaign").
+- NEVER invent a button name by combining entity name + test data (e.g. NEVER write "Create Aero" when entity is Campaign).
+- Example: if metadata shows  ⚡ BUTTON NAME: "Create Opportunity"  — your CLICK step MUST have target: "Create Opportunity", locator_type: "role".
+- If no Submit Buttons section is present for a page, infer the button name from the page entity (e.g. entity "Opportunity" → button "Create Opportunity", entity "Account" → button "Create Account").
+- The button name is ALWAYS "Create [Entity]" or "Save [Entity]" — NEVER "Create [RecordName]" or "Save [RecordName]".
 
 -------------------------
 TEST INTENT INSTRUCTIONS
@@ -594,12 +697,53 @@ OUTPUT FORMAT
   "expected_outcome": "Clear expected result"
 }
 
+-------------------------
+ENTITY SCOPE LOCK (CRITICAL — READ FIRST)
+-------------------------
+The user's test case name and description define the SOLE entity you must test.
+
+RULE: Identify the PRIMARY ENTITY from the test prompt (e.g. "Create an account" → entity = Account).
+Then STRICTLY follow these constraints:
+- ONLY navigate to pages that belong to the primary entity (e.g. /accounts, /accounts/new, /accounts/create)
+- NEVER navigate to an unrelated page (e.g. if the entity is Account, do NOT navigate to /roles, /admin/roles, /users, /campaigns, etc.)
+- ONLY fill fields that exist on the primary entity's create/edit form
+- NEVER use field names, buttons, or page paths from a different entity
+- If the metadata provides context for multiple entity pages, use ONLY the pages matching the primary entity
+- If no matching page metadata is provided, generate generic steps for the primary entity only
+
+Example:
+  Prompt: "Create an account for Lara"
+  PRIMARY ENTITY: Account
+  ✅ Correct NAVIGATE: /accounts OR /accounts/new OR /accounts/create
+  ❌ WRONG NAVIGATE: /roles, /admin/roles, /users, /campaigns, /admin/anything
+  ✅ Correct fields: Account Name, Industry, Website, Phone, etc.
+  ❌ WRONG fields: Role Name, Permissions, User fields
+
 IMPORTANT: Output ONLY valid JSON. No explanations, no comments, no markdown.
 ALWAYS use exact field labels from the metadata. NEVER invent field names.
 EVERY [REQUIRED] field MUST have a TYPE/SELECT/CHECKBOX step using a REAL value.
 EVERY field value MUST match its expected data type (see FIELD-VALUE TYPE ALIGNMENT above).
 `
 
+
+// ── Depluralization helper ────────────────────────────────────────────
+// Handles common English plural → singular conversion:
+//   opportunities → opportunity  (ies → y)
+//   addresses     → address      (sses → ss)
+//   boxes         → box          (xes → x)
+//   campaigns     → campaign     (s → ∅)
+//   status        → status       (already singular)
+function depluralize(word: string): string {
+  const w = word.toLowerCase()
+  if (w.endsWith('ies') && w.length > 4)  return w.slice(0, -3) + 'y'   // opportunities → opportunity
+  if (w.endsWith('sses'))                  return w.slice(0, -2)         // addresses → address (via 'esses' actually 'sses')
+  if (w.endsWith('ches') || w.endsWith('shes') || w.endsWith('xes') || w.endsWith('zes'))
+    return w.slice(0, -2)                                                // boxes → box, watches → watch
+  if (w.endsWith('ses') && w.length > 4)   return w.slice(0, -1)         // cases → case  (keep the 'e')
+  if (w.endsWith('s') && !w.endsWith('ss') && !w.endsWith('us') && !w.endsWith('is') && w.length > 3)
+    return w.slice(0, -1)                                                // campaigns → campaign
+  return w                                                               // status, analysis → unchanged
+}
 
 // ── LLM factory ───────────────────────────────────────────────────────
 
@@ -664,7 +808,7 @@ async function invokeLlm(
 
 // ── RAG retrieval (cosine similarity in Postgres) ─────────────────────
 
-async function retrieveRagChunks(
+export async function retrieveRagChunks(
   projectId: string,
   queryText: string,
   topK:      number = 15,
@@ -823,9 +967,11 @@ function filterChunksByObjects(chunks: string[], targetObjs: string[], isWebApp 
         lower.match(new RegExp(`(?:page:|path:)\\s*/${t}`, 'i'))
       )
     })
-    // Return path-matched chunks if found; otherwise return ALL chunks so the LLM
-    // can still pick the most relevant ones from the full set.
-    return pathMatched.length > 0 ? pathMatched : chunks
+    // Return ONLY the matched chunks — if none match, return empty so the
+    // LLM falls back to the standard prompt rather than using unrelated pages.
+    // (Previously returned ALL chunks, causing e.g. Roles pages to appear
+    //  in Account test generation.)
+    return pathMatched
   }
 
   const targetLowers = targetObjs.map(t => t.toLowerCase())
@@ -1330,15 +1476,56 @@ function buildIntentInstructions(intent: TestIntent): string {
     case 'create':
       return `TEST TYPE: CREATE (adding a new record)
 
-Step-by-step approach:
-1. NAVIGATE to the entity's CREATE page (e.g. /accounts/new, /contacts/create)
-2. For each REQUIRED field: generate a TYPE/SELECT/CHECKBOX step using the ⚡ SAMPLE VALUE shown in the metadata
-3. For optional fields explicitly mentioned in the test prompt: also add TYPE/SELECT steps
-4. CLICK the submit button (use the exact locator from the metadata "Submit Buttons" section)
-5. ASSERT_URL to verify the app redirected to the list page (e.g. /accounts) — or ASSERT_TOAST if the page shows a notification
+🚨 PRE-FLIGHT CHECKLIST — COMPLETE THIS BEFORE WRITING THE FIRST STEP 🚨
 
-CRITICAL: Use the ⚡ SAMPLE VALUE from metadata for every field value.
-Do NOT invent field values. Use the real values from REAL ENTITY RECORDS below.`
+You MUST perform this analysis first and satisfy ALL items:
+
+  ITEM 1 — ENTITY:
+    Identify the primary entity from the test name (e.g. "Opportunity", "Account").
+
+  ITEM 2 — REQUIRED FIELDS (critical — must not skip any):
+    Open the MANDATORY CHECKLIST block in the metadata.
+    List every field tagged 🔥 REQUIRED LOOKUP or [REQUIRED].
+    Every single one MUST have a corresponding step in your output.
+    🔥 REQUIRED LOOKUP fields (like "Account", "Contact", "Owner") → use LOOKUP action.
+    [REQUIRED] text/date fields → use TYPE action with ⚡ SAMPLE VALUE.
+    [REQUIRED] select fields → use SELECT action with a value from [VALID OPTIONS].
+
+  ITEM 3 — SUBMIT BUTTON:
+    Find the [SUBMIT BUTTON] line in the mandatory checklist.
+    Copy the button name EXACTLY — do NOT paraphrase it.
+    ✅ e.g. "Create Opportunity" → target: "Create Opportunity", locator_type: "role"
+    ❌ NEVER use "Save", "Submit", or any other generic name.
+    ❌ NEVER append data to entity name (e.g. "Create Tara" is WRONG).
+
+  ITEM 4 — SELF-VALIDATION before JSON output:
+    Count required fields in checklist → COUNT_A
+    Count TYPE/SELECT/LOOKUP/CHECKBOX steps in your output → COUNT_B
+    If COUNT_B < COUNT_A: you are missing required fields — ADD THEM before outputting.
+
+Step ordering:
+  Step 1: NAVIGATE to the entity's create/new page.
+  Steps 2–N: One step per required field from Item 2 (preserve order from checklist).
+  Step N+1: CLICK [SUBMIT BUTTON exact name].
+  Step N+2: ASSERT_URL to the entity list page.
+
+⛔ FORBIDDEN (these belong to SEARCH tests, NOT CREATE):
+- DO NOT type into a Search box or Search bar
+- DO NOT filter a list by status or dropdown
+- DO NOT assert a record appears in a list (that is READ, not CREATE)
+- DO NOT stop at the list page — you MUST fill the create form and submit
+- DO NOT use generic button names like "Save" or "Submit"
+
+User-specified values override metadata samples:
+- Prompt says 'for account "Tara"' → use "Tara" as the Account lookup value
+- Prompt says 'with amount 50000' → use "50000" as the Amount value
+
+🔴 "WITH REQUIRED FIELDS" ABSOLUTE RULE:
+  When the test case name contains "Required Fields" or "With Required Fields":
+  - ZERO exceptions — every 🔥 REQUIRED LOOKUP and [REQUIRED] field MUST have a step.
+  - Count them in the checklist, count them in your steps — the numbers must match.
+  - Submitting the form without ALL required fields = the form WILL reject = test FAILS.
+  - This rule overrides all other rules. No skipping for any reason whatsoever.`
 
     case 'search':
       return `TEST TYPE: SEARCH / FILTER (finding an existing record)
@@ -1493,9 +1680,48 @@ function extractUserSpecifiedValues(prompt: string): UserSpecifiedValue[] {
     }
   }
 
-  // Pattern 3: "with amount 50000" / "stage as 'Prospecting'"
+  // Pattern 3: Bare quoted value as the entity name after the entity keyword
+  // Handles: "Create a Lead 'Megha'" or "Create Lead \"Megha\"" where the quoted
+  // value is the primary entity name (First Name / Full Name / Lead Name).
+  // We only apply this when the entity type is directly followed by the quoted value.
+  const entityNamePattern = /\b(create|add|new)\b\s+(?:a\s+)?(?:new\s+)?(lead|account|contact|customer|opportunity|campaign|role|user)\s+['"\u201c]([^'"\u201d]+)['"\u201d]/gi
+  for (const match of prompt.matchAll(entityNamePattern)) {
+    const entityType = (match[2] ?? '').toLowerCase()
+    const value = match[3]?.trim() ?? ''
+    // Map entity type to likely field name
+    const fieldMap: Record<string, string> = {
+      lead: 'Lead Name',
+      account: 'Account Name',
+      contact: 'Contact Name',
+      customer: 'Customer Name',
+      opportunity: 'Opportunity Name',
+      campaign: 'Campaign Name',
+      role: 'Role Name',
+      user: 'Username',
+    }
+    const field = fieldMap[entityType] ?? `${entityType.charAt(0).toUpperCase() + entityType.slice(1)} Name`
+    // Also store a generic "Name" entry so it matches any name-like field
+    for (const key of [field, 'Name', 'First Name', 'Full Name']) {
+      if (!seen.has(key.toLowerCase()) && value) {
+        seen.add(key.toLowerCase())
+        values.push({ field: key, value })
+      }
+    }
+  }
+
+  // Pattern 4: "with status 'Qualified'" / "status as 'Qualified'"
+  const statusPattern = /\bstatus\s+(?:of|as|to|=|:)?\s*['"\u201c]?([A-Za-z][A-Za-z\s]*)['"\u201d]?/gi
+  for (const match of prompt.matchAll(statusPattern)) {
+    const value = match[1]?.trim() ?? ''
+    if (value && !seen.has('status')) {
+      seen.add('status')
+      values.push({ field: 'Status', value })
+    }
+  }
+
+  // Pattern 5: "with amount 50000" / "stage as 'Prospecting'"
   const knownFields = new Map([
-    ['amount', 'Amount'], ['stage', 'Stage'], ['status', 'Status'],
+    ['amount', 'Amount'], ['stage', 'Stage'],
     ['probability', 'Probability'], ['close date', 'Close Date'],
     ['currency', 'Currency'], ['type', 'Type'], ['priority', 'Priority'],
   ])
@@ -1791,7 +2017,7 @@ async function buildWebAppStructuredContext(
           }
           testDataMap.set(entity.entity_name.toLowerCase(), merged)
           // Also index by common variations (singular/plural)
-          const singular = entity.entity_name.toLowerCase().replace(/s$/, '')
+          const singular = depluralize(entity.entity_name)
           const plural   = singular + 's'
           testDataMap.set(singular, merged)
           testDataMap.set(plural, merged)
@@ -1803,18 +2029,57 @@ async function buildWebAppStructuredContext(
     }
 
     // ── Score and select top pages ───────────────────────────────────────
+    // Scoring rationale:
+    //   +10 — path segment exactly matches target entity (e.g. /leads)
+    //   +5  — path contains entity string anywhere
+    //   +20 — path contains a CREATE/NEW indicator → strongly prefer these for CREATE tests
+    //   +2  — entity appears in page title
     const scoredPages = allPages.map(page => {
-      const path = String(page['path'] ?? '').toLowerCase()
+      const path  = String(page['path']  ?? '').toLowerCase()
+      const title = String(page['title'] ?? '').toLowerCase()
       let score = 0
       for (const t of targetLowers) {
         if (path.includes(`/${t}`)) score += 10
         if (path.includes(t))       score += 5
+        if (title.includes(t))      score += 2
       }
-      if (/\/(new|create|add|edit|form)/.test(path)) score += 5
+      // Strong bonus for create/new pages — prevents list-page search fields from dominating
+      if (/\/(new|create|add|form)(\/.*)?(\?|$)/.test(path)) score += 20
+      else if (/\/(edit|update)(\/.*)?($|\?)/.test(path))    score += 10
       return { page, score }
     })
     scoredPages.sort((a, b) => b.score - a.score)
-    const topPages = scoredPages.slice(0, 5).map(s => s.page)
+    // Only use pages that scored > 0 (i.e. path contains the target entity).
+    // If nothing scored, fall back to the top-5 overall so we never return
+    // a completely empty context — but log a warning so this is visible.
+    const relevantPages = scoredPages.filter(s => s.score > 0)
+
+    // When relevant pages exist and at least ONE is a create/new page,
+    // EXCLUDE pure list pages (no create indicator in path) from the top selection.
+    // This prevents the search box + Status dropdown on the list page from
+    // being injected into a CREATE test's metadata context, which causes the
+    // LLM to generate search/filter steps instead of form-fill steps.
+    let topCandidates = relevantPages.length > 0 ? relevantPages : scoredPages
+    const hasCreatePage = topCandidates.some(s =>
+      /\/(new|create|add|form)(\/.*)?(\?|$)/.test(String(s.page['path'] ?? '').toLowerCase())
+    )
+    if (hasCreatePage) {
+      // Drop pure list pages that would pollute the form field context
+      const createOnly = topCandidates.filter(s =>
+        /\/(new|create|add|form|edit|update)(\/.*)?(\?|$)/.test(String(s.page['path'] ?? '').toLowerCase())
+      )
+      if (createOnly.length > 0) {
+        topCandidates = createOnly
+        log.info(`[GEN] buildWebAppStructuredContext: filtered to ${createOnly.length} create/edit pages (dropped list pages to avoid search-field contamination)`)
+      }
+    }
+
+    const topPages = topCandidates.slice(0, 5).map(s => s.page)
+    if (relevantPages.length === 0) {
+      log.warn(`[GEN] buildWebAppStructuredContext: no pages matched targets [${targetLowers.join(', ')}] — serving top-5 unfiltered pages (may cause irrelevant steps)`)
+    } else {
+      log.info(`[GEN] buildWebAppStructuredContext: ${relevantPages.length} pages matched targets [${targetLowers.join(', ')}], topPages=${topPages.length}`)
+    }
 
     // ── Helper: resolve sample value for a field locator ────────────────
     // Looks up the entity's real record map and returns the best matching value.
@@ -1827,14 +2092,14 @@ async function buildWebAppStructuredContext(
       const entitySegment = pathSegments.find(s =>
         !/^(new|create|add|edit|list|index|all|\d+)$/i.test(s)
       ) ?? ''
-      const entityLower = entitySegment.toLowerCase().replace(/s$/, '')
+      const entityLower = depluralize(entitySegment)
 
       // Try the entity map, then each target object
       const maps = [
         testDataMap.get(entityLower),
         testDataMap.get(entityLower + 's'),
         ...targetLowers.map(t => testDataMap.get(t)),
-        ...targetLowers.map(t => testDataMap.get(t.replace(/s$/, ''))),
+        ...targetLowers.map(t => testDataMap.get(depluralize(t))),
       ].filter(Boolean) as Record<string, string>[]
 
       for (const dataMap of maps) {
@@ -1855,6 +2120,132 @@ async function buildWebAppStructuredContext(
       return null
     }
 
+    // ── Build Required Fields Summary (prepended so LLM cannot miss required fields) ──
+    // Scans ALL selected pages and collects every [REQUIRED] input/select/lookup field.
+    // This is injected as the FIRST section of the context so the LLM is forced to plan
+    // all required steps before diving into per-page detail.
+    function buildRequiredFieldsSummary(): string {
+      const allPageSummaries: string[] = []
+
+      for (const page of topPages) {
+        const path    = String(page['path'] ?? '/')
+        const inputs  = (Array.isArray(page['inputs'])  ? page['inputs']  : []) as Record<string, unknown>[]
+        const selects = (Array.isArray(page['selects']) ? page['selects'] : []) as Record<string, unknown>[]
+        const buttons = (Array.isArray(page['buttons']) ? page['buttons'] : []) as Record<string, unknown>[]
+
+        const reqInputs  = inputs.filter(i  => Boolean(i['required']))
+        const reqSelects = selects.filter(s => Boolean(s['required']))
+        const submitBtns = buttons.filter(b => {
+          const n = String(b['name'] ?? '').toLowerCase()
+          return n.includes('create') || n.includes('save') || n.includes('submit') || n.includes('add')
+        })
+
+        // ── Inject synthetic required lookup fields for known entity relationships ──
+        // The HTML crawler cannot detect custom lookup/combobox widgets that don't use
+        // native <input required> — this is the root cause of "Account" being missed
+        // on the Opportunity create page. We inject them programmatically here.
+        const ENTITY_REQUIRED_LOOKUPS: Record<string, Array<{ locator: string; hint: string }>> = {
+          opportunity:  [{ locator: 'Account', hint: 'Acme Corp' }, { locator: 'Close Date', hint: '06/30/2026' }],
+          lead:         [{ locator: 'Company', hint: 'Acme Corp' }],
+          contact:      [{ locator: 'Account Name', hint: 'Acme Corp' }],
+          case:         [{ locator: 'Account Name', hint: 'Acme Corp' }],
+          invoice:      [{ locator: 'Account', hint: 'Acme Corp' }, { locator: 'Opportunity', hint: 'New Business Deal' }],
+          order:        [{ locator: 'Account', hint: 'Acme Corp' }],
+          quote:        [{ locator: 'Opportunity', hint: 'New Business Deal' }],
+          task:         [{ locator: 'Related To', hint: 'Acme Corp' }],
+          activity:     [{ locator: 'Related To', hint: 'Acme Corp' }],
+        }
+        // Determine entity from path: /opportunity/new → 'opportunity'
+        const pathEntity = path.split('/').filter(s => s && !/^(new|create|add|edit|list|index|all|\d+)$/i.test(s)).slice(-1)[0]?.toLowerCase() ?? ''
+        const knownLookups = ENTITY_REQUIRED_LOOKUPS[pathEntity] ?? []
+        // Only inject lookups that aren't ALREADY in reqInputs (avoid duplicates)
+        const existingLocators = new Set(reqInputs.map(i => String(i['locator'] ?? '').toLowerCase()))
+        const syntheticLookups = knownLookups.filter(l => !existingLocators.has(l.locator.toLowerCase()))
+
+        if (reqInputs.length === 0 && reqSelects.length === 0 && syntheticLookups.length === 0) continue
+
+        const pageLines: string[] = []
+        pageLines.push(`  Create Page: ${path}`)
+        pageLines.push('  ┌─────────────────────────────────────────────────────────────────┐')
+        pageLines.push('  │ STEP # │ ACTION │ FIELD LOCATOR (exact) │ REQUIRED VALUE        │')
+        pageLines.push('  ├─────────────────────────────────────────────────────────────────┤')
+
+        let stepNum = 2  // step 1 is always NAVIGATE
+        let lookupCount = 0
+
+        for (const inp of reqInputs) {
+          const locator     = String(inp['locator'] ?? inp['name'] ?? '')
+          const locatorType = String(inp['locator_type'] ?? 'label')
+          const isLookup = /\b(account|contact|owner|parent|manager|assigned|lead|opportunity|vendor|customer|partner|report\s*to|bill\s*to|ship\s*to|related\s*to)\b/i.test(locator)
+          const action   = isLookup ? 'LOOKUP ' : 'TYPE   '
+          const sampleVal = resolveSampleValue(locator, path)
+          const valueHint = sampleVal
+            ? `"${sampleVal}"`
+            : isLookup
+              ? '"Acme Corp" (or real record name)'
+              : '"<realistic value>"'
+          const prefix = isLookup ? '🔥 REQUIRED LOOKUP' : '  [REQUIRED]       '
+          if (isLookup) lookupCount++
+          pageLines.push(`  │ Step ${stepNum++} │ ${action} │ ${prefix} "${locator}" (locator_type: "${locatorType}") │ → ${valueHint} │`)
+        }
+
+        // Render synthetic lookups that the crawler missed (custom lookup components)
+        for (const syn of syntheticLookups) {
+          const sampleVal = resolveSampleValue(syn.locator, path) ?? syn.hint
+          pageLines.push(`  │ Step ${stepNum++} │ LOOKUP │ 🔥 REQUIRED LOOKUP "${syn.locator}" (locator_type: "label") │ → "${sampleVal}" │`)
+          lookupCount++
+        }
+
+        for (const sel of reqSelects) {
+          const locator = String(sel['locator'] ?? sel['name'] ?? '')
+          const rawOptions = sel['options']
+          const validOptions: string[] = Array.isArray(rawOptions) ? rawOptions.map(String).filter(Boolean) : []
+          const valueHint = validOptions.length > 0 ? `"${validOptions[0]}" (options: ${validOptions.slice(0, 3).join(' | ')})` : '⛔ SKIP — no valid options'
+          pageLines.push(`  │ Step ${stepNum++} │ SELECT │   [REQUIRED]        "${locator}" │ → ${valueHint} │`)
+        }
+
+        pageLines.push('  ├─────────────────────────────────────────────────────────────────┤')
+
+        // Submit button
+        let submitButtonName = ''
+        if (submitBtns.length > 0) {
+          const rawLocator  = String(submitBtns[0]['locator'] ?? submitBtns[0]['name'] ?? '')
+          const nameMatch   = rawLocator.match(/name=(.+)$/)
+          submitButtonName  = (nameMatch ? nameMatch[1].trim() : String(submitBtns[0]['name'] ?? '')).trim()
+        }
+        if (submitButtonName) {
+          pageLines.push(`  │ Step ${stepNum} │ CLICK  │ [SUBMIT BUTTON] target: "${submitButtonName}" (locator_type: "role") │`)
+          pageLines.push(`  │         ← COPY THIS NAME EXACTLY — do NOT use "Save" or any other name                     │`)
+        } else {
+          pageLines.push(`  │ Step ${stepNum} │ CLICK  │ [SUBMIT BUTTON] Infer from entity: "Create <EntityName>" (locator_type: "role")       │`)
+        }
+        pageLines.push('  └─────────────────────────────────────────────────────────────────┘')
+
+        if (lookupCount > 0) {
+          pageLines.push(`  ‼️  This page has ${lookupCount} 🔥 REQUIRED LOOKUP field(s). Each MUST have a LOOKUP step. No exceptions.`)
+        }
+        pageLines.push('')
+        allPageSummaries.push(...pageLines)
+      }
+
+      if (allPageSummaries.length === 0) return ''
+
+      return [
+        '┌══════════════════════════════════════════════════════════════════════════════════════════┐',
+        '│  🚨 MANDATORY REQUIRED FIELDS CHECKLIST — READ THIS BEFORE WRITING ANY STEP 🚨          │',
+        '│  Every row in the table below is a REQUIRED STEP. Missing even one = INVALID OUTPUT.    │',
+        '│  🔥 REQUIRED LOOKUP rows are highest priority — NEVER skip them.                        │',
+        '│  The [SUBMIT BUTTON] name must be copied EXACTLY — do NOT use generic "Save".           │',
+        '└══════════════════════════════════════════════════════════════════════════════════════════┘',
+        '',
+        ...allPageSummaries,
+        '══════════════════════════════════════════════════════════════════════════════════════════',
+        '',
+      ].join('\n')
+    }
+
+    const requiredFieldsSummary = buildRequiredFieldsSummary()
+
     // ── Build context string ─────────────────────────────────────────────
     const lines: string[] = [
       '=== WEB APPLICATION PAGE METADATA ===',
@@ -1862,6 +2253,7 @@ async function buildWebAppStructuredContext(
       'Each field shows its EXACT locator and ⚡ SAMPLE VALUE from real records.',
       'Use the EXACT locator string. Use the ⚡ SAMPLE VALUE as the step value.',
       '',
+      ...(requiredFieldsSummary ? [requiredFieldsSummary] : []),
     ]
 
     for (const page of topPages) {
@@ -2040,9 +2432,11 @@ function ensureWebAppCreateSteps(
   // Additionally: use entityUrlMap (from web_test_data.source_url) as the
   // authoritative source of verified URLs. These are paths the scraper
   // ACTUALLY navigated to successfully.
+  // Hoist knownPaths to function scope so entityListPath derivation below can use it
+  const knownPaths: string[] = []
+
   if (ragContext || Object.keys(entityUrlMap).length > 0) {
     // Collect all known page paths from the RAG context header lines
-    const knownPaths: string[] = []
     for (const m of ragContext.matchAll(/---\s*Page:\s*([^\s(]+)/gi)) {
       const p = m[1].trim()
       if (p.startsWith('/')) knownPaths.push(p)
@@ -2188,8 +2582,8 @@ function ensureWebAppCreateSteps(
       }
       if (seg) {
         // Depluralize: "roles" → "role", "campaigns" → "campaign"
-        if (seg.endsWith('s') && seg.length > 3) seg = seg.slice(0, -1)
-        entityName = seg.charAt(0).toUpperCase() + seg.slice(1).toLowerCase()
+        seg = depluralize(seg)
+        entityName = seg.charAt(0).toUpperCase() + seg.slice(1)
         entityExtractedFromSteps = true
         log.info(`[GEN] Post-process: entity "${entityName}" extracted from NAVIGATE URL "${urlVal}" (last segment)`)
         break
@@ -2267,9 +2661,38 @@ function ensureWebAppCreateSteps(
     }
   }
   
-  const entityPlural = `/${capitalizedEntity.toLowerCase()}s` // e.g. "/campaigns"
+  // ── Derive the real list-page URL for ASSERT_URL ──────────────────────────
+  // Priority: (1) entity URL map, (2) known page path from RAG context that matches
+  // entity name, (3) naive pluralization (last resort — avoids '/opportunitys' typo)
+  let entityListPath = `/${capitalizedEntity.toLowerCase()}s`  // naive default
 
-  log.info(`[GEN] Post-process: entity="${capitalizedEntity}", expectedBtn="${expectedBtnName}", foundInRag=${foundExactBtnInRag}`)
+  // Check entityUrlMap first (highest confidence)
+  const urlInfoForEntity = Object.entries(entityUrlMap).find(
+    ([eName]) => eName.toLowerCase() === capitalizedEntity.toLowerCase()
+  )?.[1]
+  if (urlInfoForEntity) {
+    const rawPath = typeof urlInfoForEntity === 'string' ? urlInfoForEntity : urlInfoForEntity.path
+    // Strip any /new, /create suffix to get the list page
+    entityListPath = rawPath.replace(/\/(new|create|add|edit|update)(\/.*)?(\?|$).*/, '')
+    log.info(`[GEN] Post-process: list path from entityUrlMap → "${entityListPath}"`)
+  } else if (knownPaths.length > 0) {
+    // Find the best list-page path from RAG context: a path containing the entity name
+    // but NOT containing /new|/create|/edit suffixes
+    const entityLower = capitalizedEntity.toLowerCase()
+    const listPage = knownPaths.find(p => {
+      const pl = p.toLowerCase()
+      return pl.includes(entityLower) && !/\/(new|create|add|edit|update)(\/?|$)/i.test(p)
+    })
+    if (listPage) {
+      // Strip any trailing /new|/create suffix
+      entityListPath = listPage.replace(/\/(new|create|add|edit|update)(\/.*)?(\?|$).*/, '')
+      log.info(`[GEN] Post-process: list path from knownPaths → "${entityListPath}"`)
+    }
+  }
+
+  const entityPlural = entityListPath  // renamed for clarity, keeps backward compat
+
+  log.info(`[GEN] Post-process: entity="${capitalizedEntity}", expectedBtn="${expectedBtnName}", listPath="${entityPlural}", foundInRag=${foundExactBtnInRag}`)
 
   // ── 1. Correct the LAST CLICK step ──
   // If we found the exact button in RAG context, we unconditionally override.
@@ -2325,7 +2748,7 @@ function ensureWebAppCreateSteps(
       const curUrl = String(assertStep.value ?? '')
       // Overwrite if: (a) exact button from RAG, (b) entity reliably from steps, (c) URL is generic/empty
       // This catches cases like '/aeros' when entity is 'Campaign' → corrects to '/campaigns'
-      const curUrlEntity = curUrl.replace(/^\//, '').replace(/s$/, '').toLowerCase()
+      const curUrlEntity = depluralize(curUrl.replace(/^\//, ''))
       const entityMismatch = curUrlEntity && curUrlEntity !== capitalizedEntity.toLowerCase()
       if (foundExactBtnInRag || (entityExtractedFromSteps && entityMismatch) || curUrl.length < 3 || curUrl === '/') {
          assertStep.value = entityPlural
@@ -2335,11 +2758,11 @@ function ensureWebAppCreateSteps(
   } else {
     // Append ASSERT_URL if completely missing
     result.steps.push({
+      id: String((result.steps.length) + 1),
       action: 'ASSERT_URL',
       target: 'url',
       locator_type: 'url',
       value: entityPlural,
-      status: 'pending'
     })
     log.info(`[GEN] Post-process: injected missing ASSERT_URL "${entityPlural}"`)
   }
@@ -3021,6 +3444,134 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
       }
     } catch (scrapeErr) {
       log.warn({ err: scrapeErr }, '[GEN] Live page scrape failed (non-critical) — falling back to conservative prompt')
+    }
+  }
+
+  // ── LAST RESORT: synthesize metadata from web_test_data field names ──────
+  // When BOTH crawled metadata AND live scrape failed (no webAppRagContext),
+  // but we DO have web_test_data records for the entity, we can still extract
+  // the field NAMES (keys) from those records and build synthetic form metadata.
+  // This ensures the LLM gets WEB_APP_RAG_SYSTEM_PROMPT with a proper required-
+  // fields checklist instead of the generic STANDARD_SYSTEM_PROMPT.
+  if (project_id && isWebAppProject && !webAppRagContext && !sfRagContext) {
+    try {
+      const { getTestData } = await import('../webapp/webapp-test-data.service.js')
+      const targetObjs = extractTargetObjects(prompt)
+      const testDataEntities = await getTestData(project_id)
+
+      // Find the matching entity's test data
+      const matchingEntity = testDataEntities.find(e =>
+        targetObjs.some(t => e.entity_name.toLowerCase() === t.toLowerCase() ||
+                              e.entity_name.toLowerCase() === depluralize(t))
+      )
+
+      if (matchingEntity && matchingEntity.records.length > 0) {
+        // Extract unique field names from all records (deduplicate case-insensitively)
+        const fieldNameMap = new Map<string, string>()  // lowercase → best display name
+        for (const rec of matchingEntity.records.slice(0, 5)) {
+          for (const key of Object.keys(rec)) {
+            const trimmed = key.trim()
+            if (!trimmed) continue
+            const lower = trimmed.toLowerCase()
+            // Prefer Title Case over ALL CAPS (e.g. "Account" over "ACCOUNT")
+            if (!fieldNameMap.has(lower) || (trimmed !== trimmed.toUpperCase() && fieldNameMap.get(lower) === fieldNameMap.get(lower)?.toUpperCase())) {
+              fieldNameMap.set(lower, trimmed)
+            }
+          }
+        }
+        const fieldNames = new Set(fieldNameMap.values())
+
+        if (fieldNames.size > 0) {
+          const entityName = matchingEntity.entity_name  // e.g. "Opportunity"
+          const entityLower = entityName.toLowerCase()    // e.g. "opportunity"
+
+          // Known entity-to-URL patterns for common CRM apps
+          const createPath = `/${entityLower}/new`
+
+          // Build synthetic page metadata
+          const LOOKUP_FIELDS = /^(account|contact|owner|parent|manager|assigned|lead|opportunity|vendor|customer|partner|report\s*to|bill\s*to|ship\s*to|related\s*to|company)$/i
+          const REQUIRED_FIELDS = /^(account|contact|name|close\s*date|company|status|stage|opportunity\s*name|account\s*name|lead\s*name|contact\s*name)$/i
+
+          const lines: string[] = [
+            '=== WEB APPLICATION PAGE METADATA ===',
+            'The following metadata was derived from stored entity field names.',
+            'Use these EXACT field names and page routes when generating test steps.',
+            '',
+            // Inject the mandatory checklist header
+            '\u250c\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2510',
+            '\u2502  \ud83d\udea8 MANDATORY REQUIRED FIELDS CHECKLIST \u2014 READ THIS BEFORE WRITING ANY STEP \ud83d\udea8          \u2502',
+            '\u2502  Every row in the table below is a REQUIRED STEP. Missing even one = INVALID OUTPUT.    \u2502',
+            '\u2502  \ud83d\udd25 REQUIRED LOOKUP rows are highest priority \u2014 NEVER skip them.                        \u2502',
+            '\u2514\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2518',
+            '',
+            `  Create Page: ${createPath}`,
+          ]
+
+          let stepNum = 2
+          const fieldArray = Array.from(fieldNames)
+
+          // Required lookup fields first
+          for (const field of fieldArray) {
+            if (LOOKUP_FIELDS.test(field)) {
+              lines.push(`  │ Step ${stepNum++} │ LOOKUP │ 🔥 REQUIRED LOOKUP "${field}" (locator_type: "label") │ → use real record name │`)
+            }
+          }
+          // Then other required fields
+          for (const field of fieldArray) {
+            if (!LOOKUP_FIELDS.test(field) && REQUIRED_FIELDS.test(field)) {
+              lines.push(`  │ Step ${stepNum++} │ TYPE   │   [REQUIRED]        "${field}" (locator_type: "label") │ → use realistic value  │`)
+            }
+          }
+          // Then all remaining fields as optional
+          for (const field of fieldArray) {
+            if (!LOOKUP_FIELDS.test(field) && !REQUIRED_FIELDS.test(field)) {
+              lines.push(`    [OPTIONAL] TYPE  locator: "${field}"  (locator_type: "label")`)
+            }
+          }
+
+          lines.push('')
+          lines.push(`  [SUBMIT BUTTON] CLICK  target: "Create ${entityName}"  locator_type: "role"  ← USE THIS EXACT NAME`)
+          lines.push('')
+
+          lines.push(`--- Page: ${createPath} (${entityName} Create Form) ---`)
+          lines.push('  Submit Buttons (use for CLICK step after filling all fields):')
+          lines.push(`    ⚡ BUTTON NAME: "Create ${entityName}"  →  Use this EXACT name as target for the CLICK step  (locator_type: "role")`)
+          lines.push('')
+
+          // Add required fields section
+          lines.push('  ⚠ MANDATORY Form Fields (MUST fill these when creating a record):')
+          for (const field of fieldArray) {
+            if (LOOKUP_FIELDS.test(field) || REQUIRED_FIELDS.test(field)) {
+              const isLookup = LOOKUP_FIELDS.test(field)
+              lines.push(`    \u2022 [REQUIRED] [label] ${field}  (tag=${isLookup ? 'lookup' : 'input'})`)
+            }
+          }
+
+          // Add optional fields
+          const optFields = fieldArray.filter(f => !LOOKUP_FIELDS.test(f) && !REQUIRED_FIELDS.test(f))
+          if (optFields.length > 0) {
+            lines.push('  Optional Form Fields:')
+            for (const field of optFields) {
+              lines.push(`    \u2022 [label] ${field}  (tag=input)`)
+            }
+          }
+
+          lines.push('')
+          lines.push('=== END OF WEB APPLICATION PAGE METADATA ===')
+
+          webAppRagContext = lines.join('\n')
+          log.info(`[GEN] Synthesized metadata from web_test_data: entity=${entityName}, fields=${fieldNames.size}, path=${createPath}`)
+
+          // Update session instruction to be metadata-aware
+          sessionInstruction =
+            '\n\nIMPORTANT: This is a web application project with an active login session. ' +
+            'DO NOT generate any login/authentication steps. The user is ALREADY authenticated. ' +
+            'Start the test from the relevant page directly using relative URL paths. ' +
+            'Use ONLY field labels from the APPLICATION METADATA provided — do not invent field names.'
+        }
+      }
+    } catch (synthErr) {
+      log.warn({ err: synthErr }, '[GEN] Synthetic metadata from web_test_data failed (non-critical)')
     }
   }
 

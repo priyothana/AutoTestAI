@@ -20,7 +20,8 @@ import {
     MonitorPlay,
     CheckCircle,
     SkipForward,
-    Square
+    Square,
+    Pencil
 } from "lucide-react"
 import { format } from "date-fns"
 
@@ -47,6 +48,7 @@ import { Badge } from "@/components/ui/badge"
 import { toast } from "sonner"
 import JiraImportPanel from "@/components/projects/JiraImportPanel"
 import AiFixAssistant from "@/components/tests/AiFixAssistant"
+import StepReviewChatbot from "@/components/tests/StepReviewChatbot"
 
 // Step Type
 type TestStep = {
@@ -95,6 +97,9 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [hasMounted, setHasMounted] = useState(false)
     const [testSource, setTestSource] = useState<'manual' | 'jira' | null>(null)
     const [jiraConfigured, setJiraConfigured] = useState<boolean | null>(null) // null = loading
+
+    // Per-step review chatbot state
+    const [reviewStepIndex, setReviewStepIndex] = useState<number | null>(null)
 
     // Readable view state — default to readable
     interface ReadableStep {
@@ -1224,18 +1229,27 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                 <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[140px]">Actual Result</th>
                                                 <th className="px-3 py-2.5 text-center font-semibold text-indigo-700 dark:text-indigo-300 w-20">Status</th>
                                                 <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[120px]">Comments / Defects</th>
+                                                <th className="px-3 py-2.5 text-center font-semibold text-indigo-700 dark:text-indigo-300 w-24">Review</th>
                                             </tr>
                                         </thead>
                                         <tbody>
                                             {readableSteps.map((step, index) => (
                                                 <tr
                                                     key={index}
-                                                    className={`border-b border-indigo-50 dark:border-indigo-900/30 transition-colors duration-150 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20 ${
-                                                        index % 2 === 0 ? 'bg-white dark:bg-gray-950/20' : 'bg-indigo-50/20 dark:bg-indigo-950/10'
+                                                    className={`border-b border-indigo-50 dark:border-indigo-900/30 transition-colors duration-150 ${
+                                                        reviewStepIndex === index
+                                                            ? 'bg-violet-50/60 dark:bg-violet-950/20 ring-1 ring-inset ring-violet-200 dark:ring-violet-800'
+                                                            : index % 2 === 0
+                                                                ? 'bg-white dark:bg-gray-950/20 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20'
+                                                                : 'bg-indigo-50/20 dark:bg-indigo-950/10 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20'
                                                     }`}
                                                 >
                                                     <td className="px-3 py-2.5 align-top">
-                                                        <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 text-xs font-bold">
+                                                        <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold ${
+                                                            reviewStepIndex === index
+                                                                ? 'bg-violet-200 text-violet-700 dark:bg-violet-800 dark:text-violet-200'
+                                                                : 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300'
+                                                        }`}>
                                                             {index + 1}
                                                         </span>
                                                     </td>
@@ -1266,6 +1280,23 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                     </td>
                                                     <td className="px-3 py-2.5 align-top text-gray-500 dark:text-gray-400 text-xs leading-relaxed">
                                                         {step.comments}
+                                                    </td>
+                                                    {/* Review button cell */}
+                                                    <td className="px-3 py-2.5 align-top text-center">
+                                                        <button
+                                                            onClick={() => setReviewStepIndex(reviewStepIndex === index ? null : index)}
+                                                            disabled={isInternalNew}
+                                                            title={isInternalNew ? 'Save test first' : `Edit Step ${index + 1} with AI`}
+                                                            id={`review-step-${index}`}
+                                                            className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-all border ${
+                                                                reviewStepIndex === index
+                                                                    ? 'bg-violet-600 text-white border-violet-600 shadow-sm'
+                                                                    : 'bg-white dark:bg-gray-900 text-violet-600 dark:text-violet-400 border-violet-200 dark:border-violet-800 hover:bg-violet-50 dark:hover:bg-violet-950/30 hover:border-violet-400'
+                                                            } disabled:opacity-40 disabled:cursor-not-allowed`}
+                                                        >
+                                                            <Pencil className="h-3 w-3" />
+                                                            {reviewStepIndex === index ? 'Close' : 'Review'}
+                                                        </button>
                                                     </td>
                                                 </tr>
                                             ))}
@@ -1497,6 +1528,31 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                   }}
                 />
               )}
+
+            {/* ── Per-Step Review Chatbot Widget ─────────────────────────── */}
+            {reviewStepIndex !== null && !isInternalNew && (
+                <StepReviewChatbot
+                    stepIndex={reviewStepIndex}
+                    step={steps[reviewStepIndex]}
+                    testCaseId={currentId}
+                    onStepUpdated={(idx, updatedStep) => {
+                        // Optimistically update the step in local state
+                        setSteps(prev => prev.map((s, i) =>
+                            i === idx ? { ...s, ...updatedStep } : s
+                        ))
+                        // Also update the readable view so the table stays in sync
+                        setReadableSteps(prev =>
+                            prev.map((rs, i) => {
+                                if (i !== idx) return rs
+                                // Regenerate human-readable text for the updated step
+                                const generated = generateLocalReadableSteps([updatedStep])
+                                return generated[0] ?? rs
+                            })
+                        )
+                    }}
+                    onClose={() => setReviewStepIndex(null)}
+                />
+            )}
         </div>
     )
 }

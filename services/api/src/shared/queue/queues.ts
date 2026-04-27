@@ -19,6 +19,9 @@ export const QUEUES = {
 
   /** Salesforce metadata sync pipeline — Normalizer → Domain Builder → Embeddings */
   METADATA_SYNC: 'metadata-sync-queue',
+
+  /** AI Test-Case Generation — async multi-source generation jobs */
+  TEST_CASE_GENERATION: 'test-case-generation-queue',
 } as const
 
 export type QueueName = (typeof QUEUES)[keyof typeof QUEUES]
