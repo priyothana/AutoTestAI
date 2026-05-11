@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect, use, useRef } from "react"
+import { useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -21,7 +22,6 @@ import {
     CheckCircle,
     SkipForward,
     Square,
-    Pencil
 } from "lucide-react"
 import { format } from "date-fns"
 
@@ -48,7 +48,7 @@ import { Badge } from "@/components/ui/badge"
 import { toast } from "sonner"
 import JiraImportPanel from "@/components/projects/JiraImportPanel"
 import AiFixAssistant from "@/components/tests/AiFixAssistant"
-import StepReviewChatbot from "@/components/tests/StepReviewChatbot"
+import NexusAssistant, { type TestStep as NexusTestStep } from "@/components/tests/NexusAssistant"
 
 // Step Type
 type TestStep = {
@@ -66,12 +66,17 @@ type Project = {
 export default function TestEditorPage({ params }: { params: Promise<{ id: string }> }) {
     const { id } = use(params)
     const router = useRouter()
+    const searchParams = useSearchParams()
+
+    // ?source=manual → coming from the "Manual Test Case" card; hide Jira import
+    const manualSourceMode = searchParams.get("source") === "manual"
 
     // Internal state for ID and mode
     const [currentId, setCurrentId] = useState(id)
     const [isInternalNew, setIsInternalNew] = useState(id === "create" || id === "new")
 
     const [testName, setTestName] = useState(isInternalNew ? "New Test Case" : "Loading...")
+    const titleRef = useRef<HTMLTextAreaElement>(null)
     const [description, setDescription] = useState("")
     const [prompt, setPrompt] = useState("")
     const [isGenerating, setIsGenerating] = useState(false)
@@ -95,11 +100,12 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [testStatus, setTestStatus] = useState<string>("draft")
     const [projectError, setProjectError] = useState(false)
     const [hasMounted, setHasMounted] = useState(false)
-    const [testSource, setTestSource] = useState<'manual' | 'jira' | null>(null)
+    // Pre-select 'manual' when arriving from the Manual Test Case card
+    const [testSource, setTestSource] = useState<'manual' | 'jira' | null>(
+        manualSourceMode ? 'manual' : null
+    )
     const [jiraConfigured, setJiraConfigured] = useState<boolean | null>(null) // null = loading
 
-    // Per-step review chatbot state
-    const [reviewStepIndex, setReviewStepIndex] = useState<number | null>(null)
 
     // Readable view state — default to readable
     interface ReadableStep {
@@ -120,6 +126,13 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     useEffect(() => {
         setHasMounted(true)
     }, [])
+
+    useEffect(() => {
+        if (titleRef.current) {
+            titleRef.current.style.height = 'auto'
+            titleRef.current.style.height = titleRef.current.scrollHeight + 'px'
+        }
+    }, [testName])
 
     const fetchProjects = async () => {
         try {
@@ -145,6 +158,13 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 setSteps(loadedSteps)
                 setSelectedProjectId(data.project_id)
                 setPriority(data.priority || "medium")
+
+                // For existing test cases, auto-select manual source and pre-fill prompt
+                // so the AI Generator is visible and ready for (re)generation
+                setTestSource(prev => prev ?? 'manual')
+                if (data.description && !prompt) {
+                    setPrompt(data.description)
+                }
 
                 // Fetch last run result for this test (to pre-fill execution columns)
                 let lastRunLogs: any[] = []
@@ -798,14 +818,21 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     return (
         <div className="space-y-5 max-w-6xl mx-auto pb-10">
             {/* ── Header ──────────────────────────────────────────────────── */}
-            <div className="flex items-center gap-2">
-                <Input
-                    value={testName}
-                    onChange={(e) => setTestName(e.target.value)}
-                    className="text-2xl font-bold h-auto border-transparent hover:border-input px-0 w-[400px] focus-visible:ring-0"
-                    placeholder="Enter test case name..."
-                />
-                <p className="text-muted-foreground text-sm ml-4 self-end pb-0.5">
+            <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-4 relative group">
+                <div className="flex-1 min-w-0">
+                    <Textarea
+                        ref={titleRef}
+                        value={testName}
+                        onChange={(e) => {
+                            setTestName(e.target.value)
+                        }}
+                        className="text-2xl font-bold border-transparent hover:border-input px-2 py-1 w-full focus-visible:ring-1 focus-visible:ring-indigo-500 resize-none overflow-hidden bg-transparent shadow-none transition-colors leading-tight"
+                        style={{ minHeight: '40px' }}
+                        placeholder="Enter test case name..."
+                        rows={1}
+                    />
+                </div>
+                <p className="text-muted-foreground text-xs sm:text-sm whitespace-nowrap pt-2 sm:pt-3 px-2 sm:px-0">
                     {isInternalNew ? "Creating a new automated test" : `Editing test ID: ${currentId}`}
                 </p>
             </div>
@@ -897,15 +924,15 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 <div>
                     <h3 className="text-lg font-semibold flex items-center gap-2">
                         <FileText className="h-5 w-5 text-indigo-600 dark:text-indigo-400" />
-                        Test Case Source
+                        {isInternalNew ? 'Test Case Source' : 'Test Case Description'}
                     </h3>
                     <p className="text-sm text-muted-foreground mt-0.5">
-                        Choose how to provide your test case.
+                        {isInternalNew ? 'Choose how to provide your test case.' : 'Edit the description below to regenerate test steps with AI.'}
                     </p>
                 </div>
 
-                {/* Source Selector Cards */}
-                <div className="grid gap-4 md:grid-cols-2">
+                {/* Source Selector Cards — Jira hidden when arriving from Manual Test Case card */}
+                <div className={`grid gap-4 ${manualSourceMode ? 'md:grid-cols-1' : 'md:grid-cols-2'}`}>
                     {/* Option 1 — Manual */}
                     <button
                         type="button"
@@ -926,40 +953,42 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         </div>
                     </button>
 
-                    {/* Option 2 — Import from Jira */}
-                    <button
-                        type="button"
-                        onClick={() => {
-                            if (jiraConfigured) setTestSource('jira')
-                        }}
-                        disabled={!jiraConfigured}
-                        className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${!jiraConfigured
-                                ? 'border-gray-200 dark:border-gray-800 opacity-60 cursor-not-allowed'
-                                : testSource === 'jira'
-                                    ? 'border-purple-500 bg-purple-50/80 dark:bg-purple-950/20 shadow-md ring-2 ring-purple-200 dark:ring-purple-800'
-                                    : 'border-gray-200 dark:border-gray-800 hover:border-purple-300 dark:hover:border-purple-700 hover:bg-purple-50/40 dark:hover:bg-purple-950/10'
-                            }`}
-                    >
-                        <div className="flex items-center gap-3 mb-2">
-                            <div className={`p-2 rounded-lg ${testSource === 'jira' ? 'bg-purple-100 dark:bg-purple-900/40' : 'bg-gray-100 dark:bg-gray-800'}`}>
-                                <svg className={`h-5 w-5 ${testSource === 'jira' ? 'text-purple-600' : 'text-gray-500'}`} viewBox="0 0 24 24" fill="currentColor">
-                                    <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83H6.77zM2 11.6a4.35 4.35 0 0 0 4.34 4.34h1.8v1.72A4.35 4.35 0 0 0 12.48 22v-9.57a.84.84 0 0 0-.84-.84H2z" />
-                                </svg>
+                    {/* Option 2 — Import from Jira (hidden when in manual-source mode) */}
+                    {!manualSourceMode && (
+                        <button
+                            type="button"
+                            onClick={() => {
+                                if (jiraConfigured) setTestSource('jira')
+                            }}
+                            disabled={!jiraConfigured}
+                            className={`text-left p-4 rounded-lg border-2 transition-all duration-200 ${!jiraConfigured
+                                    ? 'border-gray-200 dark:border-gray-800 opacity-60 cursor-not-allowed'
+                                    : testSource === 'jira'
+                                        ? 'border-purple-500 bg-purple-50/80 dark:bg-purple-950/20 shadow-md ring-2 ring-purple-200 dark:ring-purple-800'
+                                        : 'border-gray-200 dark:border-gray-800 hover:border-purple-300 dark:hover:border-purple-700 hover:bg-purple-50/40 dark:hover:bg-purple-950/10'
+                                }`}
+                        >
+                            <div className="flex items-center gap-3 mb-2">
+                                <div className={`p-2 rounded-lg ${testSource === 'jira' ? 'bg-purple-100 dark:bg-purple-900/40' : 'bg-gray-100 dark:bg-gray-800'}`}>
+                                    <svg className={`h-5 w-5 ${testSource === 'jira' ? 'text-purple-600' : 'text-gray-500'}`} viewBox="0 0 24 24" fill="currentColor">
+                                        <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53zM6.77 6.8a4.36 4.36 0 0 0 4.34 4.34h1.8v1.72a4.36 4.36 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.83-.83H6.77zM2 11.6a4.35 4.35 0 0 0 4.34 4.34h1.8v1.72A4.35 4.35 0 0 0 12.48 22v-9.57a.84.84 0 0 0-.84-.84H2z" />
+                                    </svg>
+                                </div>
+                                <div>
+                                    <h4 className="font-semibold text-sm">Import from Jira</h4>
+                                    <p className="text-xs text-muted-foreground">
+                                        {!selectedProjectId
+                                            ? 'Select an environment first'
+                                            : jiraConfigured === null
+                                                ? 'Checking Jira config...'
+                                                : jiraConfigured
+                                                    ? 'Import user stories from your connected Jira board'
+                                                    : 'Jira not configured for this environment. Configure in Environment Settings.'}
+                                    </p>
+                                </div>
                             </div>
-                            <div>
-                                <h4 className="font-semibold text-sm">Import from Jira</h4>
-                                <p className="text-xs text-muted-foreground">
-                                    {!selectedProjectId
-                                        ? 'Select an environment first'
-                                        : jiraConfigured === null
-                                            ? 'Checking Jira config...'
-                                            : jiraConfigured
-                                                ? 'Import user stories from your connected Jira board'
-                                                : 'Jira not configured for this environment. Configure in Environment Settings.'}
-                                </p>
-                            </div>
-                        </div>
-                    </button>
+                        </button>
+                    )}
                 </div>
 
                 {/* Conditional Content based on selection */}
@@ -1020,7 +1049,9 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                             AI Test Step Generator
                         </CardTitle>
                         <CardDescription>
-                            Convert the provided test case or imported Jira user story into optimized Playwright test steps.
+                            {steps.length > 0
+                                ? 'Regenerate test steps with a different model or updated description.'
+                                : 'Convert the provided test case or imported Jira user story into optimized Playwright test steps.'}
                         </CardDescription>
                     </CardHeader>
                     <CardContent>
@@ -1229,27 +1260,16 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                 <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[140px]">Actual Result</th>
                                                 <th className="px-3 py-2.5 text-center font-semibold text-indigo-700 dark:text-indigo-300 w-20">Status</th>
                                                 <th className="px-3 py-2.5 text-left font-semibold text-indigo-700 dark:text-indigo-300 min-w-[120px]">Comments / Defects</th>
-                                                <th className="px-3 py-2.5 text-center font-semibold text-indigo-700 dark:text-indigo-300 w-24">Review</th>
                                             </tr>
                                         </thead>
                                         <tbody>
                                             {readableSteps.map((step, index) => (
                                                 <tr
                                                     key={index}
-                                                    className={`border-b border-indigo-50 dark:border-indigo-900/30 transition-colors duration-150 ${
-                                                        reviewStepIndex === index
-                                                            ? 'bg-violet-50/60 dark:bg-violet-950/20 ring-1 ring-inset ring-violet-200 dark:ring-violet-800'
-                                                            : index % 2 === 0
-                                                                ? 'bg-white dark:bg-gray-950/20 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20'
-                                                                : 'bg-indigo-50/20 dark:bg-indigo-950/10 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20'
-                                                    }`}
+                                                    className={`border-b border-indigo-50 dark:border-indigo-900/30 transition-colors duration-150 ${index % 2 === 0 ? 'bg-white dark:bg-gray-950/20 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20' : 'bg-indigo-50/20 dark:bg-indigo-950/10 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20'}`}
                                                 >
                                                     <td className="px-3 py-2.5 align-top">
-                                                        <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold ${
-                                                            reviewStepIndex === index
-                                                                ? 'bg-violet-200 text-violet-700 dark:bg-violet-800 dark:text-violet-200'
-                                                                : 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300'
-                                                        }`}>
+                                                        <span className="inline-flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">
                                                             {index + 1}
                                                         </span>
                                                     </td>
@@ -1280,23 +1300,6 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                                     </td>
                                                     <td className="px-3 py-2.5 align-top text-gray-500 dark:text-gray-400 text-xs leading-relaxed">
                                                         {step.comments}
-                                                    </td>
-                                                    {/* Review button cell */}
-                                                    <td className="px-3 py-2.5 align-top text-center">
-                                                        <button
-                                                            onClick={() => setReviewStepIndex(reviewStepIndex === index ? null : index)}
-                                                            disabled={isInternalNew}
-                                                            title={isInternalNew ? 'Save test first' : `Edit Step ${index + 1} with AI`}
-                                                            id={`review-step-${index}`}
-                                                            className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-all border ${
-                                                                reviewStepIndex === index
-                                                                    ? 'bg-violet-600 text-white border-violet-600 shadow-sm'
-                                                                    : 'bg-white dark:bg-gray-900 text-violet-600 dark:text-violet-400 border-violet-200 dark:border-violet-800 hover:bg-violet-50 dark:hover:bg-violet-950/30 hover:border-violet-400'
-                                                            } disabled:opacity-40 disabled:cursor-not-allowed`}
-                                                        >
-                                                            <Pencil className="h-3 w-3" />
-                                                            {reviewStepIndex === index ? 'Close' : 'Review'}
-                                                        </button>
                                                     </td>
                                                 </tr>
                                             ))}
@@ -1529,30 +1532,37 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 />
               )}
 
-            {/* ── Per-Step Review Chatbot Widget ─────────────────────────── */}
-            {reviewStepIndex !== null && !isInternalNew && (
-                <StepReviewChatbot
-                    stepIndex={reviewStepIndex}
-                    step={steps[reviewStepIndex]}
-                    testCaseId={currentId}
-                    onStepUpdated={(idx, updatedStep) => {
-                        // Optimistically update the step in local state
-                        setSteps(prev => prev.map((s, i) =>
-                            i === idx ? { ...s, ...updatedStep } : s
-                        ))
-                        // Also update the readable view so the table stays in sync
-                        setReadableSteps(prev =>
-                            prev.map((rs, i) => {
-                                if (i !== idx) return rs
-                                // Regenerate human-readable text for the updated step
-                                const generated = generateLocalReadableSteps([updatedStep])
-                                return generated[0] ?? rs
-                            })
-                        )
-                    }}
-                    onClose={() => setReviewStepIndex(null)}
-                />
-            )}
+            {/* ── NEXUS AI Assistant (floating icon + chat panel) ─────────── */}
+            <NexusAssistant
+                testCaseId={currentId}
+                testCaseName={testName}
+                steps={steps as NexusTestStep[]}
+                isDisabled={isInternalNew}
+                onStepsUpdated={(updates) => {
+                    // Determine which indices are deletions vs updates
+                    const deletedIndices = new Set(
+                        updates.filter(u => u.deleted).map(u => u.stepIndex)
+                    )
+                    setSteps(prev => {
+                        // First apply non-delete updates in-place, then remove deleted rows
+                        const patched = prev.map((s, i) => {
+                            const upd = updates.find(u => u.stepIndex === i && !u.deleted)
+                            return upd ? { ...s, ...upd.updatedStep } : s
+                        })
+                        return patched.filter((_, i) => !deletedIndices.has(i))
+                    })
+                    // Keep readable steps in sync
+                    setReadableSteps(prev => {
+                        const patched = prev.map((s, i) => {
+                            const upd = updates.find(u => u.stepIndex === i && !u.deleted)
+                            if (!upd) return s
+                            const generated = generateLocalReadableSteps([upd.updatedStep as any])
+                            return generated[0] ?? s
+                        })
+                        return patched.filter((_, i) => !deletedIndices.has(i))
+                    })
+                }}
+            />
         </div>
     )
 }

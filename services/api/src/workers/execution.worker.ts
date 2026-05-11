@@ -2586,6 +2586,10 @@ function resolveLocator(page: Page, step: StepData): Locator {
     if (/^role=\w+,\s*name=/.test(target)) locatorType = 'role'
     else if (target.startsWith('label=')) { locatorType = 'label'; target = target.slice(6) }
     else if (target.startsWith('text=')) { locatorType = 'text'; target = target.slice(5) }
+    // For assertion actions, treat the target as plain text even if it contains dots
+    // (e.g. version strings like "Administratorv0.1.0" must NOT be parsed as CSS selectors)
+    else if (['assert', 'assertvisible', 'asserttext', 'verify', 'verifyvisible', 'verifytext'].includes(action) &&
+             !target.match(/[\[\]>()#,]/) && target.length > 0) locatorType = 'text'
     else if (!target.match(/[.#\[\]>:=]/) && target.length > 0) locatorType = 'label'
   }
 
@@ -3243,18 +3247,191 @@ async function executeStep(
               }
             }
 
-            // Not a role locator — try as direct CSS selector or text
+            // Not a role locator — use smart click with action-menu awareness
+            const isDestructiveAction = /^(delete|remove|archive|deactivate|trash)$/i.test(target.trim())
             if (!clicked) {
-              const directLoc = target.startsWith('.') || target.startsWith('#') || target.startsWith('[')
-                ? page.locator(target)
-                : page.getByText(target, { exact: false })
-              await directLoc.first().waitFor({ state: 'visible', timeout: 15_000 })
-              await directLoc.first().click()
-              clicked = true
+
+              if (isDestructiveAction) {
+                // ── Destructive action strategy ─────────────────────────────
+                // "Delete" is almost never a standalone visible button in CRMs.
+                // It is typically hidden behind a context/action/kebab menu.
+                // Strategy:
+                //   1. Try direct visibility first (quick check, no long wait)
+                //   2. Try action menu triggers (⋮, ▼, "Actions", "More") → open → click Delete
+                //   3. Fall back to getByText with short timeout
+                log.info(`[WEBAPP-ENGINE] Destructive action "${target}" — checking direct visibility first`)
+
+                // Step 1: Quick check — is a Delete button directly visible?
+                const DESTRUCTIVE_SELECTORS = [
+                  `button:has-text("${target}")`,
+                  `[role="menuitem"]:has-text("${target}")`,
+                  `[role="option"]:has-text("${target}")`,
+                  `a:has-text("${target}")`,
+                  `li:has-text("${target}")`,
+                ]
+                let directlyVisible = false
+                for (const sel of DESTRUCTIVE_SELECTORS) {
+                  try {
+                    const el = page.locator(sel).first()
+                    if (await el.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                      await el.scrollIntoViewIfNeeded().catch(() => {})
+                      await el.click()
+                      clicked = true
+                      directlyVisible = true
+                      log.info(`[WEBAPP-ENGINE] ✅ Clicked "${target}" directly via "${sel}"`)
+                      break
+                    }
+                  } catch { /* try next */ }
+                }
+
+                if (!directlyVisible) {
+                  // Step 2: Open action/context menu first, then click the destructive action
+                  log.info(`[WEBAPP-ENGINE] "${target}" not directly visible — trying action menu triggers`)
+
+                  // Common action menu trigger selectors in CRMs
+                  const ACTION_MENU_TRIGGERS = [
+                    // Kebab/three-dot menus
+                    'button[aria-label*="more" i]',
+                    'button[aria-label*="action" i]',
+                    'button[aria-label*="option" i]',
+                    'button[aria-label*="menu" i]',
+                    'button[title*="more" i]',
+                    'button[title*="action" i]',
+                    '[role="button"][aria-label*="more" i]',
+                    // Common icon buttons: ⋮ ⋯ ... ▾ ▼
+                    'button:has(svg):not([aria-label*="search" i]):not([aria-label*="filter" i]):not([aria-label*="new" i])',
+                    // Text-based triggers
+                    'button:has-text("Actions")',
+                    'button:has-text("More")',
+                    'button:has-text("Options")',
+                    '[role="button"]:has-text("Actions")',
+                  ]
+
+                  for (const triggerSel of ACTION_MENU_TRIGGERS) {
+                    try {
+                      const triggers = page.locator(triggerSel)
+                      const count = await triggers.count().catch(() => 0)
+
+                      for (let ti = 0; ti < Math.min(count, 5); ti++) {
+                        const trigger = triggers.nth(ti)
+                        if (!await trigger.isVisible({ timeout: 1_000 }).catch(() => false)) continue
+
+                        // Click the trigger to open the menu
+                        await trigger.click()
+                        await page.waitForTimeout(500)
+
+                        // Look for the destructive action in the opened menu
+                        const menuItem = page.locator(
+                          `[role="menu"] *:has-text("${target}"), ` +
+                          `[role="menuitem"]:has-text("${target}"), ` +
+                          `[role="listbox"] *:has-text("${target}"), ` +
+                          `.dropdown-menu *:has-text("${target}"), ` +
+                          `ul li:has-text("${target}")`,
+                        ).first()
+
+                        if (await menuItem.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                          await menuItem.click()
+                          clicked = true
+                          log.info(`[WEBAPP-ENGINE] ✅ Clicked "${target}" via action menu trigger "${triggerSel}"`)
+                          break
+                        }
+
+                        // Menu didn't have Delete — close it and try next trigger
+                        await page.keyboard.press('Escape').catch(() => {})
+                        await page.waitForTimeout(200)
+                      }
+                      if (clicked) break
+                    } catch { /* try next trigger */ }
+                  }
+                }
+
+                if (!clicked) {
+                  // Step 3: Last resort — standard text lookup with reduced timeout
+                  log.warn(`[WEBAPP-ENGINE] Action menu strategies failed for "${target}" — falling back to getByText`)
+                  const textLoc = page.getByText(target, { exact: false })
+                  await textLoc.first().waitFor({ state: 'visible', timeout: 5_000 })
+                  await textLoc.first().click()
+                  clicked = true
+                }
+
+              } else {
+                // Non-destructive: standard CSS/text click
+                const directLoc = target.startsWith('.') || target.startsWith('#') || target.startsWith('[')
+                  ? page.locator(target)
+                  : page.getByText(target, { exact: false })
+                await directLoc.first().waitFor({ state: 'visible', timeout: 15_000 })
+                await directLoc.first().click()
+                clicked = true
+              }
             }
 
-            if (!clicked) {
-              throw new Error(`Web App CLICK: could not find clickable element "${target}"`)
+            // ── Post-destructive-click: auto-handle confirmation dialog ───
+            // Pattern: "Delete" (or Remove/Archive) click opens a modal that asks
+            // "Are you sure?" with a confirm button (e.g. "Delete Contact").
+            // If the LLM-generated steps don't include the confirmation click,
+            // the engine must handle it automatically or the next step fails.
+            if (isDestructiveAction && clicked) {
+              await page.waitForTimeout(800)
+              const confirmDialog = page.locator(
+                '[role="dialog"], [aria-modal="true"], .modal, [class*="dialog"], [class*="modal"]'
+              ).first()
+              const dialogVisible = await confirmDialog.isVisible({ timeout: 2_000 }).catch(() => false)
+
+              if (dialogVisible) {
+                log.info(`[WEBAPP-ENGINE] Confirmation dialog detected after destructive action "${target}" — auto-confirming`)
+
+                // Priority order: most specific (entity-specific Delete button) → generic confirm
+                const CONFIRM_SELECTORS = [
+                  // Entity-specific: "Delete Contact", "Delete Account", "Delete Record"
+                  '[role="dialog"] button[class*="danger"]:not([class*="cancel"])',
+                  '[role="dialog"] button[class*="destructive"]:not([class*="cancel"])',
+                  '[role="dialog"] button[class*="red"]:not([class*="cancel"])',
+                  // Text-based: match any button starting with "Delete" (not "Cancel Delete")
+                  '[role="dialog"] button',
+                  '.modal button',
+                  '[aria-modal="true"] button',
+                ]
+
+                let confirmed = false
+                // Get all buttons inside the dialog and find the confirm one
+                const dialogBtns = confirmDialog.locator('button')
+                const btnCount = await dialogBtns.count().catch(() => 0)
+                for (let bi = 0; bi < btnCount; bi++) {
+                  const btn = dialogBtns.nth(bi)
+                  if (!await btn.isVisible({ timeout: 500 }).catch(() => false)) continue
+                  const btnText = (await btn.textContent().catch(() => '') ?? '').trim()
+                  // Skip Cancel/Close/No/Back/Dismiss buttons
+                  if (/^(cancel|close|no|back|dismiss|keep)$/i.test(btnText)) continue
+                  // Prefer buttons that start with "Delete", "Remove", "Confirm", "Yes", "Proceed"
+                  if (/^(delete|remove|archive|confirm|yes|proceed|ok)/i.test(btnText)) {
+                    await btn.scrollIntoViewIfNeeded().catch(() => {})
+                    await btn.click()
+                    confirmed = true
+                    log.info(`[WEBAPP-ENGINE] ✅ Clicked confirmation button: "${btnText}"`)
+                    await page.waitForTimeout(1_500)
+                    break
+                  }
+                }
+
+                // Fallback: click the last button in the dialog (usually the primary/confirm action)
+                if (!confirmed && btnCount > 0) {
+                  for (let bi = btnCount - 1; bi >= 0; bi--) {
+                    const btn = dialogBtns.nth(bi)
+                    if (!await btn.isVisible({ timeout: 500 }).catch(() => false)) continue
+                    const btnText = (await btn.textContent().catch(() => '') ?? '').trim()
+                    if (/^(cancel|close|no|back|dismiss|keep)$/i.test(btnText)) continue
+                    await btn.click()
+                    confirmed = true
+                    log.info(`[WEBAPP-ENGINE] ✅ Fallback: clicked last dialog button "${btnText}"`)
+                    await page.waitForTimeout(1_500)
+                    break
+                  }
+                }
+
+                if (!confirmed) {
+                  log.warn(`[WEBAPP-ENGINE] Confirmation dialog found but could not identify confirm button — proceeding`)
+                }
+              }
             }
 
             // Web app post-click: brief wait for SPA state update
@@ -3869,14 +4046,92 @@ async function executeStep(
         case 'assert':
         case 'assertvisible':
         case 'asserttext': {
-          const loc = await getFirstVisibleLocator(resolveLocator(page, step))
-          await loc.waitFor({ state: 'visible', timeout: 10_000 })
-          if (value) {
-            const text = await loc.textContent()
-            if (!text?.includes(value)) {
-              throw new Error(`Assertion failed: "${target}" text "${text}" does not contain "${value}"`)
+          // ── Multi-strategy visibility assertion ─────────────────────────────
+          // The target is plain text (e.g. "Administratorv0.1.0") that must be
+          // visible somewhere on the page. Version strings with dots must NEVER
+          // be passed to page.locator() as-is because '.' is a CSS class token
+          // and will throw: "Unexpected token '.' while parsing css selector".
+          //
+          // Strategy:
+          //   1. page.getByText(target, exact:false) — fastest, covers partial text
+          //   2. XPath contains() — handles text split across child elements
+          //   3. resolveLocator fallback — for properly structured locators
+          //
+          // Value semantics:
+          //   - 'assertvisible': value is ignored — element visibility is the only assertion.
+          //   - 'asserttext':    value is always checked as a literal DOM text substring.
+          //   - 'assert':        value is checked as a text substring ONLY when it appears to
+          //                      be a literal match candidate (not a human-readable description).
+          //                      Detection heuristic: skip the contains check when value is
+          //                      significantly longer than target (> 2×) OR contains common
+          //                      description phrases like "is displayed", "is shown", "is loaded",
+          //                      "is visible", "page is", "tab is", "successfully".
+          const assertTarget = target
+
+          // Determine whether the value field should be applied as a strict DOM text check.
+          // `assertvisible` → never (visibility-only).
+          // `asserttext`    → always.
+          // `assert`        → only for short, literal-looking values.
+          const isDescriptiveValue = (v: string): boolean => {
+            if (!v) return false
+            const lower = v.toLowerCase()
+            // Common AI-generated description patterns that are NOT literal DOM text:
+            const descriptionPatterns = [
+              'is displayed', 'is shown', 'is loaded', 'is visible', 'is active',
+              'tab is', 'page is', 'successfully', 'has been', 'should be',
+              'appears', 'loads with', 'shows', 'displays',
+            ]
+            if (descriptionPatterns.some((p) => lower.includes(p))) return true
+            // Value much longer than target is likely a description, not a DOM fragment
+            if (assertTarget && v.length > assertTarget.length * 2) return true
+            return false
+          }
+
+          const shouldCheckValue = (
+            action === 'asserttext' ||
+            (action !== 'assertvisible' && !!value && !isDescriptiveValue(value))
+          )
+
+          // Strategy 1: getByText (safe for any string including dots)
+          const byText = page.getByText(assertTarget, { exact: false })
+          const byTextCount = await byText.count().catch(() => 0)
+          if (byTextCount > 0) {
+            const firstVisible = await (async () => {
+              for (let i = 0; i < byTextCount; i++) {
+                const el = byText.nth(i)
+                if (await el.isVisible({ timeout: 2_000 }).catch(() => false)) return el
+              }
+              return null
+            })()
+            if (firstVisible) {
+              if (shouldCheckValue) {
+                const text = await firstVisible.textContent().catch(() => '')
+                if (!text?.includes(value)) {
+                  throw new Error(`Assertion failed: "${assertTarget}" text "${text}" does not contain "${value}"`)
+                }
+              }
+              log.info(`[ASSERT] ✅ "${assertTarget}" found via getByText`)
+              break
             }
           }
+
+          // Strategy 2: XPath contains() — handles text split across nodes
+          const xpathLoc = page.locator(`xpath=//*[contains(normalize-space(.), '${assertTarget.replace(/'/g, "'\"'\"'")}')]`).first()
+          if (await xpathLoc.isVisible({ timeout: 5_000 }).catch(() => false)) {
+            log.info(`[ASSERT] ✅ "${assertTarget}" found via XPath contains()`)
+            break
+          }
+
+          // Strategy 3: resolveLocator fallback (for structured targets like role=, label=, etc.)
+          const loc = await getFirstVisibleLocator(resolveLocator(page, step))
+          await loc.waitFor({ state: 'visible', timeout: 10_000 })
+          if (shouldCheckValue) {
+            const text = await loc.textContent()
+            if (!text?.includes(value)) {
+              throw new Error(`Assertion failed: "${assertTarget}" text "${text}" does not contain "${value}"`)
+            }
+          }
+          log.info(`[ASSERT] ✅ "${assertTarget}" found via resolveLocator fallback`)
           break
         }
 

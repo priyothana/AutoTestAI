@@ -117,8 +117,8 @@ describe('execution.service — enqueueExecution', () => {
 
     expect(prisma.executions.create).toHaveBeenCalledOnce()
     const callArg = vi.mocked(prisma.executions.create).mock.calls[0][0]
-    expect(callArg.data.status).toBe('PENDING')
-    expect(callArg.data.test_case_id).toBe('tc-111')
+    expect(callArg.data!.status).toBe('PENDING')
+    expect(callArg.data!.test_case_id).toBe('tc-111')
   })
 
   it('enqueues to execution-queue with correct job shape', async () => {

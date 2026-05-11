@@ -38,6 +38,9 @@ export async function createTestCase(data: TestCaseCreate) {
 
 export async function listTestCases() {
   const testCases = await prisma.test_cases.findMany({
+    where: {
+      status: { not: 'review' }
+    },
     include: {
       project: { select: { name: true } },
     },
@@ -113,8 +116,9 @@ export async function generateTestSteps(data: GenerateTestSteps) {
   })
 }
 
-export async function humanizeSteps(steps: StepModel[]) {
+export async function humanizeSteps(steps: StepModel[]): Promise<any> {
   return humanizeStepsInternal(
     steps as unknown as Record<string, unknown>[],
+    'claude'
   )
 }

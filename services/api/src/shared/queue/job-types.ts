@@ -126,10 +126,14 @@ export interface TestCaseGenerationJob {
   count: number
   /** Optional focus areas e.g. ['CRUD', 'Edge Cases', 'Negative Testing'] */
   focusAreas: string[]
+  /** Optional selected module to focus generation on */
+  selectedModule?: string
   /** Base64-encoded BRD / Functional Spec document content (optional) */
   brdContent?: string
   /** Base64-encoded existing test cases document content (optional) */
   existingTestsContent?: string
+  /** Auto-fetched previously executed test cases context for the project */
+  executedTestCasesContext?: string
   /** Whether to pull Jira stories from the connected board */
   useJira: boolean
   /** Job status — updated by the worker */

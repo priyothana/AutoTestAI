@@ -18,6 +18,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card"
 import { toast } from "sonner"
+import Logo from "@/components/shared/Logo"
 
 const formSchema = z.object({
     username: z.string().min(3, {
@@ -89,9 +90,12 @@ export default function SignupPage() {
         <div className="flex min-h-screen items-center justify-center bg-gray-50 dark:bg-gray-950 p-4">
             <Card className="w-full max-w-md shadow-lg border-0 bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm">
                 <CardHeader className="space-y-1">
+                    <div className="flex justify-center mb-2">
+                        <Logo size="lg" />
+                    </div>
                     <CardTitle className="text-2xl font-bold text-center text-primary">Create an account</CardTitle>
                     <CardDescription className="text-center">
-                        Enter your information to get started with AutoTest AI
+                        Enter your information to get started
                     </CardDescription>
                 </CardHeader>
                 <CardContent>

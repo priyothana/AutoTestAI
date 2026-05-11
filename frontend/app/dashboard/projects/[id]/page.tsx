@@ -74,7 +74,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const [syncing, setSyncing] = useState(false)
     const [disconnecting, setDisconnecting] = useState(false)
     const [syncCompleted, setSyncCompleted] = useState<{
-        raw_count: number
+        pages_crawled: number
         normalized_count: number
         domain_model_count: number
         embedding_count: number
@@ -312,6 +312,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             }
             setWebCredSuccess(true)
             setWebPassword("")
+            fetchIntegration()
             toast.success("✅ Web app credentials saved — login will be used on next test run")
             setTimeout(() => setWebCredSuccess(false), 5000)
         } catch (err: any) {
@@ -373,14 +374,15 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                 // Inline sync completed immediately
                 setSyncing(false)
                 setSyncProgress(null)
+                const pagesCrawled = data.pages_crawled ?? data.raw_count ?? 0
                 setSyncCompleted({
-                    raw_count: data.raw_count || 0,
+                    pages_crawled: pagesCrawled,
                     normalized_count: data.normalized_count || 0,
                     domain_model_count: data.domain_model_count || 0,
                     embedding_count: data.embedding_count || 0,
                     completed_at: new Date().toISOString(),
                 })
-                toast.success(`✅ Metadata synced! ${data.raw_count || 0} pages crawled, ${data.embedding_count || 0} embeddings created.`)
+                toast.success(`✅ Metadata synced! ${pagesCrawled} pages crawled, ${data.embedding_count || 0} embeddings created.`)
                 setTimeout(() => fetchIntegration(), 2000)
                 setTimeout(() => setSyncCompleted(null), 10000)
             } else if (data.status === "queued") {
@@ -446,14 +448,18 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                         setSyncing(false)
                         setSyncProgress(null)
                         setCrawlProgress(null)
+                        const totalPages = status.pages_crawled > 0
+                            ? status.pages_crawled
+                            : status.crawled_so_far > 0
+                                ? status.crawled_so_far
+                                : status.raw_count
                         setSyncCompleted({
-                            raw_count: status.raw_count,
+                            pages_crawled: totalPages,
                             normalized_count: status.normalized_count,
                             domain_model_count: status.domain_model_count,
                             embedding_count: status.embedding_count,
                             completed_at: new Date().toISOString(),
                         })
-                        const totalPages = status.crawled_so_far > 0 ? status.crawled_so_far : status.raw_count
                         toast.success(`✅ Metadata sync complete! ${totalPages} pages crawled, ${status.embedding_count} embeddings created.`)
                         fetchIntegration()
                         setTimeout(() => setSyncCompleted(null), 10000)
@@ -1111,7 +1117,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                             {integration?.sync_counts && (
                                 <div className="grid gap-4 md:grid-cols-4">
                                     {[
-                                        { label: "Raw Metadata", count: integration.sync_counts.raw_count, color: "text-blue-600" },
+                                        { label: "Pages Crawled", count: integration.sync_counts.raw_count, color: "text-blue-600" },
                                         { label: "Normalized", count: integration.sync_counts.normalized_count, color: "text-indigo-600" },
                                         { label: "Domain Models", count: integration.sync_counts.domain_model_count, color: "text-purple-600" },
                                         { label: "Embeddings", count: integration.sync_counts.embedding_count, color: "text-green-600" },
@@ -1249,7 +1255,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                     </p>
                                                     <div className="grid grid-cols-4 gap-2">
                                                         {[
-                                                            { label: "Pages Crawled", count: syncCompleted.raw_count, color: "text-blue-700" },
+                                                            { label: "Pages Crawled", count: syncCompleted.pages_crawled, color: "text-blue-700" },
                                                             { label: "Normalized", count: syncCompleted.normalized_count, color: "text-indigo-700" },
                                                             { label: "Domain Models", count: syncCompleted.domain_model_count, color: "text-purple-700" },
                                                             { label: "Embeddings", count: syncCompleted.embedding_count, color: "text-emerald-700" },
@@ -1627,11 +1633,19 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                             </Button>
 
                                             {!integration?.ui_session?.last_created_at && (
-                                                <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md">
-                                                    <p className="text-xs text-amber-700 dark:text-amber-300">
-                                                        <strong>No session stored yet.</strong> Save credentials above. AutoTest AI will automatically log in and store the session before your next test run.
-                                                    </p>
-                                                </div>
+                                                (integration?.web_credentials?.username || integration?.login_strategy === "none") ? (
+                                                    <div className="p-3 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-md">
+                                                        <p className="text-xs text-blue-700 dark:text-blue-300">
+                                                            <strong>Ready for testing.</strong> AutoTest AI will automatically initialize the session before your next test run.
+                                                        </p>
+                                                    </div>
+                                                ) : (
+                                                    <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md">
+                                                        <p className="text-xs text-amber-700 dark:text-amber-300">
+                                                            <strong>No session stored yet.</strong> Save credentials above. AutoTest AI will automatically log in and store the session before your next test run.
+                                                        </p>
+                                                    </div>
+                                                )
                                             )}
                                         </div>
                                     </CardContent>

@@ -68,6 +68,7 @@ export async function enqueueGenerationJob(params: {
   suiteName?: string
   count: number
   focusAreas: string[]
+  selectedModule?: string
   brdContent?: string
   existingTestsContent?: string
   useJira: boolean
@@ -83,6 +84,7 @@ export async function enqueueGenerationJob(params: {
       suiteName,
       count:                 params.count,
       focusAreas:            params.focusAreas,
+      selectedModule:        params.selectedModule,
       brdContent:            params.brdContent,
       existingTestsContent:  params.existingTestsContent,
       useJira:               params.useJira,
@@ -265,6 +267,63 @@ async function buildEntityFieldManifest(projectId: string): Promise<string> {
   }
 }
 
+// ── Verified URL path map builder ────────────────────────────────────────────
+/**
+ * Reads webapp_crawl metadata from DB and returns a deduplicated list of
+ * real, crawler-verified URL paths for this project.
+ * These are injected into the generation prompt so the LLM uses EXACT paths
+ * in NAVIGATE steps and does NOT hallucinate paths like /softwares, /patchs, etc.
+ */
+async function buildVerifiedUrlMap(projectId: string): Promise<{
+  baseUrl: string
+  paths: string[]
+}> {
+  try {
+    // 1. Fetch the project's configured base_url (canonical origin)
+    const project = await prisma.projects.findUnique({
+      where:  { id: projectId },
+      select: { base_url: true },
+    })
+    const rawBase = project?.base_url ?? ''
+    let baseUrl = ''
+    try { baseUrl = rawBase ? new URL(rawBase).origin : '' } catch { baseUrl = rawBase }
+
+    // 2. Also check project_integrations for a more specific base_url
+    if (!baseUrl) {
+      const integration = await prisma.project_integrations.findFirst({
+        where:  { project_id: projectId },
+        select: { base_url: true },
+      })
+      try { baseUrl = integration?.base_url ? new URL(integration.base_url).origin : '' } catch { /* ignore */ }
+    }
+
+    // 3. Extract all real paths from webapp_crawl metadata
+    const webRows = await prisma.metadata_normalized.findMany({
+      where:  { project_id: projectId, entity_type: 'webapp_crawl' },
+      select: { structured_json: true },
+    })
+
+    const pathSet = new Set<string>()
+    const SKIP = /^(login|logout|signin|signout|signup|register|auth|callback|oauth|sso|api|static|assets|_next|favicon|\.well-known)/i
+
+    for (const row of webRows) {
+      const data = (row.structured_json ?? {}) as { pages?: Array<{ path?: string }> }
+      for (const page of data.pages ?? []) {
+        const p = (page.path ?? '').trim()
+        if (!p || p === '/' || SKIP.test(p)) continue
+        // Normalise: ensure it starts with /
+        const normalised = p.startsWith('/') ? p : `/${p}`
+        pathSet.add(normalised)
+      }
+    }
+
+    return { baseUrl, paths: [...pathSet].sort() }
+  } catch (err) {
+    log.warn({ err }, '[TCG] buildVerifiedUrlMap failed — skipping URL map injection')
+    return { baseUrl: '', paths: [] }
+  }
+}
+
 export async function buildGenerationContext(params: {
   projectId: string
   brdContent?: string
@@ -272,43 +331,55 @@ export async function buildGenerationContext(params: {
   jiraStories?: Array<{ key: string; summary: string; description: string }>
   count: number
   focusAreas: string[]
+  /** Optional module name to scope generation to a specific feature area */
+  selectedModule?: string
 }): Promise<{ systemPrompt: string; userPrompt: string; metadataContext: string }> {
 
-  const { projectId, brdContent, existingTestsContent, jiraStories, count, focusAreas } = params
+  const { projectId, brdContent, existingTestsContent, jiraStories, count, focusAreas, selectedModule } = params
 
   const isCrud        = focusAreas.includes('CRUD')
   const isRealCases   = focusAreas.includes('Real Use Cases')
   const isNegative    = focusAreas.includes('Negative Testing')
   const isEdge        = focusAreas.includes('Edge Cases')
 
-  // ── Source 4: Project metadata via RAG (CRUD-targeted queries) ───────────────
-  // Use multiple targeted queries when CRUD/Real Use Cases selected so we get
-  // create-form and edit-page metadata instead of nav/sidebar metadata.
+  // ── Fetch verified URL map from crawler data ─────────────────────────────────
+  // This gives us the REAL paths the app uses so the LLM stops hallucinating
+  // paths like /softwares, /patchs, or full domain-prefixed URLs.
+  const { baseUrl: projectBaseUrl, paths: verifiedPaths } = await buildVerifiedUrlMap(projectId)
+  log.info({ projectId, projectBaseUrl, pathCount: verifiedPaths.length }, '[TCG] Verified URL map built')
+
+  // ── Source 4: Project metadata via RAG (CRUD-targeted, MODULE-SCOPED queries) ─
+  // When a selectedModule is provided, ALL queries are prefixed with the module
+  // name so cosine-similarity retrieval pulls chunks relevant to THAT entity
+  // and not unrelated objects like Contract, Opportunity, Lead, etc.
+  const modulePrefix = selectedModule ? `${selectedModule} ` : ''
   const ragQueryStrategies: string[] = []
 
   if (isCrud || isRealCases) {
     ragQueryStrategies.push(
-      'create new record form fields buttons validation',
-      'edit update record form fields save button',
-      'delete remove record confirmation',
-      'form submission required fields error validation'
+      `${modulePrefix}create new record form fields buttons validation`,
+      `${modulePrefix}edit update record form fields save button`,
+      `${modulePrefix}delete remove record confirmation`,
+      `${modulePrefix}form submission required fields error validation`
     )
   }
   if (isNegative || isEdge) {
     ragQueryStrategies.push(
-      'required field validation error message empty null',
-      'boundary limit maximum minimum value error',
-      'duplicate record error unique constraint'
+      `${modulePrefix}required field validation error message empty null`,
+      `${modulePrefix}boundary limit maximum minimum value error`,
+      `${modulePrefix}duplicate record error unique constraint`
     )
   }
   if (ragQueryStrategies.length === 0) {
     ragQueryStrategies.push(
-      `test cases for ${focusAreas.join(' ') || 'all functional areas'} of this project`
+      selectedModule
+        ? `${modulePrefix}test cases functionality workflows`
+        : `test cases for ${focusAreas.join(' ') || 'all functional areas'} of this project`
     )
   }
 
   let allChunks: string[] = []
-  for (const q of ragQueryStrategies.slice(0, 3)) {
+  for (const q of ragQueryStrategies.slice(0, 4)) {
     try {
       const chunks = await retrieveRagChunks(projectId, q, 10)
       allChunks.push(...chunks)
@@ -321,11 +392,49 @@ export async function buildGenerationContext(params: {
     if (seen.has(key)) return false
     seen.add(key)
     return true
-  }).slice(0, 25)
+  }).slice(0, 30)
+
+  // ── Module-scope chunk filter ────────────────────────────────────────────────
+  // When a specific module is selected, aggressively filter out chunks that are
+  // clearly about OTHER entities to prevent cross-entity contamination.
+  if (selectedModule && allChunks.length > 0) {
+    // Strip the " Management" suffix to get the raw entity keyword, e.g. "Software"
+    const entityKeyword = selectedModule.replace(/\s+management$/i, '').trim().toLowerCase()
+
+    // Build a set of common CRM/SF entities to exclude (these bleed in from SF orgs)
+    const COMMON_NOISY_ENTITIES = [
+      'contract', 'opportunity', 'lead', 'product', 'campaign', 'case', 'order',
+      'quote', 'price book', 'pricebook', 'account', 'contact', 'event', 'task',
+    ].filter(e => e !== entityKeyword && !selectedModule.toLowerCase().includes(e))
+
+    const entityPattern = new RegExp(
+      `\\b(${COMMON_NOISY_ENTITIES.map(e => e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`,
+      'i'
+    )
+
+    const filteredChunks = allChunks.filter(chunk => {
+      // Keep chunks that mention the selected module entity
+      const chunkLower = chunk.toLowerCase()
+      const mentionsOurEntity = chunkLower.includes(entityKeyword)
+      // Reject chunks that predominantly talk about a noisy entity (not ours)
+      const mentionsNoisyEntity = entityPattern.test(chunk)
+      // Allow if it mentions our entity OR doesn't mention any noisy entity
+      return mentionsOurEntity || !mentionsNoisyEntity
+    })
+
+    log.info(
+      { projectId, selectedModule, before: allChunks.length, after: filteredChunks.length },
+      '[TCG] Module-scoped chunk filter applied'
+    )
+    allChunks = filteredChunks
+  }
 
   if (allChunks.length === 0) {
-    // Fallback: generic query
-    try { allChunks = await retrieveRagChunks(projectId, 'application pages forms fields', 15) } catch { /* */ }
+    // Fallback: generic query scoped to module if possible
+    const fallbackQuery = selectedModule
+      ? `${modulePrefix}application pages forms fields`
+      : 'application pages forms fields'
+    try { allChunks = await retrieveRagChunks(projectId, fallbackQuery, 15) } catch { /* */ }
   }
 
   const metadataContext = allChunks.length > 0
@@ -391,13 +500,47 @@ Each negative test MUST include the EXACT expected error message text in expecte
   }
 
   // ── Build the multi-source system prompt ────────────────────────────────────
-  const systemPrompt = buildSystemPrompt(count, focusAreas)
+  const systemPrompt = buildSystemPrompt(count, focusAreas, selectedModule)
 
   // ── Build entity field manifest (DB-sourced real field labels) ───────────────
   const fieldManifest = await buildEntityFieldManifest(projectId)
   log.info({ projectId, hasManifest: fieldManifest.length > 0 }, '[TCG] Field manifest built')
 
   const userPromptParts: string[] = []
+
+  // ★ ZERO: inject verified URL map FIRST so the LLM never invents paths
+  if (verifiedPaths.length > 0 || projectBaseUrl) {
+    const urlMapLines: string[] = [
+      '## 🚨 CRITICAL — VERIFIED APPLICATION URL MAP (READ THIS BEFORE GENERATING ANY NAVIGATE STEPS)',
+      '',
+      '⛔ ABSOLUTE RULES FOR NAVIGATE STEPS:',
+      '1. NAVIGATE step "value" MUST be a RELATIVE path (e.g. "/software", "/agents") — NEVER include a domain or protocol.',
+      '2. You MUST use ONLY the paths listed in the "VERIFIED PAGE PATHS" table below.',
+      '3. Do NOT guess, pluralize, or invent paths. If "/software" is listed, do NOT use "/softwares".',
+      '4. Do NOT prefix paths with any domain (e.g. "https://d2d-uem.datasirpi.com/agents" is WRONG — use "/agents").',
+      '5. If you are unsure of the exact path for a feature, pick the closest match from the table below.',
+      '',
+    ]
+    if (projectBaseUrl) {
+      urlMapLines.push(`Application Base URL (origin only — DO NOT copy into NAVIGATE value): ${projectBaseUrl}`)
+      urlMapLines.push('')
+    }
+    if (verifiedPaths.length > 0) {
+      urlMapLines.push('VERIFIED PAGE PATHS (use ONLY these in NAVIGATE steps):')
+      for (const p of verifiedPaths) {
+        urlMapLines.push(`  ✅ ${p}`)
+      }
+      urlMapLines.push('')
+      urlMapLines.push('❌ WRONG: { "action": "NAVIGATE", "value": "https://d2d-uem.datasirpi.com/agents" }')
+      urlMapLines.push('✅ RIGHT: { "action": "NAVIGATE", "value": "/agents" }')
+      urlMapLines.push('❌ WRONG: { "action": "NAVIGATE", "value": "/softwares" }  ← invented plural, does not exist')
+      urlMapLines.push('✅ RIGHT: { "action": "NAVIGATE", "value": "/software" }  ← exact path from the verified map above')
+    } else {
+      urlMapLines.push('(No crawled paths available — use short relative paths inferred from the metadata below)')
+      urlMapLines.push('Still use ONLY relative paths starting with / — NEVER include a domain or full URL.')
+    }
+    userPromptParts.push(urlMapLines.join('\n'))
+  }
 
   // ★ FIRST: inject field manifest so the LLM reads it before anything else
   if (fieldManifest) {
@@ -412,10 +555,42 @@ Each negative test MUST include the EXACT expected error message text in expecte
     )
   }
 
+  // Detect list-only module in the user-prompt builder too
+  const _isListOnlyUp = selectedModule ? /\s+List$/i.test(selectedModule) : false
+  const _moduleEntityUp = selectedModule?.replace(/\s+(Management|List)$/i, '').trim() ?? ''
+
   userPromptParts.push(
     `## Generation Request\n\nGenerate exactly **${count} test cases** for this project.\n` +
+    (selectedModule
+      ? [
+          '',
+          '🔴🔴🔴 MODULE SCOPE LOCK — NON-NEGOTIABLE 🔴🔴🔴',
+          `You MUST generate test cases EXCLUSIVELY for the "${selectedModule}" module.`,
+          `Every single test case in your output MUST be about "${selectedModule}" — nothing else.`,
+          '',
+          ...(_isListOnlyUp ? [
+            `⚠️  "${_moduleEntityUp}" is a READ-ONLY LIST — there is NO create/edit/delete form.`,
+            `✅ ONLY generate tests that navigate to the ${_moduleEntityUp} list, verify records, search/filter.`,
+            `⛔ DO NOT generate Create, Edit, Delete tests for "${_moduleEntityUp}".`,
+            '',
+          ] : []),
+          '⛔ FORBIDDEN — DO NOT generate test cases for ANY of the following (even if the metadata mentions them):',
+          '  • Agent, Agents — "Create Agent", "Edit Agent", "Delete Agent" ARE ABSOLUTELY FORBIDDEN',
+          '  • Contracts, Opportunities, Leads, Products, Campaigns, Cases, Quotes, Price Books',
+          '  • Accounts, Contacts, Events, Tasks, Orders, Invoices, Customers, Vendors',
+          '  • Tickets, Incidents, Vulnerabilities, Patches, Policies',
+          '  • Any Salesforce standard object NOT related to "' + selectedModule + '"',
+          '  • Any page, entity, or workflow that is NOT part of "' + selectedModule + '"',
+          '',
+          `✅ ONLY generate test cases whose name, description, and steps are 100% about "${selectedModule}".`,
+          `✅ Every test case NAME must contain the word "${_moduleEntityUp}" (e.g. "Create ${_moduleEntityUp}", "Delete ${_moduleEntityUp}").`,
+          '🔴🔴🔴 END MODULE SCOPE LOCK 🔴🔴🔴',
+          '',
+        ].join('\n')
+      : '') +
     (focusAreas.length > 0 ? `**Focus Areas Selected:** ${focusAreas.join(', ')}` : '')
   )
+
 
   // Focus-area specific mandatory instructions
   if (focusInstructions.length > 0) {
@@ -474,7 +649,11 @@ Each negative test MUST include the EXACT expected error message text in expecte
    For list-display READ tests: ASSERT_TEXT with target = the entity page heading (e.g. "Opportunities"), NOT an empty string.
    Example READ assertion: { "action": "ASSERT_TEXT", "target": "Opportunities", "locator_type": "text" }
    Example CRUD assertion: { "action": "ASSERT_TEXT", "target": "Account created successfully", "locator_type": "text" }
-   A blank target ("") is INVALID and will be stripped — always use a real, non-empty text value.`)
+   A blank target ("") is INVALID and will be stripped — always use a real, non-empty text value.
+8. ⛔ NAVIGATE steps MUST use ONLY relative paths from the VERIFIED APPLICATION URL MAP above.
+   NEVER include a full URL with domain. NEVER pluralize or guess a path.
+   WRONG example: "https://d2d-uem.datasirpi.com/softwares"  —  RIGHT example: "/software"
+   WRONG example: "/patchs"  —  RIGHT example: "/patches" (only if it appears in the verified map)`)
 
   const userPrompt = userPromptParts.join('\n')
 
@@ -483,7 +662,7 @@ Each negative test MUST include the EXACT expected error message text in expecte
 
 // ── System prompt for multi-source generation ─────────────────────────────────
 
-function buildSystemPrompt(count: number, focusAreas: string[] = []): string {
+function buildSystemPrompt(count: number, focusAreas: string[] = [], selectedModule?: string): string {
   const isCrud      = focusAreas.includes('CRUD')
   const isRealCases = focusAreas.includes('Real Use Cases')
   const isNegative  = focusAreas.includes('Negative Testing')
@@ -534,9 +713,49 @@ A DELETE test MUST:
 - Do NOT just click save and leave — you MUST verify the error response
 ` : ''
 
+  // Detect whether this is a read-only "List" module (no create form)
+  const isListOnlyModule = selectedModule ? /\s+List$/i.test(selectedModule) : false
+  const moduleDisplayName = selectedModule?.replace(/\s+(Management|List)$/i, '').trim() ?? ''
+
+  const moduleScopeBlock = selectedModule ? `
+## 🔴🔴🔴 ENTITY SCOPE LOCK — ABSOLUTE RULE — READ THIS FIRST 🔴🔴🔴
+You are generating tests for ONE SPECIFIC MODULE ONLY: "${selectedModule}"
+${isListOnlyModule ? `
+⚠️  "${moduleDisplayName}" is a READ-ONLY LIST module — it has NO create/edit/delete UI.
+✅ Only generate tests that: navigate to the ${moduleDisplayName} list, verify records are shown, search/filter.
+⛔ DO NOT generate Create, Edit, Update, or Delete tests for "${moduleDisplayName}".
+⛔ DO NOT generate tests that click "Create ${moduleDisplayName}", "Add ${moduleDisplayName}", or "New ${moduleDisplayName}".
+` : ''}
+EVERY test case you generate MUST:
+✓ Be named EXACTLY after a workflow in "${selectedModule}" — the module name or its root word MUST appear in the test name
+✓ Have steps that interact ONLY with "${selectedModule}" pages and forms
+✓ Assert outcomes specific to "${selectedModule}"
+
+⛔ THE FOLLOWING ENTITIES ARE ABSOLUTELY FORBIDDEN — DO NOT generate even ONE test case about:
+• Agent, Agents — NO "Create Agent", "Edit Agent", "Delete Agent" — EVER
+• Contract, Contracts, Opportunity, Opportunities, Lead, Leads
+• Product, Products, Campaign, Campaigns, Account, Accounts
+• Contact, Contacts, Case, Cases, Quote, Quotes, Order, Orders
+• Price Book, Invoice, Invoices, Customer, Vendor, Ticket, Incident
+• Vulnerability, Vulnerabilities, Patch, Patches, Policy, Policies
+• ANY entity whose name does NOT appear in "${selectedModule}"
+
+⛔ TEST CASE NAMING RULE — MANDATORY:
+Every test case name MUST contain the word "${moduleDisplayName}" (or its plural/abbreviation).
+BAD:  "Create Agent and Verify Success"        ← REJECTED (wrong entity)
+BAD:  "Create New Record and Verify"           ← REJECTED (too generic, entity unclear)
+GOOD: "Create ${moduleDisplayName} With Required Fields and Verify Success"
+GOOD: "Delete ${moduleDisplayName} and Verify Removal"
+
+If the metadata context mentions any forbidden entities above, IGNORE THEM COMPLETELY.
+Focus 100% on "${selectedModule}" — nothing else.
+## 🔴🔴🔴 END ENTITY SCOPE LOCK 🔴🔴🔴
+` : ''
+
+
   return `
 You are a senior QA Automation Engineer specializing in end-to-end Playwright automation and risk-based test design.
-
+${moduleScopeBlock}
 ## Your Role
 Generate ${count} REAL, EXECUTABLE test cases that test actual business workflows — not UI smoke tests.
 Think like a business tester validating that the software does what the business needs, not like a UI inspector checking if buttons exist.
@@ -787,6 +1006,110 @@ export async function persistGeneratedTestCases(params: {
 }
 
 
+// ── Post-generation module scope filter ──────────────────────────────────────
+/**
+ * Hard-rejects test cases that clearly reference a different entity than the
+ * selected module. Called immediately after the LLM returns its output, before
+ * any test cases are persisted to the database.
+ *
+ * This is the FINAL safety net: even if the system/user prompts are ignored,
+ * off-module test cases (e.g. "Create Agent" when module="Dashboard") are
+ * stripped here and never saved.
+ *
+ * Strategy:
+ *  1. Derive the "entity keyword" from selectedModule (e.g. "Agent Management" → "agent")
+ *  2. Build a deny-list of OTHER common entity names that should NOT appear in
+ *     test case names for this module.
+ *  3. A test case is REJECTED if:
+ *     a. Its name does NOT contain the entity keyword, AND
+ *     b. Its name DOES contain a different known entity keyword
+ *  4. A test case always passes if it mentions the correct entity keyword at all.
+ *
+ * Note: we keep test cases even if they don't mention the entity keyword, as
+ * long as they don't mention a conflicting entity. Generic names like "Verify
+ * List View" are allowed — they are not clearly off-module.
+ */
+function filterTestCasesToModule(
+  testCases: Array<Record<string, unknown>>,
+  selectedModule: string,
+): Array<Record<string, unknown>> {
+  // Derive root entity word, e.g. "Agent Management" → "agent"
+  const entityKeyword = selectedModule
+    .replace(/\s*(Management|List|Module|Feature|Settings)$/i, '')
+    .trim()
+    .toLowerCase()
+
+  // Known entity names that are commonly hallucinated when unrelated to the
+  // selected module. Extend this list as new patterns emerge.
+  const KNOWN_ENTITIES = [
+    'agent', 'agents',
+    'contract', 'contracts',
+    'opportunity', 'opportunities',
+    'lead', 'leads',
+    'product', 'products',
+    'campaign', 'campaigns',
+    'account', 'accounts',
+    'contact', 'contacts',
+    'case', 'cases',
+    'quote', 'quotes',
+    'order', 'orders',
+    'invoice', 'invoices',
+    'customer', 'customers',
+    'vendor', 'vendors',
+    'patch', 'patches',
+    'policy', 'policies',
+    'asset', 'assets',
+    'device', 'devices',
+    'role', 'roles',
+    'user', 'users',
+    'ticket', 'tickets',
+    'incident', 'incidents',
+    'vulnerability', 'vulnerabilities',
+    'software', 'endpoint', 'endpoints',
+  ]
+
+  // Build deny-set: all known entities EXCEPT the selected module's own keyword
+  const denyKeywords = KNOWN_ENTITIES.filter(e => e !== entityKeyword && !entityKeyword.startsWith(e) && !e.startsWith(entityKeyword))
+
+  const before = testCases.length
+  const filtered = testCases.filter(tc => {
+    const name = String(tc['name'] ?? '').toLowerCase()
+    const desc = String(tc['description'] ?? '').toLowerCase()
+    const combined = `${name} ${desc}`
+
+    // Always keep if the correct entity keyword appears in name or description
+    if (combined.includes(entityKeyword)) return true
+
+    // Reject if a DIFFERENT known entity keyword appears prominently in the NAME
+    // (description can mention related entities for context — only police the name)
+    const hasForeignEntity = denyKeywords.some(deny => {
+      // Match whole-word to avoid false positives (e.g. "cases" in "test cases")
+      const re = new RegExp(`\\b${deny}\\b`, 'i')
+      return re.test(name)
+    })
+
+    if (hasForeignEntity) {
+      log.info(
+        { selectedModule, testCaseName: tc['name'] },
+        '[TCG] REJECTED off-module test case (foreign entity in name)'
+      )
+      return false
+    }
+
+    // No conflict — generic test case name (e.g. "Verify List View") → keep it
+    return true
+  })
+
+  if (filtered.length < before) {
+    log.warn(
+      { selectedModule, before, after: filtered.length, rejected: before - filtered.length },
+      '[TCG] Post-generation filter removed off-module test cases'
+    )
+  }
+
+  return filtered
+}
+
 // ── BullMQ Worker (started inline — single-process architecture like other workers) ──
 
 let _workerStarted = false
@@ -798,7 +1121,7 @@ export function startTestCaseGenerationWorker() {
   const worker = new Worker<TestCaseGenerationJob>(
     QUEUES.TEST_CASE_GENERATION,
     async (job) => {
-      const { projectId, suiteName, count, focusAreas, brdContent, existingTestsContent, useJira } = job.data
+      const { projectId, suiteName, count, focusAreas, selectedModule, brdContent, existingTestsContent, useJira } = job.data
       const jobId = job.id!
 
       const updateStatus = (
@@ -839,11 +1162,22 @@ export function startTestCaseGenerationWorker() {
           jiraStories,
           count,
           focusAreas,
+          selectedModule,
         })
 
         updateStatus('running', 55, 'Calling AI to generate test cases…')
-        const rawTestCases = await invokeBulkGeneration(systemPrompt, userPrompt)
+        let rawTestCases = await invokeBulkGeneration(systemPrompt, userPrompt)
         log.info({ projectId, rawCount: rawTestCases.length }, '[TCG] AI returned test cases')
+
+        // ── Post-generation module scope validation ───────────────────────────
+        // Hard-reject any test case whose name clearly references an entity other
+        // than the selected module. This is the final safety net against the LLM
+        // hallucinating content for wrong modules (e.g. generating "Create Agent"
+        // test cases when the selected module is "Dashboard" or vice versa).
+        if (selectedModule && rawTestCases.length > 0) {
+          rawTestCases = filterTestCasesToModule(rawTestCases, selectedModule)
+          log.info({ projectId, selectedModule, filteredCount: rawTestCases.length }, '[TCG] Post-generation module filter applied')
+        }
 
         updateStatus('running', 80, `Saving ${rawTestCases.length} test cases to database…`)
         const { suiteId, testCaseIds } = await persistGeneratedTestCases({
@@ -884,3 +1218,473 @@ export function startTestCaseGenerationWorker() {
   worker.on('error', (err) => log.error({ err }, '[TCG] Worker error'))
   log.info('[TCG] Test-case-generation worker started')
 }
+
+// ── On-demand step generation for selected test cases ─────────────────────────
+/**
+ * Called when the user clicks "Add Selected to Tests" on the frontend.
+ * For each selected test case (which was created without steps during bulk
+ * generation), this function:
+ *   1. Fetches the test case (name + description) from the DB
+ *   2. Calls the LLM to generate concrete Playwright steps
+ *   3. Persists the steps back to the test case record
+ */
+export async function generateStepsForTestCases(
+  projectId: string,
+  testCaseIds: string[],
+  selectedModule?: string,
+): Promise<{ generated: number; failed: number; errors: string[] }> {
+  let generated = 0
+  let failed = 0
+  const errors: string[] = []
+
+  const testCases = await prisma.test_cases.findMany({
+    where: { id: { in: testCaseIds }, project_id: projectId },
+    select: { id: true, name: true, description: true, priority: true, expected_result: true },
+  })
+
+  // Fetch metadata context once for all cases — scoped to the selected module
+  const ragQuery = selectedModule
+    ? `${selectedModule} create edit update delete form fields buttons navigation`
+    : 'create edit update delete form fields buttons navigation'
+  let ragContext = ''
+  try {
+    const chunks = await retrieveRagChunks(projectId, ragQuery, 15)
+    if (chunks.length > 0) {
+      ragContext = `=== PROJECT METADATA (from live sync) ===\n${chunks.join('\n\n---\n\n')}`
+    }
+  } catch { /* skip */ }
+
+  let fieldManifest = ''
+  try { fieldManifest = await buildEntityFieldManifest(projectId) } catch { /* skip */ }
+
+  for (const tc of testCases) {
+    try {
+      const moduleScopeLines = selectedModule ? [
+        '',
+        `## 🔴 MODULE SCOPE LOCK: Generate steps for the "${selectedModule}" module ONLY.`,
+        `⛔ FORBIDDEN: Do NOT generate steps for Contract, Opportunity, Lead, Product, Account, Contact, or any entity outside "${selectedModule}".`,
+        '',
+      ] : []
+
+      const systemPrompt = [
+        'You are a senior QA Automation Engineer. Generate executable Playwright test steps for the given test case.',
+        ...moduleScopeLines,
+        '',
+        '## Golden Rules',
+        '- NEVER generate login steps — authentication is pre-managed',
+        '- Use ONLY field names verified in the Entity Field Manifest below',
+        '- Every test must end with an ASSERT step',
+        '- Use realistic data: real names, valid emails, plausible amounts',
+        '- Minimum 4 steps, maximum 15 steps',
+        '',
+        '## Locator Priority',
+        '1. label — for form inputs',
+        '2. role  — for buttons/links',
+        '3. text  — for assertions',
+        '4. css   — LAST RESORT',
+        '',
+        fieldManifest ? `## Entity Field Manifest (ONLY use these fields)\n${fieldManifest}` : '',
+        ragContext ? `## Project Metadata\n${ragContext}` : '',
+        '## Output Format',
+        'Return ONLY a valid JSON array of step objects. No markdown, no explanations.',
+        '[',
+        '  { "id": "1", "action": "NAVIGATE", "value": "/path/to/page" },',
+        '  { "id": "2", "action": "TYPE", "target": "Field Label", "value": "realistic value", "locator_type": "label" },',
+        '  { "id": "3", "action": "CLICK", "target": "Button Name", "locator_type": "role" },',
+        '  { "id": "4", "action": "ASSERT_TEXT", "target": "Expected text on page", "locator_type": "text" }',
+        ']',
+      ].filter(Boolean).join('\n')
+
+      const userPrompt = [
+        'Generate test steps for this test case:',
+        `Name: ${tc.name}`,
+        `Description: ${tc.description ?? '(no description)'}`,
+        `Priority: ${tc.priority ?? 'medium'}`,
+        `Expected Outcome: ${tc.expected_result ?? '(no expected outcome)'}`,
+        '',
+        'Return ONLY a valid JSON array of step objects. No markdown, no code fences.',
+      ].join('\n')
+
+      const rawSteps = await invokeBulkGeneration(systemPrompt, userPrompt)
+      const steps = Array.isArray(rawSteps) ? rawSteps : []
+      const cleanSteps = sanitizeTestCaseSteps(steps, tc.name)
+
+      await prisma.test_cases.update({
+        where: { id: tc.id },
+        data:  { steps: cleanSteps as any, status: 'draft' },
+      })
+
+      generated++
+      log.info({ tcId: tc.id, stepsCount: cleanSteps.length }, '[TCG] Steps generated for test case')
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      log.warn({ err, tcId: tc.id, tcName: tc.name }, '[TCG] Failed to generate steps for test case')
+      errors.push(`${tc.name}: ${msg}`)
+      failed++
+
+      // Still update status to draft so it appears in the Tests tab even without steps
+      await prisma.test_cases.update({
+        where: { id: tc.id },
+        data:  { status: 'draft' },
+      }).catch(() => {/* ignore */})
+    }
+  }
+
+  log.info({ projectId, generated, failed }, '[TCG] generateStepsForTestCases complete')
+  return { generated, failed, errors }
+}
+
+// ── Salesforce managed package object detection ──────────────────────────────
+function isManagedPackageObject(apiName: string): boolean {
+  const KNOWN_MANAGED_PREFIXES = [
+    'sflma', 'sfcma', 'channel_orders', 'channel orders',
+    'npe', 'npsp', 'hed', 'fsc', 'vlocity', 'omnistudio',
+    'copado', 'sf_com', 'b2bcommerce', 'commerceextension',
+    'sfdc_checkout', 'ccrz', 'sfbase', 'finserv', 'sfcloud',
+    'dspdf', 'kpiapp', 'docgen',
+  ]
+  const lower = apiName.toLowerCase().replace(/\s+/g, '_')
+  for (const prefix of KNOWN_MANAGED_PREFIXES) {
+    const normalizedPrefix = prefix.replace(/\s+/g, '_')
+    if (lower.startsWith(normalizedPrefix + '__') || lower.startsWith(normalizedPrefix + '_')) {
+      return true
+    }
+  }
+  const parts = apiName.split('__')
+  if (parts.length >= 3) return true
+  if (apiName.endsWith('__hd')) return true
+  if (apiName.endsWith('__e')) return true
+  if (apiName.endsWith('__mdt')) return true
+  return false
+}
+
+// ── Salesforce system/setup object detection ─────────────────────────────────
+function isSystemObject(apiName: string): boolean {
+  const SYSTEM_OBJECTS = new Set([
+    'User', 'Profile', 'UserRole', 'PermissionSet', 'PermissionSetAssignment',
+    'PermissionSetGroup', 'LoginHistory', 'AuthSession', 'SessionPermSetActivation',
+    'TwoFactorInfo', 'VerificationHistory',
+    'Organization', 'BusinessHours', 'FiscalYearSettings', 'Holiday',
+    'ApexClass', 'ApexTrigger', 'ApexComponent', 'ApexPage',
+    'CustomPermission', 'ConnectedApplication', 'InstalledMobileApp',
+    'NamedCredential', 'ExternalDataSource',
+    'ContentDocument', 'ContentVersion', 'ContentDocumentLink',
+    'ContentWorkspace', 'ContentFolder', 'Attachment', 'Document',
+    'ObjectPermissions', 'FieldPermissions', 'SetupAuditTrail',
+    'LoginGeo', 'EventLogFile',
+    'EntityDefinition', 'FieldDefinition', 'RecordType', 'BusinessProcess',
+    'ListView', 'Layout',
+    'EmailTemplate', 'EmailMessage', 'EmailServicesAddress', 'OrgWideEmailAddress',
+    'FlowDefinition', 'FlowInterview', 'ProcessDefinition',
+    'Group', 'GroupMember', 'QueueSobject',
+    'PlatformEventChannel', 'PlatformEventChannelMember',
+    'AsyncApexJob', 'CronTrigger', 'CronJobDetail',
+    'BrandTemplate', 'Folder', 'Scontrol',
+    'StaticResource', 'WebLink',
+    'DuplicateRule', 'DuplicateRecordSet', 'DuplicateRecordItem',
+    'FeedItem', 'FeedComment', 'CollaborationGroup', 'CollaborationGroupMember',
+    'TopicAssignment', 'Topic', 'ChatterActivity', 'ChatterMessage',
+    'Report', 'Dashboard', 'DashboardComponent',
+    'Idea', 'IdeaComment', 'Vote', 'UserPreference',
+    'RecordAction', 'RecordActionHistory',
+    'ActionLinkGroupTemplate', 'ActionLinkTemplate',
+    'AppMenuItem', 'AppDefinition',
+  ])
+  if (SYSTEM_OBJECTS.has(apiName)) return true
+  if (/bypass/i.test(apiName.toLowerCase())) return true
+  return false
+}
+
+// ── Derive module list directly from project metadata (no LLM) ──────────────
+/**
+ * Reads the project's ACTUAL metadata from the database and derives a list of
+ * test modules deterministically — NO LLM involved.
+ *
+ * **Category-aware**: Detects the project's integration category first.
+ *   - web_app projects: Only use crawled pages, URL-based domain models, web_test_data
+ *   - salesforce projects: Only use SF objects/fields, non-URL domain models
+ *
+ * Returns an array of module name strings derived ONLY from this project's data.
+ */
+export async function generateModulesForProject(projectId: string): Promise<string[]> {
+  try {
+    const modules = new Set<string>()
+
+    // ── Detect project category to gate which sources are relevant ──
+    // 1. Try project_integrations first (most specific)
+    const integration = await prisma.project_integrations.findFirst({
+      where: { project_id: projectId },
+      select: { category: true },
+    })
+    // 2. Fallback to projects.category if no integration row exists
+    let rawCategory = integration?.category
+    if (!rawCategory) {
+      const project = await prisma.projects.findUnique({
+        where: { id: projectId },
+        select: { category: true },
+      })
+      rawCategory = project?.category
+    }
+    const category = (rawCategory ?? 'webapp').toLowerCase()
+    const isSalesforce = category === 'salesforce'
+    // Treat web_app, webapp, or ANY unrecognised category as a web app
+    // (safe default — prevents SF objects from leaking into non-SF projects)
+    const isWebApp = !isSalesforce
+
+    log.info({ projectId, category, isWebApp, isSalesforce }, '[TCG] generateModulesForProject — detected project category')
+
+    // Segments to skip when extracting modules from URL paths
+    const SKIP_AUTH_SEGMENTS = /^(login|logout|signin|signout|signup|register|auth|callback|favicon|api|static|assets|_next|oauth|sso|\.well-known)/i
+    const SKIP_NOISE_SEGMENTS = /^(new|edit|create|delete|update|view|detail|details|list|index|home|page|tab|tabs|profile|account|session|sessions|token|tokens|undefined|null|#|[0-9a-f]{8,})$/i
+    const SKIP_CONTAINER_SEGMENTS = /^(admin|manage|settings|dashboard|panel|v[0-9]+|module|modules|system|app|main)$/i
+
+    // ── Source priority for web_app projects: ───────────────────────────────────
+    //   1st  web_test_data  — explicitly synced module definitions (AUTHORITATIVE)
+    //                         When present, these override all URL-scraped sources.
+    //                         Reason: the crawler may hit the wrong URL, a CRM demo,
+    //                         or a login wall and never see the real application.
+    //   2nd  webapp_crawl   — fallback when web_test_data is empty
+    //
+    // ── Source priority for salesforce projects: ─────────────────────────────────
+    //   1st  SF objects / fields (Sources 2 & 3)
+    //   2nd  domain_models (non-URL entity names only)
+
+    // ── Source A (HIGHEST PRIORITY, web_app only): web_test_data ─────────────────
+    // Check this FIRST. If the project has explicitly-synced module entries, use
+    // them exclusively and skip all URL-scraping sources entirely.
+    //
+    // CRITICAL: Only surface entities that have a create_button_name — i.e.
+    // the crawler found an actual form/button to create records for this entity.
+    // Entities with NO create button are read-only views (e.g. an "Agents" list
+    // page where agents are provisioned externally) and MUST NOT be listed as
+    // "Management" modules that imply Create/Edit/Delete test cases.
+    let webTestDataUsed = false
+    if (!isSalesforce) {
+      const webTestData = await prisma.$queryRaw<Array<{
+        entity_name:        string
+        create_button_name: string | null
+        open_button_name:   string | null
+      }>>`
+        SELECT entity_name,
+               COALESCE(create_button_name, '') as create_button_name,
+               COALESCE(open_button_name,   '') as open_button_name
+        FROM   web_test_data
+        WHERE  project_id = ${projectId}::uuid
+        ORDER  BY entity_name
+      `
+
+      if (webTestData.length > 0) {
+        webTestDataUsed = true
+        log.info({ projectId, count: webTestData.length }, '[TCG] web_test_data entries found — checking create_button_name for each')
+
+        for (const wtd of webTestData) {
+          const raw = (wtd.entity_name ?? '').trim()
+          if (!raw || raw.length < 2) continue
+
+          // Check whether this entity has a known create path.
+          // create_button_name is set by the Tier-2 UI scraper when it finds
+          // a "New", "Add", "Create" button on the entity's list page.
+          // open_button_name is the button that opens a modal form (e.g. "Add Role").
+          const hasCreateButton = !!(wtd.create_button_name?.trim() || wtd.open_button_name?.trim())
+
+          // Strip trailing "Management" to avoid double-suffix
+          const stripped = raw.replace(/\s+management$/i, '').trim()
+          const name = stripped
+            .replace(/[_-]/g, ' ')
+            .replace(/\b\w/g, c => c.toUpperCase())
+            .replace(/\s+/g, ' ')
+            .trim()
+          if (name.length < 2) continue
+
+          if (hasCreateButton) {
+            // Full CRUD module — can test Create, Edit, Delete
+            modules.add(`${name} Management`)
+            log.info({ name, create: wtd.create_button_name, open: wtd.open_button_name }, '[TCG] Added CRUD module from web_test_data')
+          } else {
+            // Read-only entity — the list page exists but there is no create/add
+            // button, meaning the app does NOT support creating these records via UI.
+            // Expose it only as a read/list module so the LLM generates VIEW tests,
+            // NOT Create/Edit/Delete tests.
+            modules.add(`${name} List`)
+            log.info({ name }, '[TCG] Added LIST-ONLY module (no create button found) from web_test_data')
+          }
+        }
+      }
+    }
+
+    // ── Source B (FALLBACK, web_app only): webapp_crawl pages ────────────────────
+    // Only used when web_test_data has zero entries for this project.
+    if (!isSalesforce && !webTestDataUsed) {
+      const webRows = await prisma.metadata_normalized.findMany({
+        where: { project_id: projectId, entity_type: 'webapp_crawl' },
+        select: { structured_json: true, label: true },
+      })
+
+      for (const row of webRows) {
+        const data = (row.structured_json ?? {}) as {
+          pages?: Array<{
+            path?: string
+            title?: string
+            nav_items?: string[]
+          }>
+        }
+        const pages = data.pages ?? []
+
+        for (const page of pages) {
+          const path = page.path ?? ''
+          if (!path || path === '/') continue
+
+          const segments = path.split('/').filter(Boolean)
+          if (segments.length === 0) continue
+          if (SKIP_AUTH_SEGMENTS.test(segments[0])) continue
+
+          let entitySegment: string | null = null
+          for (const seg of segments) {
+            if (SKIP_CONTAINER_SEGMENTS.test(seg)) continue
+            if (SKIP_NOISE_SEGMENTS.test(seg)) continue
+            if (/^[:\[{]/.test(seg)) continue
+            if (/^\d+$/.test(seg)) continue
+            if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(seg)) continue
+            entitySegment = seg
+            break
+          }
+
+          if (!entitySegment || entitySegment.length < 2) continue
+
+          const entityName = entitySegment
+            .replace(/[_-]/g, ' ')
+            .replace(/\b\w/g, c => c.toUpperCase())
+            .replace(/\s+/g, ' ')
+            .trim()
+
+          if (!entityName || entityName.length < 2) continue
+          modules.add(`${entityName} Management`)
+
+          // Also check nav_items if the crawler captured sidebar links
+          if (Array.isArray(page.nav_items)) {
+            for (const navItem of page.nav_items) {
+              const clean = String(navItem ?? '').trim()
+              if (clean.length >= 2 && !SKIP_AUTH_SEGMENTS.test(clean) && !SKIP_NOISE_SEGMENTS.test(clean)) {
+                modules.add(`${clean.replace(/\b\w/g, c => c.toUpperCase())} Management`)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Sources 2 & 3: Salesforce objects/fields — ONLY for salesforce projects ──
+    if (isSalesforce) {
+      const sfObjects = await prisma.metadata_normalized.findMany({
+        where: { project_id: projectId, entity_type: 'object' },
+        select: { object_name: true, label: true },
+      })
+
+      for (const obj of sfObjects) {
+        const apiName = (obj.object_name ?? '').trim()
+        const label   = (obj.label ?? apiName).trim()
+        if (!apiName) continue
+        if (isManagedPackageObject(apiName)) continue
+        if (isSystemObject(apiName)) continue
+        if (/bypass/i.test(label)) continue
+
+        const displayName = (label && label.length >= 2 && !/bypass/i.test(label)) ? label : apiName
+        const cleanName = displayName
+          .replace(/__c$/i, '')
+          .replace(/__hd$/i, '')
+          .replace(/[_-]/g, ' ')
+          .replace(/\b\w/g, c => c.toUpperCase())
+          .replace(/\s+/g, ' ')
+          .trim()
+
+        if (cleanName.length >= 2) {
+          modules.add(`${cleanName} Management`)
+        }
+      }
+
+      // Source 3: SF fields fallback when no objects found
+      const sfObjectCount = await prisma.metadata_normalized.count({
+        where: { project_id: projectId, entity_type: 'object' },
+      })
+      if (sfObjectCount === 0) {
+        const fieldObjectNames = await prisma.metadata_normalized.findMany({
+          where: { project_id: projectId, entity_type: 'field' },
+          select: { object_name: true },
+          distinct: ['object_name'],
+        })
+        for (const row of fieldObjectNames) {
+          const name = (row.object_name ?? '').trim()
+          if (!name || name.length < 2) continue
+          if (isManagedPackageObject(name)) continue
+          if (isSystemObject(name)) continue
+          const cleanName = name
+            .replace(/__c$/i, '')
+            .replace(/[_-]/g, ' ')
+            .replace(/\b\w/g, c => c.toUpperCase())
+            .replace(/\s+/g, ' ')
+            .trim()
+          if (cleanName.length >= 2) modules.add(`${cleanName} Management`)
+        }
+      }
+
+      // Source 4: domain_models — SF non-URL entity names only
+      const domainModels = await prisma.domain_models.findMany({
+        where: { project_id: projectId },
+        select: { entity_name: true },
+      })
+      for (const dm of domainModels) {
+        const entityName = (dm.entity_name ?? '').trim()
+        if (!entityName) continue
+        try { new URL(entityName); continue } catch { /* not a URL — use it */ }
+        if (isManagedPackageObject(entityName)) continue
+        if (isSystemObject(entityName)) continue
+        const name = entityName
+          .replace(/__c$/i, '')
+          .replace(/[_-]/g, ' ')
+          .replace(/\b\w/g, c => c.toUpperCase())
+          .replace(/\s+/g, ' ')
+          .trim()
+        if (name.length >= 2) modules.add(`${name} Management`)
+      }
+    }
+
+    const dedupedModules = deduplicateModules([...modules])
+
+    log.info({ projectId, category, count: dedupedModules.length, modules: dedupedModules }, '[TCG] Modules derived from project metadata')
+    return dedupedModules.sort()
+  } catch (err) {
+    log.warn({ err, projectId }, '[TCG] generateModulesForProject failed — returning empty array')
+    return []
+  }
+}
+
+/**
+ * De-duplicates modules that differ only by pluralization, camelCase vs spaces,
+ * or trivial suffixes like "Custom".
+ */
+function deduplicateModules(modules: string[]): string[] {
+  const seen = new Map<string, string>()
+  for (const mod of modules) {
+    const key = mod
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .toLowerCase()
+      .replace(/\s*\(.*?\)\s*/g, ' ')
+      .replace(/\s+custom\s+/gi, ' ')
+      .replace(/s\s+management$/i, ' management')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!seen.has(key)) {
+      seen.set(key, mod)
+    } else {
+      const existing = seen.get(key)!
+      if (mod.includes(' ') && !existing.includes(' ')) {
+        seen.set(key, mod)
+      }
+      if (existing.includes('Custom') && !mod.includes('Custom')) {
+        seen.set(key, mod)
+      }
+    }
+  }
+  return [...seen.values()]
+}
+

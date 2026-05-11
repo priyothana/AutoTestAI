@@ -605,8 +605,6 @@ async function runUiScraping(
 
       // Step 1: Wait for sidebar/nav to have content
       await page.waitForFunction(
-        // IMPORTANT: page.evaluate/waitForFunction uses serialized JS — must be arrow fn, no named functions
-        // (esbuild injects __name() for named functions which is NOT available in the browser context)
         () => {
           const sels = ['nav', 'aside', '[role="navigation"]', '[class*="sidebar"]', '[class*="menu"]']
           return sels.some(s => { const el = document.querySelector(s); return el && (el.textContent || '').trim().length > 10 })
@@ -618,6 +616,42 @@ async function runUiScraping(
 
       await page.waitForTimeout(1_000)
 
+      // Step 2: Scroll the sidebar to ensure all items are rendered (lazy-rendered nav lists)
+      try {
+        await page.evaluate(() => {
+          const sidebarSels = ['aside', '[class*="sidebar"]', '[class*="side-bar"]', 'nav', '[role="navigation"]']
+          for (const sel of sidebarSels) {
+            const el = document.querySelector(sel)
+            if (el && el.scrollHeight > el.clientHeight) {
+              el.scrollTop = el.scrollHeight
+              break
+            }
+          }
+        })
+        await page.waitForTimeout(500)
+      } catch { /* non-critical */ }
+
+      // Step 3: Expand collapsed sidebar groups (e.g. "Endpoint Management ▸" → reveals Patches, Scripts)
+      // Click any sidebar parent item that has a chevron/arrow/toggle indicator.
+      try {
+        const collapsedGroups = await page.$$eval(
+          '[class*="sidebar"] [class*="arrow"], [class*="sidebar"] [class*="chevron"], [class*="sidebar"] [class*="toggle"], [class*="sidebar"] [class*="expand"], [class*="sidebar"] [class*="collapse"], [class*="menu"] [class*="arrow"], nav [class*="chevron"], aside [class*="arrow"]',
+          (els) => els.map(el => (el.closest('li, div, a, button') as HTMLElement | null)?.textContent?.trim().slice(0, 40) ?? '').filter(Boolean)
+        ).catch(() => [] as string[])
+
+        for (const groupLabel of collapsedGroups.slice(0, 8)) {
+          if (!groupLabel) continue
+          try {
+            const parent = page.locator(`[class*="sidebar"] :text-is("${groupLabel}"), nav :text-is("${groupLabel}"), aside :text-is("${groupLabel}")`).first()
+            if (await parent.isVisible({ timeout: 1_000 }).catch(() => false)) {
+              await parent.click({ timeout: 2_000 })
+              await page.waitForTimeout(800)
+              log.info(`[WTD][UI] Expanded collapsed group: "${groupLabel}"`)
+            }
+          } catch { /* non-critical — move on */ }
+        }
+      } catch { /* non-critical */ }
+
       const currentPageUrl  = page.url()
       const urlOrigin       = new URL(baseUrl).origin
 
@@ -625,27 +659,49 @@ async function runUiScraping(
       // Use a single $$eval that returns simple primitives (no named fns, no classes)
 
       // Pass 1: href-based links from nav containers
+      // Wide selector set to catch sidebar patterns across React/Vue/Angular apps
       const rawHrefLinks: Array<{ raw: string; label: string }> = await page.$$eval(
-        'nav a[href], aside a[href], [role="navigation"] a[href], [class*="sidebar"] a[href], [class*="menu"] a[href], [class*="nav"] a[href], [to], router-link, nuxt-link',
+        [
+          'nav a[href]', 'aside a[href]', '[role="navigation"] a[href]',
+          '[class*="sidebar"] a[href]', '[class*="side-bar"] a[href]',
+          '[class*="menu"] a[href]', '[class*="nav"] a[href]',
+          '[class*="link"] a[href]', '[class*="item"] a[href]',
+          'a[class*="nav"]', 'a[class*="menu"]', 'a[class*="link"]',
+          '[to]', 'router-link', 'nuxt-link',
+        ].join(', '),
         (els) => els.map((el) => ({
           raw:   el.getAttribute('href') || el.getAttribute('to') || '',
           label: (el.textContent || '').trim().slice(0, 60),
         })).filter((l) => l.raw && l.label)
       ).catch(() => [] as Array<{ raw: string; label: string }>)
 
-      // Pass 2: Text labels from nav items (button/span/li based SPAs like the CRM)
+      // Pass 2: Text labels from ALL clickable nav-like elements (button/span/li/div)
+      // Widened to catch dashboards that use div-based or custom sidebar components.
+      // Collected AFTER group expansion above so newly-revealed items are included.
       const rawTextItems: Array<{ text: string }> = await page.$$eval(
-        '[class*="sidebar"] button, [class*="sidebar"] li, [class*="sidebar"] span, [class*="sidebar"] [role="menuitem"], [class*="menu"] button, [class*="menu"] li, nav button, nav li, aside li, aside button',
+        [
+          '[class*="sidebar"] button', '[class*="sidebar"] li', '[class*="sidebar"] span',
+          '[class*="sidebar"] div[class*="item"]', '[class*="sidebar"] [role="menuitem"]',
+          '[class*="side-bar"] button', '[class*="side-bar"] li',
+          '[class*="menu"] button', '[class*="menu"] li', '[class*="menu"] div[class*="item"]',
+          'nav button', 'nav li', 'nav span',
+          'aside li', 'aside button',
+          '[class*="nav-item"]', '[class*="navitem"]', '[class*="nav_item"]',
+        ].join(', '),
         (els) => els.map((el) => ({
           text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40),
-        })).filter((l) => l.text.length > 1 && l.text.length < 35 && /^[a-zA-Z]/.test(l.text))
+        })).filter((l) => l.text.length > 1 && l.text.length < 40 && /^[a-zA-Z]/.test(l.text))
       ).catch(() => [] as Array<{ text: string }>)
 
       // ── Resolve and deduplicate discovered links ──────────────────────────
       const seen    = new Set<string>()
+      // fromNavDiscovery: URLs captured by clicking a real nav item — trusted as
+      // valid list pages even if they don't have a plural name in the path.
+      const navDiscoveredUrls = new Set<string>()
       const discoveredLinks: Array<{ url: string; label: string }> = []
 
-      const skipLabels = /^(home|dashboard|logout|sign out|profile|settings|help|admin|support|\d+)$/i
+      // Only skip truly non-entity items; keep everything else for scraping
+      const skipLabels = /^(home|dashboard|logout|sign out|sign-out|profile|settings|help|admin|support|notifications?|\d+|back|close|menu|toggle|search)$/i
 
       function resolveUrl(raw: string): string | null {
         if (!raw) return null
@@ -674,76 +730,123 @@ async function runUiScraping(
         }
       }
 
-      // From text labels — click each sidebar item to discover REAL URLs.
-      // SPAs route through JavaScript, so the only reliable way to find the
-      // actual URL is to click the element and observe the browser's URL change.
-      // Previous approach synthesized fake URLs (e.g. "Roles" → /roles) but many
-      // apps use prefixed routes like /admin/roles which were missed entirely.
-      const synthSeen = new Set<string>()
+      // ── Dynamic BFS nav discovery ─────────────────────────────────────────
+      // After each successful navigation the sidebar may reveal NEW sub-items
+      // (collapsible groups, context-sensitive menus). We re-scan after every
+      // navigation and add newly-discovered labels to the pending queue.
+      const synthSeen      = new Set<string>()
       const beforeClickUrl = page.url()
-      for (const { text } of rawTextItems) {
-        if (skipLabels.test(text)) continue
+
+      // Helper: collect current sidebar text labels
+      const collectSidebarLabels = async (): Promise<string[]> => {
+        try {
+          return await page.$$eval(
+            [
+              '[class*="sidebar"] button', '[class*="sidebar"] li', '[class*="sidebar"] span',
+              '[class*="sidebar"] div[class*="item"]', '[class*="sidebar"] [role="menuitem"]',
+              '[class*="side-bar"] button', '[class*="side-bar"] li',
+              '[class*="menu"] button', '[class*="menu"] li',
+              'nav button', 'nav li', 'nav span',
+              'aside li', 'aside button',
+              '[class*="nav-item"]', '[class*="navitem"]', '[class*="nav_item"]',
+            ].join(', '),
+            (els) => els
+              .map(el => (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40))
+              .filter(t => t.length > 1 && t.length < 40 && /^[a-zA-Z]/.test(t))
+          )
+        } catch { return [] }
+      }
+
+      // Seed queue with the initial set of visible text labels
+      const pendingLabels: string[] = rawTextItems.map(t => t.text)
+
+      let queueIdx = 0
+      const MAX_NAV_CLICKS = 40  // safety cap — prevents infinite loops
+
+      while (queueIdx < pendingLabels.length && queueIdx < MAX_NAV_CLICKS) {
+        const text = pendingLabels[queueIdx++]
+        if (!text || skipLabels.test(text)) continue
         if (synthSeen.has(text.toLowerCase())) continue
         synthSeen.add(text.toLowerCase())
 
         try {
-          // Find the clickable sidebar element by its text
-          const sidebarItem = page.locator(
+          let sidebarItem = page.locator(
             `[class*="sidebar"] :text-is("${text}"), ` +
+            `[class*="side-bar"] :text-is("${text}"), ` +
             `[class*="menu"] :text-is("${text}"), ` +
             `nav :text-is("${text}"), ` +
             `aside :text-is("${text}")`
           ).first()
 
-          if (!(await sidebarItem.isVisible({ timeout: 1_500 }).catch(() => false))) continue
+          if (!(await sidebarItem.isVisible({ timeout: 800 }).catch(() => false))) {
+            sidebarItem = page.getByRole('link', { name: text, exact: true }).or(
+              page.getByRole('button', { name: text, exact: true })
+            ).first()
+          }
 
-          // Click and wait for navigation
+          if (!(await sidebarItem.isVisible({ timeout: 800 }).catch(() => false))) continue
+
           const urlBefore = page.url()
-          await sidebarItem.click({ timeout: 3_000 })
-          // Wait for SPA route change
-          await page.waitForTimeout(1_500)
-          // Also wait for any loading to settle
+          await sidebarItem.click({ timeout: 2_500 })
+          await page.waitForTimeout(1_200)
           await page.waitForLoadState('domcontentloaded', { timeout: 3_000 }).catch(() => {})
 
           const urlAfter = page.url()
-          // Only record if URL actually changed (navigation happened)
-          if (urlAfter !== urlBefore && urlAfter !== beforeClickUrl) {
+
+          if (urlAfter !== urlBefore) {
+            // URL changed → real navigation → record it
             if (!seen.has(urlAfter)) {
               seen.add(urlAfter)
+              navDiscoveredUrls.add(urlAfter)
               discoveredLinks.push({ url: urlAfter, label: text })
-              log.info(`[WTD][UI] Click-captured: "${text}" → ${urlAfter}`)
+              log.info(`[WTD][UI] Click-captured: "${text}" \u2192 ${urlAfter}`)
+            }
+            // Re-scan sidebar for NEW labels revealed by this navigation (BFS)
+            const freshLabels = await collectSidebarLabels()
+            for (const fl of freshLabels) {
+              if (fl && !synthSeen.has(fl.toLowerCase()) && !skipLabels.test(fl)) {
+                pendingLabels.push(fl)
+              }
             }
           } else {
-            // Fallback: if click didn't change URL, synthesize as last resort
-            const slug = text.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/-+$/, '')
-            if (slug) {
-              const synthUrl = isHashRouter ? `${hashBase}#/${slug}` : `${urlOrigin}/${slug}`
-              if (!seen.has(synthUrl)) {
+            // URL unchanged → may be a toggle/expand that revealed sub-items
+            const freshLabels = await collectSidebarLabels()
+            let newCount = 0
+            for (const fl of freshLabels) {
+              if (fl && !synthSeen.has(fl.toLowerCase()) && !skipLabels.test(fl)) {
+                pendingLabels.push(fl)
+                newCount++
+              }
+            }
+            if (newCount > 0) {
+              log.info(`[WTD][UI] Toggle "${text}" revealed ${newCount} new sidebar items`)
+            } else {
+              // Synthesize URL as last resort
+              const slug = text.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/-+$/, '')
+              if (slug && !seen.has(`${urlOrigin}/${slug}`)) {
+                const synthUrl = isHashRouter ? `${hashBase}#/${slug}` : `${urlOrigin}/${slug}`
                 seen.add(synthUrl)
                 discoveredLinks.push({ url: synthUrl, label: text })
               }
             }
           }
-        } catch (clickErr) {
-          log.debug(`[WTD][UI] Click-capture failed for "${text}" — skipping`)
-          // Fallback: synthesize URL
+        } catch {
           const slug = text.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/-+$/, '')
           if (slug) {
             const synthUrl = isHashRouter ? `${hashBase}#/${slug}` : `${urlOrigin}/${slug}`
-            if (!seen.has(synthUrl)) {
-              seen.add(synthUrl)
-              discoveredLinks.push({ url: synthUrl, label: text })
-            }
+            if (!seen.has(synthUrl)) { seen.add(synthUrl); discoveredLinks.push({ url: synthUrl, label: text }) }
           }
         }
       }
-      // Navigate back to the starting page so subsequent scraping starts clean
+
+      // Navigate back to the starting page so scraping starts clean
       try {
         await page.goto(beforeClickUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 })
         await page.waitForTimeout(1_000)
       } catch { /* non-critical */ }
 
-      log.info(`[WTD][UI] Discovered ${discoveredLinks.length} nav links (${rawHrefLinks.length} href + ${rawTextItems.length} text labels)`)
+      log.info(`[WTD][UI] BFS discovery complete — ${discoveredLinks.length} links (${queueIdx} labels processed)`)
+
 
 
 
@@ -753,6 +856,7 @@ async function runUiScraping(
       // ── C. Merge with Phase 1 crawl pages (if any) ──────────────────────
       const crawlPages: Array<{ url: string; title: string }> = []
       try {
+        // Source C1: metadata_raw_store (raw crawler blobs)
         const rawRows = await prisma.metadata_raw_store.findMany({
           where:  { project_id: projectId, metadata_type: 'webpage' },
           select: { raw_json: true },
@@ -762,6 +866,26 @@ async function runUiScraping(
           const rd = row.raw_json as { pages?: Array<{ url: string; title: string }> }
           if (Array.isArray(rd?.pages)) {
             crawlPages.push(...rd.pages.map(p => ({ url: p.url ?? '', title: p.title ?? '' })))
+          }
+        }
+
+        // Source C2: metadata_normalized webapp_crawl (structured crawl data — richer)
+        const normRows = await prisma.metadata_normalized.findMany({
+          where:  { project_id: projectId, entity_type: 'webapp_crawl' },
+          select: { structured_json: true },
+          take:   3,
+        })
+        const baseOriginForMerge = new URL(baseUrl).origin
+        for (const row of normRows) {
+          const nd = (row.structured_json ?? {}) as { pages?: Array<{ path?: string; title?: string }> }
+          if (Array.isArray(nd.pages)) {
+            for (const p of nd.pages) {
+              if (p.path && p.path !== '/' && p.path !== '') {
+                // Reconstruct absolute URL from relative path
+                const absUrl = p.path.startsWith('http') ? p.path : `${baseOriginForMerge}${p.path.startsWith('/') ? p.path : '/' + p.path}`
+                crawlPages.push({ url: absUrl, title: p.title ?? '' })
+              }
+            }
           }
         }
       } catch { /* non-critical */ }
@@ -787,9 +911,12 @@ async function runUiScraping(
       // For hash routers: examine the fragment (#/accounts), not the pathname
       const listPages = allCandidates.filter(candidate => {
         try {
+          // URLs captured by clicking a nav item are trusted unconditionally
+          // (they proved the app navigated there — they ARE real pages)
+          if (navDiscoveredUrls.has(candidate.url)) return true
+
           let checkPath: string
           if (candidate.url.includes('#')) {
-            // Hash router: use fragment as path
             checkPath = candidate.url.split('#')[1] ?? ''
           } else {
             checkPath = new URL(candidate.url).pathname
@@ -801,19 +928,26 @@ async function runUiScraping(
             || checkPath === '/' || checkPath === '' || checkPath === '#/'
           if (isNonList) return false
 
-          // Prefer pages with plural entity names in path
+          // Accept plural path segments: /accounts, /vulnerabilities, /categories
           const hasListShape = (
-            /\/[a-z]+s(\/|$|#)/.test(checkPath) ||   // /accounts, /contacts, /employees
-            /\/list(\/|$)/.test(checkPath)   ||       // /user/list
-            /\/(index|all)(\/|$)/.test(checkPath) ||  // /invoices/index
-            /\/[a-z]+(s|es|ies)(\/|$)/.test(checkPath) // /categories
+            /\/[a-z]+s(\/|$|#)/.test(checkPath) ||
+            /\/list(\/|$)/.test(checkPath)       ||
+            /\/(index|all)(\/|$)/.test(checkPath) ||
+            /\/[a-z]+(es|ies)(\/|$)/.test(checkPath)
           )
-          // Also accept if label suggests list page (e.g. "Accounts", "All Employees")
-          const labelHintsList = /^(all\s+)?[a-z]+(s|es|ies)$/i.test(candidate.label.trim())
+          // Also accept any single-segment path that isn't a known noise word
+          // — handles singular entity routes like /compliance, /patch, /software
+          const segments = checkPath.split('/').filter(Boolean)
+          const isSingleCleanSegment = segments.length === 1
+            && segments[0].length >= 3
+            && !/^(api|v\d+|app|main|panel|module|system|public|static|assets)$/.test(segments[0])
 
-          return hasListShape || labelHintsList
+          // Accept if label looks like an entity (titlecase word/s)
+          const labelHintsList = /^([A-Z][a-z]+)(\s+[A-Z][a-z]+)*s?$/.test(candidate.label.trim())
+
+          return hasListShape || isSingleCleanSegment || labelHintsList
         } catch { return false }
-      }).slice(0, 12) // cap: max 12 list pages per run
+      }).slice(0, 30) // raised cap: up to 30 list pages per run
 
       log.info(`[WTD][UI] ${listPages.length} list pages identified — ${allCandidates.length - listPages.length} filtered out`)
 

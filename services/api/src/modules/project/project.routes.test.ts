@@ -506,12 +506,16 @@ describe('GET /api/v1/jira/projects/:id/config', () => {
 // ─── GET /api/v1/jira/projects/:id/stories ───────────────────────
 
 describe('GET /api/v1/jira/projects/:id/stories', () => {
-  it('200 + stories array', async () => {
-    vi.mocked(svc.getJiraStories).mockResolvedValue([{ id: 'PROJ-1', key: 'PROJ-1' }])
+  it('200 + stories object', async () => {
+    vi.mocked(svc.getJiraStories).mockResolvedValue({
+      board_id: '1',
+      board_name: 'Sprint Board',
+      issues: [{ id: 'PROJ-1', key: 'PROJ-1', summary: 'Summary', description: '', status: '', issue_type: '', priority: '' }],
+    })
 
     const res = await st.get(`/api/v1/jira/projects/${PROJECT_ID}/stories`)
     expect(res.status).toBe(200)
-    expect(res.body).toHaveLength(1)
+    expect(res.body.issues).toHaveLength(1)
   })
 
   it('404 when Jira not configured', async () => {

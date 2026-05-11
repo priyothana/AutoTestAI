@@ -29,6 +29,18 @@ export const UserResponseSchema = z.object({
   role: z.string(),
 })
 
+export const ForgotPasswordSchema = z.object({
+  // Accepts email OR username — backend resolves to user record either way
+  identifier: z.string().min(1, { message: 'Email or username is required' }),
+})
+
+export const ResetPasswordSchema = z.object({
+  token: z.string().min(1, { message: 'Reset token is required' }),
+  new_password: z.string().min(6, { message: 'Password must be at least 6 characters' }),
+})
+
 export type UserCreate = z.infer<typeof UserCreateSchema>
 export type UserLogin = z.infer<typeof UserLoginSchema>
 export type UserResponse = z.infer<typeof UserResponseSchema>
+export type ForgotPassword = z.infer<typeof ForgotPasswordSchema>
+export type ResetPassword = z.infer<typeof ResetPasswordSchema>
