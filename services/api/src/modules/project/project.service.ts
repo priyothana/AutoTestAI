@@ -481,19 +481,56 @@ export async function getIntegrationStatus(projectId: string) {
   }
 }
 
-/** Count Salesforce metadata records — returned in integration status. */
+/**
+ * Count metadata records for a project — returned in integration status.
+ *
+ * For Web App projects the crawler stores ALL pages inside a single
+ * metadata_raw_store row (raw_json.pages[]) and a single
+ * metadata_normalized row (structured_json.pages[]).
+ * Counting DB rows would always give 1 — instead we read the real
+ * page arrays so the UI shows the actual crawled-page count.
+ */
 async function getSyncCounts(projectId: string) {
-  const [raw, normalized, domain, embeddings] = await Promise.all([
-    prisma.metadata_raw_store.count({ where: { project_id: projectId } }),
-    prisma.metadata_normalized.count({ where: { project_id: projectId } }),
+  const [domain, embeddings] = await Promise.all([
     prisma.domain_models.count({ where: { project_id: projectId } }),
     prisma.vector_embeddings.count({ where: { project_id: projectId } }),
   ])
+
+  // ── Raw pages count ──────────────────────────────────────────────
+  let rawPageCount = 0
+  const rawRow = await prisma.metadata_raw_store.findFirst({
+    where: { project_id: projectId, metadata_type: 'webpage' },
+    select: { raw_json: true },
+  })
+  if (rawRow?.raw_json) {
+    const rd = rawRow.raw_json as { pages?: unknown[] }
+    rawPageCount = rd.pages?.length ?? 0
+  }
+  // For non-webapp projects (Salesforce etc.) fall back to row count
+  if (rawPageCount === 0) {
+    rawPageCount = await prisma.metadata_raw_store.count({ where: { project_id: projectId } })
+  }
+
+  // ── Normalized pages count ───────────────────────────────────────
+  let normalizedPageCount = 0
+  const normRow = await prisma.metadata_normalized.findFirst({
+    where: { project_id: projectId, entity_type: 'webapp_crawl' },
+    select: { structured_json: true },
+  })
+  if (normRow?.structured_json) {
+    const nd = normRow.structured_json as { pages?: unknown[] }
+    normalizedPageCount = nd.pages?.length ?? 0
+  }
+  // For non-webapp projects fall back to row count
+  if (normalizedPageCount === 0) {
+    normalizedPageCount = await prisma.metadata_normalized.count({ where: { project_id: projectId } })
+  }
+
   return {
-    raw_count: raw,
-    normalized_count: normalized,
+    raw_count:          rawPageCount,
+    normalized_count:   normalizedPageCount,
     domain_model_count: domain,
-    embedding_count: embeddings,
+    embedding_count:    embeddings,
   }
 }
 

@@ -21,6 +21,7 @@ import {
 } from './test-case.schema.js'
 import * as svc from './test-case.service.js'
 import { reviewStep, applyStepUpdate } from './step-review.service.js'
+import { nexusChat, nexusApply } from './nexus.service.js'
 import prisma from '../../shared/db/prisma.js'
 
 export async function testCaseRoutes(app: FastifyInstance) {
@@ -209,4 +210,64 @@ export async function testCaseRoutes(app: FastifyInstance) {
       throw err
     }
   })
+
+  // ── POST /api/v1/tests/:id/nexus/chat ─────────────────────────────────────
+  // NEXUS general chatbot — can reference ANY step by number
+  // Body: { instruction: string, chat_history: ChatMsg[] }
+  const NexusChatSchema = z.object({
+    instruction:  z.string().min(1),
+    chat_history: z.array(
+      z.object({ role: z.enum(['user', 'assistant']), content: z.string() })
+    ).default([]),
+  })
+
+  app.post<{ Params: { id: string } }>(
+    '/tests/:id/nexus/chat',
+    async (request, reply) => {
+      try {
+        const { id } = request.params
+        const body = NexusChatSchema.parse(request.body)
+        const result = await nexusChat({
+          testCaseId:  id,
+          instruction: body.instruction,
+          chatHistory: body.chat_history,
+        })
+        return reply.send(result)
+      } catch (err: any) {
+        if (err.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
+        throw err
+      }
+    }
+  )
+
+  // ── POST /api/v1/tests/:id/nexus/apply ────────────────────────────────────
+  // Apply one or more step updates returned by NEXUS
+  // Body: { stepUpdates: Array<{ stepIndex: number, updatedStep: StepShape }> }
+  const NexusApplySchema = z.object({
+    stepUpdates: z.array(z.object({
+      stepIndex:   z.number().int().min(0),
+      updatedStep: z.object({
+        id:           z.string(),
+        action:       z.string(),
+        target:       z.string().default(''),
+        value:        z.string().default(''),
+        locator_type: z.string().optional(),
+      }).passthrough(),
+    })),
+  })
+
+  app.post<{ Params: { id: string } }>(
+    '/tests/:id/nexus/apply',
+    async (request, reply) => {
+      try {
+        const { id } = request.params
+        const body = NexusApplySchema.parse(request.body)
+        const result = await nexusApply(id, body.stepUpdates as any)
+        return reply.send(result)
+      } catch (err: any) {
+        if (err.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
+        throw err
+      }
+    }
+  )
 }

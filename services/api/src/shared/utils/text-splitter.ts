@@ -27,7 +27,7 @@ export class RecursiveCharacterTextSplitter {
   public splitText(text: string): string[] {
     const finalList: string[] = []
     let separator = this.separators[this.separators.length - 1]
-    let newSeparators = []
+    let newSeparators: string[] = []
 
     for (let i = 0; i < this.separators.length; i++) {
       const s = this.separators[i]

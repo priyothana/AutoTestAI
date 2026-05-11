@@ -424,54 +424,238 @@ NEVER generate steps for fields that are NOT in the FIELD MANIFEST.
 // CRM-style CRUD forms, SPAs, and standard HTML form elements.
 
 const WEB_APP_RAG_SYSTEM_PROMPT = `
-🚨🚨🚨 STOP — READ THIS ENTIRE BLOCK BEFORE WRITING A SINGLE STEP 🚨🚨🚨
+🚨🚨🚨 STOP — READ THIS ENTIRE PROMPT BEFORE WRITING A SINGLE STEP 🚨🚨🚨
 ================================================================================
-⚠️  STRICT MANDATORY RULES — VIOLATION PRODUCES AN INVALID, REJECTED OUTPUT  ⚠️
+⚠️  DEEP METADATA ANALYSIS MODE — GROUND EVERY STEP IN REAL CRAWLED DATA  ⚠️
 ================================================================================
 
-RULE 1 — REQUIRED FIELDS ARE NON-NEGOTIABLE:
-  When the test case contains "Create", "New", "Add", or "With Required Fields":
-  a) You MUST identify the target entity (e.g. "Opportunity").
-  b) You MUST read the MANDATORY CHECKLIST block below in the APPLICATION METADATA.
-  c) You MUST generate a step for EVERY field listed as 🔥 REQUIRED LOOKUP or [REQUIRED].
-  d) ANY output that is missing a required field is COMPLETELY INVALID and will be rejected.
+=========================================================
+DEEP METADATA ANALYSIS PHASE — MANDATORY BEFORE ANY STEP
+=========================================================
+Before writing the first step, you MUST complete this 5-step analysis.
+The analysis answers are found in the ENTITY ANALYSIS CARD at the top of the APPLICATION METADATA.
 
-RULE 2 — LOOKUP FIELDS ARE ALWAYS REQUIRED (never skip):
-  Lookup/reference fields like "Account", "Contact", "Owner", "Parent" are MANDATORY.
-  Use action: "LOOKUP" with a real value from REAL ENTITY RECORDS.
-  If no real value is available, use a plausible fallback like "Acme Corp" for Account.
-  ❌ NEVER skip a lookup field. The form WILL REFUSE TO SAVE without it.
+  ANALYSIS A — ENTITY: Read the 🏷️ ENTITY line from the ENTITY ANALYSIS CARD.
+    → What is the primary entity? (e.g., "Opportunity", "Contact", "Lead")
 
-RULE 3 — BUTTON NAME MUST BE EXACT (never use generic "Save"):
-  The submit button name is shown in the metadata as [SUBMIT BUTTON].
-  Copy that name EXACTLY into the CLICK step target.
-  ❌ NEVER use "Save", "Submit", "OK" unless that is the EXACT name in the metadata.
-  ❌ NEVER combine entity name with test data (e.g. "Create Tara" is WRONG).
-  ✅ CORRECT: target: "Create Opportunity"  (copied from [SUBMIT BUTTON] in metadata)
+  ANALYSIS B — PAGE URL: Read the 📄 PAGE URL line.
+    → What is the EXACT URL to navigate to? Copy it verbatim.
+    → For CREATE: use the "Create Page" URL  (e.g., /opportunities/new)
+    → For UPDATE: use the "Edit Page" URL    (e.g., /contacts/:id/edit)
+    → For DELETE/SEARCH: use the "List Page" URL (e.g., /contacts)
 
-RULE 4 — VALIDATE BEFORE OUTPUTTING:
-  Before outputting the JSON, mentally verify:
-  ✓ Every 🔥 REQUIRED LOOKUP field has a LOOKUP step
-  ✓ Every [REQUIRED] input/select field has a TYPE/SELECT step
-  ✓ The CLICK step target matches the [SUBMIT BUTTON] name exactly
-  ✓ The button is NOT a generic name like "Save" or "Submit" unless confirmed by metadata
-  If any check fails → add the missing step before outputting.
+  ANALYSIS C — REQUIRED FIELDS: Read all 🔥 REQUIRED lines in the FIELD CATALOG.
+    → List EVERY required field. Count them. You MUST generate a step for each.
+    → Lookup fields (marked LOOKUP) need action: "LOOKUP", not "TYPE".
+    → Select fields (marked SELECT) need action: "SELECT" with a valid option.
 
-FAILURE EXAMPLE — INVALID OUTPUT (for "Create Opportunity With Required Fields"):
-  ❌ Step 1: NAVIGATE /opportunities/new
-  ❌ Step 2: TYPE "Opportunity Name" → "New Business Deal"  ← missing Account
-  ❌ Step 3: CLICK "Save"   ← wrong button name + missing Account = REJECTED
+  ANALYSIS D — SUBMIT BUTTON: Read the ⚡ SUBMIT BUTTON line.
+    → What is the EXACT button name? Copy it character-for-character.
+    → This is the ONLY valid button name. Do NOT use "Save", "Submit", or anything else.
 
-CORRECT EXAMPLE — VALID OUTPUT:
-  ✅ Step 1: NAVIGATE /opportunities/new
-  ✅ Step 2: LOOKUP "Account" → "Acme Corp"  ← 🔥 REQUIRED LOOKUP, must NOT be skipped
-  ✅ Step 3: TYPE "Opportunity Name" → "New Business Deal 2026"
-  ✅ Step 4: TYPE "Close Date" → "06/30/2026"
-  ✅ Step 5: CLICK "Create Opportunity"  ← EXACT button name from [SUBMIT BUTTON]
-  ✅ Step 6: ASSERT_URL → "/opportunities"
+  ANALYSIS E — SELF-CHECK before outputting:
+    → Count REQUIRED fields in ANALYSIS C → COUNT_A
+    → Count TYPE + SELECT + LOOKUP steps in your planned output → COUNT_B
+    → If COUNT_B < COUNT_A: you are missing required steps. ADD THEM.
+    → Does your CLICK step target EXACTLY match ANALYSIS D? If not, fix it.
+
+=========================================================
+FEW-SHOT EXAMPLES (4 complete scenarios — study ALL before generating)
+=========================================================
+
+─────────────────────────────────────────────────────────────────
+EXAMPLE 1 — CREATE with Required Lookup ("Create Opportunity With Required Fields")
+─────────────────────────────────────────────────────────────────
+ENTITY ANALYSIS CARD from metadata:
+  🏷️ ENTITY: Opportunity
+  📄 PAGE URL (Create): /opportunities/new
+  📄 PAGE URL (List):   /opportunities
+  🔑 FIELD CATALOG:
+    🔥 REQUIRED LOOKUP  "Account"           locator_type: label  → sample: "Acme Corp"
+    🔥 REQUIRED INPUT   "Opportunity Name"  locator_type: label  → sample: "New Business Deal 2026"
+    🔥 REQUIRED INPUT   "Close Date"        locator_type: label  → sample: "06/30/2026"
+    🔥 REQUIRED SELECT  "Stage"             locator_type: label  → options: Prospecting | Qualification | Closed Won  ⚡ USE: "Prospecting"
+    ✅ OPTIONAL INPUT   "Amount"            locator_type: label  → sample: "50000"
+  ⚡ SUBMIT BUTTON: "Create Opportunity"  (locator_type: role)
+REAL ENTITY RECORDS: { account: "Acme Corp", name: "New Business Deal 2026", close_date: "06/30/2026", stage: "Prospecting" }
+
+PRE-FLIGHT CHECK:
+  ANALYSIS A → Entity = Opportunity
+  ANALYSIS B → Create URL = /opportunities/new
+  ANALYSIS C → Required fields = Account (LOOKUP), Opportunity Name (TYPE), Close Date (TYPE), Stage (SELECT) — 4 fields
+  ANALYSIS D → Submit button = "Create Opportunity"
+  ANALYSIS E → My steps will have 4 field steps + 1 CLICK = COUNT_B = 4 ≥ COUNT_A = 4 ✓
+
+✅ CORRECT OUTPUT:
+  Step 1: { action: "NAVIGATE",  value: "/opportunities/new" }
+  Step 2: { action: "LOOKUP",    target: "Account",           value: "Acme Corp",             locator_type: "label" }
+  Step 3: { action: "TYPE",      target: "Opportunity Name",  value: "New Business Deal 2026", locator_type: "label" }
+  Step 4: { action: "TYPE",      target: "Close Date",        value: "06/30/2026",             locator_type: "label" }
+  Step 5: { action: "SELECT",    target: "Stage",             value: "Prospecting",            locator_type: "label" }
+  Step 6: { action: "CLICK",     target: "Create Opportunity",                                 locator_type: "role" }
+  Step 7: { action: "ASSERT_URL",value: "/opportunities" }
+
+❌ INVALID OUTPUTS (automatic rejection):
+  × { action: "CLICK", target: "Save" }                    ← "Save" is NOT the button name
+  × { action: "CLICK", target: "Create" }                   ← missing entity name
+  × missing Account LOOKUP step                              ← required field skipped = form will fail
+
+─────────────────────────────────────────────────────────────────
+EXAMPLE 2 — UPDATE specific field ("Update Contact Phone Number")
+─────────────────────────────────────────────────────────────────
+ENTITY ANALYSIS CARD from metadata:
+  🏷️ ENTITY: Contact
+  📄 PAGE URL (List): /contacts
+  📄 PAGE URL (Edit): /contacts/:id/edit
+  🔑 FIELD CATALOG (edit form):
+    🔥 REQUIRED INPUT   "Full Name"   locator_type: label  → sample: "Priya Sharma"
+    ✅ OPTIONAL INPUT   "Phone"       locator_type: label  → sample: "+91 98765 43210"
+    ✅ OPTIONAL INPUT   "Email"       locator_type: label  → sample: "priya@example.com"
+  ⚡ SUBMIT BUTTON: "Update Contact"  (locator_type: role)
+REAL ENTITY RECORDS: { name: "Priya Sharma", phone: "+91 98765 43210", email: "priya@example.com" }
+
+PRE-FLIGHT CHECK:
+  ANALYSIS A → Entity = Contact
+  ANALYSIS B → List URL = /contacts (navigate here to search)
+  ANALYSIS C → Focus field = Phone (the field the test asks to update)
+  ANALYSIS D → Submit button = "Update Contact"
+  ANALYSIS E → Search for real name, open record, type Phone value, click "Update Contact" ✓
+
+✅ CORRECT OUTPUT:
+  Step 1: { action: "NAVIGATE", value: "/contacts" }
+  Step 2: { action: "TYPE",     target: "searchbox",      value: "Priya Sharma",    locator_type: "role" }
+  Step 3: { action: "CLICK",    target: "Priya Sharma",                              locator_type: "text" }
+  Step 4: { action: "TYPE",     target: "Phone",           value: "+91 98765 43210", locator_type: "label" }
+  Step 5: { action: "CLICK",    target: "Update Contact",                            locator_type: "role" }
+  Step 6: { action: "ASSERT_URL",value: "/contacts" }
+
+❌ INVALID OUTPUTS:
+  × Step 4: { target: "Phone", value: "priya@example.com" }   ← email in Phone field (DATA TYPE ERROR)
+  × Step 5: { target: "Save" }                                  ← wrong button name
+  × Step 2: { target: "Phone", locator_type: "label" }         ← label locator on LIST page search (wrong)
+
+─────────────────────────────────────────────────────────────────
+EXAMPLE 3 — DELETE with confirmation dialog ("Delete Contact")
+─────────────────────────────────────────────────────────────────
+ENTITY ANALYSIS CARD from metadata:
+  🏷️ ENTITY: Contact
+  📄 PAGE URL (List): /contacts
+  🔑 BUTTONS:
+    ⚡ ACTION MENU BUTTON: "More"  (opens dropdown with secondary actions)
+    ⚡ SUBMENU ITEM:       "Delete"  [SUBMENU under "More" — click "More" first]
+    ⚡ CONFIRM BUTTON:     "Delete Contact"  (appears in confirmation dialog)
+REAL ENTITY RECORDS: { name: "Ravi Kumar" }
+
+PRE-FLIGHT CHECK:
+  ANALYSIS B → List URL = /contacts (search for record here)
+  ANALYSIS D → Confirmation button = "Delete Contact"
+  NOTE: Delete is a SUBMENU item — must click "More" first
+
+✅ CORRECT OUTPUT:
+  Step 1: { action: "NAVIGATE",   value: "/contacts" }
+  Step 2: { action: "TYPE",       target: "searchbox",    value: "Ravi Kumar",    locator_type: "role" }
+  Step 3: { action: "CLICK",      target: "Ravi Kumar",                           locator_type: "text" }
+  Step 4: { action: "CLICK",      target: "More",                                 locator_type: "role" }  ← MUST open menu first
+  Step 5: { action: "CLICK",      target: "Delete",                               locator_type: "text" }  ← menu item
+  Step 6: { action: "CLICK",      target: "Delete Contact",                       locator_type: "role" }  ← MANDATORY confirm dialog
+  Step 7: { action: "ASSERT_URL", value: "/contacts" }
+
+❌ INVALID OUTPUTS:
+  × Step 4: { target: "Delete" }  ← can't click Delete without opening "More" menu first
+  × missing Step 6               ← confirm dialog stays open, redirect never happens
+
+─────────────────────────────────────────────────────────────────
+EXAMPLE 4 — SEARCH / FILTER ("Search Contact By Name")
+─────────────────────────────────────────────────────────────────
+ENTITY ANALYSIS CARD from metadata:
+  🏷️ ENTITY: Contact
+  📄 PAGE URL (List): /contacts
+  🔑 LIST PAGE ELEMENTS:
+    🔍 SEARCH BOX: role=searchbox (placeholder: "Search contacts...")
+REAL ENTITY RECORDS: { name: "Anjali Menon", email: "anjali@company.com" }
+
+✅ CORRECT OUTPUT:
+  Step 1: { action: "NAVIGATE",     value: "/contacts" }
+  Step 2: { action: "TYPE",         target: "searchbox",    value: "Anjali Menon",  locator_type: "role" }
+  Step 3: { action: "ASSERT_TEXT",  target: ".results",     value: "Anjali Menon",  locator_type: "css" }
+
+❌ INVALID OUTPUTS:
+  × Step 2: { target: "Contact Name", locator_type: "label" }  ← label locator on LIST page (wrong)
+  × missing ASSERT_TEXT                                          ← search test must verify results
+
+=========================================================
+END FEW-SHOT EXAMPLES
+=========================================================
 
 ================================================================================
-🚨🚨🚨 END OF MANDATORY RULES BLOCK 🚨🚨🚨
+⚙️  GROUNDING RULES — READ ALL 8 RULES BEFORE GENERATING ANY STEP
+================================================================================
+
+RULE 1 — DEEP METADATA ANALYSIS FIRST (NON-NEGOTIABLE):
+  Before generating any step, you MUST complete the 5-step DEEP METADATA ANALYSIS
+  PHASE defined above. The ENTITY ANALYSIS CARD at the top of APPLICATION METADATA
+  gives you the exact URL, fields, and button name to use.
+  ❌ NEVER skip this analysis. ❌ NEVER guess fields or URLs without checking the card.
+
+RULE 2 — REQUIRED FIELDS ARE ABSOLUTE:
+  Any field tagged 🔥 REQUIRED in the ENTITY ANALYSIS CARD MUST have a step.
+  This applies to ALL types — input, select, lookup, checkbox.
+  ❌ NEVER skip a required field. The form WILL reject the submission without it.
+  ❌ ANY output missing a required field is INVALID and will be rejected.
+
+RULE 3 — LOOKUP FIELDS USE LOOKUP ACTION (zero exceptions):
+  Any field referencing another entity (Account, Contact, Owner, Parent, etc.)
+  that is tagged REQUIRED MUST use action: "LOOKUP" — NOT action: "TYPE".
+  Use a real value from REAL ENTITY RECORDS or a plausible name like "Acme Corp".
+  ❌ NEVER skip a required lookup field.
+  ❌ NEVER use TYPE instead of LOOKUP for a lookup/reference field.
+
+RULE 4 — BUTTON NAME MUST BE EXACT (ZERO TOLERANCE):
+  The submit button name is in the ENTITY ANALYSIS CARD as ⚡ SUBMIT BUTTON: "...".
+  Copy that name CHARACTER-FOR-CHARACTER. Treat it as a locked string.
+  ✅ If card shows "Create Opportunity" → target MUST BE exactly "Create Opportunity"
+  ✅ If card shows "Update Contact" → target MUST BE exactly "Update Contact"
+  ✅ If card shows "Save Changes" → target MUST BE exactly "Save Changes"
+  ❌ NEVER use "Save", "Submit", "OK", "Update", or ANY other assumed name.
+  ❌ NEVER combine entity name with test data (e.g. "Create Tara" = WRONG, "Create Opportunity" = RIGHT).
+  ❌ For UPDATE tests: the edit form button is ALWAYS different from the create button. Read it from metadata.
+
+RULE 5 — REAL TEST DATA IS MANDATORY:
+  Use values from REAL ENTITY RECORDS for all TYPE/SELECT/LOOKUP/CHECKBOX steps.
+  ❌ NEVER use placeholders like "Test Contact", "John Doe", "test@example.com".
+  ❌ NEVER invent record names. Use ACTUAL values from the REAL ENTITY RECORDS section.
+  ✅ When real data is available for a field, ALWAYS use it over any invented value.
+
+RULE 6 — SEMANTIC DATA TYPE ALIGNMENT:
+  Each field value MUST match the field's expected data type.
+  • Phone / Mobile → phone number (digits, spaces, dashes, + country code)
+  • Email → email address (contains @ and a domain suffix)
+  • Name / Title → person or company name string
+  • Date fields → MM/DD/YYYY format
+  • Amount / Price → numeric digits only
+  ❌ NEVER put an email address into a Phone field.
+  ❌ NEVER put a phone number into an Email field.
+  ❌ NEVER put a name into an Amount or Date field.
+
+RULE 7 — SEARCH STEP LOCATOR ON LIST PAGES:
+  When an UPDATE or DELETE test searches for a record on the list page:
+  ✅ Use:  { action: "TYPE", target: "searchbox", locator_type: "role" }
+  ✅ Or:   { action: "TYPE", target: "Search...", locator_type: "placeholder" }
+  ❌ NEVER use a form field label ("Name", "Phone", "Company") for the list-page search step.
+  ❌ NEVER use locator_type: "label" for the list-page search step.
+
+RULE 8 — URL MUST EXACTLY MATCH METADATA:
+  Use ONLY URLs that appear in the ENTITY ANALYSIS CARD under 📄 PAGE URL.
+  ❌ NEVER invent a URL. ❌ NEVER shorten /admin/contacts to /contacts.
+  ❌ NEVER append /new or /create to a URL unless the metadata shows that suffix.
+  ❌ NEVER guess a URL by combining an entity name with a path pattern (e.g. NEVER write /invoices/custom-fields just because entity is "Invoice Custom Fields").
+  ⚠ IF the ENTITY ANALYSIS CARD shows "⚠ UNKNOWN" for the page URL:
+    → DO NOT generate a NAVIGATE step with an invented path.
+    → Instead, generate a NAVIGATE step to "/" (app root) and add a CLICK step on the sidebar/navigation link for the entity.
+    → Example when URL is unknown: { action: "NAVIGATE", value: "/" } then { action: "CLICK", target: "Terms and Conditions", locator_type: "text" }
+
+================================================================================
+🚨🚨🚨 END OF GROUNDING RULES BLOCK 🚨🚨🚨
 ================================================================================
 
 You are an expert QA Automation Engineer specialized in Playwright test automation for modern web applications.
@@ -499,7 +683,9 @@ STEP A — Identify PRIMARY ENTITY from the test case name (e.g. "Opportunity", 
 STEP B — Find the MANDATORY CHECKLIST in the APPLICATION METADATA block below.
           The checklist shows every required field with 🔥 REQUIRED LOOKUP or [REQUIRED] tags.
 STEP C — Count how many required fields are in the checklist. Your steps MUST cover all of them.
-STEP D — Note the [SUBMIT BUTTON] name. Copy it EXACTLY into the CLICK step.
+STEP D — Find the ⚡ BUTTON NAME in the APPLICATION METADATA. Copy it EXACTLY into the CLICK step.
+          For UPDATE tests: look for ⚡ BUTTON NAME with "Update" or "Save Changes" pattern.
+          For CREATE tests: look for ⚡ BUTTON NAME with "Create" or "Add" pattern.
 STEP E — Write the steps array only after steps A–D are complete.
 
 -------------------------
@@ -523,7 +709,11 @@ The test prompt determines which action type you must perform. Read it carefully
   ⛔ WRONG: DO NOT fill a create form for a search test
 
 • If prompt contains UPDATE / EDIT / MODIFY / CHANGE  →  TEST TYPE = UPDATE
-  ✅ Correct flow: find existing record → open edit form → change field → save
+  ✅ Correct flow: NAVIGATE to list page → find REAL record from REAL ENTITY RECORDS → open it → edit fields → CLICK exact ⚡ BUTTON NAME → ASSERT_URL
+  ⛔ CRITICAL: The update/edit form has a SPECIFIC button name (e.g. "Update Contact", "Save Changes").
+              You MUST use the EXACT button name from the ⚡ BUTTON NAME in APPLICATION METADATA.
+              NEVER use "Save", "Submit", or "Update" alone — always the full exact name.
+  ⛔ WRONG: DO NOT use generic button names like "Save" or "Submit" for UPDATE tests.
 
 • If prompt contains DELETE / REMOVE / ARCHIVE  →  TEST TYPE = DELETE
   ✅ Correct flow: find existing record → delete it → assert it is gone
@@ -553,6 +743,23 @@ MANDATORY FIELD RULES
    - NEVER generate a step for a field that is NOT EXPLICITLY LISTED in the metadata.
    - If the user's prompt names a field that doesn't exist (e.g. "First Name" and "Last Name"), but the metadata has a combined field (e.g. "Account Name"), you MUST adapt to the metadata. Do NOT invent "First Name" or "Last Name" fields.
    - NEVER split one logical value across multiple hallucinated fields. Always use the EXACT locator string provided in the metadata.
+6. FIELD-TO-VALUE SEMANTIC MAPPING (prevents cross-type data errors):
+   - Phone / Mobile fields   → MUST receive a phone number (digits, spaces, dashes, +code)
+   - Email fields            → MUST receive an email address (contains @ and a domain)
+   - Name / Title fields     → MUST receive a person or company name string
+   - Date fields             → MUST receive MM/DD/YYYY format
+   - Amount / Numeric fields → MUST receive digits only
+   ❌ NEVER put an email address into a Phone field
+   ❌ NEVER put a phone number into an Email field
+   ❌ NEVER put a name into an Amount or Date field
+   ✅ Match the DATA TYPE of the value to the DATA TYPE of the field — always
+7. PLACEHOLDER TEXT PROHIBITION (absolute rule):
+   ❌ NEVER output literal instruction text as a step value, such as:
+      - "real contact name from REAL ENTITY RECORDS"
+      - "first real record"
+      - "<search term>" or "[contact name]"
+      These are INSTRUCTIONS TO YOU — replace them with the ACTUAL value from the data.
+   ✅ If the REAL ENTITY RECORDS section contains a name like "Priya Sharma", use "Priya Sharma" — not a description of where to find it.
 -------------------------
 FIELD ACTION MAPPING
 -------------------------
@@ -626,6 +833,26 @@ LOCATOR PRIORITY (MUST FOLLOW)
 3. placeholder— getByPlaceholder('Search...')→ for search boxes
 4. text       — getByText('Create Account')  → for visible text
 5. css        — FALLBACK ONLY for toast/structural elements
+
+-------------------------
+SEARCH STEP LOCATOR RULES (UPDATE/DELETE tests)
+-------------------------
+When an UPDATE or DELETE test searches for a record on the list page, the search input MUST use:
+  locator_type: "role"         → target: "searchbox"         (preferred — works for aria searchbox role)
+  OR
+  locator_type: "placeholder"  → target: "Search..."          (use the actual placeholder text from metadata)
+
+❌ NEVER use a form-field label like "TITLE", "Name", "Company", "First Name" as the TYPE target for the search step.
+   Those labels exist on the EDIT FORM, not on the list page search bar.
+❌ NEVER use locator_type: "label" for the list-page search step.
+
+The correct UPDATE search step JSON is:
+  { "action": "TYPE", "target": "searchbox", "value": "<actual contact name>", "locator_type": "role" }
+  OR if the page metadata shows a placeholder:
+  { "action": "TYPE", "target": "Search contacts...", "value": "<actual contact name>", "locator_type": "placeholder" }
+
+After the search TYPE step, click on the matching row/link:
+  { "action": "CLICK", "target": "<actual contact name>", "locator_type": "text" }
 
 -------------------------
 STEP FORMAT (STRICT)
@@ -955,22 +1182,42 @@ function filterChunksByObjects(chunks: string[], targetObjs: string[], isWebApp 
   // Instead filter by path segment (e.g. 'accounts' matches '/accounts/new').
   if (isWebApp) {
     const targetLowers = targetObjs.map(t => t.toLowerCase())
-    // Try path-based filter first
+
+    // Build tokenized representations for compound entity names
+    // e.g. "Invoice Custom Fields" → tokens: ['invoice', 'custom', 'fields']
+    //      slug: 'invoice-custom-fields' or 'invoicecustomfields'
+    const targetTokenSets = targetLowers.map(t => {
+      const tokens = t.split(/[\s_-]+/).filter(Boolean)
+      const slug   = tokens.join('-')
+      const noslug = tokens.join('')
+      return { original: t, tokens, slug, noslug }
+    })
+
     const pathMatched = chunks.filter(c => {
       const lower = c.toLowerCase()
-      return targetLowers.some(t =>
-        lower.includes(`/ ${t}`) ||
-        lower.includes(`/${t}/`) ||
-        lower.includes(`/${t}\n`) ||
-        lower.includes(`/${t} `) ||
-        // Also match "page: /accounts" patterns
-        lower.match(new RegExp(`(?:page:|path:)\\s*/${t}`, 'i'))
-      )
+      return targetTokenSets.some(({ original, tokens, slug, noslug }) => {
+        // Single-word: exact path segment matching
+        if (tokens.length === 1) {
+          return (
+            lower.includes(`/ ${original}`) ||
+            lower.includes(`/${original}/`) ||
+            lower.includes(`/${original}\n`) ||
+            lower.includes(`/${original} `) ||
+            !!lower.match(new RegExp(`(?:page:|path:)\\s*/${original}`, 'i'))
+          )
+        }
+        // Multi-word: match hyphenated slug, no-separator slug, OR ordered tokens in path
+        const slugMatch  = lower.includes(`/${slug}/`) || lower.includes(`/${slug}\n`) || lower.includes(`/${slug} `) || lower.includes(`/${slug}`)
+        const nosepMatch = lower.includes(`/${noslug}/`) || lower.includes(`/${noslug}`)
+        if (slugMatch || nosepMatch) return true
+        // Token-sequence: check if the path contains all tokens in sequence (possibly with separators)
+        const tokenPattern = new RegExp(tokens.map(tok => tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[/_-]'), 'i')
+        return tokenPattern.test(lower)
+      })
     })
+
     // Return ONLY the matched chunks — if none match, return empty so the
     // LLM falls back to the standard prompt rather than using unrelated pages.
-    // (Previously returned ALL chunks, causing e.g. Roles pages to appear
-    //  in Account test generation.)
     return pathMatched
   }
 
@@ -1010,10 +1257,33 @@ function filterChunksByObjects(chunks: string[], targetObjs: string[], isWebApp 
 
 function extractTargetObjects(prompt: string): string[] {
   const lower = prompt.toLowerCase()
-  const skipWords = new Set(['record', 'entry', 'form', 'item', 'test', 'case', 'step', 'the', 'a', 'an', 'new', 'with', 'for', 'to', 'and', 'convert'])
+  const skipWords = new Set(['record', 'entry', 'form', 'item', 'test', 'case', 'step', 'the', 'a', 'an', 'new', 'with', 'for', 'to', 'and', 'convert',
+    'create', 'update', 'edit', 'delete', 'view', 'add', 'successfully', 'success', 'details', 'detail'])
   
-  const targets = new Set<string>();
+  const targets = new Set<string>()
 
+  // ── Phase 1: Multi-word compound entity extraction (highest priority) ───────
+  // Matches 2-4 consecutive non-stop words after a verb or before an action word.
+  // This handles entities like "Terms and Conditions", "Invoice Custom Fields",
+  // "Credit Notes", etc., which are compound noun phrases.
+  const COMPOUND_AFTER_VERB = /\b(?:create|update|edit|delete|view|add|manage)\s+(?:a\s+|an\s+|new\s+)?([A-Z][a-zA-Z]+(?:\s+(?:and\s+|&\s+)?[A-Z][a-zA-Z]+){1,3})\b/g
+  const COMPOUND_BEFORE_ACTION = /\b([A-Z][a-zA-Z]+(?:\s+(?:and\s+|&\s+)?[A-Z][a-zA-Z]+){1,3})\s+(?:successfully|details?|list|management|page|form)\b/g
+
+  for (const pattern of [COMPOUND_AFTER_VERB, COMPOUND_BEFORE_ACTION]) {
+    for (const match of prompt.matchAll(pattern)) {
+      const phrase = match[1]?.trim()
+      if (phrase && phrase.split(/\s+/).length >= 2) {
+        // Add the FULL phrase AND each word as individual targets
+        targets.add(phrase)
+        for (const word of phrase.split(/\s+/)) {
+          const w = word.toLowerCase().replace(/[^a-z]/g, '')
+          if (w.length > 2 && !skipWords.has(w)) targets.add(w.charAt(0).toUpperCase() + w.slice(1))
+        }
+      }
+    }
+  }
+
+  // ── Phase 2: Standard single-word extraction patterns ────────────────────────
   const patterns = [
     /\b(?:create|add|convert)\b\s+(?:a\s+)?(?:new\s+)?(\w[\w\s]*?)(?:\s+record|\s+for|\s+with|\s+to|\s*$)/g,
     /\bnew\s+(\w+)(?:\s+(\w+))?/g,
@@ -1024,32 +1294,36 @@ function extractTargetObjects(prompt: string): string[] {
     for (const match of lower.matchAll(pattern)) {
       const word = match[1]?.trim()
       if (word && !skipWords.has(word)) {
-        targets.add(word);
+        targets.add(word)
       }
     }
   }
 
-  // Common Salesforce objects that might be mentioned explicitly
-  const standardObjects = ['lead', 'account', 'contact', 'opportunity', 'case', 'task', 'event', 'campaign', 'quote', 'contract', 'order'];
+  // ── Phase 3: Common Salesforce objects ───────────────────────────────────────
+  const standardObjects = ['lead', 'account', 'contact', 'opportunity', 'case', 'task', 'event', 'campaign', 'quote', 'contract', 'order']
   for (const obj of standardObjects) {
-    const regex = new RegExp(`\\b${obj}\\b`, 'i');
+    const regex = new RegExp(`\\b${obj}\\b`, 'i')
     if (regex.test(lower)) {
-      targets.add(obj.charAt(0).toUpperCase() + obj.slice(1));
+      targets.add(obj.charAt(0).toUpperCase() + obj.slice(1))
     }
   }
 
-  // Any custom object mentioned (ends with __c)
-  const customObjRegex = /\b(\w+__c)\b/gi;
+  // ── Phase 4: Custom objects ending in __c ────────────────────────────────────
+  const customObjRegex = /\b(\w+__c)\b/gi
   for (const match of lower.matchAll(customObjRegex)) {
-    if (match[1]) targets.add(match[1]);
+    if (match[1]) targets.add(match[1])
   }
 
+  // ── Phase 5: Format and deduplicate ──────────────────────────────────────────
   const formattedTargets = Array.from(targets).map(t => {
-    if (t.toLowerCase().endsWith('__c')) return t; // preserve casing
-    return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase(); // TitleCase
-  });
+    if (t.toLowerCase().endsWith('__c')) return t  // preserve __c casing
+    // Multi-word phrases: TitleCase each word
+    if (t.includes(' ')) return t.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ')
+    return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()
+  })
 
-  return Array.from(new Set(formattedTargets));
+  // Sort: longer (more specific) phrases first so they get priority in matching
+  return Array.from(new Set(formattedTargets)).sort((a, b) => b.length - a.length)
 }
 
 // ── Resolve object API name with __c suffix fallback ─────────────────
@@ -1458,19 +1732,86 @@ type TestIntent = 'create' | 'search' | 'update' | 'delete' | 'verify' | 'genera
 
 function classifyTestIntent(prompt: string): TestIntent {
   const p = prompt.toLowerCase()
-  if (/\b(create|add|new|insert|register|submit)\b/.test(p)) return 'create'
-  if (/\b(delete|remove|archive|deactivate)\b/.test(p))      return 'delete'
-  if (/\b(update|edit|modify|change|set)\b/.test(p))         return 'update'
+  // DELETE must be checked BEFORE UPDATE — "delete" tests contain "delete" not "update"
+  if (/\b(delete|remove|archive|deactivate)\b/.test(p))         return 'delete'
+  if (/\b(create|add|new|insert|register|submit)\b/.test(p))    return 'create'
+  if (/\b(update|edit|modify|change|set)\b/.test(p))            return 'update'
   if (/\b(search|filter|find|look.?up|query|browse)\b/.test(p)) return 'search'
   if (/\b(verify|assert|check|validate|confirm|view)\b/.test(p)) return 'verify'
   return 'general'
+}
+
+// ─── Focus Field Extraction ───────────────────────────────────────────────────
+//
+// Parses an UPDATE/EDIT prompt for the specific field being modified.
+// Examples:
+//   "Update Contact Phone Number"    → { label: "Phone",   semanticType: "phone" }
+//   "Edit Lead Email Address"        → { label: "Email",   semanticType: "email" }
+//   "Modify Opportunity Close Date"  → { label: "Close Date", semanticType: "date" }
+//   "Update Account Name"            → { label: "Name",    semanticType: "name" }
+//
+// Returns null when no specific field is detected (general update).
+
+interface FocusField {
+  label:        string   // e.g. "Phone Number" → "Phone"
+  semanticType: 'phone' | 'email' | 'name' | 'date' | 'number' | 'address' | 'text'
+  dataRule:     string   // human-readable rule injected into the prompt
+}
+
+function extractFocusField(prompt: string): FocusField | null {
+  const p = prompt.toLowerCase()
+
+  const FIELD_PATTERNS: Array<{ pattern: RegExp; label: string; semanticType: FocusField['semanticType']; dataRule: string }> = [
+    {
+      pattern: /\b(phone|mobile|cell|telephone|contact number|phone number|mobile number)\b/,
+      label: 'Phone', semanticType: 'phone',
+      dataRule: 'The Phone field MUST receive a PHONE NUMBER value (digits, spaces, dashes, +country code). NEVER put an email address or name into the Phone field.',
+    },
+    {
+      pattern: /\b(email|e-mail|email address|mail)\b/,
+      label: 'Email', semanticType: 'email',
+      dataRule: 'The Email field MUST receive an EMAIL ADDRESS value (contains @ and a domain). NEVER put a phone number or name into the Email field.',
+    },
+    {
+      pattern: /\b(close date|due date|start date|end date|date of birth|birth date|expiry date|deadline)\b/,
+      label: 'Close Date', semanticType: 'date',
+      dataRule: 'The Date field MUST receive a DATE value in MM/DD/YYYY format. NEVER put a name or phone number into a date field.',
+    },
+    {
+      pattern: /\b(account name|contact name|company name|full name|first name|last name|lead name|opportunity name)\b/,
+      label: 'Name', semanticType: 'name',
+      dataRule: 'The Name field MUST receive a PERSON or COMPANY NAME. NEVER put an email or phone number into the Name field.',
+    },
+    {
+      pattern: /\b(address|street|city|state|zip|postal|country)\b/,
+      label: 'Address', semanticType: 'address',
+      dataRule: 'The Address field MUST receive an ADDRESS value. NEVER put a phone number or email into an address field.',
+    },
+    {
+      pattern: /\b(amount|price|cost|revenue|budget|salary|value)\b/,
+      label: 'Amount', semanticType: 'number',
+      dataRule: 'The Amount field MUST receive a NUMERIC value (digits only, no letters). NEVER put a name or date into a numeric field.',
+    },
+    {
+      pattern: /\b(website|url|link|homepage)\b/,
+      label: 'Website', semanticType: 'text',
+      dataRule: 'The Website field MUST receive a URL value (starts with http:// or https://). NEVER put a phone number or email into a URL field.',
+    },
+  ]
+
+  for (const fp of FIELD_PATTERNS) {
+    if (fp.pattern.test(p)) {
+      return { label: fp.label, semanticType: fp.semanticType, dataRule: fp.dataRule }
+    }
+  }
+  return null
 }
 
 /**
  * Returns step-by-step LLM instructions tailored to what the test is doing.
  * These are injected into the {test_intent_instructions} placeholder.
  */
-function buildIntentInstructions(intent: TestIntent): string {
+function buildIntentInstructions(intent: TestIntent, prompt = ''): string {
   switch (intent) {
 
     case 'create':
@@ -1550,31 +1891,113 @@ Step-by-step approach:
 
 CRITICAL: Use values from REAL ENTITY RECORDS — these are actual values stored in the application.`
 
-    case 'update':
+    case 'update': {
+      const focusField = extractFocusField(prompt)
+      const focusBlock = focusField ? `
+🎯 FOCUS FIELD ANALYSIS — THIS IS WHAT THE TEST WANTS TO UPDATE:
+  Target field:  "${focusField.label}"
+  Data type:     ${focusField.semanticType.toUpperCase()}
+  Mapping rule:  ${focusField.dataRule}
+
+  ⚠ HOW TO USE REAL ENTITY RECORDS FOR THIS FIELD:
+  Look at the REAL ENTITY RECORDS section below.
+  Find the value whose DATA TYPE is ${focusField.semanticType.toUpperCase()} — that is the value to put into the "${focusField.label}" field.
+  ❌ DO NOT use placeholder text like 'real contact name from REAL ENTITY RECORDS' — use the ACTUAL value.
+  ❌ DO NOT put an email address into the Phone field or vice versa.
+  ✅ The search/name field uses the ⭐ PRIMARY_IDENTIFIER value from the records.
+  ✅ The "${focusField.label}" field uses the ${focusField.semanticType.toUpperCase()}-type value from the records.
+` : `
+🎯 FOCUS FIELD: No specific field detected — update the field(s) mentioned in the test name.
+  Use the matching DATA TYPE value from REAL ENTITY RECORDS for each field.
+`
+
       return `TEST TYPE: UPDATE / EDIT (modifying an existing record)
+${focusBlock}
+🚨 SEARCH STEP LOCATOR RULE 🚨
+The search input on the LIST PAGE uses a SEARCHBOX role or placeholder, NOT a form field label.
+Step 2 (the search/find step) MUST follow this exact format:
+  { "action": "TYPE", "target": "searchbox", "value": "<ACTUAL_NAME_FROM_REAL_RECORDS>", "locator_type": "role" }
+  ❌ target MUST NOT be: "TITLE", "Name", "Company", "First Name", or any form field label
+  ❌ locator_type MUST NOT be: "label" for the search step
+  ✅ Use the ⭐ PRIMARY_IDENTIFIER value (person/company name) from REAL ENTITY RECORDS as the value
 
-Step-by-step approach:
-1. NAVIGATE to the entity's list page or search for a specific record
-2. Find the FIRST REAL RECORD from REAL ENTITY RECORDS — search or navigate to it
-3. CLICK the Edit button
-4. Modify the field(s) mentioned in the test prompt using TYPE/SELECT
-5. CLICK Save/Update
-6. ASSERT_TEXT or ASSERT_URL to confirm the update succeeded
+Step 3 (click to open the record) format:
+  { "action": "CLICK", "target": "<ACTUAL_NAME_FROM_REAL_RECORDS>", "locator_type": "text" }
 
-CRITICAL: Always edit a REAL EXISTING RECORD — use the name/ID from REAL ENTITY RECORDS.
-Never navigate to a made-up record path.`
+🚨 BUTTON NAME CRITICAL RULE 🚨
+The submit button for update forms has a SPECIFIC name — it is NEVER generic "Save".
+Look for the ⚡ BUTTON NAME in the APPLICATION METADATA.
+Copy the button name EXACTLY — character for character.
+  ✅ CORRECT: "Update Contact"    (if metadata shows ⚡ BUTTON NAME: "Update Contact")
+  ✅ CORRECT: "Save Changes"       (if metadata shows ⚡ BUTTON NAME: "Save Changes")
+  ❌ NEVER use: "Save", "Submit", "Create Contact", "OK" or ANY generic/wrong-action name
+  ❌ The button CANNOT be a CREATE button for an UPDATE test
 
-    case 'delete':
+🚨 PLACEHOLDER TEXT RULE 🚨
+NEVER output literal text like:
+  ❌ 'real contact name from REAL ENTITY RECORDS'
+  ❌ '<search term>'
+  ❌ '[contact name]'
+These are INSTRUCTIONS TO YOU, not values to use. Replace them with the ACTUAL value from the records.
+
+Step-by-step:
+  Step 1: { action: "NAVIGATE", value: "/<entity-list-path>" }
+  Step 2: { action: "TYPE", target: "searchbox", value: "<⭐ PRIMARY_IDENTIFIER from records>", locator_type: "role" }
+  Step 3: { action: "CLICK", target: "<⭐ PRIMARY_IDENTIFIER from records>", locator_type: "text" }
+  Step 4: { action: "TYPE", target: "${focusField?.label ?? '<field label from metadata>'}", value: "<${focusField?.semanticType?.toUpperCase() ?? 'appropriate'}-type value from records>", locator_type: "label" }
+  Step 5: { action: "CLICK", target: "<⚡ BUTTON NAME from metadata>", locator_type: "role" }
+  Step 6: { action: "ASSERT_URL", value: "/<entity-list-path>" }
+
+CRITICAL: The ⭐ PRIMARY_IDENTIFIER is the NAME of the record (person name, company name, lead name).
+It is shown in REAL ENTITY RECORDS below with the label ⭐ PRIMARY_IDENTIFIER.
+Use that EXACT string as the value in Step 2 and the target in Step 3.`
+    }
+
+    case 'delete': {
+      // Extract entity name from the prompt for confirmation button
+      const delEntityMatch = prompt.match(/\b(delete|remove|archive)\s+(?:a\s+|an\s+|the\s+)?([a-z]+)/i)
+      const delEntity = delEntityMatch ? delEntityMatch[2].charAt(0).toUpperCase() + delEntityMatch[2].slice(1).toLowerCase() : 'Record'
+      const confirmBtnLabel = `Delete ${delEntity}`  // e.g. "Delete Contact"
+
       return `TEST TYPE: DELETE (removing an existing record)
 
-Step-by-step approach:
-1. NAVIGATE to the entity's list page (e.g. /accounts)
-2. Find the FIRST REAL RECORD from REAL ENTITY RECORDS — search for it by name
-3. Select or open the record
-4. CLICK the Delete/Remove button (confirm in any dialog)
-5. ASSERT_TEXT to confirm the record no longer appears (e.g. the deleted name is absent from the list)
+🚨 ENTITY FOR THIS DELETE TEST: ${delEntity}
+🚨 CONFIRMATION BUTTON NAME: "${confirmBtnLabel}" — COPY THIS EXACTLY in Step 6.
+
+🚨 SEARCH STEP LOCATOR RULE 🚨
+The search input on the LIST PAGE uses a SEARCHBOX role or placeholder, NOT a form field label.
+Step 2 (the search step) MUST follow this exact format:
+  { "action": "TYPE", "target": "searchbox", "value": "<⭐ PRIMARY_IDENTIFIER from records>", "locator_type": "role" }
+  ❌ target MUST NOT be: "Name", "TITLE", "Company", "First Name" or any form field label
+  ✅ Use the ⭐ PRIMARY_IDENTIFIER value (actual person/company name) from REAL ENTITY RECORDS as the value
+
+🚨 DELETE ACTION FLOW — MANDATORY 7-STEP SEQUENCE 🚨
+
+  Step 1: { "action": "NAVIGATE",  "value": "/<entity-list-path>" }
+  Step 2: { "action": "TYPE",      "target": "searchbox",                   "value": "<⭐ PRIMARY_IDENTIFIER>",  "locator_type": "role" }
+  Step 3: { "action": "CLICK",     "target": "<⭐ PRIMARY_IDENTIFIER>",                                          "locator_type": "text" }
+  Step 4: { "action": "CLICK",     "target": "<action menu button>",                                             "locator_type": "role" }  ← open "More"/"Actions" menu
+  Step 5: { "action": "CLICK",     "target": "Delete",                                                           "locator_type": "text" }  ← click Delete from menu
+  Step 6: { "action": "CLICK",     "target": "${confirmBtnLabel}",                                               "locator_type": "role" }  ← MANDATORY confirm dialog button
+  Step 7: { "action": "ASSERT_URL","value": "/<entity-list-path>" }
+
+⚠️ ACTION MENU RULE:
+  Look in APPLICATION METADATA for a button named "More", "More actions", "Actions", or "Options".
+  That is the action menu trigger. Use its EXACT name in Step 4.
+  If metadata shows ⚡ BUTTON NAME: "More" → use target: "More", locator_type: "role"
+  If metadata shows ⚡ BUTTON NAME: "Actions" → use target: "Actions", locator_type: "role"
+  If no action menu button is found in metadata, use: target: "More", locator_type: "role"
+
+⚠️ CONFIRMATION DIALOG RULE (MOST CRITICAL):
+  After clicking "Delete" from the menu, a CONFIRMATION DIALOG ALWAYS appears.
+  The confirm button is ALWAYS named "${confirmBtnLabel}" (Delete + EntityType).
+  ❌ DO NOT skip Step 6 — without it the dialog stays open and ASSERT_URL fails.
+  ❌ DO NOT use "Confirm", "Yes", or "OK" as the confirm button — use "${confirmBtnLabel}".
+  ❌ DO NOT use a plain "Delete" button as Step 6 — that is Step 5 (the menu item).
+  ✅ Step 6 MUST be: { "action": "CLICK", "target": "${confirmBtnLabel}", "locator_type": "role" }
 
 CRITICAL: Only delete records that appear in REAL ENTITY RECORDS — never invent record names.`
+    }
 
     default:
       return `TEST TYPE: GENERAL
@@ -1750,13 +2173,24 @@ function validateFieldValueAlignment(steps: Step[]): Step[] {
   const DATE_FIELDS = /\b(date|close date|start date|end date|due date|created|modified|birth|expiry|deadline|service provided|from|till)\b/i
   const STAGE_STATUS_FIELDS = /^(stage|status|state|phase|type|category|priority|level|rating|grade|result)$/i
   const NAME_LOOKUP_FIELDS = /\b(account|contact|customer|company|name|owner|manager|assigned|parent|opportunity|lead|partner|vendor|supplier|bill to|pay to|signed by)\b/i
+  // ── NEW: phone and email field classifiers ──
+  const PHONE_FIELDS = /\b(phone|mobile|cell|tel|telephone|fax|contact number)\b/i
+  const EMAIL_FIELDS = /\b(email|e-mail|mail)\b/i
+
+  type FieldType = 'numeric' | 'date' | 'stage' | 'name' | 'phone' | 'email' | 'unknown'
 
   const isNumericValue = (v: string) => /^[\d,]+\.?\d*$/.test(v.replace(/[\s$€£¥₹%]/g, ''))
   const isDateValue = (v: string) => /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(v) || /^\d{4}-\d{2}-\d{2}/.test(v)
   const isStageValue = (v: string) => /^[A-Z][A-Z_]+$/.test(v) || /^(open|closed|won|lost|new|pending|active|inactive|qualified|converted|prospecting|negotiation|proposal)/i.test(v)
+  // ── NEW: phone and email value detectors ──
+  const isPhoneValue = (v: string) => /^[+\d][\d\s\-().]{6,}$/.test(v.trim())
+  const isEmailValue = (v: string) => /@/.test(v) && /\.[a-z]{2,}$/i.test(v.trim())
 
-  function classifyFieldType(name: string): 'numeric' | 'date' | 'stage' | 'name' | 'unknown' {
+  function classifyFieldType(name: string): FieldType {
     const clean = name.replace(/[^a-zA-Z\s]/g, '').trim()
+    // Check phone/email BEFORE name — "Contact Number" should be phone, not name
+    if (PHONE_FIELDS.test(clean)) return 'phone'
+    if (EMAIL_FIELDS.test(clean)) return 'email'
     if (NUMERIC_FIELDS.test(clean)) return 'numeric'
     if (DATE_FIELDS.test(clean)) return 'date'
     if (STAGE_STATUS_FIELDS.test(clean)) return 'stage'
@@ -1764,7 +2198,10 @@ function validateFieldValueAlignment(steps: Step[]): Step[] {
     return 'unknown'
   }
 
-  function classifyValueType(value: string): 'numeric' | 'date' | 'stage' | 'name' | 'unknown' {
+  function classifyValueType(value: string): FieldType {
+    // Check email BEFORE phone — emails can start with digits
+    if (isEmailValue(value)) return 'email'
+    if (isPhoneValue(value)) return 'phone'
     if (isNumericValue(value)) return 'numeric'
     if (isDateValue(value)) return 'date'
     if (isStageValue(value)) return 'stage'
@@ -1777,8 +2214,8 @@ function validateFieldValueAlignment(steps: Step[]): Step[] {
     stepIndex: number
     fieldName: string
     currentValue: string
-    expectedType: 'numeric' | 'date' | 'stage' | 'name' | 'unknown'
-    actualType: 'numeric' | 'date' | 'stage' | 'name' | 'unknown'
+    expectedType: FieldType
+    actualType: FieldType
   }
 
   const mismatches: MismatchInfo[] = []
@@ -1825,15 +2262,43 @@ function validateFieldValueAlignment(steps: Step[]): Step[] {
     }
   }
 
-  // Strategy 2: Generate sensible defaults for remaining mismatches
+  // Strategy 2: Look for a matching value already present in another step
+  // e.g. if the email value "x@y.com" is in the Phone step, but a phone value "+91..."
+  // is sitting in the Email step — swap them even if only one side was flagged.
+  for (const m of mismatches) {
+    if (swapped.has(m.stepIndex)) continue
+    // Scan all TYPE/SELECT steps for a value that matches the expected type
+    for (let j = 0; j < steps.length; j++) {
+      if (j === m.stepIndex || swapped.has(j)) continue
+      const otherAction = (steps[j].action ?? '').toUpperCase()
+      if (otherAction !== 'TYPE' && otherAction !== 'SELECT') continue
+      const otherVal = String(steps[j].value ?? '')
+      if (!otherVal) continue
+      const otherValType = classifyValueType(otherVal)
+      const otherFieldType = classifyFieldType(String(steps[j].target ?? ''))
+      // If the other step has the value type we need AND its field expects our value type → swap
+      if (otherValType === m.expectedType && otherFieldType === m.actualType) {
+        log.info(`[GEN] Cross-fix swap: "${m.fieldName}" ↔ "${steps[j].target}" ("${m.currentValue}" ↔ "${otherVal}")`)
+        const temp = steps[m.stepIndex].value
+        steps[m.stepIndex].value = steps[j].value
+        steps[j].value = temp
+        swapped.add(m.stepIndex)
+        swapped.add(j)
+        break
+      }
+    }
+  }
+
+  // Strategy 3: Generate sensible defaults for remaining mismatches
   const DEFAULTS: Record<string, string> = {
     numeric: '50000', date: '06/30/2026', stage: 'Prospecting', name: 'Test Record',
+    phone: '+1 555-0100', email: 'test@example.com',
   }
   for (const m of mismatches) {
     if (swapped.has(m.stepIndex)) continue
     const defaultVal = DEFAULTS[m.expectedType]
     if (defaultVal) {
-      log.info(`[GEN] Replacing mismatched "${m.fieldName}": "${m.currentValue}" → "${defaultVal}"`)
+      log.info(`[GEN] Replacing mismatched "${m.fieldName}": "${m.currentValue}" → "${defaultVal}" (expected ${m.expectedType}, got ${m.actualType})`)
       steps[m.stepIndex].value = defaultVal
     }
   }
@@ -1929,13 +2394,64 @@ function buildTestDataContextWithIntent(
       }
 
     } else if (intent === 'update' || intent === 'delete') {
-      // For UPDATE/DELETE: show full first record to identify the target
-      lines.push('  Target record to find and act on:')
+      // For UPDATE/DELETE: emit type-annotated records so the LLM knows which value goes
+      // into which field type. Prevents email-into-phone and placeholder text leakage.
+      lines.push('  Target record to find and EDIT (use ACTUAL values — NO placeholders):')
       const sample = records[0]
-      for (const [field, value] of Object.entries(sample).slice(0, 8)) {
-        if (value === null || value === undefined || String(value).trim() === '') continue
-        lines.push(`    ${field}: "${value}"`)
+      let primaryEmitted = false
+
+      const detectDT = (key: string, val: string): string => {
+        const k = key.toLowerCase()
+        if (/\b(phone|mobile|cell|tel)\b/.test(k))          return 'PHONE'
+        if (/\b(email|e-mail|mail)\b/.test(k))              return 'EMAIL'
+        if (/\b(date|dob|birth|expiry|deadline)\b/.test(k)) return 'DATE'
+        if (/\b(name|title|full.?name|first.?name|last.?name)\b/.test(k)) return 'NAME'
+        if (/\b(amount|price|cost|revenue|budget|value|qty)\b/.test(k))   return 'NUMBER'
+        if (/\b(address|street|city|state|zip|postal)\b/.test(k))         return 'ADDRESS'
+        if (/^[+\d][\d\s\-.]{6,}$/.test(val.trim()))       return 'PHONE'
+        if (/@/.test(val) && /\.[a-z]{2,}$/.test(val))     return 'EMAIL'
+        if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(val) || /^\d{4}-\d{2}-\d{2}/.test(val)) return 'DATE'
+        return 'TEXT'
       }
+
+      // PRIMARY_IDENTIFIER priority order:
+      // 1. Exact person-name fields: first_name, last_name, contact_name, full_name
+      // 2. Generic name field: name
+      // 3. Entity-specific name: account_name, opportunity_name, lead_name etc.
+      // 4. Last resort: title, id, code, ref
+      // "title" is intentionally LOWER priority than "name" to avoid picking
+      // a company title like "Test Company 2123" as the search term for a contact.
+      const sampleKeys = Object.keys(sample).filter(k =>
+        sample[k] !== null && sample[k] !== undefined && String(sample[k]).trim() !== ''
+      )
+      const primaryFieldKey =
+        sampleKeys.find(k => /^(first.?name|last.?name|full.?name|contact.?name)$/i.test(k)) ??
+        sampleKeys.find(k => /^name$/i.test(k)) ??
+        sampleKeys.find(k => /\bname\b/i.test(k) && !/company|account|email/i.test(k)) ??
+        sampleKeys.find(k => /^(name|id|code|ref|label)/i.test(k)) ??
+        sampleKeys[0]
+
+      for (const [field, value] of Object.entries(sample).slice(0, 12)) {
+        if (value === null || value === undefined || String(value).trim() === '') continue
+        const valStr = String(value)
+        const dt = detectDT(field, valStr)
+        const isPrimary = !primaryEmitted && field === primaryFieldKey
+        if (isPrimary) primaryEmitted = true
+        const roleLabel = isPrimary
+          ? '  ⭐ PRIMARY_IDENTIFIER — use as SEARCH TERM to find the record'
+          : `  [DATA_TYPE: ${dt}] — use ONLY in ${dt}-type fields`
+        lines.push(`    ${field}: "${valStr}"${roleLabel}`)
+      }
+
+      lines.push('')
+      lines.push('  ⚠ DATA MAPPING RULES:')
+      lines.push('    • ⭐ PRIMARY_IDENTIFIER value → search step TYPE value')
+      lines.push('    • [DATA_TYPE: PHONE] values → Phone/Mobile fields ONLY')
+      lines.push('    • [DATA_TYPE: EMAIL] values → Email fields ONLY')
+      lines.push('    • [DATA_TYPE: NAME] values  → Name/Title fields ONLY')
+      lines.push('    • [DATA_TYPE: DATE] values  → Date fields ONLY (MM/DD/YYYY)')
+      lines.push('    • ❌ Cross-assigning types = test FAILURE (email ≠ phone ≠ name)')
+      lines.push('    • ❌ NEVER output template placeholder text — use actual string values')
 
     } else {
       // General: show first record as-is
@@ -1972,10 +2488,342 @@ function buildTestDataContextWithIntent(
 //
 // The returned context is placed into WEB_APP_RAG_SYSTEM_PROMPT {rag_context}.
 
+// ── ENTITY ANALYSIS CARD builder ─────────────────────────────────────
+//
+// Synthesises a concise, visual "ENTITY ANALYSIS CARD" from crawled pages.
+// The card is placed at the TOP of the RAG context so the LLM always reads
+// it first during its mandatory Deep Metadata Analysis Phase.
+//
+// Card structure (mirrors the few-shot examples in WEB_APP_RAG_SYSTEM_PROMPT):
+//   🏷️ ENTITY: <EntityName>
+//   📄 PAGE URL (Create): /path/new
+//   📄 PAGE URL (List):   /path
+//   📄 PAGE URL (Edit):   /path/:id/edit
+//   🔑 FIELD CATALOG:
+//     🔥 REQUIRED LOOKUP  "Account"           locator_type: label  → sample: "Acme Corp"
+//     🔥 REQUIRED INPUT   "Opportunity Name"  locator_type: label  → sample: "New Deal"
+//     🔥 REQUIRED SELECT  "Stage"             locator_type: label  → options: A | B  ⚡ USE: "A"
+//     ✅ OPTIONAL INPUT   "Amount"            locator_type: label  → sample: "50000"
+//   ⚡ SUBMIT BUTTON: "Create Opportunity"  (locator_type: role)
+
+function buildEntityAnalysisHeader(
+  entityName: string,
+  topPages: Record<string, unknown>[],
+  testDataMap: Map<string, Record<string, string>>,
+  targetLowers: string[],
+  testIntent: TestIntent,
+  entityUrlMap: Record<string, EntityUrlInfo> = {},
+): string {
+
+  // ── Helpers ──────────────────────────────────────────────────────────
+  const deplurSeg = (s: string) => depluralize(s)
+
+  // Identify page categories
+  const CREATE_REGEX = /\/(new|create|add|form)(\/.*)?(\/|\?|$)/
+  const EDIT_REGEX   = /\/(edit|update)(\/.*)?($|\?)/
+  const isCreatePage = (p: string) => CREATE_REGEX.test(p.toLowerCase())
+  const isEditPage   = (p: string) => EDIT_REGEX.test(p.toLowerCase())
+  const isListPage   = (p: string) => !isCreatePage(p) && !isEditPage(p)
+
+  const createPages = topPages.filter(p => isCreatePage(String(p['path'] ?? '')))
+  const editPages   = topPages.filter(p => isEditPage(String(p['path'] ?? '')))
+  const listPages   = topPages.filter(p => isListPage(String(p['path'] ?? '')))
+
+  const primaryPage: Record<string, unknown> | undefined =
+    (testIntent === 'update' ? editPages[0] : createPages[0])
+    ?? topPages[0]
+
+  // Resolved entity name from page path (more reliable than caller's guess)
+  const allPaths = topPages.map(p => String(p['path'] ?? ''))
+  const resolvedEntity = (() => {
+    for (const p of allPaths) {
+      const segs = p.split('/').filter(s => s && !/^(new|create|add|edit|update|list|index|all|\d+)$/i.test(s))
+      const last = segs.find(s => targetLowers.some(t => s.toLowerCase().includes(t) || t.includes(s.toLowerCase())))
+      if (last) return deplurSeg(last).charAt(0).toUpperCase() + deplurSeg(last).slice(1)
+    }
+    return entityName
+  })()
+
+  // Resolve sample value for a locator from test data
+  function sampleFor(locator: string): string | null {
+    const locLower = locator.toLowerCase().replace(/[^a-z0-9]/g, '')
+    const maps: Record<string, string>[] = []
+    for (const t of targetLowers) {
+      const m = testDataMap.get(t) ?? testDataMap.get(deplurSeg(t))
+      if (m) maps.push(m)
+    }
+    for (const dm of maps) {
+      const exact = Object.keys(dm).find(k => k.toLowerCase().replace(/[^a-z0-9]/g, '') === locLower)
+      if (exact) return dm[exact]
+      const fuzzy = Object.keys(dm).find(k => {
+        const kn = k.toLowerCase().replace(/[^a-z0-9]/g, '')
+        return locLower.includes(kn) || kn.includes(locLower)
+      })
+      if (fuzzy) return dm[fuzzy]
+    }
+    return null
+  }
+
+  // ── ENTITY KNOWN LOOKUPS (same as in buildRequiredFieldsSummary) ─────
+  const ENTITY_REQUIRED_LOOKUPS: Record<string, Array<{ locator: string; hint: string }>> = {
+    opportunity:  [{ locator: 'Account', hint: 'Acme Corp' }, { locator: 'Close Date', hint: '06/30/2026' }],
+    lead:         [{ locator: 'Company', hint: 'Acme Corp' }],
+    contact:      [{ locator: 'Account Name', hint: 'Acme Corp' }],
+    case:         [{ locator: 'Account Name', hint: 'Acme Corp' }],
+    invoice:      [{ locator: 'Account', hint: 'Acme Corp' }, { locator: 'Opportunity', hint: 'New Business Deal' }],
+    order:        [{ locator: 'Account', hint: 'Acme Corp' }],
+    quote:        [{ locator: 'Opportunity', hint: 'New Business Deal' }],
+    task:         [{ locator: 'Related To', hint: 'Acme Corp' }],
+    activity:     [{ locator: 'Related To', hint: 'Acme Corp' }],
+    deal:         [{ locator: 'Account', hint: 'Acme Corp' }],
+    project:      [{ locator: 'Account', hint: 'Acme Corp' }],
+    ticket:       [{ locator: 'Account', hint: 'Acme Corp' }],
+    proposal:     [{ locator: 'Opportunity', hint: 'New Business Deal' }],
+    subscription: [{ locator: 'Account', hint: 'Acme Corp' }],
+  }
+
+  // ── Build field catalog from primaryPage (or all pages merged) ───────
+  const allInputs: Record<string, unknown>[] = []
+  const allSelects: Record<string, unknown>[] = []
+  const allButtons: Record<string, unknown>[] = []
+
+  for (const pg of (primaryPage ? [primaryPage, ...topPages.filter(p => p !== primaryPage)] : topPages)) {
+    if (Array.isArray(pg['inputs']))  allInputs.push(...(pg['inputs'] as Record<string, unknown>[]))
+    if (Array.isArray(pg['selects'])) allSelects.push(...(pg['selects'] as Record<string, unknown>[]))
+    if (Array.isArray(pg['buttons'])) allButtons.push(...(pg['buttons'] as Record<string, unknown>[]))
+  }
+
+  // Deduplicate by locator
+  const dedup = <T extends Record<string, unknown>>(arr: T[]) => {
+    const seen = new Set<string>()
+    return arr.filter(it => {
+      const key = String(it['locator'] ?? it['name'] ?? '').toLowerCase()
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }
+  const inputs  = dedup(allInputs)
+  const selects = dedup(allSelects)
+  const buttons = dedup(allButtons)
+
+  // Identify known-required lookup fields for the entity
+  const entityPathKey = resolvedEntity.toLowerCase()
+  const knownLookups  = ENTITY_REQUIRED_LOOKUPS[entityPathKey] ?? []
+  const existingLocators = new Set(inputs.map(i => String(i['locator'] ?? i['name'] ?? '').toLowerCase()))
+  const syntheticLookups = knownLookups.filter(l => !existingLocators.has(l.locator.toLowerCase()))
+
+  // ── Build card lines ──────────────────────────────────────────────────
+  const card: string[] = [
+    '╔══════════════════════════════════════════════════════════════════════════════╗',
+    '║  ENTITY ANALYSIS CARD — READ THIS FIRST BEFORE WRITING ANY STEP            ║',
+    '║  This card contains the EXACT data you need for the 5-step analysis phase.  ║',
+    '╚══════════════════════════════════════════════════════════════════════════════╝',
+    '',
+    `🏷️  ENTITY: ${resolvedEntity}`,
+    '',
+  ]
+
+  // Page URLs: prefer verified entityUrlMap → crawl metadata → guessed fallback
+  // Helper: find a verified URL from entityUrlMap for the current entity
+  const findVerifiedPath = (): string | null => {
+    const lowerEntity = resolvedEntity.toLowerCase()
+    // Try exact name match
+    for (const [name, info] of Object.entries(entityUrlMap)) {
+      const p = typeof info === 'string' ? info : info.path
+      if (name.toLowerCase() === lowerEntity || name.toLowerCase() === lowerEntity + 's') return p
+    }
+    // Try partial match (e.g. entityUrlMap has "Invoice Custom Field" for target "Invoice Custom Fields")
+    for (const [name, info] of Object.entries(entityUrlMap)) {
+      const p = typeof info === 'string' ? info : info.path
+      const nLower = name.toLowerCase()
+      if (nLower.includes(lowerEntity) || lowerEntity.includes(nLower)) return p
+    }
+    // Try token-based match for compound entities
+    const tokens = lowerEntity.split(/[\s-]+/).filter(t => t.length > 2)
+    if (tokens.length > 1) {
+      for (const [name, info] of Object.entries(entityUrlMap)) {
+        const p = typeof info === 'string' ? info : info.path
+        const pLower = p.toLowerCase()
+        if (tokens.every(tok => pLower.includes(tok))) return p
+      }
+    }
+    return null
+  }
+
+  const verifiedBasePath = findVerifiedPath()
+
+  const listPath   = listPages[0]
+    ? String(listPages[0]['path'] ?? '')
+    : verifiedBasePath
+      ?? `⚠ UNKNOWN — check the app navigation for the exact URL (do NOT guess)`
+  const createPath = createPages[0]
+    ? String(createPages[0]['path'] ?? '')
+    : verifiedBasePath
+      ? `${verifiedBasePath}/new`
+      : `⚠ UNKNOWN — navigate to the list page and click the Add/New button`
+  const editPath   = editPages[0]
+    ? String(editPages[0]['path'] ?? '')
+    : verifiedBasePath
+      ? `${verifiedBasePath}/:id/edit`
+      : `⚠ UNKNOWN — open a record and use the Edit button`
+
+  // If both crawl metadata AND entityUrlMap have no matching URLs, add a hard warning
+  const hasNoVerifiedUrl = !listPages[0] && !verifiedBasePath
+
+  card.push('📄 PAGE URLS:')
+  card.push(`   List Page:   ${listPath}`)
+  card.push(`   Create Page: ${createPath}`)
+  card.push(`   Edit Page:   ${editPath}`)
+  if (hasNoVerifiedUrl) {
+    card.push(`   ⚠️  WARNING: NO verified URL found in crawl metadata or entity URL map for entity "${resolvedEntity}".`)
+    card.push(`   ⚠️  DO NOT invent a URL. Check the app's actual navigation structure.`)
+    card.push(`   ⚠️  RULE 8: Use ONLY URLs from this ENTITY ANALYSIS CARD. If all URLs show ⚠ UNKNOWN, navigate to the app root and discover the correct page by clicking.`)
+  }
+  card.push('')
+
+  // Field catalog
+  card.push('🔑 FIELD CATALOG:')
+  card.push('   (🔥 = REQUIRED  |  ✅ = OPTIONAL  |  ⛔ = SKIP)')
+  card.push('')
+
+  // Required inputs
+  const reqInputs = inputs.filter(i => Boolean(i['required']))
+  const optInputs = inputs.filter(i => !Boolean(i['required']))
+
+  for (const inp of reqInputs) {
+    const loc  = String(inp['locator'] ?? inp['name'] ?? '')
+    const lt   = String(inp['locator_type'] ?? 'label')
+    const isLookup = /\b(account|contact|owner|parent|manager|assigned|lead|opportunity|vendor|customer|partner|related\s*to|bill\s*to|ship\s*to)\b/i.test(loc)
+    const tag  = isLookup ? '🔥 REQUIRED LOOKUP ' : '🔥 REQUIRED INPUT  '
+    const sample = sampleFor(loc) ?? (isLookup ? 'Acme Corp' : '')
+    const sampleStr = sample ? `  → sample: "${sample}"` : ''
+    card.push(`   ${tag} "${loc}"  locator_type: ${lt}${sampleStr}`)
+  }
+
+  // Synthetic required lookups (from ENTITY_REQUIRED_LOOKUPS)
+  for (const syn of syntheticLookups) {
+    const sample = sampleFor(syn.locator) ?? syn.hint
+    card.push(`   🔥 REQUIRED LOOKUP  "${syn.locator}"  locator_type: label  → sample: "${sample}"  [injected — not in HTML but MUST be filled]`)
+  }
+
+  // Required selects
+  const reqSelects = selects.filter(s => Boolean(s['required']))
+  for (const sel of reqSelects) {
+    const loc  = String(sel['locator'] ?? sel['name'] ?? '')
+    const raw  = sel['options']
+    const opts: string[] = Array.isArray(raw) ? raw.map(String).filter(Boolean) : []
+    const sample = sampleFor(loc)
+    const chosen = sample && opts.length > 0
+      ? (opts.find(o => o.toLowerCase() === sample.toLowerCase()) ?? opts[0])
+      : (opts[0] ?? '')
+    if (opts.length === 0) {
+      card.push(`   ⛔ SKIP              "${loc}"  [NO VALID OPTIONS — omit this step]`)
+    } else {
+      const optsStr = opts.slice(0, 5).join(' | ')
+      card.push(`   🔥 REQUIRED SELECT  "${loc}"  locator_type: label  → options: ${optsStr}  ⚡ USE: "${chosen}"`)
+    }
+  }
+
+  // Optional inputs (up to 6)
+  for (const inp of optInputs.slice(0, 6)) {
+    const loc    = String(inp['locator'] ?? inp['name'] ?? '')
+    const lt     = String(inp['locator_type'] ?? 'label')
+    const sample = sampleFor(loc)
+    const sampleStr = sample ? `  → sample: "${sample}"` : ''
+    card.push(`   ✅ OPTIONAL INPUT   "${loc}"  locator_type: ${lt}${sampleStr}`)
+  }
+
+  // Optional selects (up to 4)
+  const optSelects = selects.filter(s => !Boolean(s['required']))
+  for (const sel of optSelects.slice(0, 4)) {
+    const loc  = String(sel['locator'] ?? sel['name'] ?? '')
+    const raw  = sel['options']
+    const opts: string[] = Array.isArray(raw) ? raw.map(String).filter(Boolean) : []
+    if (opts.length === 0) continue
+    const optsStr = opts.slice(0, 5).join(' | ')
+    card.push(`   ✅ OPTIONAL SELECT  "${loc}"  locator_type: label  → options: ${optsStr}`)
+  }
+
+  card.push('')
+
+  // Submit buttons
+  const ACTION_MENU_NAMES = /^(more|actions?|options?|settings?)$/i
+  const SUBMENU_ACTIONS   = /^(delete|remove|archive|clone|duplicate|deactivate|disable|export)$/i
+  const SUBMIT_VERBS      = /create|save|submit|add|update|delete|change|apply|confirm|done|finish|complete|more|action/i
+
+  const submitBtns = buttons.filter(b => {
+    const n = String(b['name'] ?? '').toLowerCase()
+    return SUBMIT_VERBS.test(n)
+  })
+
+  if (submitBtns.length > 0) {
+    const hasMenuBtn = submitBtns.some(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))
+    const menuBtnName = hasMenuBtn
+      ? String(submitBtns.find(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))?.['name'] ?? 'More')
+      : null
+
+    // For CREATE tests: prefer create/add/save buttons
+    // For UPDATE tests: prefer update/save/change buttons
+    const preferredBtn = (() => {
+      if (testIntent === 'update') {
+        return submitBtns.find(b => /update|save\s*changes|modify/i.test(String(b['name'] ?? '')))
+          ?? submitBtns.find(b => /save/i.test(String(b['name'] ?? '')))
+          ?? submitBtns.find(b => !ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()) && !SUBMENU_ACTIONS.test(String(b['name'] ?? '').trim()))
+      }
+      return submitBtns.find(b => /create|add|submit/i.test(String(b['name'] ?? '')))
+        ?? submitBtns.find(b => /save/i.test(String(b['name'] ?? '')))
+        ?? submitBtns.find(b => !ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()) && !SUBMENU_ACTIONS.test(String(b['name'] ?? '').trim()))
+    })()
+
+    const primaryBtnName = preferredBtn ? String(preferredBtn['name'] ?? '').trim() : ''
+
+    card.push('⚡ BUTTONS:')
+    if (primaryBtnName) {
+      card.push(`   ⚡ SUBMIT BUTTON: "${primaryBtnName}"  (locator_type: role)`)
+      card.push(`      ← COPY THIS NAME EXACTLY — this is the ONLY valid submit button name`)
+    }
+    if (menuBtnName) {
+      card.push(`   ⚡ ACTION MENU BUTTON: "${menuBtnName}"  (opens dropdown with secondary actions)`)
+      // List submenu items
+      const subItems = submitBtns.filter(b => SUBMENU_ACTIONS.test(String(b['name'] ?? '').trim()))
+      for (const si of subItems) {
+        const siName = String(si['name'] ?? '').trim()
+        card.push(`   ⚡ SUBMENU ITEM: "${siName}"  [SUBMENU under "${menuBtnName}" — click "${menuBtnName}" first]`)
+        // Inject confirmation button for delete
+        if (/^delete$/i.test(siName)) {
+          card.push(`   ⚡ CONFIRM BUTTON: "Delete ${resolvedEntity}"  (appears in confirmation dialog after clicking "${siName}")`)
+        }
+      }
+    }
+
+    // List all other buttons for reference
+    const otherBtns = submitBtns.filter(b => {
+      const n = String(b['name'] ?? '').trim()
+      return n !== primaryBtnName && n !== menuBtnName && !SUBMENU_ACTIONS.test(n)
+    }).slice(0, 4)
+    for (const ob of otherBtns) {
+      const n = String(ob['name'] ?? '').trim()
+      if (n) card.push(`   ⚡ OTHER BUTTON: "${n}"  (locator_type: role)`)
+    }
+    card.push('')
+  }
+
+  card.push('══════════════════════════════════════════════════════════════════════════════')
+  card.push('END OF ENTITY ANALYSIS CARD')
+  card.push('══════════════════════════════════════════════════════════════════════════════')
+  card.push('')
+
+  return card.join('\n')
+}
+
+
 async function buildWebAppStructuredContext(
   projectId: string,
   targetObjs: string[],
   rawChunks: string[],
+  testIntent: TestIntent = 'general',
+  entityUrlMap: Record<string, EntityUrlInfo> = {},
 ): Promise<string> {
   const targetLowers = targetObjs.map(t => t.toLowerCase())
 
@@ -2032,7 +2880,8 @@ async function buildWebAppStructuredContext(
     // Scoring rationale:
     //   +10 — path segment exactly matches target entity (e.g. /leads)
     //   +5  — path contains entity string anywhere
-    //   +20 — path contains a CREATE/NEW indicator → strongly prefer these for CREATE tests
+    //   +20 — path contains a CREATE/NEW indicator → strongly prefer for CREATE tests
+    //   +25 — path contains an EDIT/UPDATE indicator → strongly prefer for UPDATE tests
     //   +2  — entity appears in page title
     const scoredPages = allPages.map(page => {
       const path  = String(page['path']  ?? '').toLowerCase()
@@ -2044,8 +2893,9 @@ async function buildWebAppStructuredContext(
         if (title.includes(t))      score += 2
       }
       // Strong bonus for create/new pages — prevents list-page search fields from dominating
-      if (/\/(new|create|add|form)(\/.*)?(\?|$)/.test(path)) score += 20
-      else if (/\/(edit|update)(\/.*)?($|\?)/.test(path))    score += 10
+      if (/\/(new|create|add|form)(\/.*)?(\?|$)/.test(path))    score += 20
+      // Equal/higher bonus for edit/update pages — prevents CREATE page buttons from polluting UPDATE tests
+      else if (/\/(edit|update)(\/.*)?($|\?)/.test(path))       score += 25
       return { page, score }
     })
     scoredPages.sort((a, b) => b.score - a.score)
@@ -2054,23 +2904,35 @@ async function buildWebAppStructuredContext(
     // a completely empty context — but log a warning so this is visible.
     const relevantPages = scoredPages.filter(s => s.score > 0)
 
-    // When relevant pages exist and at least ONE is a create/new page,
-    // EXCLUDE pure list pages (no create indicator in path) from the top selection.
-    // This prevents the search box + Status dropdown on the list page from
-    // being injected into a CREATE test's metadata context, which causes the
-    // LLM to generate search/filter steps instead of form-fill steps.
+    // Intent-aware page filtering:
+    // • CREATE tests → strongly prefer create/new pages (filter out list pages)
+    // • UPDATE tests → strongly prefer edit/update pages (filter out create pages)
+    // • Other tests  → use all relevant pages
     let topCandidates = relevantPages.length > 0 ? relevantPages : scoredPages
     const hasCreatePage = topCandidates.some(s =>
       /\/(new|create|add|form)(\/.*)?(\?|$)/.test(String(s.page['path'] ?? '').toLowerCase())
     )
-    if (hasCreatePage) {
-      // Drop pure list pages that would pollute the form field context
+    const hasEditPage = topCandidates.some(s =>
+      /\/(edit|update)(\/.*)?($|\?)/.test(String(s.page['path'] ?? '').toLowerCase())
+    )
+
+    if (testIntent === 'update' && hasEditPage) {
+      // For UPDATE: prefer edit pages; drop pure CREATE and pure list pages
+      const editOnly = topCandidates.filter(s =>
+        /\/(edit|update)(\/.*)?($|\?)/.test(String(s.page['path'] ?? '').toLowerCase())
+      )
+      if (editOnly.length > 0) {
+        topCandidates = editOnly
+        log.info(`[GEN] buildWebAppStructuredContext: UPDATE test — filtered to ${editOnly.length} edit pages (dropped create/list pages)`)
+      }
+    } else if (hasCreatePage) {
+      // For CREATE: drop pure list pages that would pollute the form field context
       const createOnly = topCandidates.filter(s =>
         /\/(new|create|add|form|edit|update)(\/.*)?(\?|$)/.test(String(s.page['path'] ?? '').toLowerCase())
       )
       if (createOnly.length > 0) {
         topCandidates = createOnly
-        log.info(`[GEN] buildWebAppStructuredContext: filtered to ${createOnly.length} create/edit pages (dropped list pages to avoid search-field contamination)`)
+        log.info(`[GEN] buildWebAppStructuredContext: CREATE test — filtered to ${createOnly.length} create/edit pages (dropped list pages to avoid search-field contamination)`)
       }
     }
 
@@ -2120,10 +2982,12 @@ async function buildWebAppStructuredContext(
       return null
     }
 
-    // ── Build Required Fields Summary (prepended so LLM cannot miss required fields) ──
-    // Scans ALL selected pages and collects every [REQUIRED] input/select/lookup field.
-    // This is injected as the FIRST section of the context so the LLM is forced to plan
-    // all required steps before diving into per-page detail.
+    // ── Build Required Fields + Button Grounding Summary ────────────────────
+    // Scans ALL selected pages and collects:
+    //   1. Every [REQUIRED] input/select/lookup field
+    //   2. ALL submit/action buttons (create, save, update, delete, change, apply, etc.)
+    // This is the GROUNDING BLOCK — injected first so the LLM is forced to plan
+    // all required steps and copy the exact button name before writing any step.
     function buildRequiredFieldsSummary(): string {
       const allPageSummaries: string[] = []
 
@@ -2135,9 +2999,15 @@ async function buildWebAppStructuredContext(
 
         const reqInputs  = inputs.filter(i  => Boolean(i['required']))
         const reqSelects = selects.filter(s => Boolean(s['required']))
+        // ── Expanded button matching: include ALL action/submit buttons ──────
+        // Previously only matched 'create|save|submit|add' — this missed "Update Contact",
+        // "Delete Record", "Save Changes", "Apply", etc. causing hallucinations.
         const submitBtns = buttons.filter(b => {
           const n = String(b['name'] ?? '').toLowerCase()
-          return n.includes('create') || n.includes('save') || n.includes('submit') || n.includes('add')
+          return n.includes('create') || n.includes('save')   || n.includes('submit')
+              || n.includes('add')    || n.includes('update') || n.includes('delete')
+              || n.includes('change') || n.includes('apply')  || n.includes('confirm')
+              || n.includes('done')   || n.includes('finish')  || n.includes('complete')
         })
 
         // ── Inject synthetic required lookup fields for known entity relationships ──
@@ -2154,6 +3024,11 @@ async function buildWebAppStructuredContext(
           quote:        [{ locator: 'Opportunity', hint: 'New Business Deal' }],
           task:         [{ locator: 'Related To', hint: 'Acme Corp' }],
           activity:     [{ locator: 'Related To', hint: 'Acme Corp' }],
+          deal:         [{ locator: 'Account', hint: 'Acme Corp' }],
+          project:      [{ locator: 'Account', hint: 'Acme Corp' }],
+          ticket:       [{ locator: 'Account', hint: 'Acme Corp' }],
+          proposal:     [{ locator: 'Opportunity', hint: 'New Business Deal' }],
+          subscription: [{ locator: 'Account', hint: 'Acme Corp' }],
         }
         // Determine entity from path: /opportunity/new → 'opportunity'
         const pathEntity = path.split('/').filter(s => s && !/^(new|create|add|edit|list|index|all|\d+)$/i.test(s)).slice(-1)[0]?.toLowerCase() ?? ''
@@ -2232,10 +3107,12 @@ async function buildWebAppStructuredContext(
 
       return [
         '┌══════════════════════════════════════════════════════════════════════════════════════════┐',
-        '│  🚨 MANDATORY REQUIRED FIELDS CHECKLIST — READ THIS BEFORE WRITING ANY STEP 🚨          │',
-        '│  Every row in the table below is a REQUIRED STEP. Missing even one = INVALID OUTPUT.    │',
-        '│  🔥 REQUIRED LOOKUP rows are highest priority — NEVER skip them.                        │',
-        '│  The [SUBMIT BUTTON] name must be copied EXACTLY — do NOT use generic "Save".           │',
+        '│  🚨 MANDATORY REQUIRED FIELDS + BUTTON GROUNDING — READ THIS BEFORE WRITING ANY STEP   │',
+        '│  Every row in the table below is a REQUIRED STEP. Missing even one = INVALID OUTPUT.   │',
+        '│  🔥 REQUIRED LOOKUP rows are highest priority — NEVER skip them.                       │',
+        '│  ⚡ [SUBMIT BUTTON] name must be COPIED EXACTLY — NEVER use "Save", "Submit", or any   │',
+        '│     other assumed name. The EXACT name from the metadata IS the only valid button name. │',
+        '│  ❌ DO NOT invent button names. DO NOT use generic names. Copy from [SUBMIT BUTTON].    │',
         '└══════════════════════════════════════════════════════════════════════════════════════════┘',
         '',
         ...allPageSummaries,
@@ -2246,6 +3123,21 @@ async function buildWebAppStructuredContext(
 
     const requiredFieldsSummary = buildRequiredFieldsSummary()
 
+    // ── Build entity analysis card (injected FIRST for deep analysis phase) ─
+    // Extract entity name from targetObjs for the card builder
+    const primaryEntityName = targetObjs[0]
+      ? (depluralize(targetObjs[0]).charAt(0).toUpperCase() + depluralize(targetObjs[0]).slice(1))
+      : 'Entity'
+    const entityAnalysisCard = buildEntityAnalysisHeader(
+      primaryEntityName,
+      topPages,
+      testDataMap,
+      targetLowers,
+      testIntent,
+      entityUrlMap,
+    )
+    log.info(`[GEN] Entity analysis card built for "${primaryEntityName}" (${entityAnalysisCard.length} chars)`)
+
     // ── Build context string ─────────────────────────────────────────────
     const lines: string[] = [
       '=== WEB APPLICATION PAGE METADATA ===',
@@ -2253,8 +3145,11 @@ async function buildWebAppStructuredContext(
       'Each field shows its EXACT locator and ⚡ SAMPLE VALUE from real records.',
       'Use the EXACT locator string. Use the ⚡ SAMPLE VALUE as the step value.',
       '',
+      // ── ENTITY ANALYSIS CARD first so LLM does its mandatory analysis ──
+      ...(entityAnalysisCard ? [entityAnalysisCard] : []),
       ...(requiredFieldsSummary ? [requiredFieldsSummary] : []),
     ]
+
 
     for (const page of topPages) {
       const path    = String(page['path'] ?? '/')
@@ -2332,21 +3227,52 @@ async function buildWebAppStructuredContext(
         }
       }
       if (buttons.length > 0) {
+        // ── Expanded button detection — match ALL action/submit button types ──
+        // Includes: update, delete, change, apply, confirm, done, finish, complete
+        // This prevents hallucination of "Save" when the real button is "Update Contact"
         const submitBtns = buttons.filter(b => {
           const n = String(b['name'] ?? '').toLowerCase()
-          return n.includes('create') || n.includes('save') || n.includes('submit') || n.includes('add')
+          return n.includes('create') || n.includes('save')   || n.includes('submit')
+              || n.includes('add')    || n.includes('update') || n.includes('delete')
+              || n.includes('change') || n.includes('apply')  || n.includes('confirm')
+              || n.includes('done')   || n.includes('finish')  || n.includes('complete')
+              || n.includes('more')   || n.includes('action')  || n.includes('clone')
+              || n.includes('remove') || n.includes('archive')
         })
+
+        // ── Detect action-menu structure ─────────────────────────────────────
+        // If there is a "More" / "Actions" / "Options" button on the page AND
+        // destructive/secondary actions (Delete, Clone, Archive) are also present,
+        // those secondary actions are SUBMENU items under the "More" button.
+        // They CANNOT be clicked directly — the "More" button must be opened first.
+        const ACTION_MENU_NAMES = /^(more|actions?|options?|settings?)$/i
+        const SUBMENU_ACTIONS   = /^(delete|remove|archive|clone|duplicate|deactivate|disable|export)$/i
+
+        const hasActionMenuBtn = submitBtns.some(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))
+        const actionMenuBtnName = hasActionMenuBtn
+          ? (submitBtns.find(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))?.['name'] as string ?? 'More')
+          : null
+
         if (submitBtns.length > 0) {
-          lines.push('  Submit Buttons (use for CLICK step after filling all fields):')
-          for (const btn of submitBtns.slice(0, 3)) {
-            // Extract the plain button name from the locator (e.g. "role=button, name=Create Campaign" → "Create Campaign")
-            const rawLocator = String(btn['locator'] ?? btn['name'] ?? '')
-            const btnName    = String(btn['name'] ?? '')
-            const nameMatch  = rawLocator.match(/name=(.+)$/)
+          lines.push('  ⚡ SUBMIT / ACTION BUTTONS — COPY THESE NAMES EXACTLY FOR CLICK STEPS:')
+          lines.push('  ❌ DO NOT use generic names ("Save", "Submit", "OK") — use ONLY the names listed below.')
+          if (hasActionMenuBtn) {
+            lines.push(`  ⚠ ACTION MENU DETECTED: "${actionMenuBtnName}" button opens a dropdown with secondary actions.`)
+            lines.push(`    Submenu items (Delete, Clone, etc.) CANNOT be clicked directly.`)
+            lines.push(`    You MUST click "${actionMenuBtnName}" FIRST, then click the submenu item.`)
+          }
+          for (const btn of submitBtns.slice(0, 8)) {
+            // Extract the plain button name from the locator
+            const rawLocator  = String(btn['locator'] ?? btn['name'] ?? '')
+            const btnName     = String(btn['name'] ?? '')
+            const nameMatch   = rawLocator.match(/name=(.+)$/)
             const displayName = (nameMatch ? nameMatch[1].trim() : btnName).trim()
             if (!displayName) continue
-            // Show both the display name AND the raw locator so the LLM knows exactly what value to use as the CLICK target
-            lines.push(`    ⚡ BUTTON NAME: "${displayName}"  →  Use this EXACT name as target for the CLICK step  (locator_type: "role")`)
+            const isSubmenu = hasActionMenuBtn && SUBMENU_ACTIONS.test(displayName)
+            const annotation = isSubmenu
+              ? `  [SUBMENU under "${actionMenuBtnName}" — click "${actionMenuBtnName}" first, then click "${displayName}"]`
+              : ''
+            lines.push(`    ⚡ BUTTON NAME: "${displayName}"${annotation}`)
           }
         }
       }
@@ -2420,7 +3346,159 @@ function ensureWebAppCreateSteps(
   if (!isWebApp) return result
   if (!result.steps || result.steps.length === 0) return result
 
-  // ── 0. Correct NAVIGATE URLs using known page paths from RAG context ──────
+  // ── -1. Sanitise placeholder text leaking into step values ────────────────
+  // The LLM sometimes copies instruction fragments like "real contact name from
+  // REAL ENTITY RECORDS" verbatim into step values instead of using actual data.
+  // These patterns are NEVER valid step values — strip them with an empty string
+  // so the runner skips rather than attempting to type the instruction text.
+  const PLACEHOLDER_PATTERNS = [
+    /real\s+\w+\s+name\s+from\s+REAL\s+ENTITY\s+RECORDS/i,
+    /REAL\s+ENTITY\s+RECORDS/i,
+    /first\s+real\s+record/i,
+    /primary[_\s]identifier/i,
+    /search\s+term/i,
+    /<[^>]+>/,       // angle-bracket placeholders like <contact name>
+    /\[contact\s+name\]/i,
+    /\[record\s+name\]/i,
+  ]
+  for (const step of result.steps) {
+    const val = String(step.value ?? '')
+    for (const pat of PLACEHOLDER_PATTERNS) {
+      if (pat.test(val)) {
+        log.warn(`[GEN] Post-process: placeholder text detected in step ${step.id} value "${val.slice(0, 60)}" — clearing`)
+        step.value = ''
+        break
+      }
+    }
+    // Also check target
+    const tgt = String(step.target ?? '')
+    for (const pat of PLACEHOLDER_PATTERNS) {
+      if (pat.test(tgt)) {
+        log.warn(`[GEN] Post-process: placeholder text detected in step ${step.id} target "${tgt.slice(0, 60)}" — clearing`)
+        step.target = ''
+        break
+      }
+    }
+  }
+
+  // ── 0a. Fix bad search step locators for UPDATE/DELETE tests ──────────────
+  // Problem: the LLM generates Step 2 as:
+  //   { action: TYPE, target: "TITLE", locator_type: "label", value: "Test Company 2123" }
+  // But there is no "TITLE" field on the list page — that's an edit form label.
+  // The list page search box uses role=searchbox or a placeholder.
+  //
+  // Fix: for UPDATE/DELETE tests, if the 2nd non-NAVIGATE TYPE step has a target
+  // that looks like a form field label (not "searchbox", not a placeholder-style string),
+  // correct it to use role=searchbox.
+  const isUpdateOrDelete = /\b(update|edit|modify|change|delete|remove|archive)\b/i.test(prompt)
+  if (isUpdateOrDelete) {
+    // Form-field label patterns that CANNOT be a list-page search box
+    const FORM_FIELD_LABELS = /^(title|name|first.?name|last.?name|company|email|phone|account|contact|lead|subject|description|address|status|stage|type|category|priority|amount|date)$/i
+
+    let typeStepCount = 0
+    for (const step of result.steps) {
+      const action = (step.action ?? '').toUpperCase()
+      if (action === 'NAVIGATE') continue
+      if (action !== 'TYPE') { typeStepCount = 0; continue }
+
+      typeStepCount++
+      // The FIRST TYPE step after NAVIGATE is the search step
+      if (typeStepCount === 1) {
+        const tgt = String(step.target ?? '').trim()
+        const lt  = String(step.locator_type ?? '').toLowerCase()
+        // If the target is a form-field label (not searchbox/placeholder), fix it
+        if (FORM_FIELD_LABELS.test(tgt) || (lt === 'label' && tgt.toLowerCase() !== 'searchbox')) {
+          log.warn(`[GEN] Post-process: bad search step target "${tgt}" (locator_type: "${lt}") — correcting to searchbox`)
+          step.target       = 'searchbox'
+          step.locator_type = 'role'
+          // Keep the value (the actual name) — it should still be valid
+        }
+        break // Only fix the first TYPE step
+      }
+    }
+  }
+
+  // ── 0b. Inject "Click More" + confirm step for DELETE tests ──────────────
+  // Problem 1: "Delete" is a submenu item under "More" — need to open More first.
+  // Problem 2: Clicking "Delete" opens a confirmation dialog ("Delete Contact?") —
+  //            need to click the confirm button ("Delete Contact") before asserting.
+  const isDeleteTest = /\b(delete|remove|archive|trash)\b/i.test(prompt)
+  if (isDeleteTest) {
+    // Check if the context mentions a 'More'/'Actions' button
+    const contextHasMoreBtn = /⚡ BUTTON NAME:\s*"(More|Actions?|Options?)"/i.test(ragContext)
+
+    // Extract entity name from prompt for confirmation button (e.g. "Delete Contact" → "Contact")
+    const entityMatch = prompt.match(/\b(delete|remove)\s+(?:a\s+|an\s+|the\s+)?([a-z]+)\b/i)
+    const entityName = entityMatch ? entityMatch[2].trim() : ''
+    // Confirmation button name: "Delete Contact", "Delete Account", etc.
+    const confirmBtnName = entityName
+      ? `Delete ${entityName.charAt(0).toUpperCase() + entityName.slice(1).toLowerCase()}`
+      : 'Delete Contact'
+
+    const DESTRUCTIVE_TARGETS = /^(delete|remove|archive|deactivate|trash)$/i
+    const ACTION_MENU_TARGETS = /^(more|actions?|options?)$/i
+    const CONFIRM_TARGETS     = /^(delete|remove|confirm|yes|proceed|ok)/i
+
+    for (let i = 0; i < result.steps.length; i++) {
+      const step = result.steps[i]
+      const action = (step.action ?? '').toUpperCase()
+      const tgt = String(step.target ?? '').trim()
+
+      if (action !== 'CLICK' || !DESTRUCTIVE_TARGETS.test(tgt)) continue
+
+      // ── Fix A: Inject "Click More" before the destructive step if missing ──
+      const prevClickStep = result.steps.slice(0, i).reverse().find(s =>
+        (s.action ?? '').toUpperCase() === 'CLICK'
+      )
+      const prevClickTarget = String(prevClickStep?.target ?? '').trim()
+      const alreadyOpensMenu = ACTION_MENU_TARGETS.test(prevClickTarget) ||
+        /more|action|option/i.test(prevClickTarget)
+
+      if (!alreadyOpensMenu) {
+        const menuBtnName = contextHasMoreBtn
+          ? (ragContext.match(/⚡ BUTTON NAME:\s*"(More|Actions?|Options?)"/i)?.[1] ?? 'More')
+          : 'More'
+
+        const moreStep = {
+          id: `${step.id}-more`,
+          action: 'CLICK',
+          target: menuBtnName,
+          locator_type: 'role',
+          value: '',
+          expected_result: `"${menuBtnName}" dropdown menu opens`,
+          test_data: '',
+        }
+        result.steps.splice(i, 0, moreStep)
+        i++ // shift index since we inserted before current
+        log.info(`[GEN] Post-process: injected "Click ${menuBtnName}" before "Click ${tgt}"`)
+      }
+
+      // ── Fix B: Inject confirmation step after the destructive step if missing ──
+      // Check the step immediately AFTER the current destructive step
+      const nextStepIdx = i + 1
+      const nextStep = result.steps[nextStepIdx]
+      const nextAction = (nextStep?.action ?? '').toUpperCase()
+      const nextTarget = String(nextStep?.target ?? '').trim()
+      const nextIsConfirm = nextAction === 'CLICK' && CONFIRM_TARGETS.test(nextTarget)
+
+      if (!nextIsConfirm) {
+        const confirmStep = {
+          id: `${step.id}-confirm`,
+          action: 'CLICK',
+          target: confirmBtnName,
+          locator_type: 'role',
+          value: '',
+          expected_result: `Record is deleted and confirmation dialog is dismissed`,
+          test_data: '',
+        }
+        result.steps.splice(nextStepIdx, 0, confirmStep)
+        log.info(`[GEN] Post-process: injected confirm step "Click ${confirmBtnName}" after "Click ${tgt}"`)
+      }
+
+      break // Only process the first destructive step
+    }
+  }
+
   // Problem: the LLM ignores path prefixes (e.g. /admin/) and generates
   // a short relative path like "/roles" when the real page is "/admin/roles".
   // This causes the browser to navigate to a non-existent route and fail at step 1.
@@ -2518,21 +3596,84 @@ function ensureWebAppCreateSteps(
     }
   }
 
-  // Only fix "create/add/new" type tests
+  // ── NEW: Catch compound-path hallucinations using entityUrlMap fuzzy match ──
+  // Problem: LLM generates /invoices/custom-fields for entity "Invoice Custom Fields"
+  // because no metadata exists and it guesses based on entity name tokens.
+  // Fix: if a NAVIGATE step path does not match any known path, try to find
+  // the correct path by token-matching against entityUrlMap values.
+  if (isWebApp && Object.keys(entityUrlMap).length > 0) {
+    for (const step of result.steps) {
+      if ((step.action ?? '').toUpperCase() !== 'NAVIGATE') continue
+      const rawUrlHalluc = String(step.value || step.target || '').replace(/^URL:\s*/i, '').trim()
+      if (!rawUrlHalluc.startsWith('/') || rawUrlHalluc === '/') continue
+
+      // Skip if already a known path (exact or prefix)
+      const alreadyKnownHalluc = knownPaths.some(p => p === rawUrlHalluc || rawUrlHalluc.startsWith(p))
+      if (alreadyKnownHalluc) continue
+
+      // Token-match generated path against entityUrlMap verified paths
+      const rawTokensHalluc = rawUrlHalluc.toLowerCase().split(/[\/\-]/).filter((t: string) => t.length > 2 && !/^(new|create|add|edit|list)$/.test(t))
+      if (rawTokensHalluc.length === 0) continue
+
+      let bestHallucMatch: string | null = null
+      let bestHallucScore = 0
+
+      for (const [, info] of Object.entries(entityUrlMap)) {
+        const verifiedPath = typeof info === 'string' ? info : (info as EntityUrlInfo).path
+        const pathTokens = verifiedPath.toLowerCase().split(/[\/\-]/).filter(Boolean)
+        const matchCount = rawTokensHalluc.filter((t: string) => pathTokens.some((pt: string) => pt.includes(t) || t.includes(pt))).length
+        const score = matchCount / rawTokensHalluc.length
+        if (score > 0.5 && score > bestHallucScore) {
+          bestHallucScore = score
+          bestHallucMatch = verifiedPath
+        }
+      }
+
+      if (bestHallucMatch && bestHallucMatch !== rawUrlHalluc) {
+        log.warn(`[GEN] Post-process: compound-path hallucination corrected "${rawUrlHalluc}" → "${bestHallucMatch}" (entityUrlMap token match, score=${bestHallucScore.toFixed(2)})`)
+        step.value = bestHallucMatch
+      } else if (!bestHallucMatch) {
+        log.warn(`[GEN] Post-process: no verified URL for invented path "${rawUrlHalluc}" — replacing with "/" to avoid 404`)
+        step.value = '/'
+      }
+    }
+  }
+
+  // Fix button names for ALL form-submission test types (CREATE, UPDATE, DELETE)
+  // Previously only CREATE tests were patched — this caused hallucinated "Save" buttons
+  // on UPDATE tests even when metadata clearly showed "Update Contact".
   const isCreateTest = /\b(create|add|new)\b/i.test(prompt)
-  if (!isCreateTest) return result
+  const isUpdateTest = /\b(update|edit|modify|change)\b/i.test(prompt)
+  if (!isCreateTest && !isUpdateTest) return result
 
   let expectedBtnName = ''
   let foundExactBtnInRag = false
 
-  // ── A. First, try to extract the EXACT button name from the RAG metadata ──
-  // The structured context builder formats it as: ⚡ BUTTON NAME: "Create Campaign"
+  // ── A. Extract the EXACT button name from the RAG metadata ─────────────
+  // The structured context builder formats buttons as: ⚡ BUTTON NAME: "Update Contact"
+  // For UPDATE tests: prefer buttons with "update|save|change" in name.
+  // For CREATE tests: prefer buttons with "create|add|submit" in name.
   if (ragContext) {
-    const btnMatch = ragContext.match(/⚡ BUTTON NAME:\s*"([^"]+)"/i)
-    if (btnMatch && btnMatch[1]) {
-      expectedBtnName = btnMatch[1].trim()
-      foundExactBtnInRag = true
-      log.info(`[GEN] Post-process: extracted exact button name "${expectedBtnName}" from RAG context`)
+    // Collect ALL button names from the metadata
+    const allBtnMatches = [...ragContext.matchAll(/⚡ BUTTON NAME:\s*"([^"]+)"/gi)]
+    if (allBtnMatches.length > 0) {
+      const allBtnNames = allBtnMatches.map(m => m[1].trim())
+      log.info(`[GEN] Post-process: found ${allBtnNames.length} button name(s) in RAG context: ${allBtnNames.join(', ')}`)
+
+      if (isUpdateTest) {
+        // Prefer update/save/change buttons for UPDATE tests
+        const updateBtn = allBtnNames.find(n => /update|save changes|modify/i.test(n))
+        expectedBtnName = updateBtn ?? allBtnNames[0]
+      } else {
+        // Prefer create/add/submit buttons for CREATE tests
+        const createBtn = allBtnNames.find(n => /create|add|submit/i.test(n))
+        expectedBtnName = createBtn ?? allBtnNames[0]
+      }
+
+      if (expectedBtnName) {
+        foundExactBtnInRag = true
+        log.info(`[GEN] Post-process: selected exact button name "${expectedBtnName}" from RAG context (intent: ${isUpdateTest ? 'UPDATE' : 'CREATE'})`)
+      }
     }
   }
 
@@ -2985,7 +4126,7 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
     } catch (tdErr) {
       log.warn({ err: tdErr }, '[GEN] Test data fetch failed (non-critical) — skipping')
     }
-    testIntentInstructions = buildIntentInstructions(testIntent)
+    testIntentInstructions = buildIntentInstructions(testIntent, prompt)
 
     // Load verified entity→URL map (from web_test_data.source_url)
     try {
@@ -3032,8 +4173,8 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
         // types, field tags, required status, and submit buttons — not just names.
         let ragContext: string
         if (isWebAppProject) {
-          ragContext = await buildWebAppStructuredContext(project_id, targetObjs, chunks)
-          log.info(`[GEN] Web App: built structured context (${ragContext.length} chars)`)
+          ragContext = await buildWebAppStructuredContext(project_id, targetObjs, chunks, testIntent, globalEntityUrlMap)
+          log.info(`[GEN] Web App: built structured context for intent=${testIntent} (${ragContext.length} chars)`)
         } else {
           ragContext = buildRagContext(chunks)
         }
@@ -3257,7 +4398,7 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
       log.info(`[GEN] Standard path: Web App — building structured context, targets=[${targetObjs.join(', ')}]`)
       // buildWebAppStructuredContext pulls from metadata_normalized and scores pages
       // by relevance to the target entity, then formats them with exact locator info.
-      const structured = await buildWebAppStructuredContext(project_id, targetObjs, [])
+      const structured = await buildWebAppStructuredContext(project_id, targetObjs, [], testIntent, globalEntityUrlMap)
       const hasRealFormFields = structured.includes('[REQUIRED]') ||
         structured.includes('REQUIRED Form Fields') ||
         structured.includes('Optional Form Fields') ||

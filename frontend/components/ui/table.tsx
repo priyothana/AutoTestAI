@@ -13,7 +13,7 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
         backgroundColor: 'var(--color-bg-elevated)',
         border: '1px solid var(--color-border-sem)',
         borderRadius: 'var(--radius-token-lg)',
-        overflow: 'hidden',
+        overflowX: 'auto',
       }}
     >
       <table
@@ -110,7 +110,7 @@ function TableCell({ className, ...props }: React.ComponentProps<"td">) {
     <td
       data-slot="table-cell"
       className={cn(
-        "align-middle whitespace-nowrap [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+        "align-middle whitespace-nowrap overflow-hidden text-ellipsis [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
         className
       )}
       style={{

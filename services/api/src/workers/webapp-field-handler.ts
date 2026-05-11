@@ -803,6 +803,70 @@ export async function fillWebAppField(
   const fieldLabel = extractWebAppLabel(rawLabel)
   log.info(`[WEBAPP-ENGINE] fillWebAppField: "${fieldLabel}" = "${value}"`)
 
+  // ── Searchbox fast-path ───────────────────────────────────────────────────
+  // When the step uses target="searchbox" locator_type="role" (generated for UPDATE/DELETE
+  // search steps), use getByRole('searchbox') directly instead of label-based lookup.
+  // This is the standard ARIA role for search inputs — far more reliable than label matching
+  // on CRM list-page search bars which are rarely labeled.
+  if (fieldLabel.toLowerCase() === 'searchbox' || fieldLabel.toLowerCase() === 'search') {
+    log.info(`[WEBAPP-ENGINE] Searchbox fast-path: trying getByRole("searchbox") then placeholder patterns`)
+    let searchLoc: Locator | null = null
+
+    // Strategy 1: getByRole('searchbox') — standard ARIA role
+    try {
+      const byRole = page.getByRole('searchbox').first()
+      if (await byRole.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        searchLoc = byRole
+        log.info(`[WEBAPP-ENGINE] ✅ Found search input via getByRole('searchbox')`)
+      }
+    } catch { /* try next */ }
+
+    // Strategy 2: common placeholder patterns (e.g. "Search contacts...", "Search...")
+    if (!searchLoc) {
+      const SEARCH_PLACEHOLDERS = ['Search', 'Find', 'Filter', 'Quick find', 'Type to search']
+      for (const ph of SEARCH_PLACEHOLDERS) {
+        try {
+          const byPh = page.getByPlaceholder(ph, { exact: false }).first()
+          if (await byPh.isVisible({ timeout: 1_500 }).catch(() => false)) {
+            searchLoc = byPh
+            log.info(`[WEBAPP-ENGINE] ✅ Found search input via getByPlaceholder("${ph}...")`)
+            break
+          }
+        } catch { /* try next */ }
+      }
+    }
+
+    // Strategy 3: any visible input[type=search] or input[role=searchbox]
+    if (!searchLoc) {
+      try {
+        const byAttr = page.locator(
+          'input[type="search"], input[role="searchbox"], input[aria-label*="search" i], ' +
+          'input[placeholder*="search" i], input[placeholder*="find" i], input[placeholder*="filter" i]'
+        ).first()
+        if (await byAttr.isVisible({ timeout: 1_500 }).catch(() => false)) {
+          searchLoc = byAttr
+          log.info(`[WEBAPP-ENGINE] ✅ Found search input via attribute scan`)
+        }
+      } catch { /* try next */ }
+    }
+
+    if (searchLoc) {
+      await searchLoc.scrollIntoViewIfNeeded().catch(() => {})
+      try {
+        await searchLoc.fill(value, { timeout: 5_000 })
+      } catch {
+        await searchLoc.click()
+        await searchLoc.clear().catch(() => {})
+        await page.keyboard.type(value)
+      }
+      await page.waitForTimeout(500)
+      log.info(`[WEBAPP-ENGINE] ✅ Typed "${value}" into search input`)
+      return
+    }
+
+    log.warn(`[WEBAPP-ENGINE] Searchbox fast-path failed — falling through to standard label lookup`)
+  }
+
   // ── Probe field type ──────────────────────────────────────────────────────
   const detectedType = await probeWebAppFieldType(page, fieldLabel)
   log.info(`[WEBAPP-ENGINE] Detected type for "${fieldLabel}": ${detectedType ?? 'unknown — defaulting to text fill'}`)

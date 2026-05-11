@@ -15,6 +15,8 @@ import {
     Bell
 } from "lucide-react"
 import ThemeToggle from "@/components/shared/ThemeToggle"
+import Logo from "@/components/shared/Logo"
+import TestsIcon from "@/components/shared/TestsIcon"
 
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
@@ -36,7 +38,7 @@ interface DashboardLayoutProps {
 const sidebarItems = [
     { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
     { name: "Environments", href: "/dashboard/projects", icon: FolderKanban },
-    { name: "Tests", href: "/dashboard/tests", icon: TestTube2 },
+    { name: "Tests", href: "/dashboard/tests", icon: TestTube2, customIcon: true },
     { name: "Execution", href: "/dashboard/execution", icon: PlayCircle },
     { name: "Reports", href: "/dashboard/reports", icon: FileBarChart },
     { name: "Settings", href: "/dashboard/settings", icon: Settings },
@@ -63,11 +65,8 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
             {/* Desktop Sidebar */}
             <aside className="hidden w-64 md:block z-10" style={{ backgroundColor: 'var(--color-bg-elevated)', borderRight: '1px solid var(--color-border-sem)', boxShadow: 'var(--shadow-md)' }}>
                 <div className="flex h-16 items-center px-6" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
-                    <Link href="/dashboard" className="flex items-center gap-2 font-bold text-xl" style={{ color: 'var(--color-text-primary)' }}>
-                        <div className="flex items-center justify-center p-1.5 rounded-md" style={{ backgroundColor: 'var(--color-brand-light)' }}>
-                            <TestTube2 className="h-5 w-5" style={{ color: 'var(--color-brand)' }} />
-                        </div>
-                        <span>AutoTest <span className="font-black" style={{ color: 'var(--color-brand)' }}>AI</span></span>
+                    <Link href="/dashboard" className="flex items-center">
+                        <Logo size="sm" />
                     </Link>
                 </div>
 
@@ -110,14 +109,26 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                     }
                                 }}
                             >
-                                <item.icon
-                                    className="h-4 w-4 flex-shrink-0"
-                                    style={{
-                                        opacity: isActive ? 1 : 0.6,
-                                        color: isActive ? 'var(--color-brand)' : 'currentColor',
-                                        transition: 'opacity var(--transition-fast), color var(--transition-fast)',
-                                    }}
-                                />
+                                {item.customIcon ? (
+                                    <TestsIcon
+                                        className="h-4 w-4 flex-shrink-0"
+                                        active={isActive}
+                                        style={{
+                                            opacity: isActive ? 1 : 0.6,
+                                            color: isActive ? 'var(--color-brand)' : 'currentColor',
+                                            transition: 'opacity var(--transition-fast), color var(--transition-fast)',
+                                        }}
+                                    />
+                                ) : (
+                                    <item.icon
+                                        className="h-4 w-4 flex-shrink-0"
+                                        style={{
+                                            opacity: isActive ? 1 : 0.6,
+                                            color: isActive ? 'var(--color-brand)' : 'currentColor',
+                                            transition: 'opacity var(--transition-fast), color var(--transition-fast)',
+                                        }}
+                                    />
+                                )}
                                 {item.name}
                             </Link>
                         )
@@ -125,7 +136,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                 </nav>
             </aside>
 
-            <div className="flex flex-1 flex-col overflow-hidden">
+            <div className="flex flex-1 flex-col overflow-auto">
                 {/* Header */}
                 <header className="flex h-16 items-center justify-between px-6 sticky top-0 z-20 backdrop-blur-md" style={{ backgroundColor: 'color-mix(in srgb, var(--color-bg-elevated) 85%, transparent)', borderBottom: '1px solid var(--color-border-sem)' }}>
                     <div className="flex items-center gap-4 md:hidden">
@@ -139,7 +150,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                 </SheetTrigger>
                                 <SheetContent side="left" className="w-64 p-0" style={{ backgroundColor: 'var(--color-bg-elevated)', borderRight: '1px solid var(--color-border-sem)' }}>
                                     <div className="flex h-16 items-center px-6" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
-                                        <span className="text-lg font-bold" style={{ color: 'var(--color-text-primary)' }}>AutoTest AI</span>
+                                        <Logo size="sm" />
                                     </div>
                                     <nav className="flex flex-col gap-1 p-4">
                                         {sidebarItems.map((item) => {
@@ -163,13 +174,24 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                                     paddingRight: '12px',
                                                 }}
                                             >
-                                                <item.icon
-                                                    className="h-4 w-4 flex-shrink-0"
-                                                    style={{
-                                                        opacity: isActiveMobile ? 1 : 0.6,
-                                                        color: isActiveMobile ? 'var(--color-brand)' : 'currentColor',
-                                                    }}
-                                                />
+                                                {item.customIcon ? (
+                                                    <TestsIcon
+                                                        className="h-4 w-4 flex-shrink-0"
+                                                        active={isActiveMobile}
+                                                        style={{
+                                                            opacity: isActiveMobile ? 1 : 0.6,
+                                                            color: isActiveMobile ? 'var(--color-brand)' : 'currentColor',
+                                                        }}
+                                                    />
+                                                ) : (
+                                                    <item.icon
+                                                        className="h-4 w-4 flex-shrink-0"
+                                                        style={{
+                                                            opacity: isActiveMobile ? 1 : 0.6,
+                                                            color: isActiveMobile ? 'var(--color-brand)' : 'currentColor',
+                                                        }}
+                                                    />
+                                                )}
                                                 {item.name}
                                             </Link>
                                         )})}
@@ -182,7 +204,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                 <span className="sr-only">Toggle menu</span>
                             </Button>
                         )}
-                        <span className="font-semibold md:hidden">AutoTest AI</span>
+                        <span className="md:hidden"><Logo size="sm" /></span>
                     </div>
 
                     <div className="flex flex-1 items-center justify-end gap-4">

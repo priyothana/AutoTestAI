@@ -45,6 +45,12 @@ import {
   JiraProjectConfigSchema,
 } from './project.schema.js'
 import * as svc from './project.service.js'
+import {
+  generateBusinessFlows,
+  workflowRefinementChat,
+  filterTestCasesChat,
+  generateTestSuite,
+} from './workflow-chat.service.js'
 import { syncWebappMetadata } from '../webapp/webapp.service.js'
 import {
   extractTestData,
@@ -312,21 +318,29 @@ export async function projectRoutes(app: FastifyInstance) {
         }
       }
 
-      // Fall back to raw_count from DB if crawl_state hasn't been set yet
-      if (crawled_so_far === 0 && rawCount > 0) {
-        // Approximate from the raw store page count
+      // Compute actual pages_crawled from the raw_json.pages array.
+      // raw_count is always 1 (one DB row per project), NOT the page count.
+      // pages_crawled is the true number of pages visited by the Playwright crawler.
+      let pages_crawled = 0
+      if (rawCount > 0) {
         const rawRow = await prisma.metadata_raw_store.findFirst({
           where: { project_id: id, metadata_type: 'webpage' },
           select: { raw_json: true },
         })
         if (rawRow?.raw_json) {
           const rd = rawRow.raw_json as { pages?: unknown[] }
-          crawled_so_far = rd.pages?.length ?? 0
+          pages_crawled = rd.pages?.length ?? 0
         }
+      }
+
+      // Fall back: if crawl_state hasn't populated crawled_so_far yet, use pages_crawled
+      if (crawled_so_far === 0 && pages_crawled > 0) {
+        crawled_so_far = pages_crawled
       }
 
       return reply.send({
         raw_count:          rawCount,
+        pages_crawled,          // ← actual page count (from raw_json.pages.length)
         normalized_count:   normalizedCount,
         domain_model_count: domainCount,
         embedding_count:    embeddingCount,
@@ -713,6 +727,91 @@ export async function projectRoutes(app: FastifyInstance) {
       const { id } = request.params as { id: string }
       await svc.deleteExistingTests(id)
       return reply.send({ success: true })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+  // ─── AI Workflow Chat Endpoints ──────────────────────────────────────────────
+
+  // POST /api/v1/projects/:id/generate-workflows
+  // Generates a list of business flow / end-to-end journey options from metadata + BRD.
+  // Body: { brdContent?: string }
+  app.post('/projects/:id/generate-workflows', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = request.body as { brdContent?: string }
+      const result = await generateBusinessFlows(id, body.brdContent)
+      return reply.send(result)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // POST /api/v1/projects/:id/workflow-chat
+  // Conversational refinement — AI asks clarifying questions about the selected business flow.
+  // Body: { flow, history, userMessage, brdContent? }
+  app.post('/projects/:id/workflow-chat', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = request.body as {
+        flow:        string
+        history:     { role: 'user' | 'assistant'; content: string }[]
+        userMessage: string
+        brdContent?: string
+      }
+      const result = await workflowRefinementChat({
+        projectId:   id,
+        flow:        body.flow,
+        history:     body.history ?? [],
+        userMessage: body.userMessage,
+        brdContent:  body.brdContent,
+      })
+      return reply.send(result)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // POST /api/v1/projects/:id/filter-test-cases-chat
+  // Natural-language filtering of generated test cases.
+  // Body: { instruction, history, testCases, currentSelectedIds }
+  app.post('/projects/:id/filter-test-cases-chat', async (request, reply) => {
+    try {
+      const body = request.body as {
+        instruction:        string
+        history:            { role: 'user' | 'assistant'; content: string }[]
+        testCases:          { id: string; name: string; priority: string; description?: string | null }[]
+        currentSelectedIds: string[]
+      }
+      const result = await filterTestCasesChat({
+        instruction:        body.instruction,
+        history:            body.history ?? [],
+        testCases:          body.testCases ?? [],
+        currentSelectedIds: body.currentSelectedIds ?? [],
+      })
+      return reply.send(result)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // POST /api/v1/projects/:id/generate-test-suite
+  // Multi-flow test suite generation: generates & persists TCs for all selected flows,
+  // returns grouped + AI-ordered FlowGroup[] ready for the full-page wizard review.
+  // Body: { flows: string[], brdContent?: string }
+  app.post('/projects/:id/generate-test-suite', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = request.body as { flows: string[]; brdContent?: string }
+      if (!Array.isArray(body.flows) || body.flows.length === 0) {
+        return reply.status(400).send({ error: 'flows array is required' })
+      }
+      const result = await generateTestSuite({
+        projectId:  id,
+        flows:      body.flows,
+        brdContent: body.brdContent,
+      })
+      return reply.send(result)
     } catch (err: any) {
       return handleErr(err, reply)
     }

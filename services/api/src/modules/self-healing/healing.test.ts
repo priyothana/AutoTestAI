@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 // ─── Prisma mock (must be hoisted before any module import) ──────────────────
 
-vi.mock('../shared/db/prisma.js', () => ({
+vi.mock('../../shared/db/prisma.js', () => ({
   default: {
     execution_learnings: {
       findMany:   vi.fn(),
@@ -71,16 +71,16 @@ vi.mock('@langchain/core/messages', () => ({
 
 // ─── Import modules under test (after mocks) ─────────────────────────────────
 
-import prisma from '../shared/db/prisma.js'
+import prisma from '../../shared/db/prisma.js'
 import {
   getHealingSuggestionsForExecution,
   saveHealingSuggestion,
   applyHealingSuggestion,
   getHealingSuggestionById,
-} from '../modules/self-healing/healing.service.js'
+} from './healing.service.js'
 
 // We import buildApp for route testing
-import { buildApp } from '../index.js'
+import { buildApp } from '../../index.js'
 
 // ─── Shared test fixtures ─────────────────────────────────────────────────────
 
@@ -446,20 +446,18 @@ describe('GET /api/v1/heal/:executionId (route)', () => {
 
 describe('HealInputSchema validation', () => {
   it('accepts valid input', async () => {
-    const { HealInputSchema } = await import('../modules/self-healing/healing.schema.js')
+    const { HealInputSchema } = await import('./healing.schema.js')
 
     const result = HealInputSchema.safeParse({
-      failedLocator:    '#btn',
-      screenshotBase64: 'abc123',
-      htmlSnippet:      '<button>Save</button>',
-      testScriptId:     TEST_SCRIPT_ID,
+      failedLocator: "getByRole('button')",
+      htmlSnippet: '<button>Save</button>',
+      logs: [],
     })
-
     expect(result.success).toBe(true)
   })
 
   it('rejects missing required fields', async () => {
-    const { HealInputSchema } = await import('../modules/self-healing/healing.schema.js')
+    const { HealInputSchema } = await import('./healing.schema.js')
 
     const result = HealInputSchema.safeParse({
       failedLocator: '#btn',
@@ -470,7 +468,7 @@ describe('HealInputSchema validation', () => {
   })
 
   it('rejects invalid UUID for testScriptId', async () => {
-    const { HealInputSchema } = await import('../modules/self-healing/healing.schema.js')
+    const { HealInputSchema } = await import('./healing.schema.js')
 
     const result = HealInputSchema.safeParse({
       failedLocator:    '#btn',
@@ -485,7 +483,7 @@ describe('HealInputSchema validation', () => {
 
 describe('HealOutputSchema validation', () => {
   it('accepts valid output', async () => {
-    const { HealOutputSchema } = await import('../modules/self-healing/healing.schema.js')
+    const { HealOutputSchema } = await import('./healing.schema.js')
 
     const result = HealOutputSchema.safeParse({
       suggestedLocator: "getByRole('button', { name: 'Save' })",
@@ -497,7 +495,7 @@ describe('HealOutputSchema validation', () => {
   })
 
   it('rejects confidence > 1', async () => {
-    const { HealOutputSchema } = await import('../modules/self-healing/healing.schema.js')
+    const { HealOutputSchema } = await import('./healing.schema.js')
 
     const result = HealOutputSchema.safeParse({
       suggestedLocator: "getByRole('button')",
