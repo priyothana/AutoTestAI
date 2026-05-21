@@ -22,6 +22,9 @@ export const QUEUES = {
 
   /** AI Test-Case Generation — async multi-source generation jobs */
   TEST_CASE_GENERATION: 'test-case-generation-queue',
+
+  /** AI Agent Orchestrator — async multi-agent task execution */
+  AGENT_ORCHESTRATOR: 'agent-orchestrator-queue',
 } as const
 
 export type QueueName = (typeof QUEUES)[keyof typeof QUEUES]

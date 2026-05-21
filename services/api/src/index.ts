@@ -43,6 +43,7 @@ import { generationRoutes }  from './modules/test-generation/generation.routes.j
 import { executionRoutes }   from './modules/execution/execution.routes.js'
 import { notificationRoutes } from './modules/notification/notification.routes.js'
 import { testCaseGeneratorRoutes } from './modules/test-case-generator/test-case-generator.routes.js'
+import { agentRoutes }             from './modules/ai-agents/agent.routes.js'
 import { startTestCaseGenerationWorker } from './modules/test-case-generator/test-case-generator.service.js'
 import prisma from './shared/db/prisma.js'
 import { redisConnection, getRedisOptions } from './shared/queue/connection.js'
@@ -212,6 +213,7 @@ export async function buildApp() {
     { name: 'execution',            fn: executionRoutes as never,            prefix: '/api/v1' },
     { name: 'notification',         fn: notificationRoutes as never,         prefix: '/api/v1' },
     { name: 'test-case-generator',  fn: testCaseGeneratorRoutes as never,    prefix: '/api/v1' },
+    { name: 'ai-agents',            fn: agentRoutes as never,               prefix: '/api/v1/agents' },
   ]
 
   for (const mod of modules) {

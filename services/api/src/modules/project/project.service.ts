@@ -17,6 +17,7 @@ import type {
   SalesforceCredentials,
   JiraConnect,
   JiraProjectConfig,
+  KeycloakToken,
 } from './project.schema.js'
 
 const log = createModuleLogger('project')
@@ -1058,3 +1059,135 @@ export async function deleteExistingTests(projectId: string): Promise<void> {
   log.info({ projectId }, 'Existing tests doc removed')
 }
 
+// ─── Keycloak / OAuth Custom Token Session ────────────────────────────────────
+
+/**
+ * Keycloak Session Flow:
+ * 1. User logs in via Keycloak SSO in their browser.
+ * 2. Backend issues HMAC-signed auth_token + Keycloak id_token.
+ * 3. Frontend/user calls POST /api/v1/projects/:id/save-keycloak-tokens
+ *    with both tokens.
+ * 4. This function Fernet-encrypts them and stores them inside auth_config:
+ *      auth_config.keycloak_auth_token  → encrypted Bearer token
+ *      auth_config.keycloak_id_token    → encrypted Keycloak id_token
+ *      auth_config.keycloak_refresh_url → optional refresh endpoint
+ *      auth_config.keycloak_expires_at  → Unix ms expiry timestamp
+ * 5. On each test run, execution.service reads them out and injects into
+ *    the Playwright browser context via sessionStorage before any navigation.
+ */
+export async function saveKeycloakTokens(
+  projectId: string,
+  data: KeycloakToken,
+): Promise<void> {
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+  if (!integration) {
+    throw { statusCode: 404, message: 'No integration found for this project. Connect first.' }
+  }
+
+  // Encrypt the tokens before storage
+  const encAuthToken = fernetEncrypt(data.auth_token)
+  const encIdToken = data.id_token ? fernetEncrypt(data.id_token) : null
+
+  // Default expiry: 24 hours from now
+  const expiresAt = data.expires_at ?? (Date.now() + 24 * 60 * 60 * 1000)
+
+  const existingCfg = (integration.auth_config as Record<string, any>) ?? {}
+  const updatedCfg: Record<string, any> = {
+    ...existingCfg,
+    keycloak_auth_token: encAuthToken,
+    keycloak_id_token: encIdToken,
+    keycloak_refresh_url: data.refresh_url ?? existingCfg.keycloak_refresh_url ?? null,
+    keycloak_expires_at: expiresAt,
+    keycloak_stored_at: Date.now(),
+  }
+
+  await prisma.project_integrations.update({
+    where: { id: integration.id },
+    data: {
+      login_strategy: 'keycloak',
+      auth_config: updatedCfg,
+    },
+  })
+
+  // Mark session active in projects table
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: {
+      ui_session_active: true,
+      ui_session_source: 'keycloak',
+      ui_session_last_created_at: new Date(),
+    },
+  }).catch((e: unknown) => log.warn({ e }, '[KEYCLOAK] DB flag update failed (non-fatal)'))
+
+  log.info({ projectId }, '[KEYCLOAK] ✅ Tokens saved and session marked active')
+}
+
+/**
+ * Retrieve the decrypted Keycloak session tokens for a project.
+ * Returns null when no Keycloak tokens are stored.
+ * Called by execution.service to build ExecutionContext before enqueueing the job.
+ */
+export async function getKeycloakSession(
+  projectId: string,
+): Promise<{
+  auth_token: string
+  id_token: string | null
+  refresh_url: string | null
+  expires_at: number
+} | null> {
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+    select: { auth_config: true, login_strategy: true },
+  })
+  if (!integration || integration.login_strategy !== 'keycloak') return null
+
+  const cfg = (integration.auth_config as Record<string, any>) ?? {}
+  if (!cfg.keycloak_auth_token) return null
+
+  try {
+    const authToken = fernetDecrypt(cfg.keycloak_auth_token)
+    const idToken = cfg.keycloak_id_token ? fernetDecrypt(cfg.keycloak_id_token) : null
+    return {
+      auth_token: authToken,
+      id_token: idToken,
+      refresh_url: cfg.keycloak_refresh_url ?? null,
+      expires_at: cfg.keycloak_expires_at ?? (Date.now() + 24 * 60 * 60 * 1000),
+    }
+  } catch (err) {
+    log.warn({ err, projectId }, '[KEYCLOAK] Failed to decrypt stored tokens')
+    return null
+  }
+}
+
+/**
+ * Clear stored Keycloak tokens for a project (e.g. on logout or token revocation).
+ */
+export async function clearKeycloakSession(projectId: string): Promise<void> {
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId },
+  })
+  if (!integration) return
+
+  const existingCfg = (integration.auth_config as Record<string, any>) ?? {}
+  const {
+    keycloak_auth_token: _a,
+    keycloak_id_token: _b,
+    keycloak_expires_at: _c,
+    keycloak_stored_at: _d,
+    ...remainingCfg
+  } = existingCfg
+
+  await prisma.project_integrations.update({
+    where: { id: integration.id },
+    data: { auth_config: remainingCfg, login_strategy: 'form' },
+  })
+
+  await prisma.projects.update({
+    where: { id: projectId },
+    data: { ui_session_active: false },
+  }).catch(() => {})
+
+  log.info({ projectId }, '[KEYCLOAK] Session cleared')
+}

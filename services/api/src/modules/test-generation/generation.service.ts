@@ -59,12 +59,20 @@ You are an expert QA Automation Engineer specialized in Playwright test automati
 
 Your task is to convert a natural language test case into a structured Playwright-compatible JSON test definition that can be executed directly by a Playwright runner.
 
+🚨 AUTHENTICATION — READ FIRST (ABSOLUTE RULE):
+- The user IS ALREADY LOGGED IN. A valid browser session with stored credentials is injected before the test starts.
+- NEVER generate steps to navigate to /login, /signin, /sign-in, /auth, or any authentication page.
+- NEVER generate steps to fill in a username, password, or click a "Log In" / "Sign In" button.
+- If the test case name or description mentions login, it is referring to a feature being tested (e.g. contact creation) — it does NOT mean you should produce authentication steps.
+- Your FIRST step MUST be a NAVIGATE to the relevant entity page (e.g. /contacts/new, /contacts, /dashboard).
+
 IMPORTANT CONTEXT:
 - The application base URL is managed separately in the Project configuration.
 - NEVER use mock URLs like "https://example.com".
 - For NAVIGATE steps:
-  - Use relative paths like "/login", "/dashboard", "/accounts"
-  - If no specific path is mentioned, use "/" or leave value empty ""
+  - Use relative paths like "/contacts", "/contacts/new", "/dashboard", "/accounts"
+  - Do NOT use "/login" or any auth-related path — the session is already active
+  - If no specific path can be inferred, use "/" (the app root)
   - The Playwright runner will automatically prepend the Project Base URL
 
 -------------------------
@@ -75,6 +83,7 @@ GENERAL RULES
 3. Use ACCESSIBILITY-BASED LOCATORS as the PRIMARY strategy (see Locator Priority below).
 4. Avoid fragile CSS selectors like nth-child, [title=...], or class-based selectors unless absolutely necessary.
 5. Always include appropriate WAIT steps before ASSERT_TEXT or CLICK if the element loads dynamically.
+6. NEVER generate login/authentication steps — start directly from the relevant entity or feature page.
 
 -------------------------
 LOCATOR PRIORITY (MUST FOLLOW)
@@ -82,20 +91,19 @@ LOCATOR PRIORITY (MUST FOLLOW)
 When generating locators for interactive elements, use this priority order:
 
 1. getByRole (PREFERRED) — uses ARIA roles and accessible names
-   Example: getByRole('button', { name: 'Submit' })
-   Example: getByRole('link', { name: 'Home' })
-   Example: getByRole('textbox', { name: 'Email' })
+   Example: getByRole('button', { name: 'New Contact' })
+   Example: getByRole('link', { name: 'Contacts' })
+   Example: getByRole('textbox', { name: 'Full Name' })
 
 2. getByLabel — uses form field labels
-   Example: getByLabel('Email Address')
-   Example: getByLabel('Password')
+   Example: getByLabel('Full Name')
+   Example: getByLabel('Phone')
 
 3. getByText — uses visible text content
-   Example: getByText('Welcome Back')
-   Example: getByText('Sign In')
+   Example: getByText('Contact created successfully')
 
 4. CSS selector (FALLBACK ONLY) — use only when no accessible name/role exists
-   Example: #loginBtn, .toast-message, [data-testid='submit']
+   Example: .toast-message, [data-testid='submit']
 
 -------------------------
 SUPPORTED ACTIONS
@@ -129,13 +137,13 @@ Each step must follow this structure:
 
 The "locator_type" field tells the runner HOW to resolve the target:
 - "role"  → page.getByRole(role, { name: name })
-            target format: "role=button, name=Submit" or "role=link, name=Home"
+            target format: "role=button, name=New Contact" or "role=link, name=Contacts"
 - "label" → page.getByLabel(target)
-            target format: "Email Address" or "Password"
+            target format: "Full Name" or "Phone"
 - "text"  → page.getByText(target)
-            target format: "Welcome Back"
+            target format: "Contact created successfully"
 - "css"   → page.locator(target)
-            target format: "#loginBtn" or ".toast-message"
+            target format: ".toast-message" or "[data-testid='submit']"
 
 For NAVIGATE, WAIT, and ASSERT_TOAST actions, locator_type is not needed.
 
@@ -146,6 +154,7 @@ ACTION RULES
 1. NAVIGATE
    - Only needs "value" (URL path)
    - Do not include target or locator_type
+   - NEVER navigate to /login or any authentication URL
 
 2. WAIT
    - value must be number of seconds as string (e.g. "3")
@@ -155,12 +164,12 @@ ACTION RULES
    - target must identify an input field
    - value is the text to type
    - Prefer locator_type "label" for form fields
-   - Example: { "action": "TYPE", "target": "Email Address", "value": "user@test.com", "locator_type": "label" }
+   - Example: { "action": "TYPE", "target": "Full Name", "value": "Jane Smith", "locator_type": "label" }
 
 4. CLICK
    - target must identify a button, link, or clickable element
    - Prefer locator_type "role" for buttons and links
-   - Example: { "action": "CLICK", "target": "role=button, name=Submit", "locator_type": "role" }
+   - Example: { "action": "CLICK", "target": "role=button, name=Create Contact", "locator_type": "role" }
 
 5. ASSERT_TEXT
    - DO NOT put text inside target
@@ -169,16 +178,16 @@ ACTION RULES
    - Use locator_type "css" for structural selectors, "text" for text-based
 
    ✅ Correct:
-   { "action": "ASSERT_TEXT", "target": "h1", "value": "Welcome Back", "locator_type": "css" }
+   { "action": "ASSERT_TEXT", "target": "h1", "value": "Contacts", "locator_type": "css" }
 
    ❌ Wrong:
-   { "action": "ASSERT_TEXT", "target": "Welcome Back" }
+   { "action": "ASSERT_TEXT", "target": "Contacts" }
 
 6. ASSERT_TOAST
    - Use this to verify success/error notifications (toasts, snackbars) that appear after saving, submitting, or taking an action.
    - NO target or locator_type is needed.
    - value must be the expected visible text in the toast message.
-   - Example: { "action": "ASSERT_TOAST", "target": "", "value": "Successfully saved account" }
+   - Example: { "action": "ASSERT_TOAST", "target": "", "value": "Contact created successfully" }
 
 -------------------------
 OUTPUT FORMAT
@@ -189,24 +198,38 @@ Return JSON in this structure:
   "name": "Concise Test Case Name",
   "description": "Detailed description of what is being tested",
   "priority": "low" | "medium" | "high",
-  "preconditions": ["List of preconditions"],
+  "preconditions": ["User is already authenticated — no login steps needed"],
   "steps": [
     {
       "id": "1",
       "action": "NAVIGATE",
-      "value": "/dashboard"
+      "value": "/contacts/new"
     },
     {
       "id": "2",
+      "action": "TYPE",
+      "target": "Full Name",
+      "value": "Jane Smith",
+      "locator_type": "label"
+    },
+    {
+      "id": "3",
       "action": "CLICK",
-      "target": "role=button, name=New",
+      "target": "role=button, name=Create Contact",
       "locator_type": "role"
+    },
+    {
+      "id": "4",
+      "action": "ASSERT_TOAST",
+      "target": "",
+      "value": "Contact created successfully"
     }
   ],
   "expected_outcome": "Clear expected final result"
 }
 
 Generate test steps that will PASS successfully in Playwright runner.
+REMEMBER: The first step MUST be NAVIGATE to the entity page — NEVER to /login.
 `
 
 const RAG_SYSTEM_PROMPT = `
@@ -889,19 +912,27 @@ FIELD-VALUE TYPE ALIGNMENT (CRITICAL — prevents value shuffling)
 -------------------------
 Each field's value MUST match its expected data type. NEVER cross-assign values:
 
-• Amount / Currency / Price fields → MUST be NUMERIC (e.g., "50000", "1000.50")
-• Date / Close Date / Due Date fields → MUST be DATE format MM/DD/YYYY (e.g., "06/30/2026")
-• Probability / Percentage fields → MUST be NUMERIC percentage (e.g., "75", "90")
-• Stage / Status fields → MUST be a valid STAGE/STATUS option (e.g., "Prospecting", "Closed Won")
+• Amount / Currency / Price fields       → MUST be NUMERIC (e.g., "50000", "1000.50")
+• Date / Close Date / Due Date fields    → MUST be DATE format MM/DD/YYYY (e.g., "06/30/2026")
+• Probability / Percentage fields        → MUST be NUMERIC percentage (e.g., "75", "90")
+• Stage / Status fields                  → MUST be a valid STAGE/STATUS option (e.g., "Prospecting", "Closed Won")
 • Account / Contact / Name lookup fields → MUST be ENTITY NAMES (e.g., "Tara", "Acme Corp")
+• Phone / Mobile / Tel / Fax fields      → MUST be a PHONE NUMBER (digits, spaces, dashes, +country code)
+                                           ✅ e.g., "+1 555-123-4567"  ❌ NOT a URL  ❌ NOT a plain number like "1234343"
+• Website / URL / Link / Homepage fields → MUST be a full URL starting with http:// or https://
+                                           ✅ e.g., "https://www.example.com"  ❌ NOT a phone number  ❌ NOT a plain number
+• Email / E-mail / Mail fields           → MUST be an email address with @ and a domain suffix
+                                           ✅ e.g., "user@example.com"  ❌ NOT a phone number or URL
 
 ❌ NEVER put a person's name (e.g., "Santhosh Sivan") in an Amount field
 ❌ NEVER put a date (e.g., "4/29/2026") in a Stage field
 ❌ NEVER put a stage value (e.g., "CLOSED_WON") in a Date field
-❌ NEVER put a numeric value (e.g., "30000") in a Contact Name field
+❌ NEVER put a numeric value (e.g., "30000") in a Contact Name or Website field
+❌ NEVER put a URL (e.g., "www.hsdbf.com") in a Phone / Mobile field
+❌ NEVER put a plain number (e.g., "1234343") in a Website / URL field
 
-If the scraped data shows a field→value pair that violates these type rules,
-IGNORE that value and generate a type-appropriate value instead.
+If the scraped data or sample values show a field→value pair that violates these type rules,
+DISCARD that value and generate a correct type-appropriate value instead.
 
 -------------------------
 USER-SPECIFIED VALUES (HIGHEST PRIORITY)
@@ -952,6 +983,73 @@ EVERY [REQUIRED] field MUST have a TYPE/SELECT/CHECKBOX step using a REAL value.
 EVERY field value MUST match its expected data type (see FIELD-VALUE TYPE ALIGNMENT above).
 `
 
+
+// ── Semantic field-value type validator ──────────────────────────────
+// Detects a field's expected data type from its locator label and validates
+// that the resolved sample value is semantically appropriate.
+// If the stored value is mismatched (e.g. a number in a Website field or a URL
+// in a Phone field), a correct fallback value is returned instead so that
+// the LLM never receives misleading sample data.
+
+type SemanticFieldType = 'phone' | 'email' | 'url' | 'date' | 'numeric' | 'name' | 'text'
+
+const SEMANTIC_FIELD_PATTERNS: Array<{ pattern: RegExp; type: SemanticFieldType; fallback: string }> = [
+  { pattern: /\b(phone|mobile|cell|tel|telephone|fax|contact\s*number|mobile\s*number|phone\s*number)\b/i, type: 'phone',   fallback: '+1 555-123-4567' },
+  { pattern: /\b(email|e-mail|mail)\b/i,                                                                   type: 'email',   fallback: 'user@example.com' },
+  { pattern: /\b(website|url|link|homepage|web\s*address|site)\b/i,                                        type: 'url',     fallback: 'https://www.example.com' },
+  { pattern: /\b(date|dob|birth|expiry|deadline|close\s*date|start\s*date|end\s*date|due\s*date)\b/i,     type: 'date',    fallback: '06/30/2026' },
+  { pattern: /\b(amount|price|cost|revenue|budget|salary|value|qty|quantity|number|count|total)\b/i,       type: 'numeric', fallback: '50000' },
+  { pattern: /\b(name|title|full\s*name|first\s*name|last\s*name|company|account\s*name)\b/i,              type: 'name',    fallback: 'Acme Corp' },
+]
+
+/** Classify the expected semantic type of a field from its locator label. */
+function classifyFieldSemanticType(fieldLabel: string): SemanticFieldType {
+  const clean = fieldLabel.trim()
+  for (const rule of SEMANTIC_FIELD_PATTERNS) {
+    if (rule.pattern.test(clean)) return rule.type
+  }
+  return 'text'
+}
+
+/** Return the hard-coded fallback sample value for a given semantic type. */
+function getFallbackForSemanticType(type: SemanticFieldType): string {
+  return SEMANTIC_FIELD_PATTERNS.find(r => r.type === type)?.fallback ?? ''
+}
+
+/**
+ * Validate that `value` is semantically appropriate for `fieldLabel`.
+ * Returns `value` unchanged when it matches, or a type-appropriate fallback
+ * when it does not (e.g. numeric string for a Website field → https://www.example.com).
+ */
+function validateAndFixSampleValue(fieldLabel: string, value: string): string {
+  if (!value) return value
+  const expectedType = classifyFieldSemanticType(fieldLabel)
+  if (expectedType === 'text') return value  // no strong type constraint → keep as-is
+
+  const v = value.trim()
+
+  const isPhone   = (s: string) => /^[+\d][\d\s\-().]{5,}$/.test(s)
+  const isEmail   = (s: string) => /@/.test(s) && /\.[a-z]{2,}$/i.test(s)
+  const isUrl     = (s: string) => /^https?:\/\//i.test(s) || /^www\./i.test(s)
+  const isDate    = (s: string) => /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s) || /^\d{4}-\d{2}-\d{2}/.test(s)
+  const isNumeric = (s: string) => /^[\d,]+\.?\d*$/.test(s.replace(/[\s$€£¥₹%]/g, ''))
+
+  let valueMatchesType = false
+  switch (expectedType) {
+    case 'phone':   valueMatchesType = isPhone(v) && !isEmail(v) && !isUrl(v); break
+    case 'email':   valueMatchesType = isEmail(v); break
+    case 'url':     valueMatchesType = isUrl(v); break
+    case 'date':    valueMatchesType = isDate(v); break
+    case 'numeric': valueMatchesType = isNumeric(v); break
+    case 'name':    valueMatchesType = !isPhone(v) && !isEmail(v) && !isUrl(v) && !isDate(v) && !isNumeric(v); break
+  }
+
+  if (!valueMatchesType) {
+    const fallback = getFallbackForSemanticType(expectedType)
+    return fallback  // return correct semantic fallback; empty string keeps original
+  }
+  return value
+}
 
 // ── Depluralization helper ────────────────────────────────────────────
 // Handles common English plural → singular conversion:
@@ -2544,7 +2642,9 @@ function buildEntityAnalysisHeader(
     return entityName
   })()
 
-  // Resolve sample value for a locator from test data
+  // Resolve sample value for a locator from test data.
+  // Validates that the value is semantically appropriate for the field type
+  // (e.g. a URL value is not returned for a Phone field and vice-versa).
   function sampleFor(locator: string): string | null {
     const locLower = locator.toLowerCase().replace(/[^a-z0-9]/g, '')
     const maps: Record<string, string>[] = []
@@ -2554,12 +2654,18 @@ function buildEntityAnalysisHeader(
     }
     for (const dm of maps) {
       const exact = Object.keys(dm).find(k => k.toLowerCase().replace(/[^a-z0-9]/g, '') === locLower)
-      if (exact) return dm[exact]
+      if (exact) {
+        const fixed = validateAndFixSampleValue(locator, dm[exact])
+        return fixed || dm[exact]
+      }
       const fuzzy = Object.keys(dm).find(k => {
         const kn = k.toLowerCase().replace(/[^a-z0-9]/g, '')
         return locLower.includes(kn) || kn.includes(locLower)
       })
-      if (fuzzy) return dm[fuzzy]
+      if (fuzzy) {
+        const fixed = validateAndFixSampleValue(locator, dm[fuzzy])
+        return fixed || dm[fuzzy]
+      }
     }
     return null
   }
@@ -2945,6 +3051,8 @@ async function buildWebAppStructuredContext(
 
     // ── Helper: resolve sample value for a field locator ────────────────
     // Looks up the entity's real record map and returns the best matching value.
+    // Validates the value against the field's expected semantic type to prevent
+    // mismatches like a URL being used for a Phone field or a number for a Website.
     function resolveSampleValue(
       fieldLocator: string,
       pagePath: string,
@@ -2969,7 +3077,10 @@ async function buildWebAppStructuredContext(
         const exactKey = Object.keys(dataMap).find(
           k => k.toLowerCase() === fieldLocator.toLowerCase()
         )
-        if (exactKey) return dataMap[exactKey]
+        if (exactKey) {
+          const fixed = validateAndFixSampleValue(fieldLocator, dataMap[exactKey])
+          return fixed || dataMap[exactKey]
+        }
 
         // Fuzzy: check if the locator contains a key word or vice versa
         const locLower = fieldLocator.toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -2977,7 +3088,10 @@ async function buildWebAppStructuredContext(
           const kn = k.toLowerCase().replace(/[^a-z0-9]/g, '')
           return locLower.includes(kn) || kn.includes(locLower)
         })
-        if (fuzzyKey) return dataMap[fuzzyKey]
+        if (fuzzyKey) {
+          const fixed = validateAndFixSampleValue(fieldLocator, dataMap[fuzzyKey])
+          return fixed || dataMap[fuzzyKey]
+        }
       }
       return null
     }
@@ -3345,6 +3459,56 @@ function ensureWebAppCreateSteps(
 ): GenerateResponse {
   if (!isWebApp) return result
   if (!result.steps || result.steps.length === 0) return result
+
+  // ── -2. Strip hallucinated login/authentication steps (HARD GUARD) ─────────
+  // The LLM may still generate login steps despite prompt-level instructions.
+  // This filter removes them at the output level — it is the final safety net.
+  // A step is classified as a login step if:
+  //   • It is a NAVIGATE to /login, /signin, /sign-in, /auth, or /session
+  //   • It is a TYPE into a username/email/password field (for auth purposes)
+  //   • It is a CLICK on a "Log In" / "Sign In" / "Login" button
+  // EXCEPTION: a test whose name explicitly includes "login" (i.e. the feature
+  //            being tested IS the login flow) is left untouched.
+  const testingLoginFeature = /\blogin\b.*\bfeature\b|\btest.*login.*page\b/i.test(prompt)
+  if (!testingLoginFeature) {
+    const LOGIN_NAVIGATE_PATTERN = /^\/(login|signin|sign-in|auth|session)(\/|$)/i
+    const AUTH_FIELD_PATTERN = /\b(username|password|email.*login|login.*email|sign.?in)\b/i
+    const AUTH_BUTTON_PATTERN = /^(log\s*in|sign\s*in|login|signin)$/i
+
+    const originalCount = result.steps.length
+    result.steps = result.steps.filter((step) => {
+      const action = String(step.action ?? '').toLowerCase()
+      const target = String(step.target ?? '')
+      const value  = String(step.value  ?? '')
+
+      // NAVIGATE /login → strip
+      if ((action === 'navigate' || action === 'goto' || action === 'open') &&
+          LOGIN_NAVIGATE_PATTERN.test(value.trim())) {
+        log.warn(`[GEN] Post-process: stripped login NAVIGATE step (value="${value}")`)
+        return false
+      }
+
+      // TYPE into auth fields → strip
+      if (action === 'type' && AUTH_FIELD_PATTERN.test(target)) {
+        log.warn(`[GEN] Post-process: stripped auth TYPE step (target="${target}")`)
+        return false
+      }
+
+      // CLICK on Log In / Sign In button → strip
+      if (action === 'click' && AUTH_BUTTON_PATTERN.test(target.trim())) {
+        log.warn(`[GEN] Post-process: stripped auth CLICK step (target="${target}")`)
+        return false
+      }
+
+      return true
+    })
+
+    if (result.steps.length < originalCount) {
+      log.info(`[GEN] Post-process: removed ${originalCount - result.steps.length} login/auth step(s). Remaining: ${result.steps.length}`)
+      // Re-number remaining steps so ids are sequential
+      result.steps = result.steps.map((step, idx) => ({ ...step, id: String(idx + 1) }))
+    }
+  }
 
   // ── -1. Sanitise placeholder text leaking into step values ────────────────
   // The LLM sometimes copies instruction fragments like "real contact name from

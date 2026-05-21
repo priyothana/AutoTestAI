@@ -43,6 +43,7 @@ import {
   JiraBoardsSchema,
   JiraBoardIssuesSchema,
   JiraProjectConfigSchema,
+  KeycloakTokenSchema,
 } from './project.schema.js'
 import * as svc from './project.service.js'
 import {
@@ -812,6 +813,111 @@ export async function projectRoutes(app: FastifyInstance) {
         brdContent: body.brdContent,
       })
       return reply.send(result)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // ─── Keycloak / OAuth Custom Token Routes ──────────────────────────────
+
+  /**
+   * POST /api/v1/projects/:id/save-keycloak-tokens
+   *
+   * Accepts the HMAC-signed auth_token and Keycloak id_token that were
+   * captured after a successful Keycloak SSO login, Fernet-encrypts them,
+   * and stores them in auth_config alongside an expiry timestamp.
+   *
+   * Body: { auth_token, id_token?, refresh_url?, expires_at? }
+   *
+   * This is the main ingestion endpoint — called either:
+   *  a) Manually from the project Integration tab UI, or
+   *  b) Programmatically by the DS Logistics backend after Keycloak login.
+   */
+  app.post('/projects/:id/save-keycloak-tokens', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      let body: ReturnType<typeof KeycloakTokenSchema.parse>
+      try {
+        body = KeycloakTokenSchema.parse(request.body)
+      } catch (zodErr: any) {
+        const fields: Record<string, string> = {}
+        for (const issue of zodErr?.issues ?? []) {
+          const field = issue.path[0] as string | undefined
+          if (field) fields[field] = issue.message
+        }
+        return reply.status(400).send({ success: false, error: 'VALIDATION_ERROR', fields })
+      }
+
+      await svc.saveKeycloakTokens(id, body)
+      return reply.send({
+        success: true,
+        message: 'Keycloak tokens saved. Session is ready for test execution.',
+        login_strategy: 'keycloak',
+        expires_at: body.expires_at ?? (Date.now() + 24 * 60 * 60 * 1000),
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  /**
+   * GET /api/v1/projects/:id/keycloak-session
+   *
+   * Returns the current Keycloak session status for the project:
+   *  - Whether tokens are stored
+   *  - Whether the token is still valid or near/past expiry
+   *  - The token expiry timestamp
+   *  - The configured refresh URL
+   *
+   * Does NOT return the raw token value (security — tokens are server-side only).
+   */
+  app.get('/projects/:id/keycloak-session', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const session = await svc.getKeycloakSession(id)
+
+      if (!session) {
+        return reply.send({
+          configured: false,
+          message: 'No Keycloak tokens stored for this project.',
+        })
+      }
+
+      const now = Date.now()
+      const msRemaining = session.expires_at - now
+      const isExpired = msRemaining <= 0
+      const isNearExpiry = !isExpired && msRemaining < 5 * 60 * 1000
+
+      return reply.send({
+        configured: true,
+        is_expired: isExpired,
+        is_near_expiry: isNearExpiry,
+        expires_at: session.expires_at,
+        expires_at_iso: new Date(session.expires_at).toISOString(),
+        ms_remaining: Math.max(0, msRemaining),
+        has_id_token: !!session.id_token,
+        refresh_url: session.refresh_url,
+        status: isExpired ? 'expired' : isNearExpiry ? 'expiring_soon' : 'valid',
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  /**
+   * DELETE /api/v1/projects/:id/keycloak-session
+   *
+   * Clears the stored Keycloak tokens and resets login_strategy back to 'form'.
+   * Use this when tokens are revoked or the project no longer uses Keycloak.
+   */
+  app.delete('/projects/:id/keycloak-session', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      await svc.clearKeycloakSession(id)
+      return reply.send({
+        success: true,
+        message: 'Keycloak session cleared. Login strategy reset to form-based.',
+      })
     } catch (err: any) {
       return handleErr(err, reply)
     }
