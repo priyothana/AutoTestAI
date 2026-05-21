@@ -517,12 +517,135 @@ export interface WebAppSyncResult {
 }
 
 /**
+ * Force-run Stages 2-4 (Normalize → Domain Models → Embeddings) on already-crawled
+ * raw data WITHOUT re-crawling. Use this to unblock a stuck pipeline where raw pages
+ * exist but downstream stages never ran (e.g. crawl state stuck with hasMorePages=true).
+ *
+ * Clears the stale crawl_state from auth_config so the next sync starts fresh.
+ */
+export async function forceNormalizeWebapp(projectId: string): Promise<WebAppSyncResult> {
+  log.info(`[WEB-SYNC] Force-normalize started for project ${projectId} (skipping Stage 1)`)
+
+  // ── Verify raw data exists ────────────────────────────────────────────────
+  const rawRow = await prisma.metadata_raw_store.findFirst({
+    where: { project_id: projectId, metadata_type: 'webpage' },
+    select: { raw_json: true },
+  })
+  const pagesInDb = (rawRow?.raw_json as { pages?: unknown[] })?.pages?.length ?? 0
+  if (pagesInDb === 0) {
+    throw { statusCode: 400, message: 'No crawled pages found — run Sync Metadata first to crawl the site.' }
+  }
+
+  // ── Clear stale crawl_state so next sync starts fresh ────────────────────
+  const integration = await prisma.project_integrations.findFirst({
+    where: { project_id: projectId, category: 'web_app' },
+  })
+  if (integration) {
+    const existingCfg = (integration.auth_config as Record<string, any>) ?? {}
+    await prisma.project_integrations.update({
+      where: { id: integration.id },
+      data:  { auth_config: { ...existingCfg, crawl_state: null } as object },
+    })
+  }
+
+  try {
+    const { metadataSyncQueue } = await import('../../workers/metadata-sync.worker.js')
+    // Enqueue a special job that runs only stages 2-4
+    await metadataSyncQueue.add(
+      'force-normalize',
+      {
+        projectId,
+        triggeredBy:     'manual',
+        category:        'web_app',
+        isContinuation:  false,
+        skipCrawl:       true,      // flag handled by worker
+        continuationRun: 999,       // large number → triggers force-complete immediately
+      } as any,
+      {
+        attempts:         2,
+        backoff:          { type: 'fixed', delay: 3000 },
+        removeOnComplete: { count: 10 },
+        removeOnFail:     { count: 20 },
+      },
+    )
+  } catch (queueErr: unknown) {
+    // Queue unavailable — run stages 2-4 inline
+    log.warn({ err: queueErr }, '[WEB-SYNC] Queue unavailable — running stages 2-4 inline')
+    try {
+      const { generateEmbeddings } = await import('../salesforce/salesforce.embeddings.js')
+
+      const normalizedCount = await normalizeWebappMetadata(projectId)
+      const domainCount     = await buildWebappDomainModels(projectId)
+      const embeddingCount  = await generateEmbeddings(projectId)
+
+      await prisma.project_integrations.updateMany({
+        where: { project_id: projectId },
+        data:  { last_synced_at: new Date(), sync_error: null },
+      })
+
+      return {
+        status:             'completed',
+        message:            `Force-normalize complete — ${pagesInDb} pages processed inline`,
+        raw_count:          pagesInDb,
+        normalized_count:   normalizedCount,
+        domain_model_count: domainCount,
+        embedding_count:    embeddingCount,
+      }
+    } catch (inlineErr: unknown) {
+      const msg = inlineErr instanceof Error ? inlineErr.message : String(inlineErr)
+      throw { statusCode: 500, message: `Force-normalize failed: ${msg}` }
+    }
+  }
+
+  const [raw, normalized, domain, embeddings] = await Promise.all([
+    prisma.metadata_raw_store.count({ where: { project_id: projectId } }),
+    prisma.metadata_normalized.count({ where: { project_id: projectId } }),
+    prisma.domain_models.count({ where: { project_id: projectId } }),
+    prisma.vector_embeddings.count({ where: { project_id: projectId } }),
+  ])
+
+  return {
+    status:             'queued',
+    message:            `Force-normalize queued — processing ${pagesInDb} already-crawled pages (Stages 2-4)`,
+    raw_count:          pagesInDb,
+    normalized_count:   normalized,
+    domain_model_count: domain,
+    embedding_count:    embeddings,
+  }
+}
+
+/**
  * Enqueue a Web App metadata sync job on the metadata-sync-queue.
+ * Smart detection: if pages are already crawled but downstream stages are stuck
+ * (normalized=0 and pages>0), automatically redirects to forceNormalizeWebapp().
  * Returns immediately with status='queued'.
  * Falls back to inline synchronous run if Redis / BullMQ is unavailable.
  */
 export async function syncWebappMetadata(projectId: string): Promise<WebAppSyncResult> {
   log.info(`[WEB-SYNC] Sync queued for project ${projectId}`)
+
+  // ── Smart detection: stale stuck crawl state ──────────────────────────────
+  // If pages are already crawled but Normalize/Domain/Embed stages are at 0,
+  // this means the crawl never "completed" (hasMorePages was stuck). Instead
+  // of re-crawling from scratch, run forceNormalize to unblock the pipeline.
+  try {
+    const rawRow = await prisma.metadata_raw_store.findFirst({
+      where: { project_id: projectId, metadata_type: 'webpage' },
+      select: { raw_json: true },
+    })
+    const pagesInDb = (rawRow?.raw_json as { pages?: unknown[] })?.pages?.length ?? 0
+    const normalizedCount = await prisma.metadata_normalized.count({ where: { project_id: projectId } })
+
+    if (pagesInDb >= 5 && normalizedCount === 0) {
+      log.warn(
+        `[WEB-SYNC] Detected stuck pipeline for project ${projectId}: ` +
+        `${pagesInDb} pages crawled but normalized=0. Redirecting to force-normalize.`
+      )
+      return forceNormalizeWebapp(projectId)
+    }
+  } catch (detectErr) {
+    log.warn({ err: detectErr }, '[WEB-SYNC] Stuck-crawl detection failed — proceeding with normal sync')
+  }
 
   try {
     const { metadataSyncQueue } = await import('../../workers/metadata-sync.worker.js')

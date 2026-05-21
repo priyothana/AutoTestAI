@@ -65,9 +65,16 @@ async function resolveCategory(projectId: string, jobCategory?: string): Promise
 
 // ─── Pipeline processor ───────────────────────────────────────────────────────
 
+/** Max crawl continuation runs before forcing Stages 2-4 regardless of pending URLs */
+const MAX_CRAWL_RUNS = 5
+/** Min pages to consider a crawl "good enough" to proceed to Stages 2-4 */
+const MIN_PAGES_FOR_COMPLETION = 5
+
 async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
-  const { projectId, triggeredBy, category: jobCategory, isContinuation } = job.data
-  log.info(`[SYNC] Starting metadata sync pipeline for project=${projectId} trigger=${triggeredBy} jobCategory=${jobCategory ?? 'auto-detect'} continuation=${!!isContinuation}`)
+  const { projectId, triggeredBy, category: jobCategory, isContinuation, continuationRun } = job.data as MetadataSyncJob & { continuationRun?: number; skipCrawl?: boolean }
+  const skipCrawl  = (job.data as any).skipCrawl === true
+  const currentRun = continuationRun ?? 1
+  log.info(`[SYNC] Starting metadata sync pipeline for project=${projectId} trigger=${triggeredBy} jobCategory=${jobCategory ?? 'auto-detect'} continuation=${!!isContinuation} run=${currentRun} skipCrawl=${skipCrawl}`)
 
   // ── Verify integration exists ─────────────────────────────────────────────
   const integration = await prisma.project_integrations.findFirst({
@@ -101,12 +108,25 @@ async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
     if (category === 'web_app') {
       // ════════════════════════════════════════════════════════════
       // Web App Pipeline — Incremental Playwright Crawler
-      // Stage 1 always runs. Stages 2-4 only run when crawl is complete.
+      // Stage 1 runs unless skipCrawl=true (force-normalize flow).
+      // Stages 2-4 only run when crawl is complete (or force-completed).
       // ════════════════════════════════════════════════════════════
 
-      // ── Stage 1: Incremental Playwright crawl ──────────────────
-      log.info(`[SYNC] Stage 1/4 — Playwright crawl (Web App) [continuation=${!!isContinuation}]`)
-      await job.updateProgress(10)
+      if (skipCrawl) {
+        // ── Force-normalize: skip Stage 1, use existing raw data ───
+        log.info(`[SYNC] Stage 1 SKIPPED (skipCrawl=true) — using existing crawled pages`)
+        await job.updateProgress(35)
+        // Read actual page count from raw_json.pages
+        const rawRow = await prisma.metadata_raw_store.findFirst({
+          where: { project_id: projectId, metadata_type: 'webpage' },
+          select: { raw_json: true },
+        })
+        rawCount = (rawRow?.raw_json as { pages?: unknown[] })?.pages?.length ?? 0
+        log.info(`[SYNC] Found ${rawCount} existing crawled pages — proceeding to Stages 2-4`)
+      } else {
+        // ── Stage 1: Incremental Playwright crawl ──────────────────
+        log.info(`[SYNC] Stage 1/4 — Playwright crawl (Web App) [continuation=${!!isContinuation}]`)
+        await job.updateProgress(10)
 
       const crawlRunResult = await crawlAndStoreRaw(projectId, !!isContinuation)
       rawCount = crawlRunResult.totalCrawledSoFar
@@ -118,36 +138,62 @@ async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
       )
 
       if (crawlRunResult.hasMorePages) {
-        // More pages remain — auto-enqueue a continuation job
-        // Stages 2-4 are deferred until the crawl is fully complete.
-        log.info(`[SYNC] 🔄 ${crawlRunResult.progressMessage} — auto-enqueueing continuation job`)
-
-        await metadataSyncQueue.add(
-          'sync-continuation',
-          {
-            projectId,
-            triggeredBy: 'auto',
-            category:    'web_app',
-            isContinuation: true,
-          },
-          {
-            attempts:         3,
-            backoff:          { type: 'fixed', delay: 3000 },
-            removeOnComplete: { count: 10 },
-            removeOnFail:     { count: 20 },
-          },
+        // Check if we should force-complete instead of deferring
+        const shouldForceComplete = (
+          currentRun >= MAX_CRAWL_RUNS ||
+          crawlRunResult.totalCrawledSoFar >= MIN_PAGES_FOR_COMPLETION * 3
         )
 
-        await job.updateProgress(20)
-        // Clear sync error; do NOT set last_synced_at yet (crawl not done)
-        await prisma.project_integrations.update({
-          where: { id: integration.id },
-          data:  { sync_error: null },
-        })
+        if (shouldForceComplete) {
+          // Enough pages crawled or too many runs — force-complete the crawl
+          // and proceed to Stages 2-4 now to unblock the pipeline.
+          log.warn(
+            `[SYNC] ⚡ Force-completing crawl after run #${currentRun} ` +
+            `(${crawlRunResult.totalCrawledSoFar} pages crawled, ` +
+            `${crawlRunResult.pendingCount} still pending — proceeding to Stages 2-4)`
+          )
+          rawCount = crawlRunResult.totalCrawledSoFar
+          // Clear the pending crawl state so next sync starts fresh
+          const existingCfg = (integration.auth_config as Record<string, any>) ?? {}
+          await prisma.project_integrations.update({
+            where: { id: integration.id },
+            data:  { auth_config: { ...existingCfg, crawl_state: null } as object },
+          })
+          // Fall through to Stages 2-4 below
+        } else {
+          // More pages remain — auto-enqueue a continuation job
+          // Stages 2-4 are deferred until the crawl is fully complete.
+          log.info(`[SYNC] 🔄 ${crawlRunResult.progressMessage} — auto-enqueueing continuation job (run ${currentRun}/${MAX_CRAWL_RUNS})`)
 
-        log.info(`[SYNC] Continuation job enqueued — returning early (stages 2-4 deferred)`)
-        return  // ← exit: stages 2-4 run in the final continuation job
+          await metadataSyncQueue.add(
+            'sync-continuation',
+            {
+              projectId,
+              triggeredBy:    'auto',
+              category:       'web_app',
+              isContinuation: true,
+              continuationRun: currentRun + 1,
+            } as any,
+            {
+              attempts:         3,
+              backoff:          { type: 'fixed', delay: 3000 },
+              removeOnComplete: { count: 10 },
+              removeOnFail:     { count: 20 },
+            },
+          )
+
+          await job.updateProgress(20)
+          // Clear sync error; do NOT set last_synced_at yet (crawl not done)
+          await prisma.project_integrations.update({
+            where: { id: integration.id },
+            data:  { sync_error: null },
+          })
+
+          log.info(`[SYNC] Continuation job enqueued — returning early (stages 2-4 deferred)`)
+          return  // ← exit: stages 2-4 run in the final continuation job
+        }
       }
+      } // end of !skipCrawl block
 
       // Crawl fully complete — run stages 2-4 now
       log.info(`[SYNC] Crawl complete (${rawCount} pages total) — proceeding to stages 2-4`)

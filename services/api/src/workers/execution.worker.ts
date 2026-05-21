@@ -31,6 +31,7 @@ import type { ExecutionJob, HealingJob, StepData } from '../shared/queue/job-typ
 import type { ExecutionStepResult } from '../modules/execution/execution.schema.js'
 import { generateAiSuggestions } from '../modules/self-healing/self-healing.service.js'
 import { waitForResume, clearPause, resolvePause } from '../shared/execution/pause-gate.js'
+import { handleStepFailure } from '../modules/ai-agents/execution.agent.js'
 import {
   fillWebAppField,
   selectWebAppPicklist,
@@ -2876,6 +2877,180 @@ async function modalScopedResolve(page: Page, step: StepData): Promise<Locator> 
   return getFirstVisibleLocator(resolveLocator(page, step), 10_000)
 }
 
+// ─── Smart Web App Click — navigation-menu aware ──────────────────────────────
+//
+// Used for all non-destructive, non-role-string click targets in web apps.
+// Implements 8 progressive strategies so that navigation items like
+// "Admin Panel", "Settings", sidebar links, etc. are found even when they are:
+//  • Inside a <nav> / sidebar that requires scrolling
+//  • Hidden behind a collapsed hamburger / toggle
+//  • Only reachable via role="link" or aria-label
+//  • Rendered as <li>, <a>, or custom SPA route components
+//
+// Returns true if the element was clicked, throws if all strategies fail.
+
+async function smartWebAppClick(
+  page: Page,
+  target: string,
+  logger: ReturnType<typeof createModuleLogger>,
+): Promise<boolean> {
+  const isSelector = target.startsWith('.') || target.startsWith('#') || target.startsWith('[')
+
+  // ── Strategy 0: CSS / attribute selector (direct) ───────────────────────────
+  if (isSelector) {
+    try {
+      const loc = page.locator(target).first()
+      await loc.waitFor({ state: 'visible', timeout: 5_000 })
+      await loc.scrollIntoViewIfNeeded().catch(() => {})
+      await loc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 0 (CSS selector): "${target}"`)
+      return true
+    } catch { /* try next */ }
+  }
+
+  // ── Strategy 1: Exact text match (fastest) ───────────────────────────────────
+  try {
+    const loc = page.getByText(target, { exact: true }).first()
+    if (await loc.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await loc.scrollIntoViewIfNeeded().catch(() => {})
+      await loc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 1 (exact text): "${target}"`)
+      return true
+    }
+  } catch { /* try next */ }
+
+  // ── Strategy 2: Role=link (navigation menu items are almost always <a>) ──────
+  try {
+    const loc = page.getByRole('link', { name: target, exact: false }).first()
+    if (await loc.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await loc.scrollIntoViewIfNeeded().catch(() => {})
+      await loc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 2 (role=link): "${target}"`)
+      return true
+    }
+  } catch { /* try next */ }
+
+  // ── Strategy 3: Role=menuitem (dropdown / sidebar nav items) ─────────────────
+  try {
+    const loc = page.getByRole('menuitem', { name: target, exact: false }).first()
+    if (await loc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await loc.scrollIntoViewIfNeeded().catch(() => {})
+      await loc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 3 (role=menuitem): "${target}"`)
+      return true
+    }
+  } catch { /* try next */ }
+
+  // ── Strategy 4: Role=button (some nav items render as buttons) ───────────────
+  try {
+    const loc = page.getByRole('button', { name: target, exact: false }).first()
+    if (await loc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await loc.scrollIntoViewIfNeeded().catch(() => {})
+      await loc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 4 (role=button): "${target}"`)
+      return true
+    }
+  } catch { /* try next */ }
+
+  // ── Strategy 5: aria-label attribute match ───────────────────────────────────
+  try {
+    const ariaLoc = page.locator(
+      `[aria-label*="${target}" i], [title*="${target}" i], [data-title*="${target}" i]`
+    ).first()
+    if (await ariaLoc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await ariaLoc.scrollIntoViewIfNeeded().catch(() => {})
+      await ariaLoc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 5 (aria-label/title): "${target}"`)
+      return true
+    }
+  } catch { /* try next */ }
+
+  // ── Strategy 6: Collapsed nav — try to open hamburger / sidebar toggle first ─
+  // Many SPAs hide their nav on smaller viewports / initial state.
+  // Try toggling any hamburger, nav toggle, or sidebar opener, then retry.
+  const HAMBURGER_SELECTORS = [
+    'button[aria-label*="menu" i]',
+    'button[aria-label*="navigation" i]',
+    'button[aria-label*="sidebar" i]',
+    'button[aria-label*="toggle" i]',
+    '[class*="hamburger"]',
+    '[class*="menu-toggle"]',
+    '[class*="nav-toggle"]',
+    '[class*="sidebar-toggle"]',
+    '[class*="sidebar-open"]',
+    '[id*="sidebar-toggle"]',
+    '[id*="menu-toggle"]',
+  ]
+  for (const hamSel of HAMBURGER_SELECTORS) {
+    try {
+      const ham = page.locator(hamSel).first()
+      if (!await ham.isVisible({ timeout: 500 }).catch(() => false)) continue
+
+      await ham.click()
+      await page.waitForTimeout(600)
+      logger.info(`[WEBAPP-SMART-CLICK] Opened collapsed nav via "${hamSel}" — retrying target "${target}"`)
+
+      // Retry link/text after expanding nav
+      const retryLink = page.getByRole('link', { name: target, exact: false }).first()
+      if (await retryLink.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await retryLink.scrollIntoViewIfNeeded().catch(() => {})
+        await retryLink.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 6 (hamburger expand + link): "${target}"`)
+        return true
+      }
+      const retryText = page.getByText(target, { exact: false }).first()
+      if (await retryText.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await retryText.scrollIntoViewIfNeeded().catch(() => {})
+        await retryText.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 6 (hamburger expand + text): "${target}"`)
+        return true
+      }
+
+      // Close nav again if we didn't find it (undo toggle)
+      await ham.click().catch(() => {})
+      await page.waitForTimeout(300)
+    } catch { /* try next hamburger */ }
+  }
+
+  // ── Strategy 7: Scroll nav to find hidden item ───────────────────────────────
+  // Some sidebars have more items below the fold — scroll inside <nav> / sidebar
+  const NAV_CONTAINERS = ['nav', '[role="navigation"]', '[class*="sidebar"]', '[class*="nav"]', '[id*="nav"]', '[id*="sidebar"]']
+  for (const navSel of NAV_CONTAINERS) {
+    try {
+      const container = page.locator(navSel).first()
+      if (!await container.isVisible({ timeout: 500 }).catch(() => false)) continue
+
+      // Scroll the container down to reveal items
+      await container.evaluate((el) => { el.scrollTop = el.scrollHeight }).catch(() => {})
+      await page.waitForTimeout(400)
+
+      const scrolledLink = page.getByRole('link', { name: target, exact: false }).first()
+      if (await scrolledLink.isVisible({ timeout: 1_500 }).catch(() => false)) {
+        await scrolledLink.scrollIntoViewIfNeeded().catch(() => {})
+        await scrolledLink.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 7 (nav scroll + link): "${target}"`)
+        return true
+      }
+    } catch { /* try next */ }
+  }
+
+  // ── Strategy 8: Partial text fallback (broadest, last resort) ────────────────
+  try {
+    const loc = page.getByText(target, { exact: false }).first()
+    await loc.waitFor({ state: 'visible', timeout: 8_000 })
+    await loc.scrollIntoViewIfNeeded().catch(() => {})
+    await loc.click()
+    logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 8 (partial text fallback): "${target}"`)
+    return true
+  } catch { /* all strategies exhausted */ }
+
+  throw new Error(
+    `smartWebAppClick: all 8 strategies failed to locate "${target}". ` +
+    `Tried: CSS selector, exact text, role=link, role=menuitem, role=button, ` +
+    `aria-label, hamburger toggle, nav scroll, partial text.`
+  )
+}
+
 // ─── Action executor ──────────────────────────────────────────────────────────
 
 async function executeStep(
@@ -3355,13 +3530,8 @@ async function executeStep(
                 }
 
               } else {
-                // Non-destructive: standard CSS/text click
-                const directLoc = target.startsWith('.') || target.startsWith('#') || target.startsWith('[')
-                  ? page.locator(target)
-                  : page.getByText(target, { exact: false })
-                await directLoc.first().waitFor({ state: 'visible', timeout: 15_000 })
-                await directLoc.first().click()
-                clicked = true
+                // Non-destructive: use smart click with navigation-menu awareness
+                clicked = await smartWebAppClick(page, target, log)
               }
             }
 
@@ -4574,6 +4744,165 @@ async function loginToWebApp(
   await saveSession(projectId, browserCtx)
 }
 
+// ─── Keycloak / OAuth Custom Token Login ───────────────────────────────────
+
+/**
+ * Keycloak / OAuth Custom Token authentication.
+ *
+ * This function handles apps that use Keycloak as their Identity Provider
+ * and issue a custom HMAC-signed token (not a standard JWT) after SSO login.
+ *
+ * Auth flow:
+ *  1. Token expiry check — if the stored token is expired or < 2 min away,
+ *     attempt a silent refresh via keycloakRefreshUrl (if configured).
+ *  2. Both tokens are injected into every browser page via addInitScript():
+ *       sessionStorage["auth_token"] = keycloakAuthToken  (Bearer token for API calls)
+ *       sessionStorage["id_token"]   = keycloakIdToken    (Keycloak id token for logout)
+ *  3. The current page is reloaded so the app initialises with the injected session.
+ *  4. A Playwright storageState snapshot is saved for session reuse.
+ *
+ * Token storage: DS Logistics App (and similar Keycloak apps) read their
+ * tokens from sessionStorage, not from cookies.  addInitScript() runs
+ * the injection script before EVERY subsequent page.goto() so the tokens
+ * are always present — even after SPAs perform client-side navigation.
+ */
+async function loginWithKeycloak(
+  page: Page,
+  browserCtx: BrowserContext,
+  context: ExecutionJob['context'],
+  projectId: string,
+): Promise<void> {
+  const {
+    keycloakAuthToken,
+    keycloakIdToken,
+    keycloakRefreshUrl,
+    keycloakTokenExpiresAt,
+    webLoginUrl,
+  } = context
+
+  if (!keycloakAuthToken) {
+    log.warn('[KEYCLOAK] No auth_token configured — skipping Keycloak session injection')
+    return
+  }
+
+  // ── Token expiry guard ─────────────────────────────────────────────────
+  let activeAuthToken = keycloakAuthToken
+  let activeIdToken = keycloakIdToken
+
+  const now = Date.now()
+  const expiresAt = keycloakTokenExpiresAt ?? now
+  const msRemaining = expiresAt - now
+
+  if (msRemaining < 2 * 60 * 1000) {
+    // Token is expired or expiring in < 2 minutes — attempt silent refresh
+    if (keycloakRefreshUrl) {
+      log.info(`[KEYCLOAK] Token near/past expiry — attempting refresh via ${keycloakRefreshUrl}`)
+      try {
+        const refreshResp = await fetch(keycloakRefreshUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${activeAuthToken}`,
+          },
+          body: JSON.stringify({ id_token: activeIdToken }),
+        })
+        if (refreshResp.ok) {
+          const data = await refreshResp.json() as Record<string, string>
+          const newAuthToken = data.auth_token ?? data.token ?? data.access_token
+          const newIdToken = data.id_token ?? data.idToken
+          if (newAuthToken) {
+            activeAuthToken = newAuthToken
+            if (newIdToken) activeIdToken = newIdToken
+            log.info('[KEYCLOAK] ✅ Token refreshed successfully')
+          } else {
+            log.warn('[KEYCLOAK] ⚠️ Refresh response did not contain a new token — proceeding with stored token')
+          }
+        } else {
+          log.warn(
+            { status: refreshResp.status },
+            '[KEYCLOAK] ⚠️ Token refresh request failed — proceeding with stored (possibly expired) token',
+          )
+        }
+      } catch (refreshErr) {
+        log.warn({ refreshErr }, '[KEYCLOAK] Token refresh error (non-fatal) — continuing with stored token')
+      }
+    } else {
+      log.warn(
+        { msRemaining },
+        '[KEYCLOAK] ⚠️ Token near/past expiry and no refresh URL configured — test may fail on auth checks. ' +
+        'Configure keycloak_refresh_url in project integration settings or re-save fresh tokens.',
+      )
+    }
+  } else {
+    log.info(
+      { expiresIn: Math.round(msRemaining / 60_000) + 'm' },
+      '[KEYCLOAK] Token is valid — injecting into browser context',
+    )
+  }
+
+  // ── Inject tokens via addInitScript (runs before every page load) ────────
+  //
+  // addInitScript() is the correct approach for sessionStorage because:
+  //  a) sessionStorage is per-tab, not shared across contexts like cookies.
+  //  b) It runs before the page's own JS, ensuring the tokens are available
+  //     the instant the app script checks sessionStorage on load.
+  //  c) It persists across client-side navigations (SPA routing) within
+  //     the same tab without needing an extra evaluate() after each goto().
+  const authTokenVal = activeAuthToken
+  const idTokenVal = activeIdToken ?? ''
+
+  await browserCtx.addInitScript(
+    ({ authToken, idToken }: { authToken: string; idToken: string }) => {
+      // Inject into sessionStorage on every page load.
+      // This runs in the browser context — window / sessionStorage are available.
+      try {
+        sessionStorage.setItem('auth_token', authToken)
+        if (idToken) sessionStorage.setItem('id_token', idToken)
+      } catch {
+        // sessionStorage may be blocked in sandboxed iframes — safe to ignore
+      }
+    },
+    { authToken: authTokenVal, idToken: idTokenVal },
+  )
+  log.info('[KEYCLOAK] 🔑 addInitScript registered — sessionStorage[auth_token] and [id_token] will be set on every page load')
+
+  // ── Navigate to base URL so the app initialises with the injected session ───
+  const targetUrl = webLoginUrl ?? context.baseUrl
+  if (targetUrl) {
+    log.info(`[KEYCLOAK] Navigating to ${targetUrl} to initialise authenticated session`)
+    try {
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+      await page.waitForTimeout(2_000)
+
+      // Verify session storage was injected on this page
+      const injectedToken = await page.evaluate(() => sessionStorage.getItem('auth_token')).catch(() => null)
+      if (injectedToken) {
+        log.info('[KEYCLOAK] ✅ sessionStorage[auth_token] confirmed on page')
+      } else {
+        // This can happen on pages that clear sessionStorage on load — log and continue
+        log.warn('[KEYCLOAK] ⚠️ sessionStorage[auth_token] not detected after navigation — app may clear storage on load')
+        // Fallback: inject directly on current page
+        await page.evaluate(
+          ({ authToken, idToken }: { authToken: string; idToken: string }) => {
+            try {
+              sessionStorage.setItem('auth_token', authToken)
+              if (idToken) sessionStorage.setItem('id_token', idToken)
+            } catch { /* blocked */ }
+          },
+          { authToken: authTokenVal, idToken: idTokenVal },
+        )
+        log.info('[KEYCLOAK] Direct sessionStorage injection applied as fallback')
+      }
+    } catch (navErr) {
+      log.warn({ navErr }, '[KEYCLOAK] Navigation to target URL failed (non-fatal) — tokens still registered for subsequent navigations')
+    }
+  }
+
+  // Save a Playwright storageState snapshot for session reuse
+  await saveSession(projectId, browserCtx)
+  log.info('[KEYCLOAK] ✅ Keycloak session injected and saved')
+}
+
 // ─── Browser state highlighting ─────────────────────────────────────────────
 
 /**
@@ -4714,12 +5043,15 @@ async function injectPauseOverlay(
   stepValue: string,
   errorMsg: string,
   timeoutMs: number,
+  aiFailureType?: string,
+  aiFailureReason?: string,
 ): Promise<void> {
   try {
     await page.evaluate(
-      ({ stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs }: {
+      ({ stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs, aiFailureType, aiFailureReason }: {
         stepNum: number; stepAction: string; stepTarget: string;
-        stepValue: string; errorMsg: string; timeoutMs: number
+        stepValue: string; errorMsg: string; timeoutMs: number;
+        aiFailureType?: string; aiFailureReason?: string
       }) => {
         // Remove any existing overlay
         document.getElementById('autotest-pause-overlay')?.remove()
@@ -4740,6 +5072,18 @@ async function injectPauseOverlay(
         // Resume/Skip/Stop are <a> tags targeting a hidden <iframe>.
         // Clicking a native link is pure HTML — no JS event handlers needed.
         // Playwright's page.route() intercepts the iframe request at CDP level.
+        // AI Diagnosis card (shown only when agent classified the failure)
+        const aiCard = aiFailureType
+          ? `<div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.25);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start">
+              <span style="font-size:16px;flex-shrink:0">🤖</span>
+              <div style="flex:1;min-width:0">
+                <div style="color:#a5b4fc;font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px">AI Diagnosis</div>
+                <div style="color:#e0e7ff;font-size:12px;font-weight:600;margin-bottom:2px">${aiFailureType.replace(/_/g, ' ')}</div>
+                ${aiFailureReason ? `<div style="color:#94a3b8;font-size:11px;line-height:1.4">${aiFailureReason.replace(/</g, '&lt;').slice(0, 120)}</div>` : ''}
+              </div>
+            </div>`
+          : ''
+
         overlay.innerHTML = `<div id="autotest-pause-card" style="background:linear-gradient(135deg,#1a1f2e 0%,#232941 100%);border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:28px 32px;width:420px;box-shadow:0 32px 80px rgba(0,0,0,0.6);position:relative;pointer-events:auto">
           <style>@keyframes at-slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}} #autotest-pause-card{animation:at-slide .3s ease both} #autotest-pause-card a.at-btn:hover{filter:brightness(1.15)} #autotest-pause-card a.at-btn:active{transform:scale(.97);opacity:.8} #autotest-drag-handle:hover{background:rgba(255,255,255,0.06);border-radius:8px}</style>
           <div id="autotest-drag-handle" style="display:flex;align-items:center;gap:10px;margin-bottom:16px;cursor:grab;user-select:none;-webkit-user-select:none;padding:4px 0;touch-action:none" title="Drag to move">
@@ -4755,6 +5099,7 @@ async function injectPauseOverlay(
             </div>
           </div>
           <div style="height:1px;background:rgba(255,255,255,0.08);margin-bottom:16px"></div>
+          ${aiCard}
           <div style="margin-bottom:12px">
             <div style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Action Required</div>
             <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 14px">
@@ -4897,7 +5242,7 @@ async function injectPauseOverlay(
           }
         } catch { /* LWS may block addEventListener — the <a>+iframe channel handles it */ }
       },
-      { stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs },
+      { stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs, aiFailureType, aiFailureReason },
     )
     log.info(`[HITL] \u2705 Pause overlay injected for step ${stepNum} (execution ${executionId})`)
   } catch (err) {
@@ -5038,15 +5383,29 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
         }
 
       } else if (isWebAppCategory(context.projectCategory) && context.webLoginStrategy !== 'none') {
-        // Always run loginToWebApp — mirrors Salesforce's always-authenticate approach.
-        // The stored session (loaded above) pre-populates cookies, but we always
-        // re-authenticate to ensure validity — stale cookies silently block test steps.
-        log.info(`[SESSION] Running web app form login (hasStoredSession=${hasSession})`)
-        try {
-          await loginToWebApp(page!, browserContext!, context, projectId)
-        } catch (loginErr) {
-          log.error({ loginErr }, '[SESSION] Web app login failed — test cannot proceed')
-          throw loginErr
+        // Route to the correct web app authentication strategy.
+        if (context.webLoginStrategy === 'keycloak') {
+          // ── Keycloak / OAuth Custom Token ─────────────────────────────────
+          // Injects auth_token and id_token into sessionStorage via addInitScript().
+          // No form filling — the stored tokens act as the browser session.
+          log.info(`[SESSION] Running Keycloak token injection (hasStoredSession=${hasSession})`)
+          try {
+            await loginWithKeycloak(page!, browserContext!, context, projectId)
+          } catch (loginErr) {
+            log.error({ loginErr }, '[SESSION] Keycloak session injection failed — test cannot proceed')
+            throw loginErr
+          }
+        } else {
+          // Always run loginToWebApp — mirrors Salesforce's always-authenticate approach.
+          // The stored session (loaded above) pre-populates cookies, but we always
+          // re-authenticate to ensure validity — stale cookies silently block test steps.
+          log.info(`[SESSION] Running web app form login (hasStoredSession=${hasSession})`)
+          try {
+            await loginToWebApp(page!, browserContext!, context, projectId)
+          } catch (loginErr) {
+            log.error({ loginErr }, '[SESSION] Web app login failed — test cannot proceed')
+            throw loginErr
+          }
         }
       }
     }
@@ -5116,6 +5475,102 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
       )
 
       if (result.status === 'failed') {
+        // ── Execution Agent: 1 autonomous recovery attempt before HITL ───────
+        // Shows a live "AI Recovery" banner in the browser, then attempts one
+        // recovery strategy. If it fails or CALL_HITL fires, we immediately
+        // surface the HITL overlay — no prolonged retry loops.
+        let agentRecovered = false
+        let agentFailureType: string | undefined
+        let agentFailureReason: string | undefined
+
+        if (isInteractive && page) {
+          // ── Show recovery-in-progress banner ─────────────────────────────
+          await page.evaluate(({ stepNum, errMsg }: { stepNum: number; errMsg: string }) => {
+            document.getElementById('autotest-recovery-banner')?.remove()
+            const banner = document.createElement('div')
+            banner.id = 'autotest-recovery-banner'
+            banner.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:none'
+            banner.innerHTML = `<div style="background:linear-gradient(135deg,#1a1f2e,#232941);border:1px solid rgba(99,102,241,0.4);border-radius:16px;padding:16px 20px;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.5);display:flex;gap:12px;align-items:flex-start">
+              <div style="width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#6366f1,#818cf8);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">🤖</div>
+              <div style="flex:1;min-width:0">
+                <div style="color:#fff;font-size:13px;font-weight:700;margin-bottom:4px">AI Recovery in Progress…</div>
+                <div style="color:#94a3b8;font-size:11px;margin-bottom:8px">Step ${stepNum} failed — attempting autonomous fix</div>
+                <div style="background:rgba(99,102,241,0.12);border-radius:8px;padding:8px 10px;color:#a5b4fc;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${errMsg}</div>
+              </div>
+            </div>`
+            document.body.appendChild(banner)
+          }, { stepNum: i + 1, errMsg: (result.error ?? result.message ?? 'Step failed').slice(0, 80) }).catch(() => {})
+
+          try {
+            const pageHtml = await page.evaluate(() =>
+              document.body ? document.body.innerHTML.slice(0, 3000) : ''
+            ).catch(() => '')
+            const screenshotB64 = await page.screenshot({ type: 'png' })
+              .then(b => b.toString('base64')).catch(() => undefined)
+
+            // Single recovery attempt — agent escalates to HITL on attemptNum >= 2
+            const recovery = await handleStepFailure({
+              executionId,
+              projectId,
+              failedStep: step as any,
+              errorMessage: result.error ?? result.message ?? 'Step failed',
+              screenshot: screenshotB64,
+              pageHtml,
+              attemptNum: 1,
+            })
+
+            agentFailureType = recovery.failureType
+            agentFailureReason = recovery.reason
+
+            log.info(
+              { executionId, step: step.id, action: recovery.action, failureType: agentFailureType },
+              '[EXEC-AGENT] Recovery action returned',
+            )
+
+            if (recovery.action === 'WAIT_AND_RETRY') {
+              log.info(`[EXEC-AGENT] Waiting 2s then retrying step ${i + 1}`)
+              await page.waitForTimeout(2_000)
+              const retryResult = await executeStep(
+                page, step, i, isLastStep, execScreenDir, executionId,
+                browserContext ?? undefined, projectId, context.projectCategory, context,
+              )
+              if (retryResult.status === 'passed') {
+                stepResults[stepResults.length - 1] = retryResult
+                agentRecovered = true
+                log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via WAIT_AND_RETRY`)
+              }
+            } else if (recovery.action === 'DISMISS_MODAL') {
+              log.info(`[EXEC-AGENT] Dismissing modal then retrying step ${i + 1}`)
+              await page.keyboard.press('Escape').catch(() => {})
+              await page.waitForTimeout(1_000)
+              const retryResult = await executeStep(
+                page, step, i, isLastStep, execScreenDir, executionId,
+                browserContext ?? undefined, projectId, context.projectCategory, context,
+              )
+              if (retryResult.status === 'passed') {
+                stepResults[stepResults.length - 1] = retryResult
+                agentRecovered = true
+                log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via DISMISS_MODAL`)
+              }
+            } else if (recovery.hitlInvoked || recovery.action === 'HITL_INVOKED') {
+              agentRecovered = true // already paused via hitlTool
+            }
+          } catch (agentErr) {
+            log.warn({ agentErr }, '[EXEC-AGENT] Recovery attempt errored (non-fatal) — falling through to HITL overlay')
+          } finally {
+            // Always remove the recovery banner
+            page.evaluate(() => document.getElementById('autotest-recovery-banner')?.remove()).catch(() => {})
+          }
+
+          if (agentRecovered) {
+            const latestResult = stepResults[stepResults.length - 1]
+            if (latestResult.status === 'passed') continue
+            finalStatus = 'FAILED'
+            firstFailedLocator = step.target ?? ''
+            break
+          }
+        }
+
         // ── HITL: Interactive pause on step failure ───────────────────────
         if (isInteractive && page) {
           log.warn(
@@ -5175,6 +5630,8 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             step.action, step.target ?? '', step.value ?? '',
             result.error ?? result.message ?? 'Step failed',
             pauseTimeoutMs,
+            agentFailureType,
+            agentFailureReason,
           )
           await setBrowserState(page, 'paused')
 
@@ -5190,6 +5647,8 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                 step.action, step.target ?? '', step.value ?? '',
                 result.error ?? result.message ?? 'Step failed',
                 pauseTimeoutMs,
+                agentFailureType,
+                agentFailureReason,
               )
               log.info(`[HITL] ♻️ Overlay re-injected after page navigation for step ${i + 1}`)
               await setBrowserState(page!, 'paused')

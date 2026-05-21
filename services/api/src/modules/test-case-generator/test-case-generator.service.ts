@@ -643,7 +643,12 @@ Each negative test MUST include the EXACT expected error message text in expecte
    ❌ WRONG: "Contact Email"          ✅ RIGHT: "Email"
 3. Test names must describe the WORKFLOW — BAD: "Verify Page Loads" → GOOD: "Create Opportunity With Required Fields and Verify Success"
 4. Every test must have at least 4 steps ending with an ASSERT
-5. Use realistic data: real names, valid emails, plausible amounts, actual dates
+5. Use field-type-appropriate data — realistic names, valid emails, proper phone numbers, correct URLs:
+   • Phone/Mobile fields → phone number ONLY (e.g., "+1 555-123-4567") ❌ NEVER "1234343" or "www.hsdbf.com"
+   • Website/URL fields  → full URL ONLY (e.g., "https://www.example.com") ❌ NEVER a plain number or phone number
+   • Email fields        → email ONLY (e.g., "user@example.com") ❌ NEVER a URL or phone number
+   • Date fields         → MM/DD/YYYY ONLY (e.g., "06/30/2026") ❌ NEVER a name or phone number
+   • Amount fields       → numeric digits ONLY (e.g., "50000") ❌ NEVER a name or date
 6. Navigation-only tests (only NAVIGATE steps, no TYPE/CLICK/ASSERT) are REJECTED
 7. ⛔ ASSERT_TEXT / ASSERT_TOAST / ASSERT_URL steps MUST NEVER have an empty target or value.
    For list-display READ tests: ASSERT_TEXT with target = the entity page heading (e.g. "Opportunities"), NOT an empty string.
@@ -773,6 +778,18 @@ Think like a business tester validating that the software does what the business
 - ✅ Every test must end with an ASSERT verifying the outcome
 - ✅ Vary priority: high=critical paths, medium=standard flows, low=edge/rare
 - ✅ Each test must be independently executable (no dependencies on other tests)
+
+## Field Value Type Rules (MANDATORY — violations cause test execution failures)
+Each TYPE step value MUST be semantically appropriate for its field:
+- **Phone / Mobile / Tel** fields → phone number ONLY (e.g., "+1 555-123-4567") ❌ NOT a URL or number like "1234343"
+- **Website / URL / Link** fields → full URL ONLY (e.g., "https://www.example.com") ❌ NOT a phone number or plain number
+- **Email / E-mail** fields → email address ONLY (e.g., "user@example.com") ❌ NOT a phone number or URL
+- **Date** fields → MM/DD/YYYY format ONLY (e.g., "06/30/2026") ❌ NOT a name or phone number
+- **Amount / Price / Cost** fields → numeric digits ONLY (e.g., "50000") ❌ NOT a name or date
+
+❌ NEVER put a URL (e.g., "www.hsdbf.com") into a Phone field
+❌ NEVER put a number (e.g., "1234343") into a Website/URL field
+❌ NEVER put a phone number into an Email field or vice-versa
 ${crudEnforcement}${negativeEnforcement}
 ## Locator Priority (use in this order)
 1. label  — getByLabel('Account Name') — for form inputs

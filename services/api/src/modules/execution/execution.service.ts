@@ -20,6 +20,7 @@ import { createModuleLogger } from '../../shared/logger/index.js'
 import { fernetDecrypt } from '../../shared/encryption/fernet.js'
 import type { ExecutionJob, ExecutionContext, StepData } from '../../shared/queue/job-types.js'
 import type { ExecuteRequest, ExecutionResult, ExecutionStepResult } from './execution.schema.js'
+import { getKeycloakSession } from '../project/project.service.js'
 
 const log = createModuleLogger('execution')
 
@@ -158,6 +159,42 @@ export async function enqueueExecution(data: ExecuteRequest): Promise<{ executio
         const authCfg = (integration.auth_config as Record<string, any> | null) ?? {}
         context.webLoginUrl = authCfg.login_url ?? integration.base_url ?? undefined
         context.webLoginStrategy = (integration.login_strategy as ExecutionContext['webLoginStrategy']) ?? 'form'
+
+        // ── Keycloak / OAuth Custom Token strategy ──────────────────────────────
+        // When login_strategy='keycloak', we skip form-based login entirely and
+        // instead inject both tokens directly into the Playwright browser context
+        // via sessionStorage before any page navigation.
+        if (context.webLoginStrategy === 'keycloak') {
+          try {
+            const kcSession = await getKeycloakSession(testCase.project_id!)
+            if (kcSession) {
+              // Warn on near-expiry tokens (< 5 minutes remaining)
+              const msRemaining = kcSession.expires_at - Date.now()
+              if (msRemaining < 5 * 60 * 1000) {
+                log.warn(
+                  { projectId: testCase.project_id, msRemaining },
+                  '[KEYCLOAK] Token is near expiry — consider refreshing before this run',
+                )
+              } else {
+                log.info(
+                  { projectId: testCase.project_id, expiresIn: Math.round(msRemaining / 60_000) + 'm' },
+                  '[KEYCLOAK] Token loaded — injecting into browser context',
+                )
+              }
+              context.keycloakAuthToken = kcSession.auth_token
+              context.keycloakIdToken = kcSession.id_token ?? undefined
+              context.keycloakRefreshUrl = kcSession.refresh_url ?? undefined
+              context.keycloakTokenExpiresAt = kcSession.expires_at
+            } else {
+              log.warn(
+                { projectId: testCase.project_id },
+                '[KEYCLOAK] No stored Keycloak tokens found — test may fail if the app requires authentication',
+              )
+            }
+          } catch (kcErr) {
+            log.warn({ kcErr }, '[KEYCLOAK] Failed to load Keycloak session (non-fatal)')
+          }
+        }
       }
     } catch (err) {
       log.warn({ err }, 'Failed to decrypt integration credentials — continuing without them')

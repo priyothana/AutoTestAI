@@ -45,7 +45,17 @@ export interface ExecutionContext {
   webUsername?: string
   webPassword?: string
   webLoginUrl?: string
-  webLoginStrategy?: 'form' | 'basic_auth' | 'sso' | 'none'
+  webLoginStrategy?: 'form' | 'basic_auth' | 'sso' | 'none' | 'keycloak'
+
+  // Keycloak / OAuth Custom Token (optional — only for keycloak strategy projects)
+  // auth_token → injected as sessionStorage["auth_token"] (used in Authorization: Bearer)
+  // id_token   → injected as sessionStorage["id_token"] (used for Keycloak logout/refresh)
+  keycloakAuthToken?: string
+  keycloakIdToken?: string
+  // Optional refresh endpoint — e.g. /api/auth/refresh — used to auto-refresh near-expiry tokens
+  keycloakRefreshUrl?: string
+  // Unix epoch ms — token valid-until timestamp (24h from issuance by default)
+  keycloakTokenExpiresAt?: number
 }
 
 /** Individual test step — matches frontend/backend JSON shape */
@@ -161,4 +171,22 @@ export interface MetadataSyncJob {
    * crawl is fully complete (pendingUrls is empty).
    */
   isContinuation?: boolean
+}
+
+/** Agent Orchestrator queue — consumed by agent.worker.ts */
+export interface AgentJob {
+  /** Unique job identifier */
+  jobId: string
+  /** Project context */
+  projectId: string
+  /** User who triggered the job */
+  userId?: string
+  /** Natural language intent from the user */
+  intent: string
+  /** Which agent to route to directly (bypasses Orchestrator if set) */
+  targetAgent?: 'test-case-generator' | 'test-step-generator' | 'execution' | 'healing-analyzer'
+  /** Payload specific to the targetAgent */
+  payload?: Record<string, unknown>
+  /** Conversation history for context */
+  chatHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
 }

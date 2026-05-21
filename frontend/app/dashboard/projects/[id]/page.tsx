@@ -5,7 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation"
 import {
     ArrowLeft, Loader2, Settings, FileText, BarChart3, Link2,
     Cloud, Globe, Check, X, RefreshCw, Unplug, Plug, AlertCircle,
-    Key, Server, ExternalLink, Clock, Database, Search, Plus, Trash2, Edit, Play, Zap, Sparkles
+    Key, Server, ExternalLink, Clock, Database, Search, Plus, Trash2, Edit, Play, Zap, Sparkles,
+    UploadCloud, BookOpen, TestTube2, CheckCircle2, FileType, FileSpreadsheet, FolderOpen
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -182,18 +183,89 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const [webCredSaving, setWebCredSaving] = useState(false)
     const [webCredSuccess, setWebCredSuccess] = useState(false)
 
+    // ── Keycloak / OAuth Custom Token state ───────────────────────────────
+    // Keycloak tokens are short-lived — we never pre-fill them from the server
+    // (the API intentionally never returns raw token values for security).
+    const [kcAuthToken, setKcAuthToken] = useState("")
+    const [kcIdToken, setKcIdToken] = useState("")
+    const [kcRefreshUrl, setKcRefreshUrl] = useState("")
+    const [kcShowAuthToken, setKcShowAuthToken] = useState(false)
+    const [kcShowIdToken, setKcShowIdToken] = useState(false)
+    const [kcSaving, setKcSaving] = useState(false)
+    const [kcSuccess, setKcSuccess] = useState(false)
+    const [kcSessionStatus, setKcSessionStatus] = useState<{
+        configured: boolean
+        status?: "valid" | "expiring_soon" | "expired"
+        is_expired?: boolean
+        is_near_expiry?: boolean
+        expires_at?: number
+        expires_at_iso?: string
+        ms_remaining?: number
+        has_id_token?: boolean
+        refresh_url?: string | null
+    } | null>(null)
+
+    // ── Document Upload State ────────────────────────────────────────────────
+    type UploadedDoc = { id: string; name: string; size: number; type: string; uploadedAt: string }
+    const [brdDocs, setBrdDocs] = useState<UploadedDoc[]>([])
+    const [testCaseDocs, setTestCaseDocs] = useState<UploadedDoc[]>([])
+    const [brdUploading, setBrdUploading] = useState(false)
+    const [testCaseUploading, setTestCaseUploading] = useState(false)
+    const [brdDragOver, setBrdDragOver] = useState(false)
+    const [testCaseDragOver, setTestCaseDragOver] = useState(false)
+    const brdFileInputRef = useRef<HTMLInputElement>(null)
+    const testCaseFileInputRef = useRef<HTMLInputElement>(null)
+
     useEffect(() => {
         if (id) {
             fetchProject()
             fetchIntegration()
             fetchJiraConfig()
             loadTestData()
+            loadPersistedDocs()
+            fetchKeycloakSessionStatus()
         }
         const connected = searchParams.get("connected")
         if (connected === "salesforce") toast.success("Salesforce connected & metadata sync started!")
         const error = searchParams.get("error")
         if (error) toast.error(`Connection error: ${error}`)
     }, [id])
+
+    /** Load previously saved BRD and existing-test-case docs from the API on mount */
+    const loadPersistedDocs = async () => {
+        try {
+            const [brdRes, tcRes] = await Promise.all([
+                fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/brd`),
+                fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/existing-tests`),
+            ])
+            if (brdRes.ok) {
+                const data = await brdRes.json()
+                if (data.attached && data.filename) {
+                    setBrdDocs([{
+                        id: 'brd-persisted',
+                        name: data.filename,
+                        size: data.bytes ?? 0,
+                        type: 'application/octet-stream',
+                        uploadedAt: new Date().toISOString(),
+                    }])
+                }
+            }
+            if (tcRes.ok) {
+                const data = await tcRes.json()
+                if (data.attached && data.filename) {
+                    setTestCaseDocs([{
+                        id: 'tc-persisted',
+                        name: data.filename,
+                        size: data.bytes ?? 0,
+                        type: 'application/octet-stream',
+                        uploadedAt: new Date().toISOString(),
+                    }])
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load persisted docs:', e)
+        }
+    }
 
 
     const fetchJiraConfig = async () => {
@@ -319,6 +391,76 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             toast.error(err.message || "Failed to save credentials")
         } finally {
             setWebCredSaving(false)
+        }
+    }
+
+    /**
+     * Fetch the current Keycloak session status from the API.
+     * Called on mount and after saving tokens.
+     */
+    const fetchKeycloakSessionStatus = async () => {
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/keycloak-session`)
+            if (res.ok) setKcSessionStatus(await res.json())
+        } catch { /* non-critical */ }
+    }
+
+    /**
+     * Save Keycloak auth_token + id_token to the backend.
+     * The tokens are Fernet-encrypted and stored in auth_config.
+     * Calling this also sets login_strategy='keycloak' on the integration.
+     */
+    const handleSaveKeycloakTokens = async () => {
+        if (!kcAuthToken.trim()) {
+            toast.error("auth_token is required")
+            return
+        }
+        setKcSaving(true)
+        setKcSuccess(false)
+        try {
+            const body: Record<string, string | number> = {
+                auth_token: kcAuthToken.trim(),
+            }
+            if (kcIdToken.trim()) body.id_token = kcIdToken.trim()
+            if (kcRefreshUrl.trim()) body.refresh_url = kcRefreshUrl.trim()
+            // Default 24h expiry from now (Unix ms)
+            body.expires_at = Date.now() + 24 * 60 * 60 * 1000
+
+            const res = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/save-keycloak-tokens`,
+                { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+            )
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}))
+                throw new Error(err.detail || err.message || "Failed to save Keycloak tokens")
+            }
+            setKcSuccess(true)
+            setKcAuthToken("")
+            setKcIdToken("")
+            fetchIntegration()
+            fetchKeycloakSessionStatus()
+            toast.success("✅ Keycloak tokens saved — session ready for test execution")
+            setTimeout(() => setKcSuccess(false), 5000)
+        } catch (err: any) {
+            toast.error(err.message || "Failed to save Keycloak tokens")
+        } finally {
+            setKcSaving(false)
+        }
+    }
+
+    const handleClearKeycloakSession = async () => {
+        try {
+            const res = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/keycloak-session`,
+                { method: "DELETE" }
+            )
+            if (!res.ok) throw new Error("Failed to clear session")
+            setKcSessionStatus(null)
+            setWebLoginStrategy("form")
+            fetchIntegration()
+            toast.success("Keycloak session cleared")
+        } catch (err: any) {
+            toast.error(err.message || "Failed to clear session")
         }
     }
 
@@ -634,6 +776,174 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             setUploadError('Upload failed — unexpected error')
         } finally {
             setTestDataUploading(false)
+        }
+    }
+
+    // ── Document Upload Handlers ─────────────────────────────────────────────
+    const ACCEPTED_BRD_TYPES = [
+        'application/pdf',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'text/plain',
+    ]
+    const ACCEPTED_BRD_EXTS = ['.pdf', '.doc', '.docx', '.txt']
+
+    const ACCEPTED_TC_TYPES = [
+        'text/csv',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    ]
+    const ACCEPTED_TC_EXTS = ['.csv', '.xls', '.xlsx', '.doc', '.docx']
+
+    const formatFileSize = (bytes: number) => {
+        if (bytes < 1024) return `${bytes} B`
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+    }
+
+    const getDocIcon = (name: string) => {
+        const ext = name.split('.').pop()?.toLowerCase()
+        if (ext === 'pdf') return <span className="text-red-500">📄</span>
+        if (ext === 'csv') return <span className="text-green-600">📊</span>
+        if (['xls', 'xlsx'].includes(ext || '')) return <span className="text-emerald-600">📊</span>
+        if (['doc', 'docx'].includes(ext || '')) return <span className="text-blue-500">📝</span>
+        return <span className="text-gray-400">📎</span>
+    }
+
+    /**
+     * Read a file safely for JSON transport:
+     * - .txt files → UTF-8 text (AI-readable, truncated to 200 KB)
+     * - binary files (PDF, DOCX, XLS, CSV…) → base64 via readAsDataURL
+     *   (always valid JSON, never corrupts the HTTP body)
+     */
+    const readFileContent = (file: File): Promise<string> =>
+        new Promise((resolve, reject) => {
+            const isText = file.type === 'text/plain' || file.name.toLowerCase().endsWith('.txt')
+            const reader = new FileReader()
+            reader.onerror = () => reject(new Error('FileReader failed to read the file'))
+
+            if (isText) {
+                // Plain text — slice to 200 KB so it stays within backend limit
+                reader.onload = e => resolve((e.target?.result as string) ?? '')
+                reader.readAsText(file.slice(0, 200_000))
+            } else {
+                // Binary file — encode as base64 via Data URL
+                // Data URL format: "data:<mime>;base64,<content>"
+                // We slice to 150 KB of binary → ~200 KB base64 after encoding
+                reader.onload = e => {
+                    const dataUrl = (e.target?.result as string) ?? ''
+                    // Strip the "data:...;base64," prefix — keep only the base64 payload
+                    const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl
+                    resolve(base64)
+                }
+                reader.readAsDataURL(file.slice(0, 150_000))
+            }
+        })
+
+    const handleBrdFileUpload = async (files: FileList | null) => {
+        if (!files || files.length === 0) return
+        setBrdUploading(true)
+        // Only take the last file — backend stores one BRD per project
+        const file = Array.from(files).at(-1)!
+        try {
+            const isValidType = ACCEPTED_BRD_TYPES.includes(file.type) ||
+                ACCEPTED_BRD_EXTS.some(ext => file.name.toLowerCase().endsWith(ext))
+            if (!isValidType) {
+                toast.error(`"${file.name}" is not supported. Upload PDF, Word, or Text files.`)
+                setBrdUploading(false)
+                return
+            }
+            if (file.size > 20 * 1024 * 1024) {
+                toast.error(`"${file.name}" exceeds the 20 MB limit.`)
+                setBrdUploading(false)
+                return
+            }
+            const content = await readFileContent(file)
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/brd`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, content }),
+            })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            setBrdDocs([{
+                id: 'brd-persisted',
+                name: file.name,
+                size: file.size,
+                type: file.type || 'application/octet-stream',
+                uploadedAt: new Date().toISOString(),
+            }])
+            toast.success(`"${file.name}" uploaded and saved to this project!`)
+        } catch (err: any) {
+            toast.error(`Failed to upload "${file.name}": ${err.message ?? 'Unknown error'}`)
+        } finally {
+            setBrdUploading(false)
+        }
+    }
+
+    const handleTestCaseFileUpload = async (files: FileList | null) => {
+        if (!files || files.length === 0) return
+        setTestCaseUploading(true)
+        const file = Array.from(files).at(-1)!
+        try {
+            const isValidType = ACCEPTED_TC_TYPES.includes(file.type) ||
+                ACCEPTED_TC_EXTS.some(ext => file.name.toLowerCase().endsWith(ext))
+            if (!isValidType) {
+                toast.error(`"${file.name}" is not supported. Upload CSV, Excel, or Word files.`)
+                setTestCaseUploading(false)
+                return
+            }
+            if (file.size > 20 * 1024 * 1024) {
+                toast.error(`"${file.name}" exceeds the 20 MB limit.`)
+                setTestCaseUploading(false)
+                return
+            }
+            const content = await readFileContent(file)
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/existing-tests`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, content }),
+            })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            setTestCaseDocs([{
+                id: 'tc-persisted',
+                name: file.name,
+                size: file.size,
+                type: file.type || 'application/octet-stream',
+                uploadedAt: new Date().toISOString(),
+            }])
+            toast.success(`"${file.name}" uploaded and saved to this project!`)
+        } catch (err: any) {
+            toast.error(`Failed to upload "${file.name}": ${err.message ?? 'Unknown error'}`)
+        } finally {
+            setTestCaseUploading(false)
+        }
+    }
+
+    const removeBrdDoc = async (_docId: string) => {
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/brd`, {
+                method: 'DELETE',
+            })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            setBrdDocs([])
+            toast.info('BRD document removed from project')
+        } catch (err: any) {
+            toast.error(`Failed to remove document: ${err.message ?? 'Unknown error'}`)
+        }
+    }
+
+    const removeTestCaseDoc = async (_docId: string) => {
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/existing-tests`, {
+                method: 'DELETE',
+            })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            setTestCaseDocs([])
+            toast.info('Test cases file removed from project')
+        } catch (err: any) {
+            toast.error(`Failed to remove file: ${err.message ?? 'Unknown error'}`)
         }
     }
 
@@ -970,6 +1280,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                 <TabsList>
                     <TabsTrigger value="overview"><BarChart3 className="mr-2 h-4 w-4" /> Overview</TabsTrigger>
                     <TabsTrigger value="integration"><Link2 className="mr-2 h-4 w-4" /> Integration</TabsTrigger>
+                    <TabsTrigger value="artifacts"><FolderOpen className="mr-2 h-4 w-4" /> Artifacts</TabsTrigger>
                     {isConnected && isMcp && (
                         <TabsTrigger value="mcp-ops"><Database className="mr-2 h-4 w-4" /> MCP Operations</TabsTrigger>
                     )}
@@ -1338,171 +1649,6 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                 </>
                             )}
 
-                            {/* ──── Phase 2: Test Data Card ──── */}
-                            {isWebApp && isConnected && (
-                                <Card className="border-violet-200 dark:border-violet-900 overflow-hidden">
-                                    <CardHeader className="pb-3">
-                                        <div className="flex items-center justify-between">
-                                            <div className="flex items-center gap-2">
-                                                <Database className="h-5 w-5 text-violet-600" />
-                                                <CardTitle className="text-lg">Test Data</CardTitle>
-                                                {testDataEntities.length > 0 && (
-                                                    <Badge className="bg-violet-100 text-violet-700 border-violet-200">
-                                                        {testDataEntities.length} {testDataEntities.length === 1 ? 'entity' : 'entities'}
-                                                    </Badge>
-                                                )}
-                                            </div>
-                                            <Button
-                                                variant="outline"
-                                                size="sm"
-                                                onClick={handleExtractTestData}
-                                                disabled={testDataExtracting || testDataLoading}
-                                                className="text-violet-700 border-violet-300 hover:bg-violet-50"
-                                            >
-                                                {testDataExtracting
-                                                    ? <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />Extracting…</>
-                                                    : <><Search className="mr-2 h-3.5 w-3.5" />Extract from UI</>}
-                                            </Button>
-                                        </div>
-                                        <CardDescription>
-                                            Real records from your app are used by the AI to generate test steps with valid values.
-                                            Extract automatically from list pages, or upload a JSON file as fallback.
-                                        </CardDescription>
-                                    </CardHeader>
-                                    <CardContent className="space-y-5">
-
-                                        {/* Entity Table */}
-                                        {testDataEntities.length > 0 ? (
-                                            <div className="rounded-lg border border-violet-100 dark:border-violet-900 overflow-hidden">
-                                                <table className="w-full text-sm">
-                                                    <thead className="bg-violet-50 dark:bg-violet-950/30">
-                                                        <tr>
-                                                            <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Entity</th>
-                                                            <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Records</th>
-                                                            <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Source</th>
-                                                            <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Last Updated</th>
-                                                        </tr>
-                                                    </thead>
-                                                    <tbody>
-                                                        {testDataEntities.map((e, i) => (
-                                                            <tr key={e.entity_name} className={i % 2 === 0 ? 'bg-white dark:bg-transparent' : 'bg-violet-50/40 dark:bg-violet-950/10'}>
-                                                                <td className="px-4 py-2.5 font-medium">{e.entity_name}</td>
-                                                                <td className="px-4 py-2.5">
-                                                                    <Badge variant="outline" className="font-mono">{e.record_count}</Badge>
-                                                                </td>
-                                                                <td className="px-4 py-2.5">
-                                                                    {e.source === 'user_upload'
-                                                                        ? <Badge className="bg-amber-100 text-amber-700 border-amber-200 text-xs">⭐ User Upload</Badge>
-                                                                        : e.source === 'api'
-                                                                        ? <Badge className="bg-emerald-100 text-emerald-700 border-emerald-200 text-xs">🔌 OpenAPI</Badge>
-                                                                        : <Badge className="bg-blue-100 text-blue-700 border-blue-200 text-xs">🤖 UI Scraped</Badge>
-                                                                    }
-                                                                </td>
-                                                                <td className="px-4 py-2.5 text-muted-foreground text-xs">
-                                                                    {new Date(e.last_extracted_at).toLocaleDateString()}
-                                                                </td>
-                                                            </tr>
-                                                        ))}
-                                                    </tbody>
-                                                </table>
-                                            </div>
-                                        ) : (
-                                            <div className="text-center py-6 text-muted-foreground text-sm">
-                                                <Database className="h-10 w-10 mx-auto mb-2 opacity-30" />
-                                                No test data yet. Extract from UI or upload a JSON file below.
-                                            </div>
-                                        )}
-
-                                        {/* JSON Upload Zone */}
-                                        <div className="space-y-3">
-                                            <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                                                <span>📤</span> Upload Sample Test Data
-                                                <span className="text-xs text-muted-foreground font-normal ml-1">(optional fallback)</span>
-                                            </p>
-
-                                            {/* Drop zone */}
-                                            <div
-                                                onClick={() => fileInputRef.current?.click()}
-                                                onDragOver={e => e.preventDefault()}
-                                                onDrop={e => {
-                                                    e.preventDefault()
-                                                    const file = e.dataTransfer.files?.[0]
-                                                    if (file) handleTestDataFileUpload(file)
-                                                }}
-                                                className="cursor-pointer border-2 border-dashed border-violet-200 dark:border-violet-800 rounded-xl py-6 px-4 text-center hover:border-violet-400 hover:bg-violet-50/50 dark:hover:bg-violet-950/20 transition-all"
-                                            >
-                                                {testDataUploading ? (
-                                                    <div className="flex flex-col items-center gap-2">
-                                                        <Loader2 className="h-7 w-7 text-violet-500 animate-spin" />
-                                                        <p className="text-sm text-violet-600">Uploading…</p>
-                                                    </div>
-                                                ) : (
-                                                    <div className="flex flex-col items-center gap-2">
-                                                        <div className="w-10 h-10 rounded-full bg-violet-100 dark:bg-violet-900/40 flex items-center justify-center">
-                                                            <span className="text-lg">📂</span>
-                                                        </div>
-                                                        <p className="text-sm font-medium text-violet-700 dark:text-violet-300">Drop your JSON file here or click to browse</p>
-                                                        <p className="text-xs text-muted-foreground">Format: {'{"Account": [{"name": "Acme", "industry": "Tech"}], "Contact": [...]}'}</p>
-                                                    </div>
-                                                )}
-                                            </div>
-                                            <input
-                                                ref={fileInputRef}
-                                                type="file"
-                                                accept=".json,application/json"
-                                                className="hidden"
-                                                onChange={e => {
-                                                    const file = e.target.files?.[0]
-                                                    if (file) handleTestDataFileUpload(file)
-                                                    e.target.value = ''
-                                                }}
-                                            />
-
-                                            {/* Upload Result */}
-                                            {uploadResult && (
-                                                <div className={`rounded-lg p-3 text-sm flex items-start gap-2 ${
-                                                    uploadResult.success
-                                                        ? 'bg-green-50 border border-green-200 dark:bg-green-950/20 dark:border-green-800'
-                                                        : 'bg-red-50 border border-red-200'
-                                                }`}>
-                                                    <span className="mt-0.5">{uploadResult.success ? '✅' : '❌'}</span>
-                                                    <div>
-                                                        <p className={`font-medium ${uploadResult.success ? 'text-green-800 dark:text-green-300' : 'text-red-700'}`}>
-                                                            {uploadResult.message}
-                                                        </p>
-                                                        {uploadResult.preview && (
-                                                            <p className="text-xs text-muted-foreground mt-0.5">
-                                                                {Object.entries(uploadResult.preview)
-                                                                    .map(([k, v]) => `${k}: ${v} records`)
-                                                                    .join(' · ')}
-                                                            </p>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            )}
-                                            {uploadError && (
-                                                <div className="rounded-lg p-3 text-sm bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
-                                                    <span>❌</span> {uploadError}
-                                                </div>
-                                            )}
-
-                                            {/* Format hint */}
-                                            <div className="rounded-lg bg-muted/50 border p-3 text-xs text-muted-foreground">
-                                                <p className="font-medium mb-1 text-foreground">Expected JSON format:</p>
-                                                <pre className="font-mono whitespace-pre-wrap">{'{'}
-  "Account": [
-    {'{'} "name": "Acme Corp", "industry": "Technology" {'}'}
-  ],
-  "Contact": [
-    {'{'} "name": "Jane Smith", "email": "jane@acme.com" {'}'}
-  ]
-{'}'}</pre>
-                                            </div>
-                                        </div>
-                                    </CardContent>
-                                </Card>
-                            )}
-
                             {/* Web App Session & Login Card */}
                             {isWebApp && isConnected && (
                                 <Card className="border-blue-200 dark:border-blue-900">
@@ -1614,8 +1760,14 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                 >
                                                     <option value="form">Form-based (fill username + password fields)</option>
                                                     <option value="basic_auth">Basic Auth (HTTP header authentication)</option>
+                                                    <option value="keycloak">🔐 Keycloak / OAuth Custom Token (sessionStorage injection)</option>
                                                     <option value="none">None (skip login — app is public)</option>
                                                 </select>
+                                                {webLoginStrategy === "keycloak" && (
+                                                    <p className="text-xs text-purple-600 dark:text-purple-400 mt-1">
+                                                        🔑 Keycloak mode selected. Save credentials above first, then use the <strong>Keycloak Token Injection</strong> section below to register your session tokens.
+                                                    </p>
+                                                )}
                                             </div>
 
                                             <Button
@@ -1633,7 +1785,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                             </Button>
 
                                             {!integration?.ui_session?.last_created_at && (
-                                                (integration?.web_credentials?.username || integration?.login_strategy === "none") ? (
+                                                (integration?.web_credentials?.username || integration?.login_strategy === "none" || integration?.login_strategy === "keycloak") ? (
                                                     <div className="p-3 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-md">
                                                         <p className="text-xs text-blue-700 dark:text-blue-300">
                                                             <strong>Ready for testing.</strong> AutoTest AI will automatically initialize the session before your next test run.
@@ -1646,6 +1798,215 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                         </p>
                                                     </div>
                                                 )
+                                            )}
+                                        </div>
+                                    </CardContent>
+                                </Card>
+                            )}
+
+                            {/* ─── Keycloak Token Injection Card ──────────────────────────── */}
+                            {/* Shown when login_strategy is 'keycloak' for connected web app projects */}
+                            {isWebApp && isConnected && (integration?.login_strategy === "keycloak" || webLoginStrategy === "keycloak") && (
+                                <Card className="border-purple-200 dark:border-purple-900 bg-gradient-to-br from-purple-50/60 to-indigo-50/40 dark:from-purple-950/20 dark:to-indigo-950/10">
+                                    <CardHeader>
+                                        <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-2">
+                                                <div className="p-1.5 rounded-lg bg-purple-600 text-white">
+                                                    <Key className="h-4 w-4" />
+                                                </div>
+                                                <div>
+                                                    <CardTitle className="text-base">🔐 Keycloak Token Injection</CardTitle>
+                                                    <p className="text-xs text-muted-foreground mt-0.5">Inject HMAC-signed session tokens for Keycloak-protected apps</p>
+                                                </div>
+                                            </div>
+                                            {/* Token Status Badge */}
+                                            {kcSessionStatus?.configured && (
+                                                <Badge className={`text-xs ${
+                                                    kcSessionStatus.status === "valid"
+                                                        ? "bg-green-100 text-green-700 border-green-200"
+                                                        : kcSessionStatus.status === "expiring_soon"
+                                                        ? "bg-yellow-100 text-yellow-700 border-yellow-200"
+                                                        : "bg-red-100 text-red-700 border-red-200"
+                                                }`}>
+                                                    {kcSessionStatus.status === "valid" ? "🟢 Token Valid" :
+                                                     kcSessionStatus.status === "expiring_soon" ? "🟡 Expiring Soon" : "🔴 Token Expired"}
+                                                </Badge>
+                                            )}
+                                        </div>
+                                    </CardHeader>
+                                    <CardContent className="space-y-4">
+
+                                        {/* Existing session info */}
+                                        {kcSessionStatus?.configured && (
+                                            <div className="rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/50 dark:bg-purple-950/20 p-3 space-y-2">
+                                                <p className="text-xs font-semibold text-purple-800 dark:text-purple-300">Current Session</p>
+                                                <div className="grid grid-cols-2 gap-2 text-xs">
+                                                    <div>
+                                                        <span className="text-muted-foreground">Status: </span>
+                                                        <span className={`font-medium ${
+                                                            kcSessionStatus.is_expired ? "text-red-600" :
+                                                            kcSessionStatus.is_near_expiry ? "text-yellow-600" : "text-green-600"
+                                                        }`}>
+                                                            {kcSessionStatus.is_expired ? "Expired" :
+                                                             kcSessionStatus.is_near_expiry ? "Expiring soon" : "Valid"}
+                                                        </span>
+                                                    </div>
+                                                    <div>
+                                                        <span className="text-muted-foreground">ID Token: </span>
+                                                        <span className="font-medium">{kcSessionStatus.has_id_token ? "✅ Present" : "⚠️ Missing"}</span>
+                                                    </div>
+                                                    {kcSessionStatus.expires_at_iso && (
+                                                        <div className="col-span-2">
+                                                            <span className="text-muted-foreground">Expires: </span>
+                                                            <span className="font-medium">{new Date(kcSessionStatus.expires_at_iso).toLocaleString()}</span>
+                                                        </div>
+                                                    )}
+                                                    {kcSessionStatus.refresh_url && (
+                                                        <div className="col-span-2">
+                                                            <span className="text-muted-foreground">Refresh URL: </span>
+                                                            <code className="text-purple-700 dark:text-purple-300 font-mono">{kcSessionStatus.refresh_url}</code>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Info box */}
+                                        <div className="rounded-lg bg-purple-50 dark:bg-purple-950/30 border border-purple-200 dark:border-purple-800 p-3">
+                                            <p className="text-xs text-purple-700 dark:text-purple-300 leading-relaxed">
+                                                <strong>How it works:</strong> After logging into your Keycloak-protected app in your browser,
+                                                copy the <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">auth_token</code> and{" "}
+                                                <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">id_token</code> from{" "}
+                                                <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">sessionStorage</code>{" "}
+                                                and paste them below. AutoTest AI will inject them into every test browser session via{" "}
+                                                <code className="font-mono bg-purple-100 dark:bg-purple-900 px-1 rounded">sessionStorage</code> before executing steps.
+                                            </p>
+                                        </div>
+
+                                        <div className="grid gap-3 max-w-lg">
+                                            {/* auth_token */}
+                                            <div>
+                                                <label className={labelClass}>
+                                                    auth_token <span className="text-red-500">*</span>
+                                                    <span className="ml-1 font-normal text-muted-foreground">(Authorization: Bearer token)</span>
+                                                </label>
+                                                <div className="relative">
+                                                    <input
+                                                        id="kc-auth-token-input"
+                                                        type={kcShowAuthToken ? "text" : "password"}
+                                                        placeholder="Paste your auth_token here"
+                                                        value={kcAuthToken}
+                                                        onChange={(e) => setKcAuthToken(e.target.value)}
+                                                        className={inputClass + " pr-10 font-mono text-xs"}
+                                                        autoComplete="off"
+                                                    />
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setKcShowAuthToken(!kcShowAuthToken)}
+                                                        className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                                    >
+                                                        {kcShowAuthToken ? "🙈" : "👁"}
+                                                    </button>
+                                                </div>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    Find this in browser DevTools → Application → Session Storage → <code className="font-mono">auth_token</code>
+                                                </p>
+                                            </div>
+
+                                            {/* id_token */}
+                                            <div>
+                                                <label className={labelClass}>
+                                                    id_token
+                                                    <span className="ml-1 font-normal text-muted-foreground">(Keycloak ID token — optional, for logout/refresh)</span>
+                                                </label>
+                                                <div className="relative">
+                                                    <input
+                                                        id="kc-id-token-input"
+                                                        type={kcShowIdToken ? "text" : "password"}
+                                                        placeholder="Paste your id_token here"
+                                                        value={kcIdToken}
+                                                        onChange={(e) => setKcIdToken(e.target.value)}
+                                                        className={inputClass + " pr-10 font-mono text-xs"}
+                                                        autoComplete="off"
+                                                    />
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setKcShowIdToken(!kcShowIdToken)}
+                                                        className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                                    >
+                                                        {kcShowIdToken ? "🙈" : "👁"}
+                                                    </button>
+                                                </div>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    Find this in browser DevTools → Application → Session Storage → <code className="font-mono">id_token</code>
+                                                </p>
+                                            </div>
+
+                                            {/* Refresh URL */}
+                                            <div>
+                                                <label className={labelClass}>
+                                                    Token Refresh URL
+                                                    <span className="ml-1 font-normal text-muted-foreground">(optional — auto-refresh near-expiry tokens)</span>
+                                                </label>
+                                                <input
+                                                    id="kc-refresh-url-input"
+                                                    type="url"
+                                                    placeholder="e.g. https://yourapp.com/api/auth/refresh"
+                                                    value={kcRefreshUrl}
+                                                    onChange={(e) => setKcRefreshUrl(e.target.value)}
+                                                    className={inputClass}
+                                                    autoComplete="off"
+                                                />
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    If provided, AutoTest AI will POST to this endpoint to refresh expired tokens before test runs.
+                                                </p>
+                                            </div>
+
+                                            {/* Action buttons */}
+                                            <div className="flex gap-2">
+                                                <Button
+                                                    id="kc-save-tokens-btn"
+                                                    onClick={handleSaveKeycloakTokens}
+                                                    disabled={kcSaving || !kcAuthToken.trim()}
+                                                    className="flex-1 h-10 text-sm font-semibold bg-purple-600 hover:bg-purple-700"
+                                                >
+                                                    {kcSaving ? (
+                                                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Saving…</>
+                                                    ) : kcSuccess ? (
+                                                        <><Check className="mr-2 h-4 w-4" />Saved!</>
+                                                    ) : (
+                                                        <><Key className="mr-2 h-4 w-4" />Save Keycloak Tokens</>
+                                                    )}
+                                                </Button>
+                                                {kcSessionStatus?.configured && (
+                                                    <Button
+                                                        id="kc-clear-session-btn"
+                                                        variant="outline"
+                                                        onClick={handleClearKeycloakSession}
+                                                        className="h-10 text-sm border-red-200 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20"
+                                                    >
+                                                        <X className="mr-1 h-4 w-4" />Clear
+                                                    </Button>
+                                                )}
+                                            </div>
+
+                                            {/* Ready banner */}
+                                            {kcSessionStatus?.configured && !kcSessionStatus.is_expired && (
+                                                <div className="p-3 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-md">
+                                                    <p className="text-xs text-green-700 dark:text-green-300">
+                                                        <strong>✅ Keycloak session is active.</strong>{" "}
+                                                        AutoTest AI will inject <code className="font-mono">auth_token</code> and{" "}
+                                                        <code className="font-mono">id_token</code> into the test browser via{" "}
+                                                        <code className="font-mono">sessionStorage</code> before every test run.
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {kcSessionStatus?.configured && kcSessionStatus.is_expired && (
+                                                <div className="p-3 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-md">
+                                                    <p className="text-xs text-red-700 dark:text-red-300">
+                                                        <strong>🔴 Token expired.</strong> Paste fresh tokens above and save to restore the session.
+                                                    </p>
+                                                </div>
                                             )}
                                         </div>
                                     </CardContent>
@@ -1924,6 +2285,319 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                             )}
                         </div>
                     )}
+                </TabsContent>
+
+                {/* Artifacts Tab */}
+                <TabsContent value="artifacts" className="space-y-4">
+                    {/* Project Documents Panel */}
+                    <Card className="border-teal-200 dark:border-teal-900 overflow-hidden">
+                        <CardHeader className="pb-3">
+                            <div className="flex items-center gap-2">
+                                <FolderOpen className="h-5 w-5 text-teal-600" />
+                                <CardTitle className="text-lg">Project Documents</CardTitle>
+                                {(brdDocs.length + testCaseDocs.length) > 0 && (
+                                    <Badge className="bg-teal-100 text-teal-700 border-teal-200">
+                                        {brdDocs.length + testCaseDocs.length} file{(brdDocs.length + testCaseDocs.length) !== 1 ? 's' : ''}
+                                    </Badge>
+                                )}
+                            </div>
+                            <CardDescription>
+                                Upload your BRD, Functional Spec, or Existing Test Cases so the AI can generate smarter, context-aware test scenarios tailored to your requirements.
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent className="space-y-6">
+                            {/* BRD / Functional Spec Section */}
+                            <div className="space-y-3">
+                                <div className="flex items-center gap-2">
+                                    <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-blue-100 dark:bg-blue-900/40">
+                                        <BookOpen className="h-4 w-4 text-blue-600" />
+                                    </div>
+                                    <div>
+                                        <p className="text-sm font-semibold text-foreground">BRD / Functional Specification</p>
+                                        <p className="text-xs text-muted-foreground">Accepts PDF, Word (.doc, .docx), or Plain Text (.txt) · Max 20 MB</p>
+                                    </div>
+                                </div>
+                                <div
+                                    onClick={() => brdFileInputRef.current?.click()}
+                                    onDragOver={e => { e.preventDefault(); setBrdDragOver(true) }}
+                                    onDragLeave={() => setBrdDragOver(false)}
+                                    onDrop={e => {
+                                        e.preventDefault()
+                                        setBrdDragOver(false)
+                                        handleBrdFileUpload(e.dataTransfer.files)
+                                    }}
+                                    className={`cursor-pointer border-2 border-dashed rounded-xl py-7 px-4 text-center transition-all duration-200 ${
+                                        brdDragOver
+                                            ? 'border-blue-500 bg-blue-50/80 dark:bg-blue-950/30 scale-[1.01]'
+                                            : 'border-blue-200 dark:border-blue-800 hover:border-blue-400 hover:bg-blue-50/50 dark:hover:bg-blue-950/20'
+                                    }`}
+                                >
+                                    {brdUploading ? (
+                                        <div className="flex flex-col items-center gap-2">
+                                            <Loader2 className="h-7 w-7 text-blue-500 animate-spin" />
+                                            <p className="text-sm text-blue-600 font-medium">Uploading document…</p>
+                                        </div>
+                                    ) : (
+                                        <div className="flex flex-col items-center gap-2">
+                                            <div className="w-11 h-11 rounded-full bg-blue-100 dark:bg-blue-900/40 flex items-center justify-center">
+                                                <UploadCloud className="h-5 w-5 text-blue-600" />
+                                            </div>
+                                            <p className="text-sm font-medium text-blue-700 dark:text-blue-300">
+                                                {brdDragOver ? 'Release to upload' : 'Drop files here or click to browse'}
+                                            </p>
+                                            <p className="text-xs text-muted-foreground">PDF · Word · Text</p>
+                                        </div>
+                                    )}
+                                </div>
+                                <input
+                                    ref={brdFileInputRef}
+                                    type="file"
+                                    accept=".pdf,.doc,.docx,.txt,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain"
+                                    multiple
+                                    className="hidden"
+                                    onChange={e => { handleBrdFileUpload(e.target.files); e.target.value = '' }}
+                                />
+                                {brdDocs.length > 0 && (
+                                    <div className="space-y-2">
+                                        {brdDocs.map(doc => (
+                                            <div key={doc.id} className="flex items-center gap-3 rounded-lg border border-blue-100 dark:border-blue-900 bg-blue-50/60 dark:bg-blue-950/20 px-3 py-2.5 group hover:border-blue-300 transition-all">
+                                                <span className="text-lg flex-shrink-0">{getDocIcon(doc.name)}</span>
+                                                <div className="flex-1 min-w-0">
+                                                    <p className="text-sm font-medium truncate">{doc.name}</p>
+                                                    <p className="text-xs text-muted-foreground">{formatFileSize(doc.size)} · Uploaded {new Date(doc.uploadedAt).toLocaleDateString()}</p>
+                                                </div>
+                                                <Badge className="bg-blue-100 text-blue-700 border-blue-200 text-xs flex-shrink-0"><CheckCircle2 className="h-3 w-3 mr-1" />Ready</Badge>
+                                                <button onClick={() => removeBrdDoc(doc.id)} className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-500 transition-all flex-shrink-0" title="Remove document"><X className="h-4 w-4" /></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex items-center gap-3">
+                                <div className="flex-1 h-px bg-border" />
+                                <span className="text-xs text-muted-foreground font-medium px-1">AND</span>
+                                <div className="flex-1 h-px bg-border" />
+                            </div>
+                            {/* Existing Test Cases Section */}
+                            <div className="space-y-3">
+                                <div className="flex items-center gap-2">
+                                    <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-emerald-100 dark:bg-emerald-900/40">
+                                        <TestTube2 className="h-4 w-4 text-emerald-600" />
+                                    </div>
+                                    <div>
+                                        <p className="text-sm font-semibold text-foreground">Existing Test Cases</p>
+                                        <p className="text-xs text-muted-foreground">Accepts CSV, Excel (.xls, .xlsx), or Word (.doc, .docx) · Max 20 MB</p>
+                                    </div>
+                                </div>
+                                <div
+                                    onClick={() => testCaseFileInputRef.current?.click()}
+                                    onDragOver={e => { e.preventDefault(); setTestCaseDragOver(true) }}
+                                    onDragLeave={() => setTestCaseDragOver(false)}
+                                    onDrop={e => {
+                                        e.preventDefault()
+                                        setTestCaseDragOver(false)
+                                        handleTestCaseFileUpload(e.dataTransfer.files)
+                                    }}
+                                    className={`cursor-pointer border-2 border-dashed rounded-xl py-7 px-4 text-center transition-all duration-200 ${
+                                        testCaseDragOver
+                                            ? 'border-emerald-500 bg-emerald-50/80 dark:bg-emerald-950/30 scale-[1.01]'
+                                            : 'border-emerald-200 dark:border-emerald-800 hover:border-emerald-400 hover:bg-emerald-50/50 dark:hover:bg-emerald-950/20'
+                                    }`}
+                                >
+                                    {testCaseUploading ? (
+                                        <div className="flex flex-col items-center gap-2">
+                                            <Loader2 className="h-7 w-7 text-emerald-500 animate-spin" />
+                                            <p className="text-sm text-emerald-600 font-medium">Uploading file…</p>
+                                        </div>
+                                    ) : (
+                                        <div className="flex flex-col items-center gap-2">
+                                            <div className="w-11 h-11 rounded-full bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center">
+                                                <FileSpreadsheet className="h-5 w-5 text-emerald-600" />
+                                            </div>
+                                            <p className="text-sm font-medium text-emerald-700 dark:text-emerald-300">
+                                                {testCaseDragOver ? 'Release to upload' : 'Drop files here or click to browse'}
+                                            </p>
+                                            <p className="text-xs text-muted-foreground">CSV · Excel · Word</p>
+                                        </div>
+                                    )}
+                                </div>
+                                <input
+                                    ref={testCaseFileInputRef}
+                                    type="file"
+                                    accept=".csv,.xls,.xlsx,.doc,.docx,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                    multiple
+                                    className="hidden"
+                                    onChange={e => { handleTestCaseFileUpload(e.target.files); e.target.value = '' }}
+                                />
+                                {testCaseDocs.length > 0 && (
+                                    <div className="space-y-2">
+                                        {testCaseDocs.map(doc => (
+                                            <div key={doc.id} className="flex items-center gap-3 rounded-lg border border-emerald-100 dark:border-emerald-900 bg-emerald-50/60 dark:bg-emerald-950/20 px-3 py-2.5 group hover:border-emerald-300 transition-all">
+                                                <span className="text-lg flex-shrink-0">{getDocIcon(doc.name)}</span>
+                                                <div className="flex-1 min-w-0">
+                                                    <p className="text-sm font-medium truncate">{doc.name}</p>
+                                                    <p className="text-xs text-muted-foreground">{formatFileSize(doc.size)} · Uploaded {new Date(doc.uploadedAt).toLocaleDateString()}</p>
+                                                </div>
+                                                <Badge className="bg-emerald-100 text-emerald-700 border-emerald-200 text-xs flex-shrink-0"><CheckCircle2 className="h-3 w-3 mr-1" />Ready</Badge>
+                                                <button onClick={() => removeTestCaseDoc(doc.id)} className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-500 transition-all flex-shrink-0" title="Remove file"><X className="h-4 w-4" /></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            <div className="rounded-lg bg-teal-50/70 dark:bg-teal-950/20 border border-teal-200 dark:border-teal-800 p-3 flex items-start gap-2.5">
+                                <span className="mt-0.5 text-base">💡</span>
+                                <p className="text-xs text-teal-800 dark:text-teal-300 leading-relaxed">
+                                    <span className="font-semibold">Pro tip:</span> The AI uses your BRD and existing test cases as context when generating new test scenarios — ensuring generated tests align with your business requirements and avoid duplicating coverage already defined.
+                                </p>
+                            </div>
+                        </CardContent>
+                    </Card>
+
+                    {/* Test Data Panel */}
+                    <Card className="border-violet-200 dark:border-violet-900 overflow-hidden">
+                        <CardHeader className="pb-3">
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                    <Database className="h-5 w-5 text-violet-600" />
+                                    <CardTitle className="text-lg">Test Data</CardTitle>
+                                    {testDataEntities.length > 0 && (
+                                        <Badge className="bg-violet-100 text-violet-700 border-violet-200">
+                                            {testDataEntities.length} {testDataEntities.length === 1 ? 'entity' : 'entities'}
+                                        </Badge>
+                                    )}
+                                </div>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={handleExtractTestData}
+                                    disabled={testDataExtracting || testDataLoading}
+                                    className="text-violet-700 border-violet-300 hover:bg-violet-50"
+                                >
+                                    {testDataExtracting
+                                        ? <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />Extracting…</>
+                                        : <><Search className="mr-2 h-3.5 w-3.5" />Extract from UI</>}
+                                </Button>
+                            </div>
+                            <CardDescription>
+                                Real records from your app are used by the AI to generate test steps with valid values.
+                                Extract automatically from list pages, or upload a JSON file as fallback.
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent className="space-y-5">
+                            {testDataEntities.length > 0 ? (
+                                <div className="rounded-lg border border-violet-100 dark:border-violet-900 overflow-hidden">
+                                    <table className="w-full text-sm">
+                                        <thead className="bg-violet-50 dark:bg-violet-950/30">
+                                            <tr>
+                                                <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Entity</th>
+                                                <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Records</th>
+                                                <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Source</th>
+                                                <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Last Updated</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {testDataEntities.map((e, i) => (
+                                                <tr key={e.entity_name} className={i % 2 === 0 ? 'bg-white dark:bg-transparent' : 'bg-violet-50/40 dark:bg-violet-950/10'}>
+                                                    <td className="px-4 py-2.5 font-medium">{e.entity_name}</td>
+                                                    <td className="px-4 py-2.5"><Badge variant="outline" className="font-mono">{e.record_count}</Badge></td>
+                                                    <td className="px-4 py-2.5">
+                                                        {e.source === 'user_upload'
+                                                            ? <Badge className="bg-amber-100 text-amber-700 border-amber-200 text-xs">⭐ User Upload</Badge>
+                                                            : e.source === 'api'
+                                                            ? <Badge className="bg-emerald-100 text-emerald-700 border-emerald-200 text-xs">🔌 OpenAPI</Badge>
+                                                            : <Badge className="bg-blue-100 text-blue-700 border-blue-200 text-xs">🤖 UI Scraped</Badge>
+                                                        }
+                                                    </td>
+                                                    <td className="px-4 py-2.5 text-muted-foreground text-xs">{new Date(e.last_extracted_at).toLocaleDateString()}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            ) : (
+                                <div className="text-center py-6 text-muted-foreground text-sm">
+                                    <Database className="h-10 w-10 mx-auto mb-2 opacity-30" />
+                                    No test data yet. Extract from UI or upload a JSON file below.
+                                </div>
+                            )}
+                            <div className="space-y-3">
+                                <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                                    <span>📤</span> Upload Sample Test Data
+                                    <span className="text-xs text-muted-foreground font-normal ml-1">(optional fallback)</span>
+                                </p>
+                                <div
+                                    onClick={() => fileInputRef.current?.click()}
+                                    onDragOver={e => e.preventDefault()}
+                                    onDrop={e => {
+                                        e.preventDefault()
+                                        const file = e.dataTransfer.files?.[0]
+                                        if (file) handleTestDataFileUpload(file)
+                                    }}
+                                    className="cursor-pointer border-2 border-dashed border-violet-200 dark:border-violet-800 rounded-xl py-6 px-4 text-center hover:border-violet-400 hover:bg-violet-50/50 dark:hover:bg-violet-950/20 transition-all"
+                                >
+                                    {testDataUploading ? (
+                                        <div className="flex flex-col items-center gap-2">
+                                            <Loader2 className="h-7 w-7 text-violet-500 animate-spin" />
+                                            <p className="text-sm text-violet-600">Uploading…</p>
+                                        </div>
+                                    ) : (
+                                        <div className="flex flex-col items-center gap-2">
+                                            <div className="w-10 h-10 rounded-full bg-violet-100 dark:bg-violet-900/40 flex items-center justify-center">
+                                                <span className="text-lg">📂</span>
+                                            </div>
+                                            <p className="text-sm font-medium text-violet-700 dark:text-violet-300">Drop your JSON file here or click to browse</p>
+                                            <p className="text-xs text-muted-foreground">Format: {'{ "Account": [{"name": "Acme", "industry": "Tech"}], "Contact": [...] }'}</p>
+                                        </div>
+                                    )}
+                                </div>
+                                <input
+                                    ref={fileInputRef}
+                                    type="file"
+                                    accept=".json,application/json"
+                                    className="hidden"
+                                    onChange={e => {
+                                        const file = e.target.files?.[0]
+                                        if (file) handleTestDataFileUpload(file)
+                                        e.target.value = ''
+                                    }}
+                                />
+                                {uploadResult && (
+                                    <div className={`rounded-lg p-3 text-sm flex items-start gap-2 ${
+                                        uploadResult.success
+                                            ? 'bg-green-50 border border-green-200 dark:bg-green-950/20 dark:border-green-800'
+                                            : 'bg-red-50 border border-red-200'
+                                    }`}>
+                                        <span className="mt-0.5">{uploadResult.success ? '✅' : '❌'}</span>
+                                        <div>
+                                            <p className={`font-medium ${uploadResult.success ? 'text-green-800 dark:text-green-300' : 'text-red-700'}`}>{uploadResult.message}</p>
+                                            {uploadResult.preview && (
+                                                <p className="text-xs text-muted-foreground mt-0.5">
+                                                    {Object.entries(uploadResult.preview).map(([k, v]) => `${k}: ${v} records`).join(' · ')}
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+                                {uploadError && (
+                                    <div className="rounded-lg p-3 text-sm bg-red-50 border border-red-200 text-red-700 flex items-center gap-2">
+                                        <span>❌</span> {uploadError}
+                                    </div>
+                                )}
+                                <div className="rounded-lg bg-muted/50 border p-3 text-xs text-muted-foreground">
+                                    <p className="font-medium mb-1 text-foreground">Expected JSON format:</p>
+                                    <pre className="font-mono whitespace-pre-wrap">{'{'}
+  "Account": [
+    {'{'} "name": "Acme Corp", "industry": "Technology" {'}'}
+  ],
+  "Contact": [
+    {'{'} "name": "Jane Smith", "email": "jane@acme.com" {'}'}
+  ]
+{'}'}</pre>
+                                </div>
+                            </div>
+                        </CardContent>
+                    </Card>
                 </TabsContent>
 
                 {/* MCP Operations Tab */}

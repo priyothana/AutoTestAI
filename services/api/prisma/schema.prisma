@@ -1,6 +1,3 @@
-// Prisma schema — generated from existing Postgres (init.sql)
-// DO NOT modify table/column names — must match existing DB exactly
-
 generator client {
   provider      = "prisma-client-js"
   binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
@@ -11,206 +8,187 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ─── Users ───────────────────────────────────────────────────────
 model users {
-  id              Int       @id @default(autoincrement())
-  email           String    @unique @db.VarChar(255)
-  username        String?   @unique @db.VarChar(255)
-  full_name       String?   @db.VarChar(255)
-  hashed_password String    @db.VarChar(255)
-  is_active       Boolean   @default(true)
-  role            String    @default("tester") @db.VarChar(50)
-  created_at      DateTime  @default(now()) @db.Timestamptz()
-  updated_at      DateTime  @default(now()) @updatedAt @db.Timestamptz()
-
+  id              Int        @id @default(autoincrement())
+  email           String     @unique @db.VarChar(255)
+  username        String?    @unique @db.VarChar(255)
+  full_name       String?    @db.VarChar(255)
+  hashed_password String     @db.VarChar(255)
+  is_active       Boolean    @default(true)
+  role            String     @default("tester") @db.VarChar(50)
+  created_at      DateTime   @default(now()) @db.Timestamptz(6)
+  updated_at      DateTime   @default(now()) @updatedAt @db.Timestamptz(6)
   projects        projects[]
 }
 
-// ─── Projects ────────────────────────────────────────────────────
 model projects {
-  id                         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  name                       String    @db.VarChar(255)
+  id                         String                   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name                       String                   @db.VarChar(255)
   description                String?
-  type                       String    @db.VarChar(50)
-  category                   String    @default("webapp") @db.VarChar(20)
-  base_url                   String?   @db.VarChar(255)
-  status                     String    @default("Active") @db.VarChar(50)
-  tags                       Json      @default("[]")
-  members                    Json      @default("[]")
+  type                       String                   @db.VarChar(50)
+  category                   String                   @default("webapp") @db.VarChar(20)
+  base_url                   String?                  @db.VarChar(255)
+  status                     String                   @default("Active") @db.VarChar(50)
+  tags                       Json                     @default("[]")
+  members                    Json                     @default("[]")
   owner_id                   Int?
-  ui_session_active          Boolean   @default(false)
-  ui_session_last_created_at DateTime? @db.Timestamptz()
-  ui_session_source          String?   @db.VarChar(20)
-  brd_filename               String?   @db.VarChar(255)
-  brd_content                String?   @db.Text
-  existing_tests_filename    String?   @db.VarChar(255)
-  existing_tests_content     String?   @db.Text
-  created_at                 DateTime  @default(now()) @db.Timestamptz()
-  updated_at                 DateTime  @default(now()) @updatedAt @db.Timestamptz()
-
-  owner                users?                  @relation(fields: [owner_id], references: [id])
-  test_cases           test_cases[]
-  environments         environments[]
-  test_data_sets       test_data_sets[]
-  integrations         integrations[]
-  project_integrations project_integrations[]
-  salesforce_connections salesforce_connections[]
-  metadata_raw_store   metadata_raw_store[]
-  metadata_normalized  metadata_normalized[]
-  domain_models        domain_models[]
-  vector_embeddings    vector_embeddings[]
-  rag_query_logs       rag_query_logs[]
-  execution_learnings  execution_learnings[]
-  web_test_data        web_test_data[]
+  ui_session_active          Boolean                  @default(false)
+  ui_session_last_created_at DateTime?                @db.Timestamptz(6)
+  ui_session_source          String?                  @db.VarChar(20)
+  created_at                 DateTime                 @default(now()) @db.Timestamptz(6)
+  updated_at                 DateTime                 @default(now()) @updatedAt @db.Timestamptz(6)
+  brd_filename               String?                  @db.VarChar(255)
+  brd_content                String?
+  existing_tests_filename    String?                  @db.VarChar(255)
+  existing_tests_content     String?
+  agent_executions           agent_executions[]
+  domain_models              domain_models[]
+  environments               environments[]
+  execution_learnings        execution_learnings[]
+  integrations               integrations[]
+  metadata_normalized        metadata_normalized[]
+  metadata_raw_store         metadata_raw_store[]
+  project_integrations       project_integrations[]
+  owner                      users?                   @relation(fields: [owner_id], references: [id])
+  rag_query_logs             rag_query_logs[]
+  salesforce_connections     salesforce_connections[]
+  test_cases                 test_cases[]
+  test_data_sets             test_data_sets[]
+  vector_embeddings          vector_embeddings[]
+  web_test_data              web_test_data[]
 }
 
-// ─── Environments ────────────────────────────────────────────────
 model environments {
-  id         String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  name       String   @db.VarChar(255)
-  base_url   String?  @db.VarChar(255)
-  variables  Json?    @default("{}")
-  browser    String?  @db.VarChar(50)
-  os         String?  @db.VarChar(50)
-  device     String?  @db.VarChar(50)
-  project_id String?  @db.Uuid
-  created_at DateTime @default(now()) @db.Timestamptz()
-  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz()
-
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name       String    @db.VarChar(255)
+  base_url   String?   @db.VarChar(255)
+  variables  Json?     @default("{}")
+  browser    String?   @db.VarChar(50)
+  os         String?   @db.VarChar(50)
+  device     String?   @db.VarChar(50)
+  project_id String?   @db.Uuid
+  created_at DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
   project    projects? @relation(fields: [project_id], references: [id])
 }
 
-// ─── Test Cases ──────────────────────────────────────────────────
 model test_cases {
-  id              String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  name            String   @db.VarChar(255)
-  description     String?
-  steps           Json     @default("[]")
-  expected_result String?
-  priority        String   @default("medium") @db.VarChar(20)
-  status          String   @default("draft") @db.VarChar(20)
-  project_id      String?  @db.Uuid
-  created_at      DateTime @default(now()) @db.Timestamptz()
-  updated_at      DateTime @default(now()) @updatedAt @db.Timestamptz()
-
-  project    projects?    @relation(fields: [project_id], references: [id])
-  test_steps test_steps[]
-  test_runs  test_runs[]
-  executions executions[]
-  rag_query_logs    rag_query_logs[]
+  id                  String                @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name                String                @db.VarChar(255)
+  description         String?
+  steps               Json                  @default("[]")
+  expected_result     String?
+  priority            String                @default("medium") @db.VarChar(20)
+  status              String                @default("draft") @db.VarChar(20)
+  project_id          String?               @db.Uuid
+  created_at          DateTime              @default(now()) @db.Timestamptz(6)
+  updated_at          DateTime              @default(now()) @updatedAt @db.Timestamptz(6)
   execution_learnings execution_learnings[]
+  executions          executions[]
+  rag_query_logs      rag_query_logs[]
+  project             projects?             @relation(fields: [project_id], references: [id])
+  test_runs           test_runs[]
+  test_steps          test_steps[]
 }
 
-// ─── Test Steps ──────────────────────────────────────────────────
 model test_steps {
-  id           String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  test_case_id String?  @db.Uuid
+  id           String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  test_case_id String?     @db.Uuid
   step_number  Int
-  action_type  String   @db.VarChar(50)
-  locator      String?  @db.VarChar(255)
+  action_type  String      @db.VarChar(50)
+  locator      String?     @db.VarChar(255)
   value        String?
   expected     String?
-  timeout_ms   Int      @default(5000)
-  created_at   DateTime @default(now()) @db.Timestamptz()
-  updated_at   DateTime @default(now()) @updatedAt @db.Timestamptz()
-
+  timeout_ms   Int         @default(5000)
+  created_at   DateTime    @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime    @default(now()) @updatedAt @db.Timestamptz(6)
   test_case    test_cases? @relation(fields: [test_case_id], references: [id], onDelete: Cascade)
 }
 
-// ─── Test Runs ───────────────────────────────────────────────────
 model test_runs {
-  id              String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  test_case_id    String    @db.Uuid
-  status          String    @default("pending") @db.VarChar(20)
-  logs            Json      @default("[]")
-  result          String?   @db.VarChar(50)
-  duration        Float?
-  screenshot_path String?   @db.VarChar(255)
-  ai_suggestions  Json?
-  created_at      DateTime  @default(now()) @db.Timestamptz()
-
-  test_case       test_cases @relation(fields: [test_case_id], references: [id], onDelete: Cascade)
+  id                  String                @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  test_case_id        String                @db.Uuid
+  status              String                @default("pending") @db.VarChar(20)
+  logs                Json                  @default("[]")
+  result              String?               @db.VarChar(50)
+  duration            Float?
+  screenshot_path     String?               @db.VarChar(255)
+  ai_suggestions      Json?
+  created_at          DateTime              @default(now()) @db.Timestamptz(6)
   execution_learnings execution_learnings[]
+  test_case           test_cases            @relation(fields: [test_case_id], references: [id], onDelete: Cascade)
 }
 
-// ─── Test Data Sets ──────────────────────────────────────────────
 model test_data_sets {
-  id         String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  name       String   @db.VarChar(255)
-  data       Json     @default("{}")
-  project_id String?  @db.Uuid
-  created_at DateTime @default(now()) @db.Timestamptz()
-  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz()
-
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name       String    @db.VarChar(255)
+  data       Json      @default("{}")
+  project_id String?   @db.Uuid
+  created_at DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
   project    projects? @relation(fields: [project_id], references: [id])
 }
 
-// ─── Integrations (legacy) ───────────────────────────────────────
 model integrations {
-  id         String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  type       String   @db.VarChar(50)
-  config     Json     @default("{}")
-  is_active  Boolean  @default(true)
-  project_id String?  @db.Uuid
-  created_at DateTime @default(now()) @db.Timestamptz()
-  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz()
-
+  id         String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  type       String    @db.VarChar(50)
+  config     Json      @default("{}")
+  is_active  Boolean   @default(true)
+  project_id String?   @db.Uuid
+  created_at DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
   project    projects? @relation(fields: [project_id], references: [id])
 }
 
-// ─── App Settings ────────────────────────────────────────────────
 model app_settings {
-  id                  Int      @id @default(autoincrement())
-  default_timeout     Int      @default(30000)
-  parallel_execution  Boolean  @default(false)
-  retry_count         Int      @default(0)
-  screenshot_mode     String   @default("on-failure") @db.VarChar(50)
-  use_session_reuse   Boolean  @default(true)
-  base_url            String?  @db.VarChar(255)
-  browser             String   @default("chromium") @db.VarChar(50)
-  device              String   @default("desktop") @db.VarChar(50)
-  variables           Json     @default("{}")
-  slack_webhook       String?  @db.VarChar(255)
-  email_notifications Boolean  @default(false)
-  webhook_callback    String?  @db.VarChar(255)
+  id                  Int     @id @default(autoincrement())
+  default_timeout     Int     @default(30000)
+  parallel_execution  Boolean @default(false)
+  retry_count         Int     @default(0)
+  screenshot_mode     String  @default("on-failure") @db.VarChar(50)
+  use_session_reuse   Boolean @default(true)
+  base_url            String? @db.VarChar(255)
+  browser             String  @default("chromium") @db.VarChar(50)
+  device              String  @default("desktop") @db.VarChar(50)
+  variables           Json    @default("{}")
+  slack_webhook       String? @db.VarChar(255)
+  email_notifications Boolean @default(false)
+  webhook_callback    String? @db.VarChar(255)
 }
 
-// ─── Project Integrations ────────────────────────────────────────
 model project_integrations {
-  id                     String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  project_id             String    @db.Uuid
-  category               String    @db.VarChar(20)
-  status                 String    @default("disconnected") @db.VarChar(20)
-  base_url               String?
-  login_strategy         String?   @db.VarChar(50)
-  username               String?
-  password               String?
-  instance_url           String?
-  client_id              String?
-  client_secret          String?
-  access_token           String?
-  refresh_token          String?
-  token_expiry           DateTime? @db.Timestamptz()
+  id                      String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id              String    @db.Uuid
+  category                String    @db.VarChar(20)
+  status                  String    @default("disconnected") @db.VarChar(20)
+  base_url                String?
+  login_strategy          String?   @db.VarChar(50)
+  username                String?
+  password                String?
+  instance_url            String?
+  client_id               String?
+  client_secret           String?
+  access_token            String?
+  refresh_token           String?
+  token_expiry            DateTime? @db.Timestamptz(6)
   salesforce_redirect_uri String?
-  salesforce_login_url   String?   @default("https://login.salesforce.com")
-  org_id                 String?
-  security_token         String?
-  mcp_connected          Boolean   @default(false)
-  auth_config            Json?
-  jira_domain            String?
-  jira_email             String?
-  jira_token             String?
-  jira_board_id          String?   @db.VarChar(50)
-  jira_board_name        String?
-  last_synced_at         DateTime? @db.Timestamptz()
-  sync_error             String?
-  created_at             DateTime  @default(now()) @db.Timestamptz()
-  updated_at             DateTime  @default(now()) @updatedAt @db.Timestamptz()
-
-  project                projects  @relation(fields: [project_id], references: [id])
+  salesforce_login_url    String?   @default("https://login.salesforce.com")
+  org_id                  String?
+  security_token          String?
+  mcp_connected           Boolean   @default(false)
+  auth_config             Json?
+  jira_domain             String?
+  jira_email              String?
+  jira_token              String?
+  jira_board_id           String?   @db.VarChar(50)
+  jira_board_name         String?
+  last_synced_at          DateTime? @db.Timestamptz(6)
+  sync_error              String?
+  created_at              DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at              DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  project                 projects  @relation(fields: [project_id], references: [id])
 }
 
-// ─── Salesforce Connections ──────────────────────────────────────
 model salesforce_connections {
   id            String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   project_id    String   @db.Uuid
@@ -218,24 +196,20 @@ model salesforce_connections {
   access_token  String
   refresh_token String?
   org_name      String?  @db.VarChar(255)
-  created_at    DateTime @default(now()) @db.Timestamptz()
-
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
   project       projects @relation(fields: [project_id], references: [id])
 }
 
-// ─── Metadata Raw Store ──────────────────────────────────────────
 model metadata_raw_store {
   id            String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   project_id    String   @db.Uuid
   metadata_type String   @db.VarChar(50)
   api_name      String   @db.VarChar(255)
   raw_json      Json     @default("{}")
-  created_at    DateTime @default(now()) @db.Timestamptz()
-
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
   project       projects @relation(fields: [project_id], references: [id])
 }
 
-// ─── Metadata Normalized ─────────────────────────────────────────
 model metadata_normalized {
   id              String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   project_id      String   @db.Uuid
@@ -243,24 +217,20 @@ model metadata_normalized {
   entity_type     String   @db.VarChar(50)
   label           String?  @db.VarChar(255)
   structured_json Json     @default("{}")
-  created_at      DateTime @default(now()) @db.Timestamptz()
-
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
   project         projects @relation(fields: [project_id], references: [id])
 }
 
-// ─── Domain Models ───────────────────────────────────────────────
 model domain_models {
   id            String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   project_id    String   @db.Uuid
   entity_name   String   @db.VarChar(255)
   actions       Json     @default("[]")
   testing_rules Json     @default("[]")
-  created_at    DateTime @default(now()) @db.Timestamptz()
-
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
   project       projects @relation(fields: [project_id], references: [id])
 }
 
-// ─── Vector Embeddings ───────────────────────────────────────────
 model vector_embeddings {
   id               String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   project_id       String   @db.Uuid
@@ -269,31 +239,27 @@ model vector_embeddings {
   chunk_type       String   @default("metadata") @db.VarChar(50)
   embedding_vector Json
   text_chunk       String
-  created_at       DateTime @default(now()) @db.Timestamptz()
-
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
   project          projects @relation(fields: [project_id], references: [id])
 }
 
-// ─── RAG Query Logs ──────────────────────────────────────────────
 model rag_query_logs {
-  id               String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  project_id       String   @db.Uuid
-  test_case_id     String?  @db.Uuid
+  id               String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id       String      @db.Uuid
+  test_case_id     String?     @db.Uuid
   query_text       String
-  retrieved_chunks Json     @default("[]")
+  retrieved_chunks Json        @default("[]")
   chunk_sources    Json?
-  created_at       DateTime @default(now()) @db.Timestamptz()
-
-  project          projects   @relation(fields: [project_id], references: [id])
+  created_at       DateTime    @default(now()) @db.Timestamptz(6)
+  project          projects    @relation(fields: [project_id], references: [id])
   test_case        test_cases? @relation(fields: [test_case_id], references: [id])
 }
 
-// ─── Execution Learnings ─────────────────────────────────────────
 model execution_learnings {
-  id               String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  project_id       String    @db.Uuid
-  test_case_id     String?   @db.Uuid
-  test_run_id      String?   @db.Uuid
+  id               String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id       String      @db.Uuid
+  test_case_id     String?     @db.Uuid
+  test_run_id      String?     @db.Uuid
   learning_type    String
   object_name      String?
   field_name       String?
@@ -303,40 +269,58 @@ model execution_learnings {
   failure_reason   String?
   steps_pattern    Json?
   extra_metadata   Json?
-  created_at       DateTime  @default(now()) @db.Timestamptz()
-
-  project          projects   @relation(fields: [project_id], references: [id])
+  created_at       DateTime    @default(now()) @db.Timestamptz(6)
+  project          projects    @relation(fields: [project_id], references: [id])
   test_case        test_cases? @relation(fields: [test_case_id], references: [id])
   test_run         test_runs?  @relation(fields: [test_run_id], references: [id])
 }
 
-// ─── Executions (legacy) ─────────────────────────────────────────
 model executions {
-  id              String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  test_case_id    String?   @db.Uuid
-  status          String    @default("PENDING")
+  id              String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  test_case_id    String?     @db.Uuid
+  status          String      @default("PENDING")
   logs            String?
   result_metadata Json?
-  started_at      DateTime  @default(now()) @db.Timestamptz()
-  completed_at    DateTime? @db.Timestamptz()
-
+  started_at      DateTime    @default(now()) @db.Timestamptz(6)
+  completed_at    DateTime?   @db.Timestamptz(6)
   test_case       test_cases? @relation(fields: [test_case_id], references: [id])
 }
 
-// ─── Web Test Data ───────────────────────────────────────────────
-// Stores real entity records extracted from the crawled web app.
-// source: 'ui_scraping' (Tier 1 automatic) | 'user_upload' (Tier 2 manual)
 model web_test_data {
-  id                String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  project_id        String   @db.Uuid
-  entity_name       String   @db.VarChar(255)
-  records           Json     @default("[]")
-  source            String   @default("ui_scraping") @db.VarChar(20)
-  record_count      Int      @default(0)
-  last_extracted_at DateTime @default(now()) @db.Timestamptz()
-
-  project           projects @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  id                 String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id         String   @db.Uuid
+  entity_name        String   @db.VarChar(255)
+  records            Json     @default("[]")
+  source             String   @default("ui_scraping") @db.VarChar(20)
+  record_count       Int      @default(0)
+  last_extracted_at  DateTime @default(now()) @db.Timestamptz(6)
+  source_url         String?  @db.VarChar(512)
+  create_button_name String?  @db.VarChar(100)
+  open_button_name   String?  @db.VarChar(100)
+  project            projects @relation(fields: [project_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([project_id, entity_name])
   @@map("web_test_data")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model agent_executions {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  project_id     String?   @db.Uuid
+  agent_name     String
+  task_type      String
+  input_summary  Json      @default("{}")
+  output_summary Json      @default("{}")
+  thoughts       String[]  @default([])
+  tool_calls     Json[]    @default([])
+  hitl_invoked   Boolean   @default(false)
+  confidence     Float?
+  tokens_used    Int?
+  duration_ms    Int?
+  created_at     DateTime  @default(now()) @db.Timestamptz(6)
+  projects       projects? @relation(fields: [project_id], references: [id], onUpdate: NoAction)
+
+  @@index([agent_name], map: "idx_agent_executions_agent_name")
+  @@index([created_at(sort: Desc)], map: "idx_agent_executions_created_at")
+  @@index([project_id], map: "idx_agent_executions_project_id")
 }

@@ -6,7 +6,7 @@ import {
   Sparkles, ArrowLeft, Check, Loader2, ChevronRight, ChevronDown, ChevronUp,
   GitBranch, Cpu, Send, Play, RotateCcw, CheckSquare, Square, GripVertical,
   AlertCircle, CheckCircle2, XCircle, Clock, Zap, Filter, X, ArrowRight,
-  RefreshCw, FileText, BarChart3, TrendingUp
+  RefreshCw, FileText, BarChart3, TrendingUp, MonitorPlay
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -346,16 +346,26 @@ export default function GenerateWizardPage() {
     finally { setApproving(false) }
   }
 
-  // ── Run test suite as flow ────────────────────────────────────────────────────
+  // ── Run test suite as flow — INTERACTIVE (browser) mode ──────────────────────
   // Terminal statuses that BullMQ / execution worker actually write to DB:
-  // 'completed' = all steps passed, 'failed' = step failed, 'error' = worker crash
-  const TERMINAL_STATUSES = new Set(["completed", "failed", "error", "stopped"])
+  // 'passed'  = all steps passed  (execution.worker.ts line ~5413)
+  // 'failed'  = a step failed
+  // 'error'   = worker crashed
+  // 'stopped' = user manually stopped
+  const TERMINAL_STATUSES = new Set(["passed", "completed", "failed", "error", "stopped"])
+
+  // Track the currently-paused run so we can surface a HITL indicator in the UI
+  const [pausedRunId, setPausedRunId] = useState<string | null>(null)
+  const [pausedTcName, setPausedTcName] = useState<string>("")
 
   const handleRunFlow = async () => {
     setRunning(true)
     setRunResults([])
     setRunIdx(0)
     setRunCurrentTcName("")
+    setPausedRunId(null)
+    setPausedTcName("")
+
     const orderedTcs = finalGroups.flatMap(g => g.testCases)
     const results: RunResult[] = []
 
@@ -363,14 +373,16 @@ export default function GenerateWizardPage() {
       const tc = orderedTcs[i]
       setRunIdx(i + 1)
       setRunCurrentTcName(tc.name)
+      toast.info(`🖥️ Opening browser for: ${tc.name}`, { duration: 3000 })
 
-      // ── Step 1: Create the test run ──────────────────────────────────────────
+      // ── Step 1: Create the test run with interactive: true ───────────────────
       let runId: string | null = null
       try {
         const createRes = await fetch(`${API}/test-runs/`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ test_case_id: tc.id, interactive: false }),
+          // interactive: true → Playwright opens a visible browser window the user can watch
+          body: JSON.stringify({ test_case_id: tc.id, interactive: true }),
         })
         if (!createRes.ok) {
           const errBody = await createRes.json().catch(() => ({ detail: `HTTP ${createRes.status}` }))
@@ -387,10 +399,11 @@ export default function GenerateWizardPage() {
         continue
       }
 
-      // ── Step 2: Poll until terminal status ──────────────────────────────────
+      // ── Step 2: Poll until terminal status (handle HITL pauses) ─────────────
       let finalStatus = "pending"
       let attempts = 0
-      const MAX_POLLS = 90          // 90 × 3s = 4.5 min max per TC
+      // Interactive runs allow up to 15 min (300 × 3s) — same as single-run HITL budget
+      const MAX_POLLS = 300
       const POLL_INTERVAL_MS = 3000
 
       while (attempts < MAX_POLLS) {
@@ -401,6 +414,22 @@ export default function GenerateWizardPage() {
           if (pollRes.ok) {
             const pollData = await pollRes.json()
             finalStatus = pollData.status ?? "running"
+
+            // HITL: surface the paused state so the UI shows a banner
+            if (finalStatus === "paused") {
+              setPausedRunId(runId)
+              setPausedTcName(tc.name)
+              // Keep polling — the execution worker will resume when the user
+              // interacts with the browser; we detect the status change here
+              continue
+            }
+
+            // Clear paused indicator if execution resumed
+            if (pausedRunId === runId && finalStatus === "running") {
+              setPausedRunId(null)
+              setPausedTcName("")
+            }
+
             if (TERMINAL_STATUSES.has(finalStatus)) break
           }
         } catch {
@@ -408,23 +437,37 @@ export default function GenerateWizardPage() {
         }
       }
 
-      // 'completed' is the success state from the worker
+      // Clear paused state for this run once terminal
+      if (pausedRunId === runId) {
+        setPausedRunId(null)
+        setPausedTcName("")
+      }
+
+      // Worker writes 'passed' (success), 'failed', or 'error' to the DB
       const uiStatus: RunResult["status"] =
-        finalStatus === "completed" ? "passed" :
-        finalStatus === "failed"    ? "failed"  : "error"
+        (finalStatus === "passed" || finalStatus === "completed") ? "passed" :
+        finalStatus === "failed" ? "failed" : "error"
+
+      const durationSec = Math.round(attempts * (POLL_INTERVAL_MS / 1000))
 
       results.push({
         testCaseId: tc.id!,
         name: tc.name,
         status: uiStatus,
-        duration: attempts * (POLL_INTERVAL_MS / 1000),
+        duration: durationSec,
         error: uiStatus !== "passed" ? `Run status: ${finalStatus}` : undefined,
       })
       setRunResults([...results])
 
-      // Small gap between sequential runs so Playwright can fully close
+      if (uiStatus === "passed") {
+        toast.success(`✅ ${tc.name} — Passed (${durationSec}s)`, { duration: 4000 })
+      } else {
+        toast.error(`❌ ${tc.name} — ${finalStatus}`, { duration: 4000 })
+      }
+
+      // Small gap between sequential runs so Playwright can fully close the browser
       if (i < orderedTcs.length - 1) {
-        await new Promise(r => setTimeout(r, 1500))
+        await new Promise(r => setTimeout(r, 2000))
       }
     }
 
@@ -699,6 +742,13 @@ export default function GenerateWizardPage() {
               <h1 className="text-xl font-black text-slate-800 dark:text-slate-100">
                 {running ? "Running test suite as flow…" : "All tests complete!"}
               </h1>
+              {/* Browser mode badge */}
+              {running && (
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold bg-violet-100 dark:bg-violet-950/40 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-700">
+                  <MonitorPlay className="h-3.5 w-3.5" />
+                  Browser mode — watch the live test in the window
+                </div>
+              )}
               {running && runCurrentTcName && (
                 <div className="flex items-center justify-center gap-2 text-sm text-violet-600 dark:text-violet-400 font-medium">
                   <Loader2 className="h-4 w-4 animate-spin flex-shrink-0" />
@@ -707,10 +757,23 @@ export default function GenerateWizardPage() {
               )}
               <p className="text-sm text-slate-500 dark:text-slate-400">
                 {running
-                  ? `Test ${runIdx} of ${runTotal} — polling every 3s for result`
+                  ? `Test ${runIdx} of ${runTotal} — browser window open`
                   : `Finished ${runResults.length} tests`}
               </p>
             </div>
+
+            {/* HITL paused banner */}
+            {pausedTcName && (
+              <div className="flex items-start gap-3 p-4 rounded-xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/20">
+                <AlertCircle className="h-5 w-5 text-amber-500 flex-shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-bold text-amber-800 dark:text-amber-300">⏸ Test paused — browser needs your help</p>
+                  <p className="text-[12px] text-amber-700 dark:text-amber-400 mt-0.5 truncate">
+                    <span className="font-medium">{pausedTcName}</span> — switch to the browser window and complete the manual action, then execution will resume automatically.
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* Overall progress */}
             <div className="space-y-1">
@@ -736,27 +799,34 @@ export default function GenerateWizardPage() {
                   <div className="divide-y divide-slate-100 dark:divide-slate-800">
                     {group.testCases.map((tc, i) => {
                       const result = runResults.find(r => r.testCaseId === tc.id)
-                      // Use name-match: this TC is actively running if it's the current one and has no result yet
                       const isCurrentlyRunning = running && !result && runCurrentTcName === tc.name
+                      const isCurrentlyPaused = isCurrentlyRunning && pausedTcName === tc.name
                       const isPending = !result && !isCurrentlyRunning
                       return (
-                        <div key={tc.id ?? i} className={`flex items-start gap-3 px-4 py-3 transition-colors ${isCurrentlyRunning ? "bg-violet-50/50 dark:bg-violet-950/20" : ""}`}>
+                        <div key={tc.id ?? i} className={`flex items-start gap-3 px-4 py-3 transition-colors ${
+                          isCurrentlyPaused ? "bg-amber-50/60 dark:bg-amber-950/20" :
+                          isCurrentlyRunning ? "bg-violet-50/50 dark:bg-violet-950/20" : ""
+                        }`}>
                           <div className="w-5 h-5 flex-shrink-0 flex items-center justify-center mt-0.5">
-                            {isPending       && <div className="w-3 h-3 rounded-full bg-slate-200 dark:bg-slate-700" />}
-                            {isCurrentlyRunning && <Loader2 className="h-4 w-4 animate-spin text-violet-500" />}
+                            {isPending            && <div className="w-3 h-3 rounded-full bg-slate-200 dark:bg-slate-700" />}
+                            {isCurrentlyPaused    && <AlertCircle className="h-4 w-4 text-amber-500 animate-pulse" />}
+                            {isCurrentlyRunning && !isCurrentlyPaused && <Loader2 className="h-4 w-4 animate-spin text-violet-500" />}
                             {result?.status === "passed" && <CheckCircle2 className="h-5 w-5 text-emerald-500" />}
                             {result?.status === "failed" && <XCircle className="h-5 w-5 text-red-500" />}
                             {result?.status === "error"  && <AlertCircle className="h-5 w-5 text-amber-500" />}
                           </div>
                           <div className="flex-1 min-w-0">
                             <span className={`text-[12px] font-medium ${
-                              isCurrentlyRunning      ? "text-violet-700 dark:text-violet-300" :
+                              isCurrentlyPaused           ? "text-amber-700 dark:text-amber-300" :
+                              isCurrentlyRunning          ? "text-violet-700 dark:text-violet-300" :
                               result?.status === "passed" ? "text-emerald-700 dark:text-emerald-400" :
                               result?.status === "failed" ? "text-red-600 dark:text-red-400" :
                               result?.status === "error"  ? "text-amber-600 dark:text-amber-400" :
                               "text-slate-500 dark:text-slate-500"
                             }`}>{tc.name}</span>
-                            {/* Show real error message under failed/error rows */}
+                            {isCurrentlyPaused && (
+                              <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5 font-semibold">⏸ Paused — waiting for browser interaction</p>
+                            )}
                             {result?.error && result.status !== "passed" && (
                               <p className="text-[10px] text-red-500 dark:text-red-400 mt-0.5 truncate">{result.error}</p>
                             )}
@@ -779,10 +849,15 @@ export default function GenerateWizardPage() {
 
             {/* Run / view results buttons */}
             {!running && runResults.length === 0 && (
-              <div className="flex flex-col items-center gap-3 py-6">
+              <div className="flex flex-col items-center gap-4 py-6">
+                {/* Browser mode explanation */}
+                <div className="flex items-center gap-2 text-[12px] text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 max-w-md text-center">
+                  <MonitorPlay className="h-4 w-4 text-violet-500 flex-shrink-0" />
+                  <span>Each test will open a <strong>visible browser window</strong> so you can watch the automated steps in real time. Tests run sequentially, one after another.</span>
+                </div>
                 <Button onClick={handleRunFlow} className="gap-2 text-white h-12 px-10 text-sm font-bold shadow-xl shadow-violet-200 dark:shadow-violet-900/30"
                   style={{ background: "linear-gradient(135deg,#7c3aed,#4f46e5)" }}>
-                  <Play className="h-4 w-4" />Run All Tests as Flow
+                  <MonitorPlay className="h-4 w-4" />Run All in Browser
                 </Button>
                 <button onClick={() => {
                   const ids = Array.from(selectedIds)

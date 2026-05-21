@@ -78,6 +78,11 @@ export const ConnectProjectSchema = z.object({
   // Salesforce (OAuth)
   client_id: z.string().optional(),
   client_secret: z.string().optional(),
+  // Keycloak / OAuth Custom Token
+  keycloak_auth_token: z.string().optional(),
+  keycloak_id_token: z.string().optional(),
+  keycloak_refresh_url: z.string().optional(),
+  keycloak_token_expires_at: z.number().optional(), // Unix ms
 })
 
 export const SalesforceCredentialsSchema = z.object({
@@ -134,6 +139,22 @@ export const JiraConnectSchema = z.object({
   jira_token: z.string().min(1),
 })
 
+// ─── Keycloak Token ──────────────────────────────────────────────
+
+/**
+ * Body for POST /api/v1/projects/:id/save-keycloak-tokens
+ * Accepts the HMAC-signed auth_token and Keycloak id_token captured
+ * after a successful Keycloak login and stores them encrypted in auth_config.
+ */
+export const KeycloakTokenSchema = z.object({
+  auth_token: z.string().min(1, 'auth_token is required'),
+  id_token: z.string().optional(),
+  /** Optional refresh endpoint, e.g. /api/auth/refresh */
+  refresh_url: z.string().optional(),
+  /** Unix epoch ms — leave blank to default to 24h from now */
+  expires_at: z.number().optional(),
+})
+
 export const JiraBoardsSchema = z.object({
   jira_domain: z.string().min(1),
   jira_email: z.string().min(1),
@@ -165,3 +186,4 @@ export type SalesforceCredentials = z.infer<typeof SalesforceCredentialsSchema>
 export type IntegrationStatusResponse = z.infer<typeof IntegrationStatusResponseSchema>
 export type JiraConnect = z.infer<typeof JiraConnectSchema>
 export type JiraProjectConfig = z.infer<typeof JiraProjectConfigSchema>
+export type KeycloakToken = z.infer<typeof KeycloakTokenSchema>
