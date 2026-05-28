@@ -36,6 +36,16 @@ export interface ElementInfo {
   options?: string[]
 }
 
+/** A navigation menu item extracted from <nav> / sidebar / [role="navigation"] */
+export interface NavItemInfo {
+  text:       string
+  role:       'link' | 'menuitem' | 'button' | 'tab' | 'treeitem' | 'unknown'
+  href?:      string
+  ariaLabel?: string
+  /** Ready-to-use Playwright locator string — e.g. "role=link, name=Users" */
+  locator:    string
+}
+
 export interface PageMetadata {
   url: string
   path: string
@@ -46,6 +56,8 @@ export interface PageMetadata {
   inputs: ElementInfo[]
   selects: ElementInfo[]
   testids: string[]
+  /** Navigation menu items extracted from <nav>/sidebar containers */
+  navigation_items: NavItemInfo[]
   source?: 'sitemap' | 'playwright'
   crawl_depth?: number
 }
@@ -97,6 +109,64 @@ function normalizeUrl(url: string, baseUrl: string): string | null {
   } catch {
     return null
   }
+}
+
+/**
+ * Derive navigable route paths from button labels on a crawled page.
+ * Only matches buttons that look like SPA sidebar navigation items:
+ * - Must have a multi-line format: "Label\nDescription" (the description confirms it's a nav item)
+ * - Must NOT be generic action buttons, record IDs, or user profile labels
+ *
+ * Example match:   "Enquiries\nManage freight enquiries" → /enquiries
+ * Example reject:  "Add Item", "Create Opportunity", "AGS2", "ENQ-0002"
+ */
+function deriveRoutesFromButtons(buttons: ElementInfo[], baseUrl: string): string[] {
+  const candidates: string[] = []
+
+  for (const btn of buttons) {
+    const rawName = (btn.name ?? '').trim()
+    if (!rawName) continue
+
+    const lines = rawName.split('\n').map(l => l.trim()).filter(Boolean)
+
+    // STRICT: require at least 2 lines — nav items always have a label + description
+    // (e.g. "Enquiries\n\nManage freight enquiries")
+    if (lines.length < 2) continue
+
+    const firstLine = lines[0]
+    const description = lines.slice(1).join(' ').toLowerCase()
+
+    // Description must contain navigation verbs to confirm this is a nav menu item
+    const NAV_DESCRIPTION_KEYWORDS = [
+      'manage', 'view', 'create', 'track', 'handle', 'monitor',
+      'browse', 'list', 'access', 'process', 'submit',
+    ]
+    const hasNavDescription = NAV_DESCRIPTION_KEYWORDS.some(k => description.includes(k))
+    if (!hasNavDescription) continue
+
+    // First line must be a reasonable module name (3-25 chars, no numbers or special chars)
+    if (firstLine.length < 3 || firstLine.length > 25) continue
+    // Skip labels with record-ID patterns: "ENQ-0002", "AGS2", "DTA1"
+    if (/^[A-Z]{2,5}[-\s]?\d/.test(firstLine)) continue
+    // Skip labels with numbers (like user shorthand "AGS2", "DTA1")
+    if (/\d/.test(firstLine)) continue
+    // Must be a single clean word or two words ("Account Management" OK, "Back to List" not)
+    const wordCount = firstLine.split(/\s+/).length
+    if (wordCount > 3) continue
+
+    const slug = firstLine
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .trim()
+      .replace(/\s+/g, '-')
+
+    if (slug && slug.length >= 3 && slug.length <= 25) {
+      const candidateUrl = normalizeUrl(`/${slug}`, baseUrl)
+      if (candidateUrl) candidates.push(candidateUrl)
+    }
+  }
+
+  return [...new Set(candidates)]
 }
 
 // ─── Crawler ──────────────────────────────────────────────────────────────────
@@ -274,6 +344,20 @@ export class WebMetadataService {
           )
 
           if (pageMeta) {
+            // ── Filter 404 / error pages ─────────────────────────────────────────────────
+            // Do not store pages that returned a 404 / not-found response.
+            // These are bad routes from key_routes that don't exist in this app.
+            const is404 = (
+              pageMeta.title?.toLowerCase().includes('404') ||
+              pageMeta.title?.toLowerCase().includes('not found') ||
+              pageMeta.title?.toLowerCase().includes('could not be found') ||
+              pageMeta.title?.toLowerCase().includes('page not found')
+            )
+            if (is404) {
+              visitedUrls.add(url) // mark visited so we don't retry
+              log.debug(`[CRAWLER] Skipped 404 page: ${url} ("${pageMeta.title}")`)
+              continue
+            }
             pageMeta.source = source
             pageMeta.crawl_depth = 0
             result.pages.push(pageMeta)
@@ -307,6 +391,27 @@ export class WebMetadataService {
                   }
                 }
               }
+            }
+
+            // ── Button-based route discovery ─────────────────────────────────
+            // SPA apps often use <button> elements for navigation (not <a> tags).
+            // Derive candidate URLs from button labels and add to pending queue.
+            const buttonRoutes = deriveRoutesFromButtons(pageMeta.buttons, baseUrl)
+            let buttonRoutesAdded = 0
+            for (const candidate of buttonRoutes) {
+              if (
+                !visitedUrls.has(candidate) &&
+                !pendingUrls.includes(candidate) &&
+                !toVisitThisRun.includes(candidate)
+              ) {
+                pendingUrls.push(candidate)
+                buttonRoutesAdded++
+              }
+            }
+            if (buttonRoutesAdded > 0) {
+              log.info(
+                `[CRAWLER] Button-route discovery: found ${buttonRoutesAdded} new candidate routes from buttons on ${url}`
+              )
             }
           } else {
             // Navigation failed — keep in visited to avoid infinite retries
@@ -436,6 +541,7 @@ export class WebMetadataService {
       inputs: [],
       selects: [],
       testids: [],
+      navigation_items: [],
     }
 
     try { meta.title = (await page.title()) || '' } catch { /* ignore */ }
@@ -636,6 +742,102 @@ export class WebMetadataService {
       }
     } catch { /* ignore */ }
 
+    // ── Navigation Menu Item Extraction ──────────────────────────────────────
+    // Scan dedicated nav containers for sidebar/topnav items.
+    // These are stored separately from generic links so the LLM can generate
+    // reliable role=link locators instead of fragile text= selectors.
+    try {
+      const navRaw = await page.evaluate(() => {
+        const NAV_SELECTORS = [
+          'nav', '[role="navigation"]', '[role="menubar"]',
+          '[class*="sidebar"]', '[class*="side-bar"]',
+          '[class*="sidenav"]', '[class*="side-nav"]',
+          '[class*="nav-menu"]', '[class*="navmenu"]',
+          '[id*="sidebar"]', '[id*="side-nav"]', '[id*="nav-menu"]',
+        ]
+
+        // Collect all nav container elements (deduplicated)
+        const containers: Element[] = []
+        for (const sel of NAV_SELECTORS) {
+          for (const el of Array.from(document.querySelectorAll(sel))) {
+            if (!containers.includes(el)) containers.push(el)
+          }
+        }
+
+        const items: Array<{
+          text: string; role: string; href: string; ariaLabel: string; tag: string
+        }> = []
+        const seen = new Set<string>()
+
+        for (const container of containers) {
+          // Only process visible containers
+          if ((container as HTMLElement).offsetParent === null) continue
+
+          // Query clickable nav children: links, menuitem elements, buttons
+          const candidates = Array.from(container.querySelectorAll(
+            'a[href], [role="menuitem"], [role="treeitem"], [role="tab"], button'
+          ) as NodeListOf<HTMLElement>)
+
+          for (const el of candidates) {
+            if (el.offsetParent === null) continue  // skip hidden items
+
+            // Extract text — prefer innerText, fall back to aria-label / title
+            const rawText = (el.innerText ?? '').trim().split('\n')[0].trim()
+            const ariaLabel = el.getAttribute('aria-label') ?? ''
+            const text = (rawText || ariaLabel).slice(0, 60)
+            if (!text || text.length < 2) continue
+
+            // Deduplicate by text
+            const key = text.toLowerCase()
+            if (seen.has(key)) continue
+            seen.add(key)
+
+            const tag = el.tagName.toLowerCase()
+            const href = (el as HTMLAnchorElement).href ?? ''
+            const role = el.getAttribute('role') ?? (tag === 'a' ? 'link' : tag === 'button' ? 'button' : '')
+
+            items.push({ text, role, href, ariaLabel, tag })
+          }
+        }
+
+        return items.slice(0, 30)
+      }) as Array<{ text: string; role: string; href: string; ariaLabel: string; tag: string }>
+
+      for (const raw of navRaw) {
+        // Determine canonical ARIA role
+        let role: NavItemInfo['role'] = 'unknown'
+        if (raw.role === 'link' || raw.tag === 'a')       role = 'link'
+        else if (raw.role === 'menuitem')                  role = 'menuitem'
+        else if (raw.role === 'button' || raw.tag === 'button') role = 'button'
+        else if (raw.role === 'treeitem')                  role = 'treeitem'
+        else if (raw.role === 'tab')                       role = 'tab'
+
+        // Build a recommended Playwright locator
+        // Prefer role=link (most reliable), fallback to role=button or getByText
+        let locator = ''
+        if (role === 'link')      locator = `role=link, name=${raw.text}`
+        else if (role === 'menuitem') locator = `role=menuitem, name=${raw.text}`
+        else if (role === 'tab')   locator = `role=tab, name=${raw.text}`
+        else if (role === 'button') locator = `role=button, name=${raw.text}`
+        else                       locator = `text=${raw.text}`
+
+        const item: NavItemInfo = {
+          text:       raw.text,
+          role,
+          locator,
+          href:       raw.href || undefined,
+          ariaLabel:  raw.ariaLabel || undefined,
+        }
+        meta.navigation_items.push(item)
+      }
+
+      if (meta.navigation_items.length > 0) {
+        log.info(
+          `[CRAWLER] Extracted ${meta.navigation_items.length} navigation item(s) from nav/sidebar on ${url}`
+        )
+      }
+    } catch (navErr) { log.debug({ navErr }, '[CRAWLER] Navigation item extraction failed (non-fatal)') }
+
     return meta
   }
 
@@ -672,6 +874,19 @@ export class WebMetadataService {
 
         lines.push('  All Buttons (use locator_type=\'role\'):')
         for (const btn of pm.buttons.slice(0, 15)) lines.push(`    • ${btn.locator}  [${btn.name}]`)
+      }
+
+      // ── Navigation Menu Items ─────────────────────────────────────────────
+      // These are the sidebar/topnav items extracted from <nav> / [role="navigation"].
+      // ALWAYS use the locator shown here (role=link/menuitem) for CLICK navigation steps.
+      // NEVER use text= for these items — it matches inner <span> elements that are not clickable.
+      if (pm.navigation_items && pm.navigation_items.length > 0) {
+        lines.push('  🧭 NAVIGATION MENU ITEMS (sidebar/topnav — use the locator shown EXACTLY):')
+        for (const ni of pm.navigation_items.slice(0, 20)) {
+          const href = ni.href ? `  [href: ${new URL(ni.href).pathname}]` : ''
+          lines.push(`    → "${ni.text}"  locator: "${ni.locator}"  locator_type: "role"${href}`)
+        }
+        lines.push('    ⚠️ RULE: For CLICK steps targeting any item above, set locator_type: "role" and copy the locator EXACTLY.')
       }
 
       const reqInputs = pm.inputs.filter((i) => i.required)

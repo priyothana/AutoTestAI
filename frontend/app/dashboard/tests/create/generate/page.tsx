@@ -673,8 +673,31 @@ export default function GenerateWizardPage() {
               {/* Flow groups */}
               <div className="space-y-4">
                 {groups.map((group, gi) => (
-                  <FlowGroupCard key={gi} group={group} groupIdx={gi}
-                    selectedIds={selectedIds} onToggleTc={toggleTc} onToggleAll={toggleGroupAll} showDragHint />
+                  <div key={group.flow}>
+                    {group.testCases.length === 0 ? (
+                      // Empty group — LLM generation failed for this flow
+                      <div className="rounded-xl border-2 border-amber-200 dark:border-amber-800 bg-amber-50/60 dark:bg-amber-950/20 overflow-hidden">
+                        <div className="flex items-center gap-3 px-4 py-3">
+                          <div className="w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-black text-white flex-shrink-0"
+                            style={{ background: "linear-gradient(135deg,#d97706,#b45309)" }}>
+                            {group.order}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <span className="font-semibold text-sm text-amber-800 dark:text-amber-300 truncate">{group.flow}</span>
+                            <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-0.5">
+                              ⚠️ AI could not generate test cases for this flow. You can skip it or regenerate the full suite.
+                            </p>
+                          </div>
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700 px-2 py-0.5 rounded-full flex-shrink-0">
+                            0 tests
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <FlowGroupCard key={gi} group={group} groupIdx={gi}
+                        selectedIds={selectedIds} onToggleTc={toggleTc} onToggleAll={toggleGroupAll} showDragHint />
+                    )}
+                  </div>
                 ))}
               </div>
 

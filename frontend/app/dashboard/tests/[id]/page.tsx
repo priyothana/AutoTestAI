@@ -85,6 +85,9 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const isRunningRef = useRef(false)
     const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
     const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    const [executionStatus, setExecutionStatus] = useState<'idle' | 'running' | 'paused' | 'passed' | 'failed'>("idle")
+    const [elapsedSeconds, setElapsedSeconds] = useState(0)
+    const elapsedRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
     // HITL interactive state
     const [isPaused, setIsPaused] = useState(false)
@@ -324,6 +327,16 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
     const [lastRunResult, setLastRunResult] = useState<any>(null)
 
+    // ── Elapsed timer for execution panel ──────────────────────────────
+    const startElapsedTimer = () => {
+        setElapsedSeconds(0)
+        if (elapsedRef.current) clearInterval(elapsedRef.current)
+        elapsedRef.current = setInterval(() => setElapsedSeconds(s => s + 1), 1000)
+    }
+    const stopElapsedTimer = () => {
+        if (elapsedRef.current) { clearInterval(elapsedRef.current); elapsedRef.current = null }
+    }
+
     // ── Helper: stop polling and reset running state ────────────────────
     const stopRunning = (
         toastId: string | number,
@@ -333,10 +346,12 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     ) => {
         if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
         if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
+        stopElapsedTimer()
         setIsRunning(false)
         isRunningRef.current = false
         setIsPaused(false)
         setPausedStepIndex(null)
+        setExecutionStatus('idle')
         if (type === "success") toast.success(message, { id: toastId })
         else if (type === "error") toast.error(message, { id: toastId })
         else if (type === "info") toast.info(message, { id: toastId })
@@ -350,8 +365,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 .then(data => {
                     if (data && data.status && !['pending','running','paused'].includes(data.status)) {
                         setLastRunResult(data)
-                        if (data.status === 'passed') setTestStatus('passed')
-                        else setTestStatus('failed')
+                        if (data.status === 'passed') { setTestStatus('passed'); setExecutionStatus('passed') }
+                        else { setTestStatus('failed'); setExecutionStatus('failed') }
                     }
                 })
                 .catch(() => { /* non-critical */ })
@@ -379,6 +394,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         setIsPaused(false)
         setPausedStepIndex(null)
         setLastRunResult(null)
+        setExecutionStatus('running')
+        startElapsedTimer()
         const runToastId = toast.loading("Saving & starting execution...")
 
         try {
@@ -451,6 +468,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         const pausedStep = lastLog?.step ?? null
                         setIsPaused(true)
                         setPausedStepIndex(pausedStep)
+                        setExecutionStatus('paused')
                         toast.warning(
                             `⏸ Step ${pausedStep ?? '?'} needs manual help — see banner below`,
                             { id: runToastId, duration: Infinity }
@@ -462,6 +480,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     if (isPaused && status === 'running') {
                         setIsPaused(false)
                         setPausedStepIndex(null)
+                        setExecutionStatus('running')
                         toast.loading('▶ Continuing from next step...', { id: runToastId })
                         return
                     }
@@ -470,6 +489,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         // Clear timeout first so it doesn't fire after we've finished
                         if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
                         if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
+                        stopElapsedTimer()
                         setIsRunning(false)
                         isRunningRef.current = false
                         setIsPaused(false)
@@ -483,6 +503,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         }
 
                         if (status === "passed") {
+                            setExecutionStatus('passed')
                             toast.success(
                                 <div className="flex flex-col gap-1">
                                     <span>✅ Test Passed! ({statusData.duration?.toFixed(1) || 0}s)</span>
@@ -497,6 +518,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                             )
                             setTestStatus("passed")
                         } else {
+                            setExecutionStatus('failed')
                             toast.error(`Test ${status} – View details below`, { id: runToastId })
                             setTestStatus("failed")
 
@@ -837,55 +859,144 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 </p>
             </div>
 
-            {/* ── HITL Pause Banner ────────────────────────────────────────── */}
-            {isPaused && (
-                <div className="flex items-start gap-4 p-4 rounded-xl border-2 border-amber-400 bg-amber-50 dark:bg-amber-950/30 dark:border-amber-600 shadow-md animate-pulse">
-                    <div className="flex-shrink-0 bg-amber-100 dark:bg-amber-900/40 p-2 rounded-full">
-                        <AlertCircle className="h-6 w-6 text-amber-600 dark:text-amber-400" />
+            {/* ── Execution Status Highlight Panel ─────────────────────────── */}
+            {(isRunning || executionStatus === 'passed' || executionStatus === 'failed') && (
+                <div className={`rounded-xl border-2 shadow-lg overflow-hidden transition-all duration-300 ${
+                    executionStatus === 'running'
+                        ? 'border-blue-400 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/30 dark:to-indigo-950/20 dark:border-blue-600'
+                        : executionStatus === 'paused'
+                            ? 'border-amber-400 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-950/30 dark:to-orange-950/20 dark:border-amber-600'
+                            : executionStatus === 'passed'
+                                ? 'border-green-400 bg-gradient-to-r from-green-50 to-emerald-50 dark:from-green-950/30 dark:to-emerald-950/20 dark:border-green-600'
+                                : 'border-red-400 bg-gradient-to-r from-red-50 to-rose-50 dark:from-red-950/30 dark:to-rose-950/20 dark:border-red-600'
+                }`}>
+                    {/* Status Bar */}
+                    <div className={`px-4 py-2 flex items-center gap-3 border-b ${
+                        executionStatus === 'running'
+                            ? 'border-blue-200 dark:border-blue-800 bg-blue-100/60 dark:bg-blue-900/30'
+                            : executionStatus === 'paused'
+                                ? 'border-amber-200 dark:border-amber-800 bg-amber-100/60 dark:bg-amber-900/30'
+                                : executionStatus === 'passed'
+                                    ? 'border-green-200 dark:border-green-800 bg-green-100/60 dark:bg-green-900/30'
+                                    : 'border-red-200 dark:border-red-800 bg-red-100/60 dark:bg-red-900/30'
+                    }`}>
+                        {/* Status dot + label */}
+                        <div className="flex items-center gap-2 flex-1">
+                            {executionStatus === 'running' && (
+                                <>
+                                    <span className="relative flex h-3 w-3">
+                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                                        <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500" />
+                                    </span>
+                                    <span className="font-semibold text-blue-700 dark:text-blue-300 text-sm">Running</span>
+                                    <span className="text-blue-500 dark:text-blue-400 text-xs font-mono ml-1">{elapsedSeconds}s elapsed</span>
+                                </>
+                            )}
+                            {executionStatus === 'paused' && (
+                                <>
+                                    <span className="relative flex h-3 w-3">
+                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                                        <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500" />
+                                    </span>
+                                    <span className="font-semibold text-amber-700 dark:text-amber-300 text-sm">Paused</span>
+                                    <span className="text-amber-500 dark:text-amber-400 text-xs ml-1">— Step {pausedStepIndex ?? '?'} needs action</span>
+                                </>
+                            )}
+                            {executionStatus === 'passed' && (
+                                <>
+                                    <CheckCircle className="h-4 w-4 text-green-600 dark:text-green-400" />
+                                    <span className="font-semibold text-green-700 dark:text-green-300 text-sm">Passed</span>
+                                    {lastRunResult?.duration && (
+                                        <span className="text-green-500 dark:text-green-400 text-xs font-mono ml-1">{lastRunResult.duration.toFixed(1)}s</span>
+                                    )}
+                                </>
+                            )}
+                            {executionStatus === 'failed' && (
+                                <>
+                                    <AlertCircle className="h-4 w-4 text-red-600 dark:text-red-400" />
+                                    <span className="font-semibold text-red-700 dark:text-red-300 text-sm">Failed</span>
+                                    {lastRunResult?.duration && (
+                                        <span className="text-red-500 dark:text-red-400 text-xs font-mono ml-1">{lastRunResult.duration.toFixed(1)}s</span>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                        {/* Quick stats */}
+                        {lastRunResult?.logs && (
+                            <div className="flex items-center gap-3 text-xs">
+                                <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300 font-semibold">
+                                    ✓ {lastRunResult.logs.filter((l: any) => l.status === 'passed' || l.status === 'success').length} passed
+                                </span>
+                                {lastRunResult.logs.filter((l: any) => l.status === 'failed' || l.status === 'error').length > 0 && (
+                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 font-semibold">
+                                        ✗ {lastRunResult.logs.filter((l: any) => l.status === 'failed' || l.status === 'error').length} failed
+                                    </span>
+                                )}
+                                {lastRunResult.logs.filter((l: any) => l.status === 'skipped').length > 0 && (
+                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 font-semibold">
+                                        ↷ {lastRunResult.logs.filter((l: any) => l.status === 'skipped').length} skipped
+                                    </span>
+                                )}
+                            </div>
+                        )}
+                        {/* Dismiss for terminal states */}
+                        {(executionStatus === 'passed' || executionStatus === 'failed') && (
+                            <button
+                                onClick={() => setExecutionStatus('idle')}
+                                className="ml-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 text-xs px-1 rounded transition-colors"
+                                title="Dismiss"
+                            >✕</button>
+                        )}
+                        {/* Stop button for running state */}
+                        {executionStatus === 'running' && (
+                            <button
+                                onClick={() => stopRunning("run-stop", "Test run stopped manually.", "warning")}
+                                className="ml-2 text-sm font-medium text-red-500 hover:text-red-700 dark:hover:text-red-300 px-2 py-0.5 rounded border border-red-300 dark:border-red-700 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
+                            >Stop</button>
+                        )}
                     </div>
-                    <div className="flex-1">
-                        <p className="font-semibold text-amber-800 dark:text-amber-200 text-sm">
-                            ⏸ Step {pausedStepIndex ?? '?'} is stuck — manual intervention needed
-                        </p>
-                        <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
-                            The browser window is open and waiting. Complete the action manually in the Chrome window,
-                            then click <strong>Resume</strong> below. Or click <strong>Skip</strong> to skip this step and continue.
-                        </p>
-                        <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5 font-mono">
-                            ⚠️  Step editing is locked while paused. You have up to 10 minutes.
-                        </p>
-                    </div>
-                    <div className="flex flex-col gap-2 flex-shrink-0">
-                        <Button
-                            size="sm"
-                            className="bg-green-600 hover:bg-green-700 text-white gap-1"
-                            onClick={() => handlePauseAction('resume')}
-                            disabled={isResumingPause}
-                        >
-                            {isResumingPause ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle className="h-3 w-3" />}
-                            Resume (I completed it)
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            className="border-amber-400 text-amber-700 hover:bg-amber-100 gap-1"
-                            onClick={() => handlePauseAction('skip')}
-                            disabled={isResumingPause}
-                        >
-                            <SkipForward className="h-3 w-3" />
-                            Skip this step
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            className="border-red-400 text-red-600 hover:bg-red-50 hover:text-red-700 dark:border-red-600 dark:text-red-400 dark:hover:bg-red-950/30 gap-1"
-                            onClick={handleStopTest}
-                            disabled={isResumingPause}
-                        >
-                            <Square className="h-3 w-3 fill-current" />
-                            Stop Testing
-                        </Button>
-                    </div>
+
+                    {/* Pause action panel — only shown when paused */}
+                    {executionStatus === 'paused' && (
+                        <div className="px-4 py-3 flex items-start gap-4">
+                            <div className="flex-1">
+                                <p className="font-semibold text-amber-800 dark:text-amber-200 text-sm">
+                                    ⏸ Step {pausedStepIndex ?? '?'} is stuck — manual intervention needed
+                                </p>
+                                <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
+                                    The browser window is open and waiting. Complete the action manually in Chrome,
+                                    then click <strong>Resume</strong>. Or click <strong>Skip</strong> to skip this step.
+                                </p>
+                                <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5 font-mono">
+                                    ⚠️  Step editing is locked while paused. You have up to 10 minutes.
+                                </p>
+                            </div>
+                            <div className="flex flex-col gap-2 flex-shrink-0">
+                                <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white gap-1" onClick={() => handlePauseAction('resume')} disabled={isResumingPause}>
+                                    {isResumingPause ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle className="h-3 w-3" />}
+                                    Resume
+                                </Button>
+                                <Button size="sm" variant="outline" className="border-amber-400 text-amber-700 hover:bg-amber-100 gap-1" onClick={() => handlePauseAction('skip')} disabled={isResumingPause}>
+                                    <SkipForward className="h-3 w-3" /> Skip step
+                                </Button>
+                                <Button size="sm" variant="outline" className="border-red-400 text-red-600 hover:bg-red-50 gap-1" onClick={handleStopTest} disabled={isResumingPause}>
+                                    <Square className="h-3 w-3 fill-current" /> Stop
+                                </Button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Running progress indicator */}
+                    {executionStatus === 'running' && (
+                        <div className="px-4 py-3 flex items-center gap-3">
+                            <Loader2 className="h-4 w-4 animate-spin text-blue-500 flex-shrink-0" />
+                            <div className="flex-1">
+                                <p className="text-blue-700 dark:text-blue-300 text-sm font-medium">Test is executing in the browser...</p>
+                                <p className="text-blue-500 dark:text-blue-400 text-xs mt-0.5">Polling for results every 3 seconds. The browser window will close automatically when done.</p>
+                            </div>
+                            <Link href="/dashboard/execution" className="text-xs text-blue-500 underline whitespace-nowrap">View Execution Tab →</Link>
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -1063,7 +1174,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                                     onChange={(e) => setSelectedProvider(e.target.value)}
                                     className="w-full h-9 rounded-md border border-blue-200 dark:border-blue-800 bg-white/50 dark:bg-black/20 px-3 py-1 text-sm shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-400 cursor-pointer"
                                 >
-                                    <option value="openai">🟢 OpenAI (GPT-4o Mini)</option>
+                                    <option value="openai">🟢 OpenAI (GPT-4o)</option>
                                     <option value="claude">🟣 Claude (Sonnet 4)</option>
                                 </select>
                             </div>

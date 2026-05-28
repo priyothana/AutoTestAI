@@ -33,7 +33,40 @@ import type { TestCaseGenerationJob } from '../../shared/queue/job-types.js'
 // Cross-module: RAG retrieval lives in generation.service
 import { retrieveRagChunks }       from '../test-generation/generation.service.js'
 
+// Cross-module: field manifest for button name auto-correction
+import { autoCorrectButtonNames } from '../ai-agents/tools/metadata-reader.tool.js'
+
 const log = createModuleLogger('test-case-generator')
+
+/**
+ * Generates English singular and plural stems for robust module matching.
+ * Handles patterns like:
+ *  - y -> ies (opportunity -> opportunities, policy -> policies)
+ *  - s/es (agent -> agents, patch -> patches, case -> cases)
+ */
+export function getEntityStems(name: string): string[] {
+  const normalized = name.toLowerCase().trim()
+  const stems = new Set<string>([normalized])
+
+  if (normalized.endsWith('ies')) {
+    stems.add(normalized.slice(0, -3) + 'y')
+  }
+  if (normalized.endsWith('y')) {
+    stems.add(normalized.slice(0, -1) + 'ies')
+  }
+  if (normalized.endsWith('es')) {
+    stems.add(normalized.slice(0, -2))
+    stems.add(normalized.slice(0, -1))
+  }
+  if (normalized.endsWith('s') && !normalized.endsWith('ss')) {
+    stems.add(normalized.slice(0, -1))
+  }
+  stems.add(normalized + 's')
+  stems.add(normalized + 'es')
+
+  return Array.from(stems)
+}
+
 
 // ── BullMQ producer ──────────────────────────────────────────────────────────
 
@@ -400,12 +433,13 @@ export async function buildGenerationContext(params: {
   if (selectedModule && allChunks.length > 0) {
     // Strip the " Management" suffix to get the raw entity keyword, e.g. "Software"
     const entityKeyword = selectedModule.replace(/\s+management$/i, '').trim().toLowerCase()
+    const stems = getEntityStems(entityKeyword)
 
     // Build a set of common CRM/SF entities to exclude (these bleed in from SF orgs)
     const COMMON_NOISY_ENTITIES = [
       'contract', 'opportunity', 'lead', 'product', 'campaign', 'case', 'order',
       'quote', 'price book', 'pricebook', 'account', 'contact', 'event', 'task',
-    ].filter(e => e !== entityKeyword && !selectedModule.toLowerCase().includes(e))
+    ].filter(e => !stems.some(stem => e === stem || e.startsWith(stem) || stem.startsWith(e)))
 
     const entityPattern = new RegExp(
       `\\b(${COMMON_NOISY_ENTITIES.map(e => e.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`,
@@ -415,7 +449,7 @@ export async function buildGenerationContext(params: {
     const filteredChunks = allChunks.filter(chunk => {
       // Keep chunks that mention the selected module entity
       const chunkLower = chunk.toLowerCase()
-      const mentionsOurEntity = chunkLower.includes(entityKeyword)
+      const mentionsOurEntity = stems.some(stem => chunkLower.includes(stem))
       // Reject chunks that predominantly talk about a noisy entity (not ours)
       const mentionsNoisyEntity = entityPattern.test(chunk)
       // Allow if it mentions our entity OR doesn't mention any noisy entity
@@ -465,12 +499,12 @@ Distribute evenly: at least ${Math.floor(crudMin / 4)} of each C, R, U, D.`)
 ### REAL USE CASES MANDATORY REQUIREMENTS
 Generate real-world business workflow tests that a real user would actually perform.
 Examples of what "Real Use Cases" means:
-- "Create a Contact named 'Sam Wilson' with email left EMPTY → click Save → verify required field error 'Email is required' appears"
-- "Create an Account with duplicate name 'Acme Corp' → verify duplicate error message"
-- "Update an Opportunity amount from 5000 to 10000 → verify the new amount shows in the record detail"
-- "Search for a Contact by phone number → verify the correct contact appears in results"
-- "Assign a Lead to a User who does not exist → verify the lookup shows no results"
-- "Create an Invoice with negative amount → verify validation error"
+- "Create a record with a required field left EMPTY → click Save → verify required field error appears"
+- "Create a record with a duplicate name → verify duplicate error message"
+- "Update a numeric field from 5000 to 10000 → verify the new value shows in the record detail"
+- "Search for a record by a specific field → verify the correct record appears in results"
+- "Create a record with invalid data in a validated field → verify validation error"
+- "Delete a record and verify it no longer appears in the list"
 
 Think like a business tester, not a UI tester. Test the BUSINESS LOGIC, not the pixels.`)
   }
@@ -574,13 +608,9 @@ Each negative test MUST include the EXACT expected error message text in expecte
             `⛔ DO NOT generate Create, Edit, Delete tests for "${_moduleEntityUp}".`,
             '',
           ] : []),
-          '⛔ FORBIDDEN — DO NOT generate test cases for ANY of the following (even if the metadata mentions them):',
-          '  • Agent, Agents — "Create Agent", "Edit Agent", "Delete Agent" ARE ABSOLUTELY FORBIDDEN',
-          '  • Contracts, Opportunities, Leads, Products, Campaigns, Cases, Quotes, Price Books',
-          '  • Accounts, Contacts, Events, Tasks, Orders, Invoices, Customers, Vendors',
-          '  • Tickets, Incidents, Vulnerabilities, Patches, Policies',
-          '  • Any Salesforce standard object NOT related to "' + selectedModule + '"',
-          '  • Any page, entity, or workflow that is NOT part of "' + selectedModule + '"',
+          '⛔ FORBIDDEN — DO NOT generate test cases for ANY entity, page, or workflow that is NOT part of "' + selectedModule + '":',
+          '  • Do NOT generate tests for entities other than "' + selectedModule + '" even if the metadata mentions them',
+          '  • Only the selected module matters — ignore all other entities visible in navigation or metadata',
           '',
           `✅ ONLY generate test cases whose name, description, and steps are 100% about "${selectedModule}".`,
           `✅ Every test case NAME must contain the word "${_moduleEntityUp}" (e.g. "Create ${_moduleEntityUp}", "Delete ${_moduleEntityUp}").`,
@@ -651,9 +681,9 @@ Each negative test MUST include the EXACT expected error message text in expecte
    • Amount fields       → numeric digits ONLY (e.g., "50000") ❌ NEVER a name or date
 6. Navigation-only tests (only NAVIGATE steps, no TYPE/CLICK/ASSERT) are REJECTED
 7. ⛔ ASSERT_TEXT / ASSERT_TOAST / ASSERT_URL steps MUST NEVER have an empty target or value.
-   For list-display READ tests: ASSERT_TEXT with target = the entity page heading (e.g. "Opportunities"), NOT an empty string.
-   Example READ assertion: { "action": "ASSERT_TEXT", "target": "Opportunities", "locator_type": "text" }
-   Example CRUD assertion: { "action": "ASSERT_TEXT", "target": "Account created successfully", "locator_type": "text" }
+   For list-display READ tests: ASSERT_TEXT with target = the entity page heading, NOT an empty string.
+   Example READ assertion: { "action": "ASSERT_TEXT", "target": "Entity List Page Heading", "locator_type": "text" }
+   Example CRUD assertion: { "action": "ASSERT_TEXT", "target": "Record created successfully", "locator_type": "text" }
    A blank target ("") is INVALID and will be stripped — always use a real, non-empty text value.
 8. ⛔ NAVIGATE steps MUST use ONLY relative paths from the VERIFIED APPLICATION URL MAP above.
    NEVER include a full URL with domain. NEVER pluralize or guess a path.
@@ -683,12 +713,12 @@ function buildSystemPrompt(count: number, focusAreas: string[] = [], selectedMod
 
 ## ✅ REQUIRED: Every CRUD test MUST be a COMPLETE WORKFLOW
 A CREATE test MUST:
-  1. Navigate to the create/new form URL (e.g. /opportunities/new, /accounts/new)
+  1. Navigate to the create/new form URL from the URL MAP
   2. Fill in ALL required fields with realistic data values — including required LOOKUP fields
-     ⚠ LOOKUP fields (Account, Contact, Owner, Parent, etc.) MUST use LOOKUP action, not TYPE.
+     ⚠ LOOKUP fields (parent records, related records, owner, etc.) MUST use LOOKUP action, not TYPE.
      ⚠ NEVER skip a required lookup field — the form will NOT save without it.
-  3. Click the EXACT submit button name from the metadata (e.g. "Create Opportunity", NOT generic "Save")
-     ⚠ Button name is always "Create [EntityName]" or "Save [EntityName]" — NEVER "Create [RecordName]"
+  3. Click the EXACT submit button name from the metadata — NEVER use a generic "Save" unless it is the real button name
+     ⚠ Copy the button name CHARACTER-FOR-CHARACTER from the PRIMARY ACTION BUTTON in the manifest
   4. Assert the result (ASSERT_URL to the list page is preferred over ASSERT_TOAST)
 
 🔴 "WITH REQUIRED FIELDS" RULE:
@@ -736,14 +766,10 @@ EVERY test case you generate MUST:
 ✓ Have steps that interact ONLY with "${selectedModule}" pages and forms
 ✓ Assert outcomes specific to "${selectedModule}"
 
-⛔ THE FOLLOWING ENTITIES ARE ABSOLUTELY FORBIDDEN — DO NOT generate even ONE test case about:
-• Agent, Agents — NO "Create Agent", "Edit Agent", "Delete Agent" — EVER
-• Contract, Contracts, Opportunity, Opportunities, Lead, Leads
-• Product, Products, Campaign, Campaigns, Account, Accounts
-• Contact, Contacts, Case, Cases, Quote, Quotes, Order, Orders
-• Price Book, Invoice, Invoices, Customer, Vendor, Ticket, Incident
-• Vulnerability, Vulnerabilities, Patch, Patches, Policy, Policies
-• ANY entity whose name does NOT appear in "${selectedModule}"
+⛔ THE FOLLOWING RULE IS ABSOLUTE — DO NOT generate even ONE test case about ANY entity that is NOT "${selectedModule}":
+• ANY entity, page, or workflow whose name does NOT match "${selectedModule}" is FORBIDDEN
+• Even if the metadata mentions other entities — IGNORE them completely
+• Only "${selectedModule}" tests are allowed — nothing else
 
 ⛔ TEST CASE NAMING RULE — MANDATORY:
 Every test case name MUST contain the word "${moduleDisplayName}" (or its plural/abbreviation).
@@ -792,9 +818,9 @@ Each TYPE step value MUST be semantically appropriate for its field:
 ❌ NEVER put a phone number into an Email field or vice-versa
 ${crudEnforcement}${negativeEnforcement}
 ## Locator Priority (use in this order)
-1. label  — getByLabel('Account Name') — for form inputs
-2. role   — getByRole('button', { name: 'Save' }) — for buttons/links
-3. text   — getByText('Error: Email required') — for assertions
+1. label  — getByLabel('Field Label') — for form inputs
+2. role   — getByRole('button', { name: 'Submit' }) — for buttons/links
+3. text   — getByText('Error: field required') — for assertions
 4. css    — LAST RESORT only
 
 ## Step Count Rule
@@ -819,7 +845,7 @@ function buildLlm(): BaseChatModel {
 function buildFallbackLlm(): BaseChatModel {
   return new ChatOpenAI({
     apiKey:      process.env.OPENAI_API_KEY,
-    model:       'gpt-4o-mini',
+    model:       'gpt-4o',
     temperature: 0.7,
   })
 }
@@ -973,11 +999,12 @@ function sanitizeTestCaseSteps(
 // ── Persist generated test cases to DB ───────────────────────────────────────
 
 export async function persistGeneratedTestCases(params: {
-  projectId: string
-  suiteName: string
-  testCases: Array<Record<string, unknown>>
+  projectId:      string
+  suiteName:      string
+  testCases:      Array<Record<string, unknown>>
+  selectedModule?: string   // ← forwarded so autoCorrectButtonNames can be entity-scoped
 }): Promise<{ suiteId: string; testCaseIds: string[] }> {
-  const { projectId, suiteName, testCases } = params
+  const { projectId, suiteName, testCases, selectedModule } = params
 
   // Store the suite metadata in test_data_sets (lightweight — no migration needed)
   const suite = await prisma.test_data_sets.create({
@@ -996,9 +1023,31 @@ export async function persistGeneratedTestCases(params: {
   const createdIds: string[] = []
   for (const tc of testCases) {
     try {
-      const rawSteps   = Array.isArray(tc['steps']) ? tc['steps'] : []
-      const tcName     = String(tc['name'] ?? 'Generated Test Case')
-      // ── Sanitize: drop / fix degenerate assert steps before storing ──
+      const rawSteps = Array.isArray(tc['steps']) ? tc['steps'] as Array<Record<string, any>> : []
+      const tcName   = String(tc['name'] ?? 'Generated Test Case')
+
+      // ── Infer entity from selectedModule or the test-case name ───────────────
+      // Priority: 1) selectedModule  2) first capitalised word after common verbs in tcName
+      const entityHint: string = (
+        selectedModule
+          ? selectedModule.replace(/\s*(Management|List|Module|Feature|Settings)$/i, '').trim()
+          : (() => {
+              const stripped = tcName
+                .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check|search|list|open|close)\s+/i, '')
+                .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|form|page|module|entry|item|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+                .trim()
+              const m = stripped.match(/\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\b/)
+              return m?.[1] ?? stripped.split(/\s+/)[0] ?? ''
+            })()
+      )
+
+      // ── Universal post-correction: fix button names, field names, assert types ─
+      // Called here so EVERY code path (agent, direct LLM, chat) is covered.
+      if (entityHint && entityHint.length > 2) {
+        await autoCorrectButtonNames(rawSteps, projectId, entityHint)
+      }
+
+      // ── Sanitize: drop / fix degenerate assert steps before storing ──────────
       const cleanSteps = sanitizeTestCaseSteps(rawSteps, tcName)
 
       const created = await prisma.test_cases.create({
@@ -1007,7 +1056,7 @@ export async function persistGeneratedTestCases(params: {
           description:     String(tc['description'] ?? '').slice(0, 2000),
           steps:           cleanSteps as any,
           priority:        (['low', 'medium', 'high'].includes(String(tc['priority'])) ? String(tc['priority']) : 'medium'),
-          status:          'draft',
+          status:          'review',
           project_id:      projectId,
           expected_result: String(tc['expected_outcome'] ?? '').slice(0, 2000) || null,
         },
@@ -1046,7 +1095,7 @@ export async function persistGeneratedTestCases(params: {
  * long as they don't mention a conflicting entity. Generic names like "Verify
  * List View" are allowed — they are not clearly off-module.
  */
-function filterTestCasesToModule(
+export function filterTestCasesToModule(
   testCases: Array<Record<string, unknown>>,
   selectedModule: string,
 ): Array<Record<string, unknown>> {
@@ -1055,6 +1104,8 @@ function filterTestCasesToModule(
     .replace(/\s*(Management|List|Module|Feature|Settings)$/i, '')
     .trim()
     .toLowerCase()
+
+  const stems = getEntityStems(entityKeyword)
 
   // Known entity names that are commonly hallucinated when unrelated to the
   // selected module. Extend this list as new patterns emerge.
@@ -1085,8 +1136,10 @@ function filterTestCasesToModule(
     'software', 'endpoint', 'endpoints',
   ]
 
-  // Build deny-set: all known entities EXCEPT the selected module's own keyword
-  const denyKeywords = KNOWN_ENTITIES.filter(e => e !== entityKeyword && !entityKeyword.startsWith(e) && !e.startsWith(entityKeyword))
+  // Build deny-set: all known entities EXCEPT the selected module's own keyword stems
+  const denyKeywords = KNOWN_ENTITIES.filter(e => {
+    return !stems.some(stem => e === stem || e.startsWith(stem) || stem.startsWith(e))
+  })
 
   const before = testCases.length
   const filtered = testCases.filter(tc => {
@@ -1094,10 +1147,11 @@ function filterTestCasesToModule(
     const desc = String(tc['description'] ?? '').toLowerCase()
     const combined = `${name} ${desc}`
 
-    // Always keep if the correct entity keyword appears in name or description
-    if (combined.includes(entityKeyword)) return true
+    // Always keep if the correct entity keyword stem appears in name or description
+    if (stems.some(stem => combined.includes(stem))) return true
 
     // Reject if a DIFFERENT known entity keyword appears prominently in the NAME
+
     // (description can mention related entities for context — only police the name)
     const hasForeignEntity = denyKeywords.some(deny => {
       // Match whole-word to avoid false positives (e.g. "cases" in "test cases")
@@ -1199,8 +1253,9 @@ export function startTestCaseGenerationWorker() {
         updateStatus('running', 80, `Saving ${rawTestCases.length} test cases to database…`)
         const { suiteId, testCaseIds } = await persistGeneratedTestCases({
           projectId,
-          suiteName: suiteName ?? `Generated Suite – ${new Date().toISOString()}`,
-          testCases: rawTestCases,
+          suiteName:      suiteName ?? `Generated Suite – ${new Date().toISOString()}`,
+          testCases:      rawTestCases,
+          selectedModule, // ← forward so button/field correction is entity-scoped
         })
 
         updateStatus('completed', 100, `Done! Generated ${testCaseIds.length} test cases.`, {
@@ -1236,14 +1291,50 @@ export function startTestCaseGenerationWorker() {
   log.info('[TCG] Test-case-generation worker started')
 }
 
+// ── Action alias normalizer (mirrors generation.service.ts normaliseAction) ────
+// Catches any surviving FILL_FORM / ENTER / SET action names before DB persist.
+const TCG_ACTION_ALIASES: Record<string, string> = {
+  fill_form: 'TYPE', fillform: 'TYPE', fill_field: 'TYPE', fillfield: 'TYPE',
+  enter: 'TYPE', enter_text: 'TYPE', set: 'TYPE', set_text: 'TYPE',
+  settext: 'TYPE', input_text: 'TYPE', write: 'TYPE', type_text: 'TYPE',
+  press: 'CLICK', tap: 'CLICK', submit: 'CLICK', button_click: 'CLICK',
+  choose: 'SELECT', pick: 'SELECT', dropdown: 'SELECT', select_option: 'SELECT',
+  goto: 'NAVIGATE', go_to: 'NAVIGATE', open: 'NAVIGATE', visit: 'NAVIGATE',
+}
+
+const TCG_CANONICAL_ACTIONS = new Set([
+  'NAVIGATE','CLICK','TYPE','FILL','INPUT','SELECT','LOOKUP','CHECKBOX',
+  'ASSERT_TEXT','ASSERT_URL','ASSERT_TOAST','WAIT','MULTI_SELECT','UPLOAD',
+])
+
+function normaliseActionAlias(action: string): string {
+  const upper = (action ?? '').toUpperCase().trim()
+  if (TCG_CANONICAL_ACTIONS.has(upper)) return upper
+  const mapped = TCG_ACTION_ALIASES[(action ?? '').toLowerCase().trim()]
+  if (mapped) {
+    log.warn(`[TCG] normaliseAction: mapped "${action}" → "${mapped}"`)
+    return mapped
+  }
+  return upper
+}
+
+function normaliseSteps(steps: unknown[]): unknown[] {
+  return (steps as Array<Record<string, unknown>>).map(s => ({
+    ...s,
+    action: normaliseActionAlias(String(s.action ?? '')),
+  }))
+}
+
 // ── On-demand step generation for selected test cases ─────────────────────────
 /**
  * Called when the user clicks "Add Selected to Tests" on the frontend.
  * For each selected test case (which was created without steps during bulk
  * generation), this function:
  *   1. Fetches the test case (name + description) from the DB
- *   2. Calls the LLM to generate concrete Playwright steps
- *   3. Persists the steps back to the test case record
+ *   2. Routes through runTestStepGeneratorAgent (STEP_GEN_MODEL) for validated
+ *      metadata-grounded step generation with 6-check validation + self-correction
+ *   3. Applies action alias normalization (FILL_FORM → TYPE, etc.)
+ *   4. Persists the steps back to the test case record
  */
 export async function generateStepsForTestCases(
   projectId: string,
@@ -1259,7 +1350,16 @@ export async function generateStepsForTestCases(
     select: { id: true, name: true, description: true, priority: true, expected_result: true },
   })
 
-  // Fetch metadata context once for all cases — scoped to the selected module
+  // Lazily import the STEP_GEN_MODEL agent (avoids circular deps at module load)
+  let runTestStepGeneratorAgent: typeof import('../ai-agents/test-step-generator.agent.js').runTestStepGeneratorAgent
+  try {
+    const agentMod = await import('../ai-agents/test-step-generator.agent.js')
+    runTestStepGeneratorAgent = agentMod.runTestStepGeneratorAgent
+  } catch (importErr) {
+    log.warn({ err: importErr }, '[TCG] Could not import runTestStepGeneratorAgent — will use direct LLM fallback')
+  }
+
+  // Fetch RAG context once for all cases (used for direct-LLM fallback path)
   const ragQuery = selectedModule
     ? `${selectedModule} create edit update delete form fields buttons navigation`
     : 'create edit update delete form fields buttons navigation'
@@ -1276,55 +1376,215 @@ export async function generateStepsForTestCases(
 
   for (const tc of testCases) {
     try {
-      const moduleScopeLines = selectedModule ? [
-        '',
-        `## 🔴 MODULE SCOPE LOCK: Generate steps for the "${selectedModule}" module ONLY.`,
-        `⛔ FORBIDDEN: Do NOT generate steps for Contract, Opportunity, Lead, Product, Account, Contact, or any entity outside "${selectedModule}".`,
-        '',
-      ] : []
+      let steps: unknown[] = []
 
-      const systemPrompt = [
-        'You are a senior QA Automation Engineer. Generate executable Playwright test steps for the given test case.',
-        ...moduleScopeLines,
-        '',
-        '## Golden Rules',
-        '- NEVER generate login steps — authentication is pre-managed',
-        '- Use ONLY field names verified in the Entity Field Manifest below',
-        '- Every test must end with an ASSERT step',
-        '- Use realistic data: real names, valid emails, plausible amounts',
-        '- Minimum 4 steps, maximum 15 steps',
-        '',
-        '## Locator Priority',
-        '1. label — for form inputs',
-        '2. role  — for buttons/links',
-        '3. text  — for assertions',
-        '4. css   — LAST RESORT',
-        '',
-        fieldManifest ? `## Entity Field Manifest (ONLY use these fields)\n${fieldManifest}` : '',
-        ragContext ? `## Project Metadata\n${ragContext}` : '',
-        '## Output Format',
-        'Return ONLY a valid JSON array of step objects. No markdown, no explanations.',
-        '[',
-        '  { "id": "1", "action": "NAVIGATE", "value": "/path/to/page" },',
-        '  { "id": "2", "action": "TYPE", "target": "Field Label", "value": "realistic value", "locator_type": "label" },',
-        '  { "id": "3", "action": "CLICK", "target": "Button Name", "locator_type": "role" },',
-        '  { "id": "4", "action": "ASSERT_TEXT", "target": "Expected text on page", "locator_type": "text" }',
-        ']',
-      ].filter(Boolean).join('\n')
+      // Extract entity filter from test case name or selected module.
+      // Must strip verb prefixes ("Create", "Update", etc.) and noise words
+      // to get the actual entity noun. This is used by BOTH the agent path
+      // and the cross-entity CLICK filter below.
+      const entityFilter = selectedModule
+        ? selectedModule.replace(/\s*(Management|List|Module|Feature)$/i, '').trim()
+        : (() => {
+            const stripped = tc.name
+              .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check|search|list|open|close)\s+/i, '')
+              .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|form|page|module|entry|item|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+              .trim()
+            // Case-agnostic: normalize to lowercase so ALL-CAPS, TitleCase, mixed-case all work
+            const STOP = new Set(['the','and','for','with','new','all','record','records','form','page','test','case'])
+            const words = stripped.toLowerCase().split(/\s+/).filter(w => w.length >= 3 && !STOP.has(w))
+            const entity = words[0] ?? stripped.split(/\s+/)[0] ?? ''
+            return entity.charAt(0).toUpperCase() + entity.slice(1)
+          })()
 
-      const userPrompt = [
-        'Generate test steps for this test case:',
-        `Name: ${tc.name}`,
-        `Description: ${tc.description ?? '(no description)'}`,
-        `Priority: ${tc.priority ?? 'medium'}`,
-        `Expected Outcome: ${tc.expected_result ?? '(no expected outcome)'}`,
-        '',
-        'Return ONLY a valid JSON array of step objects. No markdown, no code fences.',
-      ].join('\n')
+      // ── Primary path: STEP_GEN_MODEL agent ──────────────────────────────────
+      // The agent has a 6-check validation gate + up to 3 self-correction loops:
+      //   Check 1: Required field coverage
+      //   Check 2: URL verification
+      //   Check 3: Button name exactness (rejects "Save" if actual button is "Create Account")
+      //   Check 4: Locator type validity
+      //   Check 5: Data type alignment (rejects Industry="Tara", Website=number, etc.)
+      //   Check 6: Action name validity (rejects FILL_FORM, ENTER, SET, SUBMIT, etc.)
+      if (runTestStepGeneratorAgent!) {
+        try {
 
-      const rawSteps = await invokeBulkGeneration(systemPrompt, userPrompt)
-      const steps = Array.isArray(rawSteps) ? rawSteps : []
-      const cleanSteps = sanitizeTestCaseSteps(steps, tc.name)
+          log.info(
+            { tcId: tc.id, tcName: tc.name, entityFilter },
+            '[TCG] Routing to STEP_GEN_MODEL agent'
+          )
+
+          const agentOutput = await runTestStepGeneratorAgent({
+            projectId,
+            testName:     tc.name,
+            description:  tc.description ?? tc.name,
+            entityFilter: entityFilter || undefined,
+          })
+
+          log.info(
+            {
+              tcId: tc.id, steps: agentOutput.steps.length,
+              loops: agentOutput.loopCount, passed: agentOutput.validation.passed,
+              issues: agentOutput.validation.issues,
+            },
+            '[TCG] STEP_GEN_MODEL agent completed'
+          )
+
+          steps = agentOutput.steps.map((s, i) => ({
+            id:           String(i + 1),
+            action:       normaliseActionAlias(s.action),
+            target:       s.target,
+            value:        s.value,
+            locator_type: s.locator_type,
+          }))
+
+        } catch (agentErr) {
+          log.warn({ err: agentErr, tcId: tc.id }, '[TCG] STEP_GEN_MODEL agent failed — falling back to direct LLM')
+          steps = [] // signal to use fallback below
+        }
+      }
+
+      // ── Fallback path: Direct LLM with strict action schema ─────────────────
+      // Used only when agent import failed or agent threw an unrecoverable error.
+      if (steps.length === 0) {
+        const moduleScopeLines = selectedModule ? [
+          '',
+          `## 🔴 MODULE SCOPE LOCK: Generate steps for the "${selectedModule}" module ONLY.`,
+          `⛔ FORBIDDEN: Do NOT generate steps for any entity outside "${selectedModule}". Only generate steps for "${selectedModule}".`,
+          '',
+        ] : []
+
+        const systemPrompt = [
+          'You are a senior QA Automation Engineer. Generate executable Playwright test steps for the given test case.',
+          ...moduleScopeLines,
+          '',
+          '## Golden Rules',
+          '- NEVER generate login steps — authentication is pre-managed',
+          '- Use ONLY field names verified in the Entity Field Manifest below',
+          '- Every test must end with an ASSERT step',
+          '- Use realistic data: real names, valid emails, plausible amounts',
+          '- Minimum 4 steps, maximum 15 steps',
+          '',
+          '╔══════════════════════════════════════════════════════════════╗',
+          '║  VALID ACTIONS — USE ONLY THESE EXACT STRINGS                ║',
+          '║  NAVIGATE · CLICK · TYPE · SELECT · LOOKUP · CHECKBOX        ║',
+          '║  ASSERT_TEXT · ASSERT_URL · ASSERT_TOAST · WAIT              ║',
+          '╠══════════════════════════════════════════════════════════════╣',
+          '║  ⛔ FORBIDDEN (will be skipped at runtime — NEVER use):      ║',
+          '║     FILL_FORM  FILL  ENTER  SET  SET_TEXT  INPUT_TEXT        ║',
+          '║     WRITE  TYPE_TEXT  PRESS  TAP  SUBMIT  BUTTON_CLICK       ║',
+          '║  Use TYPE to fill a form field. Use CLICK to click a button. ║',
+          '╚══════════════════════════════════════════════════════════════╝',
+          '',
+          '## Button Name Rule (CRITICAL)',
+          '- For the submit/save button, use ONLY the EXACT button label visible on screen.',
+          '- Look for it in the Entity Field Manifest or Project Metadata below.',
+          '- NEVER use generic names: "Save", "Submit", "OK" are WRONG unless explicitly listed.',
+          '- Use ONLY the button for the SAME ENTITY as this test case. Do NOT click buttons for other entities.',
+          '- NEVER click buttons for OTHER entities. Sidebars/navbars show buttons for all entities — IGNORE buttons for entities you are NOT testing.',
+          '',
+          '## Locator Priority',
+          '1. label — for form inputs (locator_type: "label")',
+          '2. role  — for buttons/links (locator_type: "role")',
+          '3. text  — for assertions (locator_type: "text")',
+          '4. css   — LAST RESORT',
+          '',
+          // Null-manifest fallback: tell LLM to use BRD/RAG when no manifest available
+          !fieldManifest && /^(create|add|new)\b/i.test(tc.name.trim())
+            ? [
+                '## 🔴 CREATE OPERATION — NO FIELD MANIFEST',
+                `This is a CREATE test. You MUST generate at least 2 TYPE/SELECT/LOOKUP steps.`,
+                `Use the Project Metadata section below to discover which fields exist on the form.`,
+                `Common create-form fields: Name, Description, Type/Category, Status, SKU, Currency.`,
+                `DO NOT generate only NAVIGATE + CLICK + ASSERT — that WILL FAIL validation.`,
+              ].join('\n')
+            : '',
+          fieldManifest ? `## Entity Field Manifest (ONLY use these fields)\n${fieldManifest}` : '',
+          ragContext ? `## Project Metadata\n${ragContext}` : '',
+          '## Output Format',
+          'Return ONLY a valid JSON array of step objects. No markdown, no explanations.',
+          '[',
+          '  { "id": "1", "action": "NAVIGATE", "value": "/path/to/page" },',
+          '  { "id": "2", "action": "TYPE", "target": "Field Label", "value": "realistic value", "locator_type": "label" },',
+          '  { "id": "3", "action": "CLICK", "target": "Exact Button Name from Manifest", "locator_type": "role" },',
+          '  { "id": "4", "action": "ASSERT_TEXT", "target": "Expected text on page", "locator_type": "text" }',
+          ']',
+        ].filter(Boolean).join('\n')
+
+        const userPrompt = [
+          'Generate test steps for this test case:',
+          `Name: ${tc.name}`,
+          `Description: ${tc.description ?? '(no description)'}`,
+          `Priority: ${tc.priority ?? 'medium'}`,
+          `Expected Outcome: ${tc.expected_result ?? '(no expected outcome)'}`,
+          '',
+          // Hard constraint reminder for Create operations
+          /^(create|add|new)\b/i.test(tc.name.trim())
+            ? `⚠️ CREATE CONSTRAINT: You MUST include at least 2 TYPE/SELECT/LOOKUP steps that fill in form fields.\nDo NOT produce only NAVIGATE+CLICK+ASSERT steps.`
+            : '',
+          'Return ONLY a valid JSON array of step objects. No markdown, no code fences.',
+        ].filter(Boolean).join('\n')
+
+        const rawSteps = await invokeBulkGeneration(systemPrompt, userPrompt)
+        steps = Array.isArray(rawSteps) ? rawSteps : []
+        log.info({ tcId: tc.id, stepsCount: steps.length }, '[TCG] Direct LLM fallback produced steps')
+      }
+
+      // ── Normalize action names before persisting ─────────────────────────────
+      // Safety net: convert any surviving FILL_FORM/ENTER/SET → TYPE, etc.
+      let normalisedSteps = normaliseSteps(steps)
+
+      // ── Cross-entity CLICK button filter (HARD GUARD) ───────────────────────
+      // Strip CLICK steps like "+ New Lead" in an Account test.
+      // This is the LAST defence before steps are written to the DB.
+      const effectiveEntity = (typeof entityFilter === 'string' && entityFilter.length > 2)
+        ? entityFilter
+        : (() => {
+            const stripped = tc.name
+              .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check|search|list|open|close)\s+/i, '')
+              .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|form|page|module|entry|item|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+              .trim()
+            // Case-agnostic extraction for effective entity
+            const STOP = new Set(['the','and','for','with','new','all','record','records','form','page'])
+            const words = stripped.toLowerCase().split(/\s+/).filter(w => w.length >= 3 && !STOP.has(w))
+            const entity = words[0] ?? stripped.split(/\s+/)[0] ?? ''
+            return entity.charAt(0).toUpperCase() + entity.slice(1)
+          })()
+
+      if (effectiveEntity && effectiveEntity.length > 2) {
+        const eLower = effectiveEntity.toLowerCase()
+        const beforeLen = normalisedSteps.length
+        normalisedSteps = normalisedSteps.filter((s: any) => {
+          if (String(s.action ?? '').toUpperCase() !== 'CLICK') return true
+          const target = String(s.target ?? '').toLowerCase().trim()
+          if (!target) return true
+          const match = target.match(/\b(?:new|create|add)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+          if (!match) return true
+          const entityWord = match[1].trim()
+          if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
+          if (eLower.includes(entityWord) || entityWord.includes(eLower)) return true
+          log.warn(
+            { tcId: tc.id, tcName: tc.name, target: s.target, entityWord, effectiveEntity },
+            '[TCG] ⚠️ Stripped cross-entity CLICK step — button is for wrong entity',
+          )
+          return false
+        })
+        if (normalisedSteps.length < beforeLen) {
+          // Renumber remaining steps
+          normalisedSteps = normalisedSteps.map((s: any, i: number) => ({ ...s, id: String(i + 1) }))
+          log.info(
+            { tcId: tc.id, removed: beforeLen - normalisedSteps.length },
+            '[TCG] Cross-entity CLICK steps stripped before DB persist',
+          )
+        }
+      }
+
+      // ── Button name auto-correction (CENTRALIZED) ─────────────────────────
+      // Uses the centralized autoCorrectButtonNames() which independently loads
+      // the manifest and deterministically replaces LLM-invented button names.
+      if (effectiveEntity && effectiveEntity.length > 2) {
+        await autoCorrectButtonNames(normalisedSteps as Array<Record<string, any>>, projectId, effectiveEntity)
+      }
+
+      const cleanSteps = sanitizeTestCaseSteps(normalisedSteps, tc.name)
 
       await prisma.test_cases.update({
         where: { id: tc.id },
@@ -1350,6 +1610,7 @@ export async function generateStepsForTestCases(
   log.info({ projectId, generated, failed }, '[TCG] generateStepsForTestCases complete')
   return { generated, failed, errors }
 }
+
 
 // ── Salesforce managed package object detection ──────────────────────────────
 function isManagedPackageObject(apiName: string): boolean {

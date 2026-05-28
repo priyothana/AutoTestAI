@@ -138,12 +138,23 @@ export default function NexusAssistant({
 
     // Mount: read saved position (SSR-safe)
     useEffect(() => {
+        const rightEdge = window.innerWidth - 88
+        const centerY   = Math.round(window.innerHeight / 2) - 32
         const saved = localStorage.getItem(storageKey)
         if (saved) {
-            try { setPos(JSON.parse(saved)); return } catch { /* fallback */ }
+            try {
+                const p = JSON.parse(saved) as { x: number; y: number }
+                // Clamp: if the saved Y is in the bottom 15% of the viewport it would
+                // be hidden by footers/scrollbars — move it back to right-center.
+                const bottomThreshold = window.innerHeight * 0.85
+                const safePosY = p.y > bottomThreshold ? centerY : p.y
+                setPos({ x: p.x, y: safePosY })
+                setMounted(true)
+                return
+            } catch { /* fallback to default */ }
         }
-        // Default: bottom-right corner with padding
-        setPos({ x: window.innerWidth - 88, y: window.innerHeight - 120 })
+        // Default: right-center of the viewport so it is always visible
+        setPos({ x: rightEdge, y: centerY })
         setMounted(true)
     }, [storageKey])
 
@@ -359,7 +370,7 @@ export default function NexusAssistant({
                         onClick={closePanel}
                     />
 
-                    {/* Panel — compact bottom-right widget, ~50 vh */}
+                    {/* Panel — right-center widget, vertically centred in viewport */}
                     <div
                         className={`fixed z-[9992] flex flex-col bg-white dark:bg-gray-950 rounded-2xl overflow-hidden shadow-2xl border border-gray-200 dark:border-gray-800 ${closing ? "nexus-slide-out" : "nexus-slide-in"}`}
                         style={{
@@ -368,7 +379,8 @@ export default function NexusAssistant({
                             height: "52vh",
                             minHeight: 380,
                             maxHeight: 560,
-                            bottom: 24,
+                            top: "50%",
+                            transform: "translateY(-50%)",
                             right: 24,
                         }}
                     >

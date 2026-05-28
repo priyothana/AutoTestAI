@@ -32,6 +32,9 @@ import {
   getPageLayoutFields,
 } from '../salesforce/salesforce.service.js'
 
+// Layer 4: Selector Registry for the Intent-Cache-Heal pattern
+import { selectorRegistry } from './selector-registry.service.js'
+
 const log = createModuleLogger('self-healing-chat')
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -622,5 +625,94 @@ Output ONLY the JSON object with 'analysis' and 'corrected_steps'. No markdown.`
     log.info(`[AI-SUGGEST] ✅ Saved ${result.corrected_steps.length} corrected steps for run ${testRunId}`)
   } catch (err) {
     log.warn({ err }, `[AI-SUGGEST] Non-fatal: failed to generate AI suggestions for run ${testRunId}`)
+  }
+}
+
+// ── Intent-Cache-Heal Pattern ─────────────────────────────────────────────────
+
+/**
+ * Heal a broken selector using the Intent-Cache-Heal pattern.
+ *
+ * When the Selector Registry reports a BROKEN selector, this function:
+ *   1. Loads the intent description from the registry (semantic meaning)
+ *   2. Uses the current DOM snapshot to re-resolve the selector via LLM
+ *   3. Updates the registry with the new working selector on success
+ *
+ * This is deliberately lightweight — it re-uses the existing LLM infrastructure
+ * and does NOT call the heavy vision-based healing chain (that runs async in
+ * healing.worker.ts after the test completes).
+ *
+ * Returns the new selector string, or null if healing failed.
+ */
+export async function healWithIntent(params: {
+  projectId:         string
+  fieldName:         string
+  intentDescription: string
+  currentDom:        string
+  pageUrl?:          string
+  provider?:         string
+}): Promise<string | null> {
+  const { projectId, fieldName, intentDescription, currentDom, pageUrl, provider = LLM_PROVIDER } = params
+
+  const systemPrompt = `You are an expert Playwright locator engineer.
+A web element selector has broken. Use the element's SEMANTIC INTENT and the current DOM to find the correct Playwright locator.
+
+Return ONLY valid JSON (no markdown):
+{
+  "selector": "getByLabel('Account Name')",
+  "selectorType": "label",
+  "confidence": 0.92,
+  "reasoning": "one sentence"
+}
+
+Locator strategy preference: getByRole > getByLabel > getByText > locator(css) > xpath`
+
+  const userPrompt = [
+    `Field name: "${fieldName}"`,
+    `Intent: "${intentDescription}"`,
+    `DOM snapshot (first 3000 chars):\n${currentDom.slice(0, 3000)}`,
+  ].join('\n\n')
+
+  try {
+    const llm    = buildLlm()
+    const parser = new StringOutputParser()
+    let   raw    = await llm.pipe(parser).invoke([
+      new SystemMessage(systemPrompt),
+      new HumanMessage(userPrompt),
+    ])
+    raw = raw.trim()
+    if (raw.startsWith('```')) {
+      raw = raw.split('\n').filter((l: string) => !l.trim().startsWith('```')).join('\n')
+    }
+
+    const parsed = JSON.parse(raw) as {
+      selector:     string
+      selectorType: string
+      confidence:   number
+      reasoning:    string
+    }
+
+    if (!parsed.selector || parsed.confidence < 0.5) {
+      log.warn(`[HEAL-INTENT] Low confidence (${parsed.confidence}) for "${fieldName}" — not applying`)
+      return null
+    }
+
+    log.info(
+      `[HEAL-INTENT] ✅ Healed "${fieldName}": "${parsed.selector.slice(0, 80)}" (confidence=${parsed.confidence})`,
+    )
+
+    // Update the registry with the healed selector
+    await selectorRegistry.recordHeal(
+      projectId,
+      fieldName,
+      parsed.selector,
+      parsed.selectorType,
+      pageUrl,
+    )
+
+    return parsed.selector
+  } catch (err) {
+    log.warn({ err, fieldName }, '[HEAL-INTENT] healWithIntent failed (non-fatal)')
+    return null
   }
 }

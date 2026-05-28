@@ -199,20 +199,39 @@ async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
       log.info(`[SYNC] Crawl complete (${rawCount} pages total) — proceeding to stages 2-4`)
 
       // ── Stage 2: Normalization ─────────────────────────────────
-      log.info('[SYNC] Stage 2/4 — Normalization (webapp_crawl)')
-      await job.updateProgress(40)
+      log.info('[SYNC] Stage 2/5 — Normalization (webapp_crawl)')
+      await job.updateProgress(35)
       normalizedCount = await normalizeWebappMetadata(projectId)
       log.info(`[SYNC] Stage 2 done — ${normalizedCount} normalized records`)
 
       // ── Stage 3: Domain model build ────────────────────────────
-      log.info('[SYNC] Stage 3/4 — Domain model build (Web App pages)')
-      await job.updateProgress(60)
+      log.info('[SYNC] Stage 3/5 — Domain model build (Web App pages)')
+      await job.updateProgress(50)
       domainCount = await buildWebappDomainModels(projectId)
       log.info(`[SYNC] Stage 3 done — ${domainCount} domain models`)
 
+      // ── Stage 3.5: Canonical + Knowledge Graph Builder (feature-flagged) ──
+      // Consolidates metadata_normalized + web_test_data + execution_learnings
+      // + domain_models into single entity-centric records with cross-entity
+      // relationships and business rules. This is the primary anti-hallucination
+      // layer — pre-merges all sources so the LLM gets one definitive manifest.
+      // Runs AFTER domain models so relationship extraction can use domain data.
+      // Non-critical: if it fails, Stages 4-5 continue normally.
+      if (process.env.ENABLE_CANONICAL_METADATA !== 'false') {
+        log.info('[SYNC] Stage 3.5/5 — Canonical + Knowledge Graph build')
+        await job.updateProgress(60)
+        try {
+          const { buildCanonicalMetadata } = await import('../modules/webapp/canonical-builder.service.js')
+          const canonicalCount = await buildCanonicalMetadata(projectId)
+          log.info(`[SYNC] Stage 3.5 done — ${canonicalCount} canonical records (with Knowledge Graph)`)
+        } catch (canErr) {
+          log.warn({ err: canErr }, '[SYNC] Stage 3.5 failed (non-critical) — canonical metadata skipped')
+        }
+      }
+
       // ── Stage 4: Embeddings ────────────────────────────────────
       log.info('[SYNC] Stage 4/5 — OpenAI embeddings')
-      await job.updateProgress(80)
+      await job.updateProgress(75)
       embeddingCount = await generateEmbeddings(projectId)
       log.info(`[SYNC] Stage 4 done — ${embeddingCount} embeddings`)
 
@@ -228,7 +247,7 @@ async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
 
     } else {
       // ════════════════════════════════════════════════════════════
-      // Salesforce Pipeline (JSforce → normalize → domain → embed) — UNCHANGED
+      // Salesforce Pipeline (JSforce → normalize → domain → canonical → embed)
       // ════════════════════════════════════════════════════════════
 
       // ── Stage 1: Raw extraction ──────────────────────────────────────────────
@@ -239,15 +258,31 @@ async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
 
       // ── Stage 2: Normalization ───────────────────────────────────────────────
       log.info('[SYNC] Stage 2/4 — Normalization')
-      await job.updateProgress(30)
+      await job.updateProgress(25)
       normalizedCount = await normalizeMetadata(projectId)
       log.info(`[SYNC] Stage 2 done — ${normalizedCount} normalized records`)
 
       // ── Stage 3: Domain model build ──────────────────────────────────────────
       log.info('[SYNC] Stage 3/4 — Domain model build')
-      await job.updateProgress(55)
+      await job.updateProgress(45)
       domainCount = await buildDomainModels(projectId)
       log.info(`[SYNC] Stage 3 done — ${domainCount} domain models`)
+
+      // ── Stage 3.5: Canonical + Knowledge Graph Builder (feature-flagged) ────
+      // Same canonical layer for Salesforce — builds entity-centric records
+      // with field manifests, cross-entity relationships from lookup fields,
+      // and business rules from validation rules.
+      if (process.env.ENABLE_CANONICAL_METADATA !== 'false') {
+        log.info('[SYNC] Stage 3.5/4 — Canonical + Knowledge Graph build (Salesforce)')
+        await job.updateProgress(55)
+        try {
+          const { buildSalesforceCanonicalMetadata } = await import('../modules/webapp/canonical-builder.service.js')
+          const canonicalCount = await buildSalesforceCanonicalMetadata(projectId)
+          log.info(`[SYNC] Stage 3.5 done — ${canonicalCount} SF canonical records (with Knowledge Graph)`)
+        } catch (canErr) {
+          log.warn({ err: canErr }, '[SYNC] Stage 3.5 failed (non-critical) — SF canonical metadata skipped')
+        }
+      }
 
       // ── Stage 4: Embeddings ──────────────────────────────────────────────────
       log.info('[SYNC] Stage 4/4 — OpenAI embeddings')

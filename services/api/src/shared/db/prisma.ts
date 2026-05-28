@@ -4,7 +4,7 @@
  * All modules import the Prisma client from here — never instantiate directly.
  * Prevents multiple client instances in development (hot-reload safe).
  */
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient } from '../../../node_modules/.prisma/client/index.js'
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient }
 

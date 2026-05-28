@@ -180,6 +180,15 @@ export async function extractTestData(projectId: string): Promise<number> {
 
   const baseOrigin = new URL(integration.base_url).origin
 
+  // Extract key_routes from auth_config — user-configured known-good entity paths
+  // These are injected directly into Tier 2 so they're always scraped regardless of BFS discovery
+  const authCfg    = (integration.auth_config ?? {}) as Record<string, unknown>
+  const keyRoutes  = Array.isArray(authCfg.key_routes)
+    ? (authCfg.key_routes as string[]).filter(r => typeof r === 'string')
+    : []
+
+  log.info(`[WTD] key_routes from auth_config: [${keyRoutes.join(', ')}]`)
+
   // ── Tier 1: OpenAPI Detection ────────────────────────────────────────────
   const apiSummary = await runOpenApiDetection(projectId, baseOrigin, {
     username: integration.username ?? undefined,
@@ -190,7 +199,7 @@ export async function extractTestData(projectId: string): Promise<number> {
   const coveredByApi = new Set(apiSummary.coveredEntities.map(e => e.toLowerCase()))
 
   // ── Tier 2: UI List Page Scraping (fallback) ─────────────────────────────
-  const uiCount = await runUiScraping(projectId, integration, coveredByApi)
+  const uiCount = await runUiScraping(projectId, integration, coveredByApi, keyRoutes)
 
   const totalEntities = apiSummary.entitiesStored + uiCount
 
@@ -303,7 +312,7 @@ async function runOpenApiDetection(
   let recordsStored   = 0
   const coveredEntities: string[] = []
 
-  for (const endpoint of listEndpoints.slice(0, 15)) {
+  for (const endpoint of listEndpoints.slice(0, 30)) {
     const endpointUrl = `${baseOrigin}${endpoint.path}`
     try {
       const res = await fetchWithTimeout(endpointUrl, {
@@ -528,9 +537,10 @@ async function fetchWithTimeout(
  * @param coveredByApi — entity names already extracted by OpenAPI (skipped here)
  */
 async function runUiScraping(
-  projectId:   string,
-  integration: { base_url: string | null; username: string | null; password: string | null },
+  projectId:    string,
+  integration:  { base_url: string | null; username: string | null; password: string | null },
   coveredByApi: Set<string>,
+  keyRoutes:    string[] = [],
 ): Promise<number> {
   log.info('[WTD][UI] Tier 2 — UI List Page Scraping (self-contained discovery)')
 
@@ -700,8 +710,9 @@ async function runUiScraping(
       const navDiscoveredUrls = new Set<string>()
       const discoveredLinks: Array<{ url: string; label: string }> = []
 
-      // Only skip truly non-entity items; keep everything else for scraping
-      const skipLabels = /^(home|dashboard|logout|sign out|sign-out|profile|settings|help|admin|support|notifications?|\d+|back|close|menu|toggle|search)$/i
+      // Only skip truly non-entity items. Module group labels (e.g. "Warehouse", "Logistics")
+      // must NOT be skipped — clicking them expands the group to reveal sub-entities.
+      const skipLabels = /^(home|dashboard|logout|sign out|sign-out|profile|settings|help|support|notifications?|\d+|back|close|toggle|search|overview|summary report|report)$/i
 
       function resolveUrl(raw: string): string | null {
         if (!raw) return null
@@ -729,6 +740,30 @@ async function runUiScraping(
           discoveredLinks.push({ url, label })
         }
       }
+
+      // ── Inject key_routes from auth_config as trusted entity URLs ────────
+      // These are user-configured paths (e.g. /warehouse, /inventory, /skus).
+      // We mark them as navDiscoveredUrls so they BYPASS all URL-shape filters
+      // and are always scraped, even if BFS never discovers them.
+      //
+      // Skip paths that end with action suffixes (/create, /new, /edit, /add, /update)
+      // — these are form pages, not list pages. Match on the last path segment only.
+      const keyRouteActionSuffix = /\/(create|new|edit|add|update|delete)(\?.*)?$/i
+      for (const route of keyRoutes) {
+        const raw = route.startsWith('/') ? route : `/${route}`
+        if (keyRouteActionSuffix.test(raw)) continue   // skip form/action pages
+        const url = resolveUrl(raw)
+        if (url && !seen.has(url)) {
+          seen.add(url)
+          navDiscoveredUrls.add(url)  // mark as trusted — skips URL-shape filter
+          // Derive label from the last path segment
+          const lastSeg = raw.split('/').filter(Boolean).pop() ?? raw
+          const label   = lastSeg.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+          discoveredLinks.push({ url, label })
+          log.info(`[WTD][UI] key_route injected: "${label}" → ${url}`)
+        }
+      }
+      log.info(`[WTD][UI] Discovered ${discoveredLinks.length} nav links (${rawHrefLinks.length} href + ${rawTextItems.length} text labels, ${keyRoutes.length} key_routes)`)
 
       // ── Dynamic BFS nav discovery ─────────────────────────────────────────
       // After each successful navigation the sidebar may reveal NEW sub-items
@@ -761,7 +796,7 @@ async function runUiScraping(
       const pendingLabels: string[] = rawTextItems.map(t => t.text)
 
       let queueIdx = 0
-      const MAX_NAV_CLICKS = 40  // safety cap — prevents infinite loops
+      const MAX_NAV_CLICKS = 80  // safety cap — must be large enough for multi-module apps
 
       while (queueIdx < pendingLabels.length && queueIdx < MAX_NAV_CLICKS) {
         const text = pendingLabels[queueIdx++]
@@ -935,19 +970,26 @@ async function runUiScraping(
             /\/(index|all)(\/|$)/.test(checkPath) ||
             /\/[a-z]+(es|ies)(\/|$)/.test(checkPath)
           )
-          // Also accept any single-segment path that isn't a known noise word
-          // — handles singular entity routes like /compliance, /patch, /software
+          // Accept any single-segment or two-segment path that isn't a known noise word.
+          // Two-segment paths handle module-scoped entities e.g. /warehouse/inventory,
+          // /warehouse/sku, /logistics/shipments — the entity is the LAST clean segment.
           const segments = checkPath.split('/').filter(Boolean)
+          const NOISE_SEGMENTS = /^(api|v\d+|app|main|panel|system|public|static|assets)$/
           const isSingleCleanSegment = segments.length === 1
             && segments[0].length >= 3
-            && !/^(api|v\d+|app|main|panel|module|system|public|static|assets)$/.test(segments[0])
+            && !NOISE_SEGMENTS.test(segments[0])
+          // Two-segment paths: /module/entity — accept if entity segment is clean
+          const isTwoSegmentEntity = segments.length === 2
+            && segments[1].length >= 3
+            && !NOISE_SEGMENTS.test(segments[1])
+            && !/^(\d+|[0-9a-f-]{36}|new|create|edit|add|update)$/.test(segments[1])
 
           // Accept if label looks like an entity (titlecase word/s)
           const labelHintsList = /^([A-Z][a-z]+)(\s+[A-Z][a-z]+)*s?$/.test(candidate.label.trim())
 
-          return hasListShape || isSingleCleanSegment || labelHintsList
+          return hasListShape || isSingleCleanSegment || isTwoSegmentEntity || labelHintsList
         } catch { return false }
-      }).slice(0, 30) // raised cap: up to 30 list pages per run
+      }).slice(0, 60) // raised cap: up to 60 list pages — needed for multi-module apps
 
       log.info(`[WTD][UI] ${listPages.length} list pages identified — ${allCandidates.length - listPages.length} filtered out`)
 
@@ -994,10 +1036,15 @@ async function runUiScraping(
           if (records.length === 0) {
             log.info(`[WTD][UI] No table rows on ${listPage.url} — trying to wait longer...`)
             // One more attempt after a longer wait (some data grids load lazily)
-            await page.waitForTimeout(2_000)
+            await page.waitForTimeout(3_000)
             const records2 = await scrapeTableRows(page)
             if (records2.length === 0) {
-              log.info(`[WTD][UI] Still no rows — skipping ${listPage.url}`)
+              log.info(`[WTD][UI] No rows found on ${listPage.url} — storing entity with 0 records so it appears in the list`)
+              // Still register the entity so it shows up in the metadata table.
+              // Its existence tells the system the page is a valid entity page,
+              // even if we could not extract table data (custom renderer, empty data, etc.)
+              await upsertEntity(projectId, entityName, [], 'ui_scraping', listPage.url)
+              entitiesStored++
               continue
             }
             records.push(...records2)
@@ -1275,6 +1322,7 @@ function deriveEntityName(url: string, title: string): string {
 /**
  * Scrapes the first visible HTML table or ARIA grid on a Playwright page.
  * Returns up to 10 rows as key-value records using the header row as keys.
+ * Handles: HTML tables, ARIA grids, div-based lists, card grids, list-items.
  */
 async function scrapeTableRows(
   page: import('playwright').Page,
@@ -1282,10 +1330,11 @@ async function scrapeTableRows(
   return page.evaluate(() => {
     // NOTE: This function uses ONLY anonymous arrow functions (no named functions).
     // esbuild transforms named functions with __name() which is not available in the browser context.
+    // DO NOT add `const foo = ...` named helpers — inline the regex replace at every call site.
 
-    // Clean icon/emoji characters from header/cell text inline to avoid esbuild __name() injection
     const records: Record<string, string>[] = []
 
+    // ── Strategy 1: Standard HTML <table> ────────────────────────────────────
     const tables = Array.from(document.querySelectorAll('table')).filter(
       t => t.offsetParent !== null && t.querySelectorAll('tbody tr').length > 0,
     )
@@ -1293,16 +1342,15 @@ async function scrapeTableRows(
     if (tables.length > 0) {
       const table   = tables[0]
       const headers = Array.from(table.querySelectorAll('thead th, thead td'))
-        .map(th => (th.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u{1F000}-\u{1FFFF}☰▼▲×✓✗≡⋮⁝⋯]/gu, '').trim())
-        .filter(h => h.length > 0 && h.length < 60)  // skip icon-only or excessively long headers
+        .map(th => (th.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim())
 
-      if (headers.length === 0) {
+      if (headers.length === 0 || headers.every(h => h.length === 0)) {
         const firstRow = table.querySelector('tr')
         if (firstRow) {
+          headers.length = 0
           headers.push(
             ...Array.from(firstRow.querySelectorAll('th, td'))
-              .map(c => (c.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u{1F000}-\u{1FFFF}☰▼▲×✓✗≡⋮⁝⋯]/gu, '').trim())
-              .filter(h => h.length > 0 && h.length < 60),
+              .map(c => (c.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim())
           )
         }
       }
@@ -1314,7 +1362,9 @@ async function scrapeTableRows(
           if (cells.length === 0) continue
           const record: Record<string, string> = {}
           headers.forEach((h, i) => {
-            if (h && cells[i]) record[h] = (cells[i].textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u{1F000}-\u{1FFFF}☰▼▲×✓✗≡⋮⁝⋯]/gu, '').trim()
+            if (h && h.length > 0 && h.length < 60 && cells[i]) {
+              record[h] = (cells[i].textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim()
+            }
           })
           if (Object.keys(record).length > 0) records.push(record)
         }
@@ -1323,12 +1373,11 @@ async function scrapeTableRows(
 
     if (records.length > 0) return records
 
-    // Fallback: ARIA grid
+    // ── Strategy 2: ARIA grid ([role="grid"] / [role="table"]) ────────────────
     const grid = document.querySelector('[role="grid"], [role="table"]')
     if (grid) {
       const headerCells = Array.from(grid.querySelectorAll('[role="columnheader"]'))
-        .map(c => (c.textContent ?? '').trim())
-        .filter(Boolean)
+        .map(c => (c.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim())
 
       const dataRows = Array.from(grid.querySelectorAll('[role="row"]')).filter(
         r => r.querySelector('[role="gridcell"], [role="cell"]') !== null,
@@ -1339,9 +1388,86 @@ async function scrapeTableRows(
         if (cells.length === 0) continue
         const record: Record<string, string> = {}
         headerCells.forEach((h, i) => {
-          if (h && cells[i]) record[h] = (cells[i].textContent ?? '').trim()
+          if (h && h.length > 0 && h.length < 60 && cells[i]) {
+            record[h] = (cells[i].textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim()
+          }
         })
         if (Object.keys(record).length > 0) records.push(record)
+      }
+    }
+
+    if (records.length > 0) return records
+
+    // ── Strategy 3: Div-based list rows (common in React/Next.js data grids) ─
+    // Looks for repeating div containers that share a common class pattern.
+    // Heuristic: find a parent with 3+ direct children that look like data rows.
+    const gridSelectors = [
+      '[class*="ag-row"]',          // ag-Grid
+      '[class*="grid-row"]',
+      '[class*="data-row"]',
+      '[class*="list-row"]',
+      '[class*="table-row"]',
+      '[class*="row-item"]',
+      '[class*="list-item"]:not(li)',  // custom list items
+      'tr[class*="row"]',
+    ]
+    for (const sel of gridSelectors) {
+      const rows = Array.from(document.querySelectorAll(sel) as NodeListOf<HTMLElement>)
+        .filter(r => r.offsetParent !== null)
+      if (rows.length < 2) continue
+
+      // Extract text from each child cell of the row
+      for (const row of rows.slice(0, 10)) {
+        const cells = Array.from(row.children) as HTMLElement[]
+        const record: Record<string, string> = {}
+        let col = 0
+        for (const cell of cells) {
+          const text = (cell.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim()
+          if (text && text.length < 200) {
+            record[`col${col + 1}`] = text
+            col++
+          }
+        }
+        if (col >= 2) records.push(record)
+      }
+      if (records.length > 0) break
+    }
+
+    if (records.length > 0) return records
+
+    // ── Strategy 4: Card-based list (each entity rendered as a card/panel) ───
+    const cardSelectors = [
+      '[class*="card"]:not([class*="card-header"]):not([class*="card-body"])',
+      '[class*="item-card"]',
+      '[class*="list-card"]',
+      '[class*="entity-card"]',
+      '[class*="record-card"]',
+    ]
+    for (const sel of cardSelectors) {
+      const cards = Array.from(document.querySelectorAll(sel) as NodeListOf<HTMLElement>)
+        .filter(c => c.offsetParent !== null && (c.textContent || '').trim().length > 5)
+      if (cards.length < 2) continue
+
+      for (const card of cards.slice(0, 10)) {
+        const text = ((card.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim()).slice(0, 300)
+        if (text.length > 5) records.push({ value: text })
+      }
+      if (records.length > 0) break
+    }
+
+    if (records.length > 0) return records
+
+    // ── Strategy 5: Standard <ul>/<ol> list items ────────────────────────────
+    const lists = Array.from(document.querySelectorAll('ul, ol')).filter(
+      l => (l as HTMLElement).offsetParent !== null && l.querySelectorAll('li').length >= 2
+    )
+    if (lists.length > 0) {
+      const items = Array.from(lists[0].querySelectorAll('li'))
+        .filter(li => (li as HTMLElement).offsetParent !== null)
+        .slice(0, 10)
+      for (const li of items) {
+        const text = ((li.textContent ?? '').replace(/[\u2600-\u27FF\u2900-\u2BFF\u2630\u25bc\u25b2\u00d7\u2713\u2717\u2261\u22ee\u205d\u22ef]/g, '').trim()).slice(0, 200)
+        if (text.length > 3) records.push({ value: text })
       }
     }
 

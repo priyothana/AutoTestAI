@@ -2930,6 +2930,28 @@ async function smartWebAppClick(
     }
   } catch { /* try next */ }
 
+  // ── Strategy 2b: Scoped nav-container role=link (faster for sidebar items) ────
+  // Searches role=link within <nav>/sidebar containers first, which is more
+  // precise than page-wide and avoids false matches in main content areas.
+  const NAV_CONTAINER_SELECTORS = [
+    'nav', '[role="navigation"]', '[role="menubar"]',
+    '[class*="sidebar"]', '[class*="sidenav"]', '[class*="side-nav"]',
+    '[id*="sidebar"]', '[id*="side-nav"]',
+  ]
+  for (const navSel of NAV_CONTAINER_SELECTORS) {
+    try {
+      const container = page.locator(navSel).first()
+      if (!await container.isVisible({ timeout: 500 }).catch(() => false)) continue
+      const scopedLink = container.getByRole('link', { name: target, exact: false }).first()
+      if (await scopedLink.isVisible({ timeout: 1_500 }).catch(() => false)) {
+        await scopedLink.scrollIntoViewIfNeeded().catch(() => {})
+        await scopedLink.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 2b (scoped nav ${navSel} + link): "${target}"`)
+        return true
+      }
+    } catch { /* try next */ }
+  }
+
   // ── Strategy 3: Role=menuitem (dropdown / sidebar nav items) ─────────────────
   try {
     const loc = page.getByRole('menuitem', { name: target, exact: false }).first()
@@ -3185,12 +3207,17 @@ async function executeStep(
               // DOM-based: a password field is visible on the page now
               await page.locator('input[type="password"]').first().isVisible({ timeout: 3_000 }).catch(() => false)
 
-            // Also detect "silent redirects" — some apps (e.g. this CRM) send
+            // Also detect "silent redirects" — some apps send
             // unauthenticated users to /home or /dashboard instead of /login.
+            // EXCEPTION: if the intended path IS a login/auth page (e.g. /login),
+            // landing on /home or /dashboard is a SUCCESSFUL LOGIN — not a session expiry.
             const intendedPath = (() => { try { return new URL(resolvedUrl).pathname.replace(/\/$/, '') || '/' } catch { return '' } })()
             const actualPath   = (() => { try { return new URL(page.url()).pathname.replace(/\/$/, '') || '/' } catch { return '' } })()
+            const IS_LOGIN_PATH = /\/(login|signin|sign-in|sign_in|auth|session|sso|oauth|authenticate|logon)(\/|$)/i
+            const intendedIsLoginPage = IS_LOGIN_PATH.test(intendedPath)
             const silentRedirect =
               !redirectedToLogin &&
+              !intendedIsLoginPage &&     // ← login→home is expected, not a session expiry
               intendedPath !== '' &&
               actualPath !== intendedPath &&
               !actualPath.startsWith(intendedPath + '/') &&
@@ -3298,7 +3325,21 @@ async function executeStep(
                 const pathMatches =
                   finalPath.startsWith(expectedPath + '/') ||
                   expectedPath.startsWith(finalPath + '/')
-                if (!pathMatches) {
+
+                // ── Login → landing page is a SUCCESSFUL LOGIN, not a permission denial ──
+                // When the test navigates to /login and after authentication the app
+                // redirects to /home or /dashboard, that's normal successful behavior
+                // for ALL web apps. Do NOT flag this as PERMISSION DENIED.
+                const LOGIN_PAGE_PATTERNS = /\/(login|signin|sign-in|sign_in|auth|session|sso|oauth|authenticate|logon)(\/|$)/i
+                const LANDING_PAGE_PATTERNS = /^\/(home|dashboard|index|main|app|welcome|overview|portal|console|workspace)(\/|$)/i
+                const isLoginToLandingRedirect =
+                  LOGIN_PAGE_PATTERNS.test(expectedPath) && LANDING_PAGE_PATTERNS.test(finalPath)
+
+                if (isLoginToLandingRedirect) {
+                  log.info(
+                    `[EXEC] NAVIGATE ✅ Successful login redirect: "${expectedPath}" → "${finalPath}" (authenticated OK)`,
+                  )
+                } else if (!pathMatches) {
                   // Distinguish permission-denied from a normal unexpected redirect.
                   // If we end up on /home or /dashboard AFTER a valid re-auth,
                   // the account simply lacks access to this page.
@@ -3308,8 +3349,9 @@ async function executeStep(
                       `The logged-in account does not have access to this page. Grant the required role/permission in the app or use a privileged account.`
                     : `NAVIGATE failed: requested "${expectedPath}" but landed on "${finalPath}".`
                   throw new Error(errMsg)
+                } else {
+                  log.info(`[EXEC] NAVIGATE ✅ SPA parent route match: "${expectedPath}" → "${finalPath}"`)
                 }
-                log.info(`[EXEC] NAVIGATE ✅ SPA parent route match: "${expectedPath}" → "${finalPath}"`)
               }
             } catch (urlVerifyErr: unknown) {
               if (urlVerifyErr instanceof Error && urlVerifyErr.message.startsWith('NAVIGATE failed')) throw urlVerifyErr
@@ -3530,10 +3572,24 @@ async function executeStep(
                 }
 
               } else {
-                // Non-destructive: use smart click with navigation-menu awareness
+                // ── Non-destructive: smart click with navigation-menu fast-path ──
+                // Detect if this is a nav section click (e.g., "Users", "Accounts", "Dashboard").
+                // Nav-section clicks go DIRECTLY to smartWebAppClick (bypassing getByText which
+                // can match an inner <span> inside <li> that is not clickable).
+                const NAV_SECTION_FAST_PATH_RE = /^(users|user|accounts|account|contacts|contact|leads|lead|opportunities|opportunity|dashboard|home|settings|setting|reports|report|products|product|orders|order|invoices|invoice|campaigns|campaign|tasks|task|cases|case|projects|project|customers|customer|vendors|vendor|employees|employee|admin|panel|modules|module|team|billing|analytics|calendar|messages|notifications|documents|integrations|permissions|roles|groups|categories|workflows|automation)s?$/i
+                const isNavSectionClick = (
+                  !target.includes('=') &&
+                  !target.startsWith('.') &&
+                  !target.startsWith('#') &&
+                  !target.startsWith('[') &&
+                  NAV_SECTION_FAST_PATH_RE.test(target.trim())
+                )
+                if (isNavSectionClick) {
+                  log.info(`[WEBAPP-ENGINE] Nav-section fast-path: "${target}" → smartWebAppClick directly`)
+                }
                 clicked = await smartWebAppClick(page, target, log)
               }
-            }
+            } // end if (!clicked)
 
             // ── Post-destructive-click: auto-handle confirmation dialog ───
             // Pattern: "Delete" (or Remove/Archive) click opens a modal that asks
@@ -4306,27 +4362,93 @@ async function executeStep(
         }
 
         case 'asserturl': {
-          // ASSERT_URL: value = expected URL path fragment (e.g. "/accounts")
-          // target is empty for web app redirects; value holds the fragment.
+          // ASSERT_URL: value = expected URL path fragment (e.g. "/products")
+          // Uses STRICT pathname-level matching so /products/new does NOT satisfy /products.
           const urlFragment = value || target
           if (!urlFragment) {
             log.warn(`[EXEC] ASSERT_URL step ${stepIndex + 1} has no value/target — skipping`)
             break
           }
 
+          // ── Helper: normalise any URL string to just its pathname ───────────
+          const toPathname = (raw: string): string => {
+            try { return new URL(raw).pathname.replace(/\/$/, '') || '/' } catch { return raw }
+          }
+          // Build the expected pathname even if urlFragment is a bare path like "/products"
+          const expectedPathname = toPathname(
+            urlFragment.startsWith('http')
+              ? urlFragment
+              : `http://placeholder${urlFragment.startsWith('/') ? '' : '/'}${urlFragment}`
+          )
+
+          // ── Strict URL matcher ───────────────────────────────────────────────
+          // Accepts:
+          //   /products        === /products          (exact list page)
+          //   /products/123    satisfies /products    (detail page redirect)
+          // Rejects:
+          //   /products/new    does NOT satisfy /products  (still on form!)
+          const urlSatisfiesExpected = (url: string): boolean => {
+            const currentPath = toPathname(url)
+            if (currentPath === expectedPathname) return true
+            if (currentPath.startsWith(expectedPathname + '/')) {
+              const subPath = currentPath.slice(expectedPathname.length)  // e.g. "/new" or "/123"
+              // Reject if the child segment is a creation/edit route
+              return !/^\/(new|create|add|edit)(\/$|$)/i.test(subPath)
+            }
+            return false
+          }
+
           // Wait for the SPA redirect to settle (up to 8 seconds)
-          // Many CRM apps take 1–3s to redirect after a form save.
           const urlDeadline = Date.now() + 8_000
           let currentUrl = page.url()
-          while (!currentUrl.toLowerCase().includes(urlFragment.toLowerCase()) && Date.now() < urlDeadline) {
+          while (!urlSatisfiesExpected(currentUrl) && Date.now() < urlDeadline) {
             await page.waitForTimeout(500)
             currentUrl = page.url()
           }
 
-          if (!currentUrl.toLowerCase().includes(urlFragment.toLowerCase())) {
-            throw new Error(`URL assertion failed: expected URL to contain "${urlFragment}" but got "${currentUrl}"`)
+          if (!urlSatisfiesExpected(currentUrl)) {
+            // ── Scan for form validation errors before reporting URL failure ─────
+            // If the form stayed open due to a required-field error (e.g. "Currency is
+            // required"), surface THAT message rather than a generic URL mismatch.
+            const FORM_ERROR_SELECTORS = [
+              '[role="alert"]',
+              '[aria-live="assertive"]',
+              '.alert-danger', '.alert-error', '.alert-destructive',
+              '[class*="error-message"]', '[class*="form-error"]', '[class*="field-error"]',
+              '[class*="validation-error"]', '[class*="validation-message"]',
+              '.invalid-feedback', '.field-validation-error',
+              // Tailwind / shadcn red-text patterns
+              'p.text-red-500', 'span.text-red-500', 'div.text-red-500',
+              '[class*="text-red-"]', '[class*="text-destructive"]',
+              // Banner-style error summaries at top of form
+              '[class*="error-banner"]', '[class*="form-errors"]',
+            ].join(', ')
+
+            const validationErrors: string[] = []
+            try {
+              const errEls = page.locator(FORM_ERROR_SELECTORS)
+              const count  = await errEls.count()
+              for (let ei = 0; ei < Math.min(count, 8); ei++) {
+                const txt = (await errEls.nth(ei).textContent())?.trim()
+                if (txt && txt.length > 1 && txt.length < 400) validationErrors.push(txt)
+              }
+            } catch { /* non-critical — swallow so the real error is still thrown */ }
+
+            if (validationErrors.length > 0) {
+              const unique = [...new Set(validationErrors)]
+              throw new Error(
+                `Form submission failed — validation error(s) detected on page: ${unique.slice(0, 4).join(' | ')}. ` +
+                `The URL is still "${currentUrl}" (expected "${urlFragment}"). ` +
+                `Ensure all required fields are filled in the test steps.`
+              )
+            }
+
+            throw new Error(
+              `URL assertion failed: expected path "${expectedPathname}" but got "${currentUrl}". ` +
+              `The form may still be open — verify all required fields are filled.`
+            )
           }
-          log.info(`[EXEC] ASSERT_URL ✅ URL "${currentUrl}" contains "${urlFragment}"`)
+          log.info(`[EXEC] ASSERT_URL ✅ URL "${currentUrl}" satisfies expected path "${urlFragment}"`)
           break
         }
 
@@ -5073,8 +5195,21 @@ async function injectPauseOverlay(
         // Clicking a native link is pure HTML — no JS event handlers needed.
         // Playwright's page.route() intercepts the iframe request at CDP level.
         // AI Diagnosis card (shown only when agent classified the failure)
-        const aiCard = aiFailureType
-          ? `<div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.25);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start">
+        // INVALID_FIELD gets a distinct orange/red warning card; other failures get the standard blue card
+        let aiCard = ''
+        if (aiFailureType === 'INVALID_FIELD') {
+          aiCard = `<div style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start">
+              <span style="font-size:16px;flex-shrink:0">⚠️</span>
+              <div style="flex:1;min-width:0">
+                <div style="color:#fbbf24;font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px">AI Diagnosis</div>
+                <div style="color:#fef3c7;font-size:12px;font-weight:600;margin-bottom:2px">INVALID FIELD FOR ENTITY</div>
+                <div style="color:#fde68a;font-size:11px;line-height:1.4;margin-bottom:4px">The field "${(stepTarget || '').replace(/</g, '&lt;')}" does not exist on this form.</div>
+                <div style="color:#d97706;font-size:10px;line-height:1.4">This step was incorrectly generated by AI and should be removed from the test case.</div>
+                ${aiFailureReason ? `<div style="color:#94a3b8;font-size:10px;line-height:1.4;margin-top:4px">${aiFailureReason.replace(/</g, '&lt;').slice(0, 180)}</div>` : ''}
+              </div>
+            </div>`
+        } else if (aiFailureType) {
+          aiCard = `<div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.25);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start">
               <span style="font-size:16px;flex-shrink:0">🤖</span>
               <div style="flex:1;min-width:0">
                 <div style="color:#a5b4fc;font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px">AI Diagnosis</div>
@@ -5082,7 +5217,7 @@ async function injectPauseOverlay(
                 ${aiFailureReason ? `<div style="color:#94a3b8;font-size:11px;line-height:1.4">${aiFailureReason.replace(/</g, '&lt;').slice(0, 120)}</div>` : ''}
               </div>
             </div>`
-          : ''
+        }
 
         overlay.innerHTML = `<div id="autotest-pause-card" style="background:linear-gradient(135deg,#1a1f2e 0%,#232941 100%);border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:28px 32px;width:420px;box-shadow:0 32px 80px rgba(0,0,0,0.6);position:relative;pointer-events:auto">
           <style>@keyframes at-slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}} #autotest-pause-card{animation:at-slide .3s ease both} #autotest-pause-card a.at-btn:hover{filter:brightness(1.15)} #autotest-pause-card a.at-btn:active{transform:scale(.97);opacity:.8} #autotest-drag-handle:hover{background:rgba(255,255,255,0.06);border-radius:8px}</style>
@@ -5257,6 +5392,20 @@ async function removePauseOverlay(page: Page): Promise<void> {
   try {
     await page.evaluate(() => document.getElementById('autotest-pause-overlay')?.remove())
   } catch { /* page may have navigated — non-fatal */ }
+}
+
+async function injectAiRecoveryBanner(page: Page): Promise<void> {
+  try {
+    await page.evaluate(() => {
+      let banner = document.getElementById('autotest-ai-recovery-banner')
+      if (banner) return
+      banner = document.createElement('div')
+      banner.id = 'autotest-ai-recovery-banner'
+      banner.style.cssText = 'position:fixed;top:50%;right:24px;transform:translateY(-50%);z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;pointer-events:none'
+      banner.innerHTML = `<div style="background:linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%);color:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.3);font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px"><span>🤖</span> AI Recovery Mode Active</div>`
+      document.body.appendChild(banner)
+    })
+  } catch { /* non-fatal */ }
 }
 
 // ─── Core worker function ─────────────────────────────────────────────────────
@@ -5485,21 +5634,32 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
 
         if (isInteractive && page) {
           // ── Show recovery-in-progress banner ─────────────────────────────
-          await page.evaluate(({ stepNum, errMsg }: { stepNum: number; errMsg: string }) => {
+          const stepValue = (step.value ?? '').trim()
+          const isLikelyBadData = !stepValue || stepValue.length < 2 || /^[-\u2013\u2014.?!_*#@~`\/\\]+$/.test(stepValue)
+          const bannerTitle = isLikelyBadData ? 'AI Recovery — Fixing Invalid Data…' : 'AI Recovery in Progress…'
+          const bannerSubtext = isLikelyBadData
+            ? `Step ${i + 1}: invalid value "${stepValue || '(empty)'}" — generating realistic data`
+            : `Step ${i + 1} failed — attempting autonomous fix`
+          await page.evaluate(({ stepNum, errMsg, title, subtext }: { stepNum: number; errMsg: string; title: string; subtext: string }) => {
             document.getElementById('autotest-recovery-banner')?.remove()
             const banner = document.createElement('div')
             banner.id = 'autotest-recovery-banner'
-            banner.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:none'
+            banner.style.cssText = 'position:fixed;top:50%;right:24px;transform:translateY(-50%);z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:none'
             banner.innerHTML = `<div style="background:linear-gradient(135deg,#1a1f2e,#232941);border:1px solid rgba(99,102,241,0.4);border-radius:16px;padding:16px 20px;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.5);display:flex;gap:12px;align-items:flex-start">
               <div style="width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#6366f1,#818cf8);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">🤖</div>
               <div style="flex:1;min-width:0">
-                <div style="color:#fff;font-size:13px;font-weight:700;margin-bottom:4px">AI Recovery in Progress…</div>
-                <div style="color:#94a3b8;font-size:11px;margin-bottom:8px">Step ${stepNum} failed — attempting autonomous fix</div>
+                <div style="color:#fff;font-size:13px;font-weight:700;margin-bottom:4px">${title}</div>
+                <div style="color:#94a3b8;font-size:11px;margin-bottom:8px">${subtext}</div>
                 <div style="background:rgba(99,102,241,0.12);border-radius:8px;padding:8px 10px;color:#a5b4fc;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${errMsg}</div>
               </div>
             </div>`
             document.body.appendChild(banner)
-          }, { stepNum: i + 1, errMsg: (result.error ?? result.message ?? 'Step failed').slice(0, 80) }).catch(() => {})
+          }, {
+            stepNum: i + 1,
+            errMsg: (result.error ?? result.message ?? 'Step failed').slice(0, 80),
+            title: bannerTitle,
+            subtext: bannerSubtext,
+          }).catch(() => {})
 
           try {
             const pageHtml = await page.evaluate(() =>
@@ -5551,6 +5711,74 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                 stepResults[stepResults.length - 1] = retryResult
                 agentRecovered = true
                 log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via DISMISS_MODAL`)
+              }
+            } else if (recovery.action === 'SKIP_STEP') {
+              // INVALID_FIELD or known-skip scenario: auto-skip the step without HITL
+              // The field doesn't exist on the form — no human intervention can fix this
+              log.info(
+                { executionId, step: step.id, failureType: recovery.failureType, reason: recovery.reason },
+                `[EXEC-AGENT] ⏭ Auto-skipping step ${i + 1} (${recovery.failureType ?? 'SKIP_STEP'})`,
+              )
+              stepResults[stepResults.length - 1] = {
+                ...result,
+                status: 'skipped' as any,
+                message: `⏭ Step auto-skipped: ${recovery.reason ?? 'Field does not exist on this entity'}`,
+                error: recovery.reason ?? result.error,
+              }
+              agentRecovered = true
+            } else if (recovery.action === 'REGENERATE_AND_RETRY') {
+              // INVALID_TEST_DATA: the step value is placeholder/garbage — replace with corrected value and retry
+              const correctedValue = (recovery as any).correctedValue as string | undefined
+              if (correctedValue) {
+                log.info(
+                  { executionId, step: step.id, originalValue: step.value, correctedValue, failureType: recovery.failureType },
+                  `[EXEC-AGENT] 🔄 Retrying step ${i + 1} with corrected value (${recovery.failureType})`,
+                )
+
+                // Update the recovery banner to show the fix
+                await page.evaluate(({ corrected, fieldName }: { corrected: string; fieldName: string }) => {
+                  const banner = document.getElementById('autotest-recovery-banner')
+                  if (banner) {
+                    const msgEl = banner.querySelector('div > div:nth-child(2) > div:last-child') as HTMLElement | null
+                    if (msgEl) msgEl.textContent = `Fixing: "${fieldName}" \u2192 "${corrected}"`
+                    const titleEl = banner.querySelector('div > div:nth-child(2) > div:first-child') as HTMLElement | null
+                    if (titleEl) titleEl.textContent = 'AI Recovery \u2014 Replacing Bad Data\u2026'
+                  }
+                }, { corrected: correctedValue.slice(0, 40), fieldName: (step.target ?? '').slice(0, 30) }).catch(() => {})
+
+                // Create a corrected copy of the step with the new value
+                const correctedStep = { ...step, value: correctedValue }
+                await page.waitForTimeout(500)
+                const retryResult = await executeStep(
+                  page, correctedStep, i, isLastStep, execScreenDir, executionId,
+                  browserContext ?? undefined, projectId, context.projectCategory, context,
+                )
+                if (retryResult.status === 'passed') {
+                  stepResults[stepResults.length - 1] = {
+                    ...retryResult,
+                    message: `✅ Step auto-corrected: value changed from "${(step.value ?? '').slice(0, 20)}" to "${correctedValue.slice(0, 30)}"`,
+                  }
+                  agentRecovered = true
+                  log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via REGENERATE_AND_RETRY (value: "${correctedValue}")`)
+                } else {
+                  log.warn(
+                    { executionId, step: step.id, correctedValue },
+                    `[EXEC-AGENT] ❌ Step ${i + 1} still failed after REGENERATE_AND_RETRY`,
+                  )
+                }
+              } else {
+                // No corrected value available — skip the step
+                log.info(
+                  { executionId, step: step.id, failureType: recovery.failureType },
+                  `[EXEC-AGENT] ⏭ Auto-skipping step ${i + 1} (INVALID_TEST_DATA, no corrected value)`,
+                )
+                stepResults[stepResults.length - 1] = {
+                  ...result,
+                  status: 'skipped' as any,
+                  message: `⏭ Step auto-skipped: ${recovery.reason ?? 'Invalid test data with no replacement available'}`,
+                  error: recovery.reason ?? result.error,
+                }
+                agentRecovered = true
               }
             } else if (recovery.hitlInvoked || recovery.action === 'HITL_INVOKED') {
               agentRecovered = true // already paused via hitlTool
