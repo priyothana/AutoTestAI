@@ -88,14 +88,41 @@ export interface FieldEntry {
   locatorType:  'label' | 'role' | 'placeholder'
 }
 
+/**
+ * A single navigation menu item captured by the crawler from <nav>,
+ * [role="navigation"], sidebar containers, or similar structures.
+ */
+export interface NavigationItem {
+  /** Visible text label (e.g. "Users", "Accounts", "Dashboard") */
+  text:       string
+  /** ARIA role of the element */
+  role:       'link' | 'menuitem' | 'button' | 'treeitem' | 'tab' | 'unknown'
+  /** href if the element is an <a> tag */
+  href?:      string
+  /** aria-label attribute if present */
+  ariaLabel?: string
+  /** Recommended Playwright locator — e.g. "role=link, name=Users" */
+  locator:    string
+}
+
 export interface FieldManifest {
   entityName:    string
   requiredCount: number
   fields:        FieldEntry[]
-  submitButton?: string            // exact button name
+  submitButton?: string            // exact primary action button name (e.g. "+ New Lead")
+  allButtons?:   string[]         // all button names found on the page (verbatim)
   createUrl?:    string
   listUrl?:      string
   editUrl?:      string
+  /** Knowledge Graph: cross-entity relationships — e.g. {"Account": "required_lookup"} */
+  relationships?:  Record<string, string>
+  /** Knowledge Graph: discovered business rules — e.g. {"stage_required": true} */
+  businessRules?:  Record<string, unknown>
+  /**
+   * Navigation menu items captured by the crawler from the app's sidebar/nav.
+   * Used to generate reliable role=link locators for CLICK navigation steps.
+   */
+  navigationItems?: NavigationItem[]
 }
 
 export interface VerifiedUrlMap {

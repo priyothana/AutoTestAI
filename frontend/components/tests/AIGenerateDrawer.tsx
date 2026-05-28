@@ -1,27 +1,31 @@
 "use client"
-import{useState,useRef,useEffect,useCallback}from"react"
-import{Sparkles,X,Loader2,Check,ChevronDown,Layers,Send,ArrowLeft,CheckSquare,Square,GitBranch,Cpu,Zap,RefreshCw}from"lucide-react"
+import{useState,useRef,useEffect}from"react"
+import{Sparkles,X,Loader2,Check,ChevronRight,Layers,Send,ArrowLeft,CheckSquare,Square,GitBranch,Cpu,Zap,RefreshCw,ChevronDown,ChevronUp,GripVertical}from"lucide-react"
 import{Button}from"@/components/ui/button"
 import{Badge}from"@/components/ui/badge"
 import{toast}from"sonner"
 import{Sheet,SheetContent,SheetHeader,SheetTitle,SheetDescription}from"@/components/ui/sheet"
 const API=(process.env.NEXT_PUBLIC_API_URL||"http://localhost:4000")+"/api/v1"
-type Phase="flow"|"refine"|"preview"|"done"
+
+// Types
+type Phase="flow"|"generating"|"review"|"done"
 interface Msg{role:"user"|"assistant";content:string}
-interface TC{id:string;name:string;priority:string;description?:string|null}
+interface TC{id:string;name:string;priority:string;description?:string|null;steps?:unknown[]}
+interface FlowItem{name:string;description:string}
+interface FlowGroup{flow:string;order:number;rationale:string;testCases:(TC&{id?:string})[]}
 interface Props{open:boolean;onClose:()=>void;onGenerationComplete:(ids:string[])=>void}
 
-// ── Priority badge color ─────────────────────────────────────────────────────
+// ── Priority badge ────────────────────────────────────────────────────────────
 function PriBadge({p}:{p:string}){
   const map:Record<string,string>={
-    high:"bg-red-50 text-red-700 border border-red-200",
-    medium:"bg-amber-50 text-amber-700 border border-amber-200",
-    low:"bg-green-50 text-green-700 border border-green-200",
+    high:"bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/30 dark:text-red-400 dark:border-red-800",
+    medium:"bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/30 dark:text-amber-400 dark:border-amber-800",
+    low:"bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/30 dark:text-emerald-400 dark:border-emerald-800",
   }
-  return <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold capitalize ${map[p?.toLowerCase()]??""}`}>{p}</span>
+  return <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold capitalize ${map[p?.toLowerCase()]??"bg-slate-100 text-slate-600"}`}>{p}</span>
 }
 
-// ── AI chat bubble ───────────────────────────────────────────────────────────
+// ── AI chat bubble ────────────────────────────────────────────────────────────
 function AiBubble({content,loading}:{content?:string;loading?:boolean}){
   return(
     <div className="flex gap-2.5 items-start">
@@ -47,9 +51,9 @@ function UserBubble({content}:{content:string}){
   )
 }
 
-// ── Step indicator ───────────────────────────────────────────────────────────
+// ── Step indicator ────────────────────────────────────────────────────────────
 function StepBar({phase}:{phase:Phase}){
-  const steps=[{id:"flow",label:"Select Flow"},{id:"refine",label:"Refine"},{id:"preview",label:"Review"},{id:"done",label:"Done"}]
+  const steps=[{id:"flow",label:"Select Flows"},{id:"generating",label:"Generating"},{id:"review",label:"Review"},{id:"done",label:"Done"}]
   const idx=steps.findIndex(s=>s.id===phase)
   return(
     <div className="flex items-center gap-0 px-6 py-3 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-black/10">
@@ -68,51 +72,105 @@ function StepBar({phase}:{phase:Phase}){
   )
 }
 
+// ── Collapsible FlowGroup card for Review phase ───────────────────────────────
+function FlowGroupCard({
+  group,selectedIds,onToggleTc,onToggleAll,
+}:{
+  group:FlowGroup
+  selectedIds:Set<string>
+  onToggleTc:(id:string)=>void
+  onToggleAll:(ids:string[],val:boolean)=>void
+}){
+  const [open,setOpen]=useState(true)
+  const ids=group.testCases.map(t=>t.id).filter(Boolean) as string[]
+  const selCount=ids.filter(id=>selectedIds.has(id)).length
+  const allSel=ids.length>0&&selCount===ids.length
+  return(
+    <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+      <div
+        role="button" tabIndex={0}
+        onClick={()=>setOpen(v=>!v)}
+        onKeyDown={e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();setOpen(v=>!v)}}}
+        className="w-full flex items-center gap-3 px-4 py-3 bg-gradient-to-r from-violet-50 to-indigo-50/60 dark:from-violet-950/30 dark:to-indigo-950/20 hover:from-violet-100 dark:hover:from-violet-950/50 transition-colors text-left cursor-pointer select-none">
+        <div className="w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-black text-white flex-shrink-0"
+          style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
+          {group.order}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-sm text-slate-800 dark:text-slate-100 truncate">{group.flow}</span>
+            <Badge variant="outline" className="text-[10px] border-violet-300 text-violet-600 dark:border-violet-700 dark:text-violet-400 hidden sm:inline-flex">
+              {selCount}/{ids.length} selected
+            </Badge>
+          </div>
+          {group.rationale&&<p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{group.rationale}</p>}
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={e=>{e.stopPropagation();onToggleAll(ids,!allSel)}}
+            className={`text-[11px] font-semibold px-2.5 py-1 rounded-lg transition-colors ${allSel?"bg-violet-600 text-white":"border border-violet-300 text-violet-600 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-400"}`}>
+            {allSel?"Deselect all":"Select all"}
+          </button>
+          {open?<ChevronUp className="h-4 w-4 text-slate-400"/>:<ChevronDown className="h-4 w-4 text-slate-400"/>}
+        </div>
+      </div>
+      {open&&(
+        <div className="divide-y divide-slate-100 dark:divide-slate-800">
+          {group.testCases.map((tc,i)=>{
+            const sel=tc.id?selectedIds.has(tc.id):false
+            return(
+              <div key={tc.id??i} onClick={()=>tc.id&&onToggleTc(tc.id)}
+                className={`flex items-start gap-3 px-4 py-3 cursor-pointer transition-colors ${sel?"bg-violet-50/50 dark:bg-violet-950/20":"hover:bg-slate-50 dark:hover:bg-slate-900/50"}`}>
+                <div className={`mt-0.5 w-4 h-4 rounded flex items-center justify-center flex-shrink-0 border-2 transition-colors ${sel?"bg-violet-600 border-violet-600":"border-slate-300 dark:border-slate-600"}`}>
+                  {sel&&<Check className="h-2.5 w-2.5 text-white"/>}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className={`text-[12px] font-medium leading-snug ${sel?"text-violet-800 dark:text-violet-200":"text-slate-700 dark:text-slate-300"}`}>{tc.name}</p>
+                  {tc.description&&<p className="text-[11px] text-slate-400 mt-0.5 line-clamp-1">{tc.description}</p>}
+                  {tc.steps&&<p className="text-[10px] text-slate-400 mt-0.5">{(tc.steps as any[]).length} steps</p>}
+                </div>
+                <PriBadge p={tc.priority}/>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 export default function AIGenerateDrawer({open,onClose,onGenerationComplete}:Props){
-  // ── Core state ──────────────────────────────────────────────────────────────
+  // Core state
   const [phase,setPhase]=useState<Phase>("flow")
   const [projectId,setProjectId]=useState("")
   const [projects,setProjects]=useState<{id:string;name:string}[]>([])
   const [projLoading,setProjLoading]=useState(false)
 
-  // Phase 1 — flow selection
-  const [flows,setFlows]=useState<string[]>([])
+  // Phase 1 — multi-select flows
+  const [flows,setFlows]=useState<FlowItem[]>([])
   const [flowsLoading,setFlowsLoading]=useState(false)
-  const [selectedFlow,setSelectedFlow]=useState("")
+  const [selectedFlows,setSelectedFlows]=useState<Set<string>>(new Set())
+  const [customFlowInput,setCustomFlowInput]=useState("")
 
-  // Phase 2 — refinement chat
-  const [refineHistory,setRefineHistory]=useState<Msg[]>([])
-  const [refineInput,setRefineInput]=useState("")
-  const [refineSending,setRefineSending]=useState(false)
-  const [readyToGenerate,setReadyToGenerate]=useState(false)
-  const [workflowScope,setWorkflowScope]=useState<any>(null)
+  // Phase 2 — generating progress
+  const [genProgress,setGenProgress]=useState(0)
+  const [genMessage,setGenMessage]=useState("Initialising…")
 
-  // Phase 3 — preview + filter chat
-  const [testCases,setTestCases]=useState<TC[]>([])
-  const [tcLoading,setTcLoading]=useState(false)
+  // Phase 3 — review
+  const [groups,setGroups]=useState<FlowGroup[]>([])
   const [selectedIds,setSelectedIds]=useState<Set<string>>(new Set())
   const [filterHistory,setFilterHistory]=useState<Msg[]>([])
   const [filterInput,setFilterInput]=useState("")
   const [filterSending,setFilterSending]=useState(false)
-  const [confirming,setConfirming]=useState(false)
-  const [genSteps,setGenSteps]=useState(false)
+  const [approving,setApproving]=useState(false)
 
-  const refineEndRef=useRef<HTMLDivElement>(null)
   const filterEndRef=useRef<HTMLDivElement>(null)
-  const refineInputRef=useRef<HTMLInputElement>(null)
   const filterInputRef=useRef<HTMLInputElement>(null)
 
-  // Auto-scroll chat panels
-  useEffect(()=>{refineEndRef.current?.scrollIntoView({behavior:"smooth"})},[refineHistory,refineSending])
   useEffect(()=>{filterEndRef.current?.scrollIntoView({behavior:"smooth"})},[filterHistory,filterSending])
+  useEffect(()=>{if(phase==="review")setTimeout(()=>filterInputRef.current?.focus(),100)},[phase])
 
-  // Focus inputs when phase changes
-  useEffect(()=>{
-    if(phase==="refine")setTimeout(()=>refineInputRef.current?.focus(),100)
-    if(phase==="preview")setTimeout(()=>filterInputRef.current?.focus(),100)
-  },[phase])
-
-  // ── Load projects ───────────────────────────────────────────────────────────
+  // ── Load projects ──────────────────────────────────────────────────────────
   useEffect(()=>{
     if(!open)return
     setProjLoading(true)
@@ -125,159 +183,94 @@ export default function AIGenerateDrawer({open,onClose,onGenerationComplete}:Pro
 
   // Reset on close
   const handleClose=()=>{
-    setPhase("flow");setSelectedFlow("");setFlows([])
-    setRefineHistory([]);setRefineInput("");setReadyToGenerate(false);setWorkflowScope(null)
-    setTestCases([]);setSelectedIds(new Set());setFilterHistory([]);setFilterInput("")
-    setConfirming(false);setGenSteps(false)
+    setPhase("flow");setFlows([]);setSelectedFlows(new Set());setCustomFlowInput("")
+    setGroups([]);setSelectedIds(new Set());setFilterHistory([]);setFilterInput("")
+    setApproving(false)
     onClose()
   }
 
-  // ── Phase 1: Generate flows ─────────────────────────────────────────────────
+  // ── Phase 1: Discover flows ────────────────────────────────────────────────
   const loadFlows=async()=>{
     if(!projectId){toast.error("Select a project first");return}
-    setFlowsLoading(true);setFlows([]);setSelectedFlow("")
+    setFlowsLoading(true);setFlows([]);setSelectedFlows(new Set())
     try{
       const res=await fetch(`${API}/projects/${projectId}/generate-workflows`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})})
       if(!res.ok)throw new Error("Failed")
       const d=await res.json()
-      setFlows(Array.isArray(d.flows)?d.flows:[])
-    }catch{toast.error("Could not generate flows")}
+      const raw:unknown[]=Array.isArray(d.flows)?d.flows:[]
+      const items:FlowItem[]=raw.map((f:any)=>
+        typeof f==="string"?{name:f,description:""}:{name:f.name??f,description:f.description??""}
+      )
+      setFlows(items)
+    }catch{toast.error("Could not discover flows")}
     finally{setFlowsLoading(false)}
   }
 
-  const handleFlowNext=()=>{
-    if(!selectedFlow){toast.error("Select a business flow");return}
-    setRefineHistory([])
-    setReadyToGenerate(false)
-    setWorkflowScope(null)
-    setPhase("refine")
-    // Kick off first AI message — ask a single high-level optional question
-    setTimeout(()=>sendRefineMsg("__init__"),100)
-  }
+  const toggleFlow=(name:string)=>setSelectedFlows(prev=>{
+    const n=new Set(prev);n.has(name)?n.delete(name):n.add(name);return n
+  })
 
-  // Skip refinement and jump directly to generation with inferred scope
-  const handleSkipToGenerate=async()=>{
-    const scopeFromFlow={
-      flow:selectedFlow,
-      actors:["Application users"],
-      preconditions:["User has valid credentials and application is accessible"],
-      steps:[`Complete the ${selectedFlow} end-to-end workflow`],
-      edgeCases:["Invalid inputs","Session expiry","Concurrent actions"]
+  const addCustomFlow=()=>{
+    const name=customFlowInput.trim()
+    if(!name)return
+    if(flows.some(f=>f.name.toLowerCase()===name.toLowerCase())){
+      setSelectedFlows(prev=>{const n=new Set(prev);n.add(name);return n})
+      setCustomFlowInput("");return
     }
-    setReadyToGenerate(true)
-    setWorkflowScope(scopeFromFlow)
-    // Trigger generation immediately
-    setTcLoading(true);setPhase("preview");setTestCases([]);setSelectedIds(new Set())
-    try{
-      const res=await fetch(`${API}/projects/${projectId}/generate-test-cases`,{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          selectedModule:selectedFlow,
-          count:20,
-          focusAreas:scopeFromFlow.steps,
-        })
-      })
-      if(!res.ok)throw new Error()
-      const d=await res.json()
-      const jobId=d.jobId
-      let done=false;let attempts=0
-      while(!done&&attempts<120){
-        await new Promise(r=>setTimeout(r,2500))
-        attempts++
-        const sr=await fetch(`${API}/projects/${projectId}/generate-test-cases/status/${jobId}`)
-        if(sr.ok){
-          const sd=await sr.json()
-          if(sd.status==="completed"){
-            done=true
-            if(sd.testCaseIds?.length){
-              const br=await fetch(`${API}/tests/bulk-fetch`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:sd.testCaseIds})})
-              if(br.ok){const cases=await br.json();setTestCases(Array.isArray(cases)?cases:[]);setSelectedIds(new Set(cases.map((c:TC)=>c.id)))}
-            }
-          }else if(sd.status==="failed"){done=true;toast.error("Generation failed")}
-        }
-      }
-      if(!done)toast.error("Generation timed out")
-    }catch{toast.error("Failed to generate test cases")}
-    finally{setTcLoading(false)}
+    setFlows(prev=>[...prev,{name,description:"Custom workflow defined by you."}])
+    setSelectedFlows(prev=>{const n=new Set(prev);n.add(name);return n})
+    setCustomFlowInput("")
+    toast.success(`Custom flow "${name}" added`)
   }
 
-  // ── Phase 2: Refinement chat ────────────────────────────────────────────────
-  const sendRefineMsg=async(msg:string)=>{
-    const text=msg.trim();if(!text||refineSending)return
-    setRefineInput("")
-    setRefineSending(true)
-    const userMsg:Msg={role:"user",content:text}
-    const isAuto=text==="__init__"
-    const nextHistory=isAuto?refineHistory:[...refineHistory,userMsg]
-    if(!isAuto)setRefineHistory(nextHistory)
-    const msgToSend=isAuto?`Let's define the test scope for the "${selectedFlow}" flow.`:text
+  // ── Phase 2: Generate test suite for all selected flows ───────────────────
+  const handleGenerate=async()=>{
+    if(selectedFlows.size===0){toast.error("Select at least one flow");return}
+    setPhase("generating");setGenProgress(0);setGenMessage("Ordering flows for optimal execution…")
     try{
-      const res=await fetch(`${API}/projects/${projectId}/workflow-chat`,{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({flow:selectedFlow,history:nextHistory,userMessage:msgToSend})
-      })
-      if(!res.ok)throw new Error("Failed")
-      const d=await res.json()
-      const aMsg:Msg={role:"assistant",content:d.reply}
-      setRefineHistory(prev=>[...prev,aMsg])
-      if(d.readyToGenerate){
-        setReadyToGenerate(true)
-        setWorkflowScope(d.workflowScope)
+      const progressSteps=[
+        [800,20,"Ordering flows for optimal execution…"],
+        [1600,40,"Generating test cases per flow…"],
+        [2400,65,"Grounding test steps in project metadata…"],
+        [1200,80,"Persisting test cases…"],
+      ]
+      let delay=0
+      for(const[ms,pct,msg]of progressSteps){
+        delay+=ms as number
+        setTimeout(()=>{setGenProgress(pct as number);setGenMessage(msg as string)},delay)
       }
-    }catch{setRefineHistory(prev=>[...prev,{role:"assistant",content:"Sorry, something went wrong. Please try again."}])}
-    finally{setRefineSending(false)}
+
+      const res=await fetch(`${API}/projects/${projectId}/generate-test-suite`,{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({flows:Array.from(selectedFlows)})
+      })
+      if(!res.ok)throw new Error("Generation failed")
+      const d:{groups:FlowGroup[];totalTestCases:number}=await res.json()
+
+      setGroups(d.groups)
+      const allIds=new Set(d.groups.flatMap(g=>g.testCases.map(tc=>tc.id).filter(Boolean) as string[]))
+      setSelectedIds(allIds)
+      setGenProgress(100);setGenMessage("Done!")
+      setTimeout(()=>setPhase("review"),600)
+      toast.success(`Generated ${d.totalTestCases} test cases across ${d.groups.length} flows!`)
+    }catch(e:any){
+      toast.error(e?.message??"Generation failed");setPhase("flow")
+    }
   }
 
-  const handleRefineGenerate=async()=>{
-    if(!readyToGenerate&&!workflowScope)return
-    setTcLoading(true);setPhase("preview");setTestCases([]);setSelectedIds(new Set())
-    try{
-      const res=await fetch(`${API}/projects/${projectId}/generate-test-cases`,{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({
-          selectedModule:workflowScope?.flow??selectedFlow,
-          count:20,
-          focusAreas:workflowScope?.steps??[],
-        })
-      })
-      if(!res.ok)throw new Error()
-      const d=await res.json()
-      // Poll for completion
-      const jobId=d.jobId
-      let done=false;let attempts=0
-      while(!done&&attempts<120){
-        await new Promise(r=>setTimeout(r,2500))
-        attempts++
-        const sr=await fetch(`${API}/projects/${projectId}/generate-test-cases/status/${jobId}`)
-        if(sr.ok){
-          const sd=await sr.json()
-          if(sd.status==="completed"){
-            done=true
-            if(sd.testCaseIds?.length){
-              const br=await fetch(`${API}/tests/bulk-fetch`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:sd.testCaseIds})})
-              if(br.ok){const cases=await br.json();setTestCases(Array.isArray(cases)?cases:[]);setSelectedIds(new Set(cases.map((c:TC)=>c.id)))}
-            }
-          }else if(sd.status==="failed"){done=true;toast.error("Generation failed")}
-        }
-      }
-      if(!done)toast.error("Generation timed out")
-    }catch{toast.error("Failed to generate test cases")}
-    finally{setTcLoading(false)}
-  }
+  // ── Phase 3: Filter chat ───────────────────────────────────────────────────
+  const allTcs=groups.flatMap(g=>g.testCases)
 
-  // ── Phase 3: Filter chat ────────────────────────────────────────────────────
-  const sendFilterMsg=async(msg:string)=>{
+  const sendFilter=async(msg:string)=>{
     const text=msg.trim();if(!text||filterSending)return
     setFilterInput("");setFilterSending(true)
-    const uMsg:Msg={role:"user",content:text}
-    setFilterHistory(prev=>[...prev,uMsg])
+    setFilterHistory(prev=>[...prev,{role:"user",content:text}])
     try{
       const res=await fetch(`${API}/projects/${projectId}/filter-test-cases-chat`,{
         method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
-          instruction:text,
-          history:filterHistory.slice(-8),
-          testCases:testCases.map(tc=>({id:tc.id,name:tc.name,priority:tc.priority,description:tc.description})),
+          instruction:text,history:filterHistory.slice(-8),
+          testCases:allTcs.map(tc=>({id:tc.id,name:tc.name,priority:tc.priority,description:tc.description})),
           currentSelectedIds:Array.from(selectedIds),
         })
       })
@@ -290,36 +283,42 @@ export default function AIGenerateDrawer({open,onClose,onGenerationComplete}:Pro
   }
 
   const toggleTc=(id:string)=>setSelectedIds(prev=>{const n=new Set(prev);n.has(id)?n.delete(id):n.add(id);return n})
-  const allSel=testCases.length>0&&selectedIds.size===testCases.length
-  const toggleAll=()=>setSelectedIds(allSel?new Set():new Set(testCases.map(tc=>tc.id)))
+  const toggleGroupAll=(ids:string[],val:boolean)=>setSelectedIds(prev=>{
+    const n=new Set(prev);ids.forEach(id=>val?n.add(id):n.delete(id));return n
+  })
 
+  // ── Approve & generate steps ───────────────────────────────────────────────
   const handleApprove=async()=>{
     if(selectedIds.size===0){toast.error("Select at least one test case");return}
-    setConfirming(true)
+    setApproving(true)
     try{
-      // Delete unselected
-      const toDel=testCases.map(t=>t.id).filter(id=>!selectedIds.has(id))
-      if(toDel.length>0)await fetch(`${API}/tests/bulk-delete`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:toDel})})
-      // Generate steps
-      setGenSteps(true)
-      toast.info(`Generating test steps for ${selectedIds.size} test case${selectedIds.size!==1?"s":""}…`)
+      // Delete unselected test cases
+      const allIds=groups.flatMap(g=>g.testCases.map(t=>t.id).filter(Boolean)) as string[]
+      const toDel=allIds.filter(id=>!selectedIds.has(id))
+      if(toDel.length>0){
+        await fetch(`${API}/tests/bulk-delete`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ids:toDel})})
+      }
+      // Generate Playwright steps for selected
+      toast.info(`Generating Playwright steps for ${selectedIds.size} test cases…`)
       const sr=await fetch(`${API}/projects/${projectId}/generate-steps-for-selected`,{
         method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({testCaseIds:Array.from(selectedIds),selectedModule:selectedFlow})
+        body:JSON.stringify({testCaseIds:Array.from(selectedIds)})
       })
-      if(sr.ok){const sd=await sr.json();toast.success(`✅ ${sd.generated} test case${sd.generated!==1?"s":""} added to Tests!`)}
-      else{toast.success(`✅ ${selectedIds.size} test cases added to Tests!`)}
+      const sData=sr.ok?await sr.json():null
+      if(sData?.generated)toast.success(`✅ ${sData.generated} test cases ready with Playwright steps`)
+      else toast.success(`✅ ${selectedIds.size} test cases added to Tests!`)
       setPhase("done")
       onGenerationComplete(Array.from(selectedIds))
     }catch{toast.error("Failed to add test cases")}
-    finally{setConfirming(false);setGenSteps(false)}
+    finally{setApproving(false)}
   }
 
-  // ── RENDER ──────────────────────────────────────────────────────────────────
+  // ── RENDER ─────────────────────────────────────────────────────────────────
   return(
     <Sheet open={open} onOpenChange={v=>{if(!v)handleClose()}}>
-      <SheetContent side="right" className="w-full sm:w-[560px] sm:max-w-[560px] p-0 flex flex-col overflow-hidden">
+      <SheetContent side="right" className="w-full sm:w-[580px] sm:max-w-[580px] p-0 flex flex-col overflow-hidden">
         <SheetHeader className="sr-only"><SheetTitle>AI Test Generator</SheetTitle></SheetHeader>
+
         {/* Header */}
         <div className="flex-shrink-0 px-6 py-4 border-b border-slate-200 dark:border-slate-800" style={{background:"linear-gradient(135deg,#2e1065 0%,#1e1b4b 50%,#0f172a 100%)"}}>
           <div className="flex items-center justify-between">
@@ -332,25 +331,24 @@ export default function AIGenerateDrawer({open,onClose,onGenerationComplete}:Pro
                   <span className="text-sm font-black tracking-[0.15em] text-white uppercase">AI Test Generator</span>
                   <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/30 text-violet-200 font-semibold border border-violet-500/40">BETA</span>
                 </div>
-                <p className="text-[11px] text-violet-300 mt-0.5">Business Flow Wizard</p>
+                <p className="text-[11px] text-violet-300 mt-0.5">Multi-Flow Test Suite Wizard</p>
               </div>
             </div>
             <button onClick={handleClose} className="p-1.5 rounded-md text-violet-300 hover:text-white hover:bg-white/10 transition-colors"><X className="h-4 w-4"/></button>
           </div>
         </div>
 
-        {/* Phase step bar */}
         <StepBar phase={phase}/>
 
         {/* Scrollable body */}
         <div className="flex-1 overflow-y-auto">
 
-          {/* ── PHASE 1: Flow Selection ── */}
+          {/* ── PHASE 1: Flow Selection (multi-select) ── */}
           {phase==="flow"&&(
             <div className="p-6 space-y-5">
               <div>
-                <h3 className="text-base font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-2"><GitBranch className="h-4 w-4 text-violet-500"/>Select a Business Flow</h3>
-                <p className="text-[12px] text-slate-500 dark:text-slate-400 mt-1">Choose a project, then let AI discover the key end-to-end journeys to test.</p>
+                <h3 className="text-base font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-2"><GitBranch className="h-4 w-4 text-violet-500"/>Select Business Flows</h3>
+                <p className="text-[12px] text-slate-500 dark:text-slate-400 mt-1">Choose a project, discover all end-to-end journeys, then pick the ones you want to test. You can select multiple flows.</p>
               </div>
 
               {/* Project selector */}
@@ -358,216 +356,194 @@ export default function AIGenerateDrawer({open,onClose,onGenerationComplete}:Pro
                 <label className="text-xs font-semibold text-slate-600 dark:text-slate-300 uppercase tracking-wide">Project</label>
                 {projLoading
                   ?<div className="flex items-center gap-2 text-sm text-slate-400 py-2"><Loader2 className="h-4 w-4 animate-spin"/>Loading projects…</div>
-                  :<select value={projectId} onChange={e=>{setProjectId(e.target.value);setFlows([]);setSelectedFlow("")}}
+                  :<select value={projectId} onChange={e=>{setProjectId(e.target.value);setFlows([]);setSelectedFlows(new Set())}}
                       className="w-full px-3 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm text-slate-700 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-transparent transition-all">
                       <option value="">— Choose a project —</option>
                       {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
                     </select>}
               </div>
 
-              {/* Generate flows button */}
+              {/* Discover flows button */}
               {projectId&&(
                 <Button onClick={loadFlows} disabled={flowsLoading} variant="outline" className="w-full border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 gap-2">
                   {flowsLoading?<><Loader2 className="h-4 w-4 animate-spin"/>Discovering flows…</>:<><Zap className="h-4 w-4"/>Discover Business Flows</>}
                 </Button>
               )}
 
-              {/* Flow list */}
+              {/* Multi-select flow cards */}
               {flows.length>0&&(
-                <div className="space-y-2">
-                  <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide">{flows.length} flows discovered — select one</p>
-                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-                    {flows.map((f,i)=>(
-                      <button key={i} onClick={()=>setSelectedFlow(f)}
-                        className={`w-full text-left px-4 py-3 rounded-xl border-2 text-sm transition-all duration-150 flex items-center gap-3 ${selectedFlow===f?"border-violet-500 bg-violet-50 dark:bg-violet-950/40 text-violet-700 dark:text-violet-200 shadow-sm":"border-slate-200 dark:border-slate-700 hover:border-violet-300 dark:hover:border-violet-600 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/50"}`}>
-                        <div className={`w-5 h-5 rounded-full flex-shrink-0 flex items-center justify-center border-2 ${selectedFlow===f?"border-violet-500 bg-violet-500":"border-slate-300 dark:border-slate-600"}`}>
-                          {selectedFlow===f&&<Check className="h-3 w-3 text-white"/>}
-                        </div>
-                        <span className="font-medium">{f}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* CTA */}
-              <Button onClick={handleFlowNext} disabled={!selectedFlow} className="w-full gap-2 text-white shadow-lg" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
-                Continue to Refinement <ChevronDown className="h-4 w-4 rotate-[-90deg]"/>
-              </Button>
-            </div>
-          )}
-
-          {/* ── PHASE 2: Refinement Chat ── */}
-          {phase==="refine"&&(
-            <div className="flex flex-col h-full min-h-0">
-              {/* Flow chip + Skip button */}
-              <div className="px-5 py-3 border-b border-slate-100 dark:border-slate-800 flex items-center gap-2 flex-shrink-0">
-                <button onClick={()=>setPhase("flow")} className="p-1 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"><ArrowLeft className="h-4 w-4"/></button>
-                <div className="flex items-center gap-2 min-w-0 flex-1">
-                  <span className="inline-flex items-center gap-1.5 bg-violet-600 text-white text-[11px] font-semibold px-3 py-1 rounded-full truncate max-w-[220px]"><GitBranch className="h-3 w-3 flex-shrink-0"/>{selectedFlow}</span>
-                </div>
-                <button onClick={handleSkipToGenerate} disabled={refineSending}
-                  className="flex items-center gap-1.5 text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:text-violet-800 dark:hover:text-violet-200 bg-violet-50 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-700 px-3 py-1.5 rounded-lg transition-all hover:bg-violet-100 dark:hover:bg-violet-900/40 flex-shrink-0">
-                  <Sparkles className="h-3 w-3"/>Generate Now
-                </button>
-              </div>
-
-              {/* Chat messages */}
-              <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0">
-                {refineHistory.length===0&&refineSending&&(
-                  <div className="text-center py-6 space-y-2">
-                    <div className="w-10 h-10 rounded-full flex items-center justify-center mx-auto" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}><Cpu className="h-5 w-5 text-white"/></div>
-                    <p className="text-xs text-slate-400">AI is preparing a quick context check…</p>
-                  </div>
-                )}
-                {refineHistory.map((m,i)=>(
-                  <div key={i}>
-                    {m.role==="assistant"?<AiBubble content={m.content}/>:<UserBubble content={m.content}/>}
-                  </div>
-                ))}
-                {refineSending&&refineHistory.length>0&&<AiBubble loading/>}
-                <div ref={refineEndRef}/>
-              </div>
-
-              {/* Ready-to-generate banner */}
-              {readyToGenerate&&(
-                <div className="flex-shrink-0 mx-4 mb-3 p-3 rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/20 flex items-center gap-3">
-                  <Check className="h-4 w-4 text-emerald-600 flex-shrink-0"/>
-                  <p className="text-[12px] text-emerald-700 dark:text-emerald-300 font-medium flex-1">Scope confirmed! Ready to generate test cases.</p>
-                  <Button size="sm" onClick={handleRefineGenerate} className="h-8 text-[11px] gap-1 text-white flex-shrink-0" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
-                    <Sparkles className="h-3 w-3"/>Generate
-                  </Button>
-                </div>
-              )}
-
-              {/* Input + always-visible Generate button */}
-              <div className="flex-shrink-0 border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-black/10">
-                <div className="px-4 pt-3 pb-2 flex gap-2">
-                  <input ref={refineInputRef} value={refineInput} onChange={e=>setRefineInput(e.target.value)}
-                    onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendRefineMsg(refineInput)}}}
-                    disabled={refineSending} placeholder="Add context or just press Generate…"
-                    className="flex-1 px-3 py-2 rounded-lg text-sm border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-transparent text-slate-800 dark:text-slate-200 placeholder-slate-400"/>
-                  <Button size="icon" className="h-9 w-9 flex-shrink-0 rounded-lg text-white" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}
-                    onClick={()=>sendRefineMsg(refineInput)} disabled={!refineInput.trim()||refineSending}>
-                    {refineSending?<Loader2 className="h-4 w-4 animate-spin"/>:<Send className="h-4 w-4"/>}
-                  </Button>
-                </div>
-                {/* Always-visible go-to-next-step button */}
-                <div className="px-4 pb-3">
-                  <Button onClick={readyToGenerate?handleRefineGenerate:handleSkipToGenerate}
-                    disabled={refineSending}
-                    className="w-full gap-2 text-white h-10 text-sm font-semibold shadow-md" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
-                    {refineSending?<><Loader2 className="h-4 w-4 animate-spin"/>Thinking…</>:<><Sparkles className="h-4 w-4"/>Generate Test Cases →</>}
-                  </Button>
-                  <p className="text-[10px] text-center text-slate-400 mt-1.5">You can type context above or jump straight to generation</p>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ── PHASE 3: Preview + Filter Chat ── */}
-          {phase==="preview"&&(
-            <div className="flex flex-col h-full min-h-0">
-              {/* Header bar */}
-              <div className="px-5 py-3 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between flex-shrink-0">
-                <div className="flex items-center gap-2">
-                  <button onClick={()=>setPhase("refine")} className="p-1 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"><ArrowLeft className="h-4 w-4"/></button>
-                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">Review Test Cases</span>
-                </div>
-                {!tcLoading&&testCases.length>0&&(
-                  <Badge variant="outline" className="border-violet-300 text-violet-600 bg-violet-50 dark:bg-violet-950/30 dark:text-violet-300 dark:border-violet-700">
-                    {selectedIds.size} / {testCases.length} selected
-                  </Badge>
-                )}
-              </div>
-
-              {/* Loading state */}
-              {tcLoading&&(
-                <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8">
-                  <div className="relative">
-                    <div className="w-16 h-16 rounded-full flex items-center justify-center" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
-                      <Loader2 className="h-8 w-8 text-white animate-spin"/>
-                    </div>
-                    <div className="absolute inset-0 rounded-full animate-ping opacity-20" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}/>
-                  </div>
-                  <div className="text-center space-y-1">
-                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">Generating test cases…</p>
-                    <p className="text-[11px] text-slate-400">AI is analyzing the workflow scope and creating your test suite.</p>
-                  </div>
-                </div>
-              )}
-
-              {/* Test case list + filter chat */}
-              {!tcLoading&&testCases.length>0&&(
-                <div className="flex-1 overflow-y-auto min-h-0 flex flex-col">
-                  {/* Select-all bar */}
-                  <div className="flex-shrink-0 px-4 py-2.5 border-b border-slate-100 dark:border-slate-800 flex items-center gap-3 bg-slate-50/50 dark:bg-black/10">
-                    <button onClick={toggleAll} className="flex items-center gap-2 text-[12px] font-medium text-slate-600 dark:text-slate-300 hover:text-violet-600 dark:hover:text-violet-400 transition-colors">
-                      {allSel?<CheckSquare className="h-4 w-4 text-violet-600"/>:<Square className="h-4 w-4"/>}
-                      {allSel?"Deselect all":"Select all"}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide">
+                      {flows.length} flows discovered — select flows to test
+                    </p>
+                    <button
+                      onClick={()=>setSelectedFlows(selectedFlows.size===flows.length?new Set():new Set(flows.map(f=>f.name)))}
+                      className="text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:underline">
+                      {selectedFlows.size===flows.length?"Deselect all":"Select all"}
                     </button>
-                    <span className="text-[11px] text-slate-400">{testCases.length} test cases generated</span>
-                    <button onClick={()=>setSelectedIds(new Set(testCases.map(t=>t.id)))} className="ml-auto text-[11px] text-violet-600 dark:text-violet-400 hover:underline flex items-center gap-1"><RefreshCw className="h-3 w-3"/>Reset</button>
                   </div>
 
-                  {/* TC rows */}
-                  <div className="flex-1 overflow-y-auto px-4 py-2 space-y-2">
-                    {testCases.map(tc=>{
-                      const sel=selectedIds.has(tc.id)
+                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                    {flows.map((f,i)=>{
+                      const sel=selectedFlows.has(f.name)
                       return(
-                        <div key={tc.id} onClick={()=>toggleTc(tc.id)}
-                          className={`flex items-start gap-3 px-3 py-2.5 rounded-xl border cursor-pointer transition-all duration-150 ${sel?"border-violet-400 dark:border-violet-600 bg-violet-50/60 dark:bg-violet-950/20":"border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600 bg-white dark:bg-slate-900/50"}`}>
-                          <div className={`mt-0.5 w-4 h-4 rounded flex items-center justify-center flex-shrink-0 border-2 transition-colors ${sel?"bg-violet-600 border-violet-600":"border-slate-300 dark:border-slate-600"}`}>
+                        <button key={i} onClick={()=>toggleFlow(f.name)} type="button"
+                          className={`w-full text-left px-4 py-3 rounded-xl border-2 transition-all duration-150 flex items-start gap-3 ${sel
+                            ?"border-violet-500 bg-violet-50 dark:bg-violet-950/40 shadow-sm shadow-violet-100 dark:shadow-violet-900/20"
+                            :"border-slate-200 dark:border-slate-700 hover:border-violet-300 dark:hover:border-violet-600 hover:bg-violet-50/30 dark:hover:bg-violet-950/10"}`}>
+                          <div className={`mt-0.5 w-5 h-5 rounded flex-shrink-0 flex items-center justify-center border-2 transition-colors ${sel?"bg-violet-600 border-violet-600":"border-slate-300 dark:border-slate-600"}`}>
                             {sel&&<Check className="h-3 w-3 text-white"/>}
                           </div>
                           <div className="flex-1 min-w-0">
-                            <p className={`text-[12px] font-medium leading-snug ${sel?"text-violet-800 dark:text-violet-200":"text-slate-700 dark:text-slate-300"}`}>{tc.name}</p>
-                            {tc.description&&<p className="text-[11px] text-slate-400 mt-0.5 truncate">{tc.description}</p>}
+                            <p className={`text-sm font-semibold leading-snug ${sel?"text-violet-800 dark:text-violet-200":"text-slate-700 dark:text-slate-300"}`}>{f.name}</p>
+                            {f.description&&<p className={`text-[11px] leading-relaxed mt-0.5 ${sel?"text-violet-700/80 dark:text-violet-300/80":"text-slate-400 dark:text-slate-500"}`}>{f.description}</p>}
                           </div>
-                          <PriBadge p={tc.priority}/>
-                        </div>
+                          <GitBranch className={`h-4 w-4 flex-shrink-0 mt-0.5 ${sel?"text-violet-500":"text-slate-300 dark:text-slate-600"}`}/>
+                        </button>
                       )
                     })}
                   </div>
 
-                  {/* AI Filter Chat */}
-                  <div className="flex-shrink-0 border-t border-slate-200 dark:border-slate-800">
-                    {filterHistory.length>0&&(
-                      <div className="max-h-40 overflow-y-auto px-4 py-3 space-y-2.5 bg-slate-50/50 dark:bg-black/10">
-                        {filterHistory.map((m,i)=>(
-                          <div key={i}>{m.role==="assistant"?<AiBubble content={m.content}/>:<UserBubble content={m.content}/>}</div>
-                        ))}
-                        {filterSending&&<AiBubble loading/>}
-                        <div ref={filterEndRef}/>
-                      </div>
-                    )}
-                    <div className="px-4 py-3 bg-slate-50/80 dark:bg-black/10 space-y-2">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5"><Cpu className="h-3 w-3"/>AI Filter — refine selection by natural language</p>
-                      <div className="flex gap-2">
-                        <input ref={filterInputRef} value={filterInput} onChange={e=>setFilterInput(e.target.value)}
-                          onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendFilterMsg(filterInput)}}}
-                          disabled={filterSending} placeholder='e.g. "Keep only High priority" or "Remove login tests"'
-                          className="flex-1 px-3 py-2 rounded-lg text-xs border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-400 text-slate-800 dark:text-slate-200 placeholder-slate-400"/>
-                        <Button size="icon" className="h-9 w-9 flex-shrink-0 rounded-lg text-white" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}
-                          onClick={()=>sendFilterMsg(filterInput)} disabled={!filterInput.trim()||filterSending}>
-                          {filterSending?<Loader2 className="h-3.5 w-3.5 animate-spin"/>:<Send className="h-3.5 w-3.5"/>}
-                        </Button>
-                      </div>
+                  {/* Custom flow input */}
+                  <div className="rounded-xl border-2 border-dashed border-slate-200 dark:border-slate-700 p-4 space-y-3">
+                    <p className="text-xs font-bold text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
+                      <Zap className="h-3.5 w-3.5 text-violet-500"/>Add a custom business flow
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        value={customFlowInput}
+                        onChange={e=>setCustomFlowInput(e.target.value)}
+                        onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addCustomFlow()}}}
+                        placeholder='e.g. "Generate Invoice and Send to Customer"'
+                        className="flex-1 px-3 py-2.5 rounded-lg text-[12px] border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-400 text-slate-800 dark:text-slate-200 placeholder-slate-400"
+                      />
+                      <Button type="button" onClick={addCustomFlow} disabled={!customFlowInput.trim()} variant="outline"
+                        className="flex-shrink-0 gap-1.5 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 font-semibold text-[12px]">
+                        <Check className="h-3.5 w-3.5"/>Add
+                      </Button>
                     </div>
                   </div>
+
+                  {/* Selected flows summary */}
+                  {selectedFlows.size>0&&(
+                    <div className="flex flex-wrap gap-1.5">
+                      {Array.from(selectedFlows).map(name=>(
+                        <span key={name} className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-full bg-violet-100 dark:bg-violet-950/40 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-700">
+                          {name}
+                          <button onClick={()=>toggleFlow(name)} className="hover:text-violet-900 dark:hover:text-violet-100 ml-0.5">
+                            <X className="h-2.5 w-2.5"/>
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
-              {/* Approve footer */}
-              {!tcLoading&&testCases.length>0&&(
-                <div className="flex-shrink-0 px-4 py-3.5 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950">
-                  <Button onClick={handleApprove} disabled={selectedIds.size===0||confirming||genSteps} className="w-full gap-2 text-white h-11 text-sm font-semibold shadow-lg" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
-                    {(confirming||genSteps)?<><Loader2 className="h-4 w-4 animate-spin"/>{genSteps?"Generating steps…":"Processing…"}</>
-                      :<><Sparkles className="h-4 w-4"/>Add {selectedIds.size} Test Case{selectedIds.size!==1?"s":""} to Tests</>}
-                  </Button>
-                  <p className="text-[10px] text-center text-slate-400 mt-1.5">Selected test cases will get Playwright steps generated automatically.</p>
-                </div>
+              {/* CTA */}
+              {selectedFlows.size>0&&(
+                <Button onClick={handleGenerate} className="w-full gap-2 text-white shadow-lg h-12 text-sm font-bold" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
+                  <Sparkles className="h-4 w-4"/>
+                  Generate Test Suite for {selectedFlows.size} flow{selectedFlows.size!==1?"s":""}
+                  <ChevronRight className="h-4 w-4"/>
+                </Button>
               )}
+            </div>
+          )}
+
+          {/* ── PHASE 2: Generating ── */}
+          {phase==="generating"&&(
+            <div className="flex flex-col items-center gap-8 py-20 px-8">
+              <div className="relative">
+                <div className="absolute inset-0 rounded-full animate-ping opacity-15" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}/>
+                <div className="relative w-20 h-20 rounded-full flex items-center justify-center" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
+                  <Loader2 className="h-9 w-9 text-white animate-spin"/>
+                </div>
+              </div>
+              <div className="text-center space-y-2">
+                <p className="text-xl font-black text-slate-800 dark:text-slate-100">Generating your test suite…</p>
+                <p className="text-sm text-slate-500 dark:text-slate-400 max-w-sm">{genMessage}</p>
+              </div>
+              <div className="w-full space-y-2">
+                <div className="flex justify-between text-[11px] text-slate-500">
+                  <span>Progress</span><span>{genProgress}%</span>
+                </div>
+                <div className="h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                  <div className="h-full rounded-full transition-all duration-700" style={{width:`${genProgress}%`,background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}/>
+                </div>
+                <div className="flex flex-wrap gap-1.5 justify-center mt-2">
+                  {Array.from(selectedFlows).map(name=>(
+                    <span key={name} className="text-[10px] px-2 py-0.5 rounded-full bg-violet-100 dark:bg-violet-950/40 text-violet-600 dark:text-violet-300 border border-violet-200 dark:border-violet-700">{name}</span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── PHASE 3: Review & Filter ── */}
+          {phase==="review"&&(
+            <div className="flex flex-col h-full min-h-0">
+              {/* Summary bar */}
+              <div className="flex-shrink-0 px-5 py-3 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <p className="text-sm font-bold text-slate-800 dark:text-slate-100">Review & Filter Test Cases</p>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                    {groups.reduce((s,g)=>s+g.testCases.length,0)} test cases across {groups.length} flows
+                  </p>
+                </div>
+                <Badge variant="outline" className="border-violet-300 text-violet-600 bg-violet-50 dark:bg-violet-950/30 dark:border-violet-700 dark:text-violet-300">
+                  {selectedIds.size} selected
+                </Badge>
+              </div>
+
+              {/* Flow groups */}
+              <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0">
+                {groups.map((group,gi)=>(
+                  <FlowGroupCard key={gi} group={group} selectedIds={selectedIds} onToggleTc={toggleTc} onToggleAll={toggleGroupAll}/>
+                ))}
+
+                {/* AI Filter Chat */}
+                <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+                  <div className="px-4 py-2.5 border-b border-slate-100 dark:border-slate-800 bg-gradient-to-r from-violet-50 to-indigo-50/60 dark:from-violet-950/30 dark:to-indigo-950/20 flex items-center gap-2">
+                    <Cpu className="h-4 w-4 text-violet-500"/>
+                    <span className="text-xs font-bold text-slate-700 dark:text-slate-200">AI Filter Assistant</span>
+                  </div>
+                  <div className="max-h-40 overflow-y-auto px-4 py-3 space-y-3">
+                    {filterHistory.length===0&&(
+                      <p className="text-[11px] text-slate-400 text-center py-2">
+                        Tell me what to keep or remove, e.g. <span className="italic">"Keep only High priority"</span>
+                      </p>
+                    )}
+                    {filterHistory.map((m,i)=>(
+                      <div key={i}>{m.role==="assistant"?<AiBubble content={m.content}/>:<UserBubble content={m.content}/>}</div>
+                    ))}
+                    {filterSending&&<AiBubble loading/>}
+                    <div ref={filterEndRef}/>
+                  </div>
+                  <div className="flex-shrink-0 px-3 py-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-black/10 flex gap-2">
+                    <input ref={filterInputRef} value={filterInput} onChange={e=>setFilterInput(e.target.value)}
+                      onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendFilter(filterInput)}}}
+                      disabled={filterSending} placeholder='e.g. "Remove Low priority tests"'
+                      className="flex-1 px-3 py-2 rounded-lg text-[12px] border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-400 text-slate-800 dark:text-slate-200 placeholder-slate-400"/>
+                    <Button size="icon" className="h-9 w-9 flex-shrink-0 rounded-lg text-white"
+                      style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}
+                      onClick={()=>sendFilter(filterInput)} disabled={!filterInput.trim()||filterSending}>
+                      {filterSending?<Loader2 className="h-3.5 w-3.5 animate-spin"/>:<Send className="h-3.5 w-3.5"/>}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Approve footer */}
+              <div className="flex-shrink-0 px-4 py-3.5 border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950">
+                <Button onClick={handleApprove} disabled={selectedIds.size===0||approving}
+                  className="w-full gap-2 text-white h-11 text-sm font-bold shadow-lg" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
+                  {approving?<><Loader2 className="h-4 w-4 animate-spin"/>Generating steps…</>
+                    :<><Sparkles className="h-4 w-4"/>Approve & Add {selectedIds.size} Test Case{selectedIds.size!==1?"s":""}</>}
+                </Button>
+                <p className="text-[10px] text-center text-slate-400 mt-1.5">Selected test cases will get Playwright steps generated automatically.</p>
+              </div>
             </div>
           )}
 
@@ -590,9 +566,11 @@ export default function AIGenerateDrawer({open,onClose,onGenerationComplete}:Pro
                 <Button onClick={handleClose} className="w-full gap-2 text-white shadow-lg" style={{background:"linear-gradient(135deg,#7c3aed,#4f46e5)"}}>
                   <Check className="h-4 w-4"/>Go to Tests
                 </Button>
-                <Button variant="outline" onClick={()=>{setPhase("flow");setSelectedFlow("");setFlows([]);setRefineHistory([]);setReadyToGenerate(false);setWorkflowScope(null);setTestCases([]);setSelectedIds(new Set());setFilterHistory([])}}
-                  className="w-full gap-2 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30">
-                  <Sparkles className="h-4 w-4"/>Generate Another Flow
+                <Button variant="outline" onClick={()=>{
+                  setPhase("flow");setFlows([]);setSelectedFlows(new Set());setCustomFlowInput("")
+                  setGroups([]);setSelectedIds(new Set());setFilterHistory([])
+                }} className="w-full gap-2 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30">
+                  <Sparkles className="h-4 w-4"/>Generate Another Suite
                 </Button>
               </div>
             </div>

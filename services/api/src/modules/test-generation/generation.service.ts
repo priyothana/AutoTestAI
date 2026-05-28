@@ -45,6 +45,10 @@ import {
   getEntityUrlMap,
   type EntityUrlInfo,
 } from '../webapp/webapp-test-data.service.js'
+import { buildFieldManifest as buildWebAppFieldManifest } from '../ai-agents/tools/metadata-reader.tool.js'
+
+// Layer 1: Structured output schema enforcement
+import { STRUCTURED_OUTPUT_SCHEMA_INSTRUCTION } from '../../shared/types/structured-action.schema.js'
 
 const log = createModuleLogger('test-generation')
 
@@ -55,6 +59,9 @@ const executionQueue = new Queue<ExecutionJob>(QUEUES.EXECUTION, getRedisOptions
 // ─── System Prompts (exact copy from Python ai_service.py) ──────────
 
 const STANDARD_SYSTEM_PROMPT = `
+${STRUCTURED_OUTPUT_SCHEMA_INSTRUCTION}
+
+
 You are an expert QA Automation Engineer specialized in Playwright test automation.
 
 Your task is to convert a natural language test case into a structured Playwright-compatible JSON test definition that can be executed directly by a Playwright runner.
@@ -233,6 +240,9 @@ REMEMBER: The first step MUST be NAVIGATE to the entity page — NEVER to /login
 `
 
 const RAG_SYSTEM_PROMPT = `
+${STRUCTURED_OUTPUT_SCHEMA_INSTRUCTION}
+
+
 You are an expert QA Automation Engineer specialized in Salesforce testing with Playwright.
 
 Your task is to convert a natural language test case into a structured Playwright-compatible JSON test definition, using REAL Salesforce org metadata provided below.
@@ -286,6 +296,9 @@ ALWAYS prefer getByRole and getByLabel over CSS selectors.
 `
 
 const MCP_RAG_SYSTEM_PROMPT = `
+${STRUCTURED_OUTPUT_SCHEMA_INSTRUCTION}
+
+
 You are an expert Salesforce QA Automation Engineer specialized in Playwright test automation with STRICT metadata alignment.
 
 This is a METADATA-DRIVEN GENERATION MODE.
@@ -447,6 +460,9 @@ NEVER generate steps for fields that are NOT in the FIELD MANIFEST.
 // CRM-style CRUD forms, SPAs, and standard HTML form elements.
 
 const WEB_APP_RAG_SYSTEM_PROMPT = `
+${STRUCTURED_OUTPUT_SCHEMA_INSTRUCTION}
+
+
 🚨🚨🚨 STOP — READ THIS ENTIRE PROMPT BEFORE WRITING A SINGLE STEP 🚨🚨🚨
 ================================================================================
 ⚠️  DEEP METADATA ANALYSIS MODE — GROUND EVERY STEP IN REAL CRAWLED DATA  ⚠️
@@ -810,8 +826,9 @@ SUBMIT BUTTON RULES (CRITICAL)
 - NEVER use generic names like "Submit", "Save", or "OK" unless that is the EXACT button name shown in the metadata.
 - NEVER invent a button name by combining entity name + test data (e.g. NEVER write "Create Aero" when entity is Campaign).
 - Example: if metadata shows  ⚡ BUTTON NAME: "Create Opportunity"  — your CLICK step MUST have target: "Create Opportunity", locator_type: "role".
-- If no Submit Buttons section is present for a page, infer the button name from the page entity (e.g. entity "Opportunity" → button "Create Opportunity", entity "Account" → button "Create Account").
-- The button name is ALWAYS "Create [Entity]" or "Save [Entity]" — NEVER "Create [RecordName]" or "Save [RecordName]".
+- If no Submit Buttons section is present for a page, DO NOT invent a button name. Instead: navigate to the list page and use a CLICK step with the exact text visible in the UI (e.g. "⚡ PRIMARY ACTION BUTTON" from the ENTITY ANALYSIS CARD). NEVER assume "Create [Entity]" or "Save [Entity]" — these are likely wrong for custom web apps.
+- The button name comes ONLY from the metadata. If the metadata shows "+ New Lead", use "+ New Lead". If it shows "New Lead", use "New Lead". Never transform or rewrite the button name.
+
 
 -------------------------
 TEST INTENT INSTRUCTIONS
@@ -915,24 +932,34 @@ Each field's value MUST match its expected data type. NEVER cross-assign values:
 • Amount / Currency / Price fields       → MUST be NUMERIC (e.g., "50000", "1000.50")
 • Date / Close Date / Due Date fields    → MUST be DATE format MM/DD/YYYY (e.g., "06/30/2026")
 • Probability / Percentage fields        → MUST be NUMERIC percentage (e.g., "75", "90")
-• Stage / Status fields                  → MUST be a valid STAGE/STATUS option (e.g., "Prospecting", "Closed Won")
-• Account / Contact / Name lookup fields → MUST be ENTITY NAMES (e.g., "Tara", "Acme Corp")
-• Phone / Mobile / Tel / Fax fields      → MUST be a PHONE NUMBER (digits, spaces, dashes, +country code)
+• Stage / Status / State / Phase fields       → MUST be a valid option from the field's picklist (e.g., "Active", "Completed", "Pending", "Approved")
+• Industry / Sector / Vertical / Segment fields → MUST be an INDUSTRY CATEGORY name (e.g., "Technology", "Healthcare", "Finance",
+                                           "Retail", "Manufacturing", "Education", "Consulting", "Banking")
+                                           ❌ NEVER put a person's name (e.g., a test user's name) in an Industry field
+                                           ❌ NEVER put status words (e.g., "Active", "New", "Draft") in an Industry field
+• Lookup / Reference / Name fields           → MUST be a REAL ENTITY NAME that exists in the system (e.g., "Sample Org Ltd", "Global Entity Inc")
+                                           ❌ NEVER put status words (e.g., "Active", "New") in a lookup/name field
+                                           ❌ NEVER put a bare phone number or date in a name/lookup field
+• Phone / Mobile / Tel / Fax fields         → MUST be a PHONE NUMBER (digits, spaces, dashes, +country code)
                                            ✅ e.g., "+1 555-123-4567"  ❌ NOT a URL  ❌ NOT a plain number like "1234343"
-• Website / URL / Link / Homepage fields → MUST be a full URL starting with http:// or https://
-                                           ✅ e.g., "https://www.example.com"  ❌ NOT a phone number  ❌ NOT a plain number
-• Email / E-mail / Mail fields           → MUST be an email address with @ and a domain suffix
+• Website / URL / Link / Homepage fields    → MUST be a full URL starting with http:// or https://
+                                           ✅ e.g., "https://www.example.com"  ❌ NOT a phone number  ❌ NOT a plain number like "823462434234"
+• Email / E-mail / Mail fields              → MUST be an email address with @ and a domain suffix
                                            ✅ e.g., "user@example.com"  ❌ NOT a phone number or URL
 
-❌ NEVER put a person's name (e.g., "Santhosh Sivan") in an Amount field
-❌ NEVER put a date (e.g., "4/29/2026") in a Stage field
-❌ NEVER put a stage value (e.g., "CLOSED_WON") in a Date field
-❌ NEVER put a numeric value (e.g., "30000") in a Contact Name or Website field
-❌ NEVER put a URL (e.g., "www.hsdbf.com") in a Phone / Mobile field
-❌ NEVER put a plain number (e.g., "1234343") in a Website / URL field
+❌ NEVER put a person's name (e.g., a test user's name) in an Amount or Numeric field
+❌ NEVER put a date in a Stage, Status, or Industry field
+❌ NEVER put a status/stage value in an Industry or Lookup/Reference field
+❌ NEVER put a numeric value in a Name or Website field
+❌ NEVER put a URL in a Phone / Mobile field
+❌ NEVER put a plain number (e.g., "823462434234") in a Website / URL field — this is NOT a URL
 
 If the scraped data or sample values show a field→value pair that violates these type rules,
 DISCARD that value and generate a correct type-appropriate value instead.
+For Industry/Sector fields with no metadata options: default to "Technology".
+For Website/URL fields with no metadata: default to "https://www.example.com".
+For Lookup/Reference/Name fields with no data: default to a realistic entity name like "Sample Organization Ltd".
+
 
 -------------------------
 USER-SPECIFIED VALUES (HIGHEST PRIORITY)
@@ -999,7 +1026,7 @@ const SEMANTIC_FIELD_PATTERNS: Array<{ pattern: RegExp; type: SemanticFieldType;
   { pattern: /\b(website|url|link|homepage|web\s*address|site)\b/i,                                        type: 'url',     fallback: 'https://www.example.com' },
   { pattern: /\b(date|dob|birth|expiry|deadline|close\s*date|start\s*date|end\s*date|due\s*date)\b/i,     type: 'date',    fallback: '06/30/2026' },
   { pattern: /\b(amount|price|cost|revenue|budget|salary|value|qty|quantity|number|count|total)\b/i,       type: 'numeric', fallback: '50000' },
-  { pattern: /\b(name|title|full\s*name|first\s*name|last\s*name|company|account\s*name)\b/i,              type: 'name',    fallback: 'Acme Corp' },
+  { pattern: /\b(name|title|full\s*name|first\s*name|last\s*name|company|account\s*name)\b/i,              type: 'name',    fallback: 'Sample Organization Ltd' },
 ]
 
 /** Classify the expected semantic type of a field from its locator label. */
@@ -1076,7 +1103,7 @@ function buildLlm(provider: string, model?: string): BaseChatModel {
   const providerLower = provider.toLowerCase().trim()
 
   if (providerLower === 'openai') {
-    const modelName = model ?? 'gpt-4o-mini'
+    const modelName = model ?? 'gpt-4o'
     return new ChatOpenAI({
       apiKey: process.env.OPENAI_API_KEY,
       model:  modelName,
@@ -2267,89 +2294,163 @@ function extractUserSpecifiedValues(prompt: string): UserSpecifiedValue[] {
 // swapping values between mismatched fields or using sensible defaults.
 
 function validateFieldValueAlignment(steps: Step[]): Step[] {
-  const NUMERIC_FIELDS = /\b(amount|currency|price|cost|total|revenue|quantity|qty|budget|discount|tax|rate|probability|percent|percentage|number|count|weight|balance)\b/i
-  const DATE_FIELDS = /\b(date|close date|start date|end date|due date|created|modified|birth|expiry|deadline|service provided|from|till)\b/i
-  const STAGE_STATUS_FIELDS = /^(stage|status|state|phase|type|category|priority|level|rating|grade|result)$/i
-  const NAME_LOOKUP_FIELDS = /\b(account|contact|customer|company|name|owner|manager|assigned|parent|opportunity|lead|partner|vendor|supplier|bill to|pay to|signed by)\b/i
-  // ── NEW: phone and email field classifiers ──
-  const PHONE_FIELDS = /\b(phone|mobile|cell|tel|telephone|fax|contact number)\b/i
-  const EMAIL_FIELDS = /\b(email|e-mail|mail)\b/i
+  // ── Field type classifiers ───────────────────────────────────────────────────
+  const NUMERIC_FIELDS    = /\b(amount|currency|price|cost|total|revenue|quantity|qty|budget|discount|tax|rate|probability|percent|percentage|number|count|weight|balance|fee|charge|salary|wage|turnover)\b/i
+  const DATE_FIELDS       = /\b(date|close date|start date|end date|due date|created|modified|birth|expiry|deadline|service provided|from|till|valid until|effective|delivery|dispatch|arrival|departure)\b/i
+  const STAGE_STATUS_FIELDS = /^(stage|status|state|phase|type|category|priority|level|rating|grade|result|mode|condition|disposition)$/i
+  // Generic lookup/name patterns — covers CRM, logistics, ERP, HR, healthcare and any other domain
+  const NAME_LOOKUP_FIELDS = /\b(name|owner|manager|assigned|parent|partner|entity|organization|org|group|department|division|location|region|branch|site|facility|warehouse|vessel|carrier|shipper|consignee|vendor|supplier|customer|client|account|contact|person|employee|agent|operator|user|requestor|approver|buyer|seller)\b/i
+  const PHONE_FIELDS      = /\b(phone|mobile|cell|tel|telephone|fax|contact number|mobile number|phone number|landline|hotline|helpdesk)\b/i
+  const EMAIL_FIELDS      = /\b(email|e-mail|mail|inbox|address)\b/i
+  const URL_FIELDS        = /\b(website|url|link|homepage|web address|site|portal|endpoint|api url|base url)\b/i
+  const INDUSTRY_FIELDS   = /\b(industry|sector|vertical|market|domain|field of business|niche|segment|business type)\b/i
 
-  type FieldType = 'numeric' | 'date' | 'stage' | 'name' | 'phone' | 'email' | 'unknown'
+  // Valid industry category values — any value NOT in this set when going into an Industry field is wrong
+  const VALID_INDUSTRY_VALUES = new Set([
+    'Technology', 'Healthcare', 'Finance', 'Education', 'Retail', 'Manufacturing',
+    'Real Estate', 'Transportation', 'Energy', 'Agriculture', 'Media', 'Entertainment',
+    'Government', 'Nonprofit', 'Construction', 'Legal', 'Consulting', 'Hospitality',
+    'Automotive', 'Aerospace', 'Pharmaceuticals', 'Telecommunications', 'Banking',
+    'Insurance', 'Food & Beverage', 'Fashion', 'Sports', 'Travel', 'Software',
+    'IT Services', 'E-Commerce', 'Logistics', 'Marketing', 'Engineering',
+  ])
+  const DEFAULT_INDUSTRY = 'Technology'
+
+  // Type-appropriate canonical fallback values — all domain-neutral
+  const CANONICAL_FALLBACKS: Record<string, string> = {
+    numeric:  '50000',
+    date:     '06/30/2026',
+    stage:    'Active',           // generic status — not CRM-specific "Prospecting"
+    name:     'Sample Organization Ltd',  // generic entity name — not CRM-specific "Acme Corp"
+    phone:    '+1 555-123-4567',
+    email:    'test@example.com',
+    url:      'https://www.example.com',
+    industry: DEFAULT_INDUSTRY,
+  }
+
+  type FieldKind = 'numeric' | 'date' | 'stage' | 'name' | 'phone' | 'email' | 'url' | 'industry' | 'unknown'
 
   const isNumericValue = (v: string) => /^[\d,]+\.?\d*$/.test(v.replace(/[\s$€£¥₹%]/g, ''))
-  const isDateValue = (v: string) => /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(v) || /^\d{4}-\d{2}-\d{2}/.test(v)
-  const isStageValue = (v: string) => /^[A-Z][A-Z_]+$/.test(v) || /^(open|closed|won|lost|new|pending|active|inactive|qualified|converted|prospecting|negotiation|proposal)/i.test(v)
-  // ── NEW: phone and email value detectors ──
-  const isPhoneValue = (v: string) => /^[+\d][\d\s\-().]{6,}$/.test(v.trim())
-  const isEmailValue = (v: string) => /@/.test(v) && /\.[a-z]{2,}$/i.test(v.trim())
+  const isDateValue    = (v: string) => /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(v) || /^\d{4}-\d{2}-\d{2}/.test(v)
+  const isStageValue   = (v: string) => /^[A-Z][A-Z_]+$/.test(v) || /^(open|closed|won|lost|new|pending|active|inactive|qualified|converted|prospecting|negotiation|proposal)/i.test(v)
+  const isPhoneValue   = (v: string) => /^[+\d][\d\s\-().]{6,}$/.test(v.trim()) && !v.includes('@') && !v.startsWith('http')
+  const isEmailValue   = (v: string) => /@/.test(v) && /\.[a-z]{2,}$/i.test(v.trim())
+  const isUrlValue     = (v: string) => /^https?:\/\//i.test(v) || /^www\./i.test(v)
+  const isPersonName   = (v: string) => /^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$/.test(v.trim()) && v.split(' ').length <= 4
+  const isPureNumber   = (v: string) => /^\d{5,}$/.test(v.trim())  // bare digits with no formatting
 
-  function classifyFieldType(name: string): FieldType {
+  function classifyFieldKind(name: string): FieldKind {
     const clean = name.replace(/[^a-zA-Z\s]/g, '').trim()
-    // Check phone/email BEFORE name — "Contact Number" should be phone, not name
-    if (PHONE_FIELDS.test(clean)) return 'phone'
-    if (EMAIL_FIELDS.test(clean)) return 'email'
-    if (NUMERIC_FIELDS.test(clean)) return 'numeric'
-    if (DATE_FIELDS.test(clean)) return 'date'
+    if (PHONE_FIELDS.test(clean))       return 'phone'
+    if (EMAIL_FIELDS.test(clean))       return 'email'
+    if (URL_FIELDS.test(clean))         return 'url'
+    if (INDUSTRY_FIELDS.test(clean))    return 'industry'
+    if (NUMERIC_FIELDS.test(clean))     return 'numeric'
+    if (DATE_FIELDS.test(clean))        return 'date'
     if (STAGE_STATUS_FIELDS.test(clean)) return 'stage'
     if (NAME_LOOKUP_FIELDS.test(clean)) return 'name'
     return 'unknown'
   }
 
-  function classifyValueType(value: string): FieldType {
-    // Check email BEFORE phone — emails can start with digits
-    if (isEmailValue(value)) return 'email'
-    if (isPhoneValue(value)) return 'phone'
-    if (isNumericValue(value)) return 'numeric'
-    if (isDateValue(value)) return 'date'
-    if (isStageValue(value)) return 'stage'
-    // Name heuristic: starts with uppercase letter, is not a number/date/stage
-    if (/^[A-Z][a-z]/.test(value) && !isNumericValue(value) && !isDateValue(value)) return 'name'
-    return 'unknown'
+  function isValueValidForKind(value: string, kind: FieldKind): boolean {
+    const v = value.trim()
+    switch (kind) {
+      case 'phone':    return isPhoneValue(v)
+      case 'email':    return isEmailValue(v)
+      case 'url':      return isUrlValue(v) && !isPureNumber(v)
+      case 'industry': return VALID_INDUSTRY_VALUES.has(v)
+      case 'numeric':  return isNumericValue(v)
+      case 'date':     return isDateValue(v)
+      case 'stage':    return isStageValue(v)
+      case 'name':
+        // A name field must NOT contain pure status words (Prospect, Active, Closed) or
+        // a bare number — it should be a real entity/company name
+        if (isStageValue(v) && !isPersonName(v)) return false
+        if (isPureNumber(v)) return false
+        return true
+      default:         return true  // unknown type — do not touch
+    }
+  }
+
+  function fixValueForKind(fieldName: string, badValue: string, kind: FieldKind): string {
+    // For URL fields: bare number like "823462434234" → "https://www.example.com"
+    if (kind === 'url' && isPureNumber(badValue)) {
+      log.warn(`[GEN] validateFieldValueAlignment: Website field "${fieldName}" has pure number "${badValue}" → https://www.example.com`)
+      return 'https://www.example.com'
+    }
+    // For Industry fields: a person's name like "Tara" → "Technology"
+    if (kind === 'industry' && !VALID_INDUSTRY_VALUES.has(badValue)) {
+      log.warn(`[GEN] validateFieldValueAlignment: Industry field "${fieldName}" has invalid value "${badValue}" → ${DEFAULT_INDUSTRY}`)
+      return DEFAULT_INDUSTRY
+    }
+    // For lookup/name fields: a bare status word → generic entity name
+    if (kind === 'name' && isStageValue(badValue) && !isPersonName(badValue)) {
+      log.warn(`[GEN] validateFieldValueAlignment: Lookup/Name field "${fieldName}" has status value "${badValue}" → Sample Organization Ltd`)
+      return 'Sample Organization Ltd'
+    }
+    // For phone fields: URL or email → canonical phone
+    if (kind === 'phone' && (isUrlValue(badValue) || isEmailValue(badValue))) {
+      log.warn(`[GEN] validateFieldValueAlignment: Phone field "${fieldName}" has non-phone value "${badValue}" → +1 555-123-4567`)
+      return '+1 555-123-4567'
+    }
+    // For email fields: phone or URL → canonical email
+    if (kind === 'email' && !isEmailValue(badValue)) {
+      log.warn(`[GEN] validateFieldValueAlignment: Email field "${fieldName}" has non-email value "${badValue}" → test@example.com`)
+      return 'test@example.com'
+    }
+    // Default: use canonical fallback
+    const fallback = CANONICAL_FALLBACKS[kind] ?? ''
+    if (fallback) {
+      log.warn(`[GEN] validateFieldValueAlignment: Field "${fieldName}" (kind=${kind}) has wrong value "${badValue}" → "${fallback}"`)
+    }
+    return fallback || badValue
   }
 
   interface MismatchInfo {
     stepIndex: number
     fieldName: string
     currentValue: string
-    expectedType: FieldType
-    actualType: FieldType
+    expectedKind: FieldKind
   }
 
   const mismatches: MismatchInfo[] = []
 
   for (let i = 0; i < steps.length; i++) {
-    const step = steps[i]
+    const step   = steps[i]
     const action = (step.action ?? '').toUpperCase()
     if (action !== 'TYPE' && action !== 'SELECT' && action !== 'LOOKUP') continue
 
     const fieldName = String(step.target ?? '')
-    const value = String(step.value ?? '')
+    const value     = String(step.value ?? '')
     if (!fieldName || !value) continue
 
-    const expectedType = classifyFieldType(fieldName)
-    const actualType = classifyValueType(value)
+    const expectedKind = classifyFieldKind(fieldName)
+    if (expectedKind === 'unknown') continue   // no type constraint — leave alone
 
-    if (expectedType !== 'unknown' && actualType !== 'unknown' && expectedType !== actualType) {
-      mismatches.push({ stepIndex: i, fieldName, currentValue: value, expectedType, actualType })
+    if (!isValueValidForKind(value, expectedKind)) {
+      mismatches.push({ stepIndex: i, fieldName, currentValue: value, expectedKind })
     }
   }
 
   if (mismatches.length === 0) return steps
 
-  log.warn(`[GEN] Field-value misalignment detected: ${mismatches.length} fields have wrong value types`)
+  log.warn(`[GEN] Field-value misalignment: ${mismatches.length} field(s) have wrong value types`)
   for (const m of mismatches) {
-    log.warn(`[GEN]   Field "${m.fieldName}" expects ${m.expectedType} but got ${m.actualType}: "${m.currentValue}"`)
+    log.warn(`[GEN]   Field "${m.fieldName}" (expects ${m.expectedKind}) has bad value: "${m.currentValue}"`)
   }
 
-  // Strategy 1: Swap partners — if field A expects X but has Y, and field B expects Y but has X
+  // ── Strategy 1: Swap partner steps (e.g. Phone↔Email values transposed) ──
   const swapped = new Set<number>()
   for (const m1 of mismatches) {
     if (swapped.has(m1.stepIndex)) continue
     for (const m2 of mismatches) {
       if (m1.stepIndex === m2.stepIndex || swapped.has(m2.stepIndex)) continue
-      if (m1.expectedType === m2.actualType && m2.expectedType === m1.actualType) {
-        log.info(`[GEN] Swapping: "${m1.fieldName}" ↔ "${m2.fieldName}" ("${m1.currentValue}" ↔ "${m2.currentValue}")`)
+      const m2Kind = classifyFieldKind(String(steps[m2.stepIndex].target ?? ''))
+      // Check if swapping would fix both
+      const m1ValFitsM2 = isValueValidForKind(m1.currentValue, m2Kind)
+      const m2ValFitsM1 = isValueValidForKind(String(steps[m2.stepIndex].value ?? ''), m1.expectedKind)
+      if (m1ValFitsM2 && m2ValFitsM1) {
+        log.info(`[GEN] Swap fix: "${m1.fieldName}" ↔ "${steps[m2.stepIndex].target}" ("${m1.currentValue}" ↔ "${steps[m2.stepIndex].value}")`)
         const temp = steps[m1.stepIndex].value
         steps[m1.stepIndex].value = steps[m2.stepIndex].value
         steps[m2.stepIndex].value = temp
@@ -2360,49 +2461,142 @@ function validateFieldValueAlignment(steps: Step[]): Step[] {
     }
   }
 
-  // Strategy 2: Look for a matching value already present in another step
-  // e.g. if the email value "x@y.com" is in the Phone step, but a phone value "+91..."
-  // is sitting in the Email step — swap them even if only one side was flagged.
+  // ── Strategy 2: For remaining mismatches, replace with type-correct fallback ──
   for (const m of mismatches) {
     if (swapped.has(m.stepIndex)) continue
-    // Scan all TYPE/SELECT steps for a value that matches the expected type
-    for (let j = 0; j < steps.length; j++) {
-      if (j === m.stepIndex || swapped.has(j)) continue
-      const otherAction = (steps[j].action ?? '').toUpperCase()
-      if (otherAction !== 'TYPE' && otherAction !== 'SELECT') continue
-      const otherVal = String(steps[j].value ?? '')
-      if (!otherVal) continue
-      const otherValType = classifyValueType(otherVal)
-      const otherFieldType = classifyFieldType(String(steps[j].target ?? ''))
-      // If the other step has the value type we need AND its field expects our value type → swap
-      if (otherValType === m.expectedType && otherFieldType === m.actualType) {
-        log.info(`[GEN] Cross-fix swap: "${m.fieldName}" ↔ "${steps[j].target}" ("${m.currentValue}" ↔ "${otherVal}")`)
-        const temp = steps[m.stepIndex].value
-        steps[m.stepIndex].value = steps[j].value
-        steps[j].value = temp
-        swapped.add(m.stepIndex)
-        swapped.add(j)
-        break
-      }
-    }
-  }
-
-  // Strategy 3: Generate sensible defaults for remaining mismatches
-  const DEFAULTS: Record<string, string> = {
-    numeric: '50000', date: '06/30/2026', stage: 'Prospecting', name: 'Test Record',
-    phone: '+1 555-0100', email: 'test@example.com',
-  }
-  for (const m of mismatches) {
-    if (swapped.has(m.stepIndex)) continue
-    const defaultVal = DEFAULTS[m.expectedType]
-    if (defaultVal) {
-      log.info(`[GEN] Replacing mismatched "${m.fieldName}": "${m.currentValue}" → "${defaultVal}" (expected ${m.expectedType}, got ${m.actualType})`)
-      steps[m.stepIndex].value = defaultVal
-    }
+    steps[m.stepIndex].value = fixValueForKind(m.fieldName, m.currentValue, m.expectedKind)
   }
 
   return steps
 }
+
+
+/**
+ * Universal field-existence filter — removes TYPE/SELECT/LOOKUP steps that
+ * reference fields which do NOT exist on the real form.
+ *
+ * Called alongside validateFieldValueAlignment() to ensure both:
+ *   1. Field values have correct data types (phone in phone field, etc.)
+/**
+ * Post-generation safety net — ensures step quality at the API boundary:
+ *   1. Steps use valid action names
+ *   2. Fields actually EXIST on the form (no hallucinated "Email" on Account)
+ *   3. CLICK steps don't target buttons for a DIFFERENT entity
+ *      (no "+ New Lead" button in an Account test)
+ *
+ * Uses buildFieldManifest (same as Check 7 in runTestStepGeneratorAgent)
+ * to load the real field inventory from crawler/metadata.
+ *
+ * @returns filtered steps — hallucinated field steps AND cross-entity clicks removed
+ */
+async function filterNonExistentFieldSteps(
+  steps: Step[],
+  projectId: string,
+  entityHint?: string,
+): Promise<Step[]> {
+  try {
+    const manifest = await buildWebAppFieldManifest(projectId, entityHint)
+
+    let filtered = [...steps]
+
+    // ── Part A: Filter hallucinated field steps ──────────────────────────────
+    if (manifest && manifest.fields.length > 0) {
+      // Normalize field labels: strip trailing '*', '(required)', etc. that live scrape may add
+      const normalizeLabel = (s: string) =>
+        s.toLowerCase()
+         .replace(/\s*\*+\s*$/, '')       // trailing asterisk(s): "PRODUCT NAME *" → "product name"
+         .replace(/\s*\(required\)\s*$/i, '') // "(required)" suffix
+         .replace(/\s*\[required\]\s*$/i, '') // "[required]" suffix
+         .replace(/\s*required\s*$/i, '')     // trailing "required"
+         .trim()
+
+      const knownFieldLabels = new Set(
+        manifest.fields.map(f => normalizeLabel(f.label))
+      )
+      const FIELD_ACTIONS = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
+
+      const beforeFieldFilter = filtered.length
+      filtered = filtered.filter(s => {
+        const action = (s.action ?? '').toUpperCase()
+        if (!FIELD_ACTIONS.has(action)) return true  // keep non-field steps (NAVIGATE, CLICK, etc.)
+        const target = (s.target ?? '').trim()
+        if (!target) return true
+        const normTarget = normalizeLabel(target)
+        if (knownFieldLabels.has(normTarget)) return true  // field exists in manifest
+
+        // Field NOT in manifest → hallucinated → remove
+        log.warn(
+          `[GEN] filterNonExistentFieldSteps: Removing step "${action} → ${target}" (normalized: "${normTarget}") — ` +
+          `field does NOT exist in the ${entityHint ?? 'entity'} form. ` +
+          `Known fields: ${manifest.fields.map(f => f.label).join(', ')}`
+        )
+        return false
+      })
+
+
+      if (filtered.length < beforeFieldFilter) {
+        log.info(
+          `[GEN] filterNonExistentFieldSteps: removed ${beforeFieldFilter - filtered.length} hallucinated field steps ` +
+          `(${filtered.length} remaining) for entity "${entityHint ?? 'unknown'}"`
+        )
+      }
+    }
+
+    // ── Part B: Filter cross-entity CLICK buttons ───────────────────────────
+    // Catches steps like CLICK "+ New Lead" in an Account test.
+    // A CLICK target containing "new/create/add <Entity>" where <Entity> ≠ entityHint
+    // is a cross-entity contamination from sidebar navigation buttons.
+    if (entityHint && entityHint.length > 2) {
+      const entityHintLower = entityHint.toLowerCase()
+      const beforeClickFilter = filtered.length
+
+      filtered = filtered.filter(s => {
+        const action = (s.action ?? '').toUpperCase()
+        if (action !== 'CLICK') return true  // only filter CLICK steps
+
+        const target = (s.target ?? '').toLowerCase().trim()
+        if (!target) return true
+
+        // Detect "new/create/add <entity>" pattern in the click target
+        const entityWordMatch = target.match(/\b(?:new|create|add)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+        if (!entityWordMatch) return true  // no entity word pattern → keep
+
+        const entityWord = entityWordMatch[1].trim()
+        // Skip short/generic words
+        if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
+
+        // Check if the entity word matches our target entity
+        if (entityHintLower.includes(entityWord) || entityWord.includes(entityHintLower)) return true  // correct entity → keep
+
+        // Entity word does NOT match → cross-entity contamination → remove
+        log.warn(
+          `[GEN] filterNonExistentFieldSteps: Removing CLICK step "CLICK → ${s.target}" — ` +
+          `this button is for "${entityWord}", not for "${entityHint}". ` +
+          `Cross-entity button contamination from sidebar/navigation.`
+        )
+        return false
+      })
+
+      if (filtered.length < beforeClickFilter) {
+        log.info(
+          `[GEN] filterNonExistentFieldSteps: removed ${beforeClickFilter - filtered.length} cross-entity CLICK steps ` +
+          `for entity "${entityHint}"`
+        )
+      }
+    }
+
+    // Re-number remaining steps if any were removed
+    if (filtered.length < steps.length) {
+      filtered = filtered.map((s, i) => ({ ...s, id: String(i + 1) }))
+    }
+
+    return filtered
+  } catch (err) {
+    log.warn({ err }, '[GEN] filterNonExistentFieldSteps failed (non-critical) — returning original steps')
+    return steps
+  }
+}
+
 
 /**
  * Formats test data into a compact LLM-ready string tailored to the test intent.
@@ -2686,6 +2880,7 @@ function buildEntityAnalysisHeader(
     ticket:       [{ locator: 'Account', hint: 'Acme Corp' }],
     proposal:     [{ locator: 'Opportunity', hint: 'New Business Deal' }],
     subscription: [{ locator: 'Account', hint: 'Acme Corp' }],
+    product:      [{ locator: 'Name', hint: 'Sample Product' }, { locator: 'Currency', hint: 'USD' }],
   }
 
   // ── Build field catalog from primaryPage (or all pages merged) ───────
@@ -2797,11 +2992,20 @@ function buildEntityAnalysisHeader(
   const reqInputs = inputs.filter(i => Boolean(i['required']))
   const optInputs = inputs.filter(i => !Boolean(i['required']))
 
-  for (const inp of reqInputs) {
+  // For CREATE tests where the crawler found no required fields: promote all
+  // available inputs so the LLM knows it must fill the form fields.
+  const isCreateTest = testIntent === 'create' || testIntent === 'general'
+  const effectiveReqInputs = (reqInputs.length === 0 && syntheticLookups.length === 0 && inputs.length > 0 && isCreateTest)
+    ? inputs.slice(0, 8)
+    : reqInputs
+  const effectiveOptInputs = (effectiveReqInputs !== reqInputs) ? [] : optInputs
+
+  for (const inp of effectiveReqInputs) {
     const loc  = String(inp['locator'] ?? inp['name'] ?? '')
     const lt   = String(inp['locator_type'] ?? 'label')
     const isLookup = /\b(account|contact|owner|parent|manager|assigned|lead|opportunity|vendor|customer|partner|related\s*to|bill\s*to|ship\s*to)\b/i.test(loc)
-    const tag  = isLookup ? '🔥 REQUIRED LOOKUP ' : '🔥 REQUIRED INPUT  '
+    const isPromoted = effectiveReqInputs !== reqInputs
+    const tag  = isLookup ? '🔥 REQUIRED LOOKUP ' : (isPromoted ? '🔥 FILL (create form)' : '🔥 REQUIRED INPUT  ')
     const sample = sampleFor(loc) ?? (isLookup ? 'Acme Corp' : '')
     const sampleStr = sample ? `  → sample: "${sample}"` : ''
     card.push(`   ${tag} "${loc}"  locator_type: ${lt}${sampleStr}`)
@@ -2831,8 +3035,8 @@ function buildEntityAnalysisHeader(
     }
   }
 
-  // Optional inputs (up to 6)
-  for (const inp of optInputs.slice(0, 6)) {
+  // Optional inputs (up to 6) — only show when not already promoted to required
+  for (const inp of effectiveOptInputs.slice(0, 6)) {
     const loc    = String(inp['locator'] ?? inp['name'] ?? '')
     const lt     = String(inp['locator_type'] ?? 'label')
     const sample = sampleFor(loc)
@@ -2856,7 +3060,7 @@ function buildEntityAnalysisHeader(
   // Submit buttons
   const ACTION_MENU_NAMES = /^(more|actions?|options?|settings?)$/i
   const SUBMENU_ACTIONS   = /^(delete|remove|archive|clone|duplicate|deactivate|disable|export)$/i
-  const SUBMIT_VERBS      = /create|save|submit|add|update|delete|change|apply|confirm|done|finish|complete|more|action/i
+  const SUBMIT_VERBS      = /create|save|submit|add|new|update|delete|change|apply|confirm|done|finish|complete|more|action/i
 
   const submitBtns = buttons.filter(b => {
     const n = String(b['name'] ?? '').toLowerCase()
@@ -2878,6 +3082,7 @@ function buildEntityAnalysisHeader(
           ?? submitBtns.find(b => !ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()) && !SUBMENU_ACTIONS.test(String(b['name'] ?? '').trim()))
       }
       return submitBtns.find(b => /create|add|submit/i.test(String(b['name'] ?? '')))
+        ?? submitBtns.find(b => /^\+\s*new|\bnew\s+/i.test(String(b['name'] ?? '')))
         ?? submitBtns.find(b => /save/i.test(String(b['name'] ?? '')))
         ?? submitBtns.find(b => !ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()) && !SUBMENU_ACTIONS.test(String(b['name'] ?? '').trim()))
     })()
@@ -3119,10 +3324,11 @@ async function buildWebAppStructuredContext(
         const submitBtns = buttons.filter(b => {
           const n = String(b['name'] ?? '').toLowerCase()
           return n.includes('create') || n.includes('save')   || n.includes('submit')
-              || n.includes('add')    || n.includes('update') || n.includes('delete')
+              || n.includes('add')    || n.includes('new')    || n.includes('update') || n.includes('delete')
               || n.includes('change') || n.includes('apply')  || n.includes('confirm')
               || n.includes('done')   || n.includes('finish')  || n.includes('complete')
         })
+
 
         // ── Inject synthetic required lookup fields for known entity relationships ──
         // The HTML crawler cannot detect custom lookup/combobox widgets that don't use
@@ -3143,6 +3349,7 @@ async function buildWebAppStructuredContext(
           ticket:       [{ locator: 'Account', hint: 'Acme Corp' }],
           proposal:     [{ locator: 'Opportunity', hint: 'New Business Deal' }],
           subscription: [{ locator: 'Account', hint: 'Acme Corp' }],
+          product:      [{ locator: 'Name', hint: 'Sample Product' }, { locator: 'Currency', hint: 'USD' }],
         }
         // Determine entity from path: /opportunity/new → 'opportunity'
         const pathEntity = path.split('/').filter(s => s && !/^(new|create|add|edit|list|index|all|\d+)$/i.test(s)).slice(-1)[0]?.toLowerCase() ?? ''
@@ -3151,7 +3358,24 @@ async function buildWebAppStructuredContext(
         const existingLocators = new Set(reqInputs.map(i => String(i['locator'] ?? '').toLowerCase()))
         const syntheticLookups = knownLookups.filter(l => !existingLocators.has(l.locator.toLowerCase()))
 
-        if (reqInputs.length === 0 && reqSelects.length === 0 && syntheticLookups.length === 0) continue
+        // ── Fallback for CREATE pages where the crawler found no required fields ──
+        // When a create form has all inputs marked required:false (common with modern
+        // SPAs that handle validation client-side), reqInputs is empty and the page
+        // is skipped — leaving the LLM with no field grounding.
+        // Fix: for CREATE pages (/new, /create, /add), promote ALL inputs to
+        // implicitly-required so the LLM knows what form fields exist.
+        const isCreatePagePath = /\/(new|create|add|form)(\/.*)?(\?|$)/i.test(path)
+        let effectiveReqInputs = reqInputs
+        if (isCreatePagePath && reqInputs.length === 0 && inputs.length > 0 && syntheticLookups.length === 0) {
+          // Use all available inputs as implicit required fields for the grounding table
+          effectiveReqInputs = inputs.slice(0, 8)  // cap at 8 to avoid token overload
+          log.info(
+            { path, inputCount: inputs.length },
+            '[GEN] buildRequiredFieldsSummary: CREATE page has no marked-required fields — promoting all inputs as implicit required'
+          )
+        }
+
+        if (effectiveReqInputs.length === 0 && reqSelects.length === 0 && syntheticLookups.length === 0) continue
 
         const pageLines: string[] = []
         pageLines.push(`  Create Page: ${path}`)
@@ -3162,18 +3386,23 @@ async function buildWebAppStructuredContext(
         let stepNum = 2  // step 1 is always NAVIGATE
         let lookupCount = 0
 
-        for (const inp of reqInputs) {
+        for (const inp of effectiveReqInputs) {
           const locator     = String(inp['locator'] ?? inp['name'] ?? '')
           const locatorType = String(inp['locator_type'] ?? 'label')
           const isLookup = /\b(account|contact|owner|parent|manager|assigned|lead|opportunity|vendor|customer|partner|report\s*to|bill\s*to|ship\s*to|related\s*to)\b/i.test(locator)
           const action   = isLookup ? 'LOOKUP ' : 'TYPE   '
           const sampleVal = resolveSampleValue(locator, path)
+          const isImplicit = effectiveReqInputs !== reqInputs  // promoted from optional
           const valueHint = sampleVal
             ? `"${sampleVal}"`
             : isLookup
               ? '"Acme Corp" (or real record name)'
               : '"<realistic value>"'
-          const prefix = isLookup ? '🔥 REQUIRED LOOKUP' : '  [REQUIRED]       '
+          const prefix = isLookup
+            ? '🔥 REQUIRED LOOKUP'
+            : isImplicit
+              ? '  [FILL — form field]'
+              : '  [REQUIRED]       '
           if (isLookup) lookupCount++
           pageLines.push(`  │ Step ${stepNum++} │ ${action} │ ${prefix} "${locator}" (locator_type: "${locatorType}") │ → ${valueHint} │`)
         }
@@ -3347,12 +3576,13 @@ async function buildWebAppStructuredContext(
         const submitBtns = buttons.filter(b => {
           const n = String(b['name'] ?? '').toLowerCase()
           return n.includes('create') || n.includes('save')   || n.includes('submit')
-              || n.includes('add')    || n.includes('update') || n.includes('delete')
+              || n.includes('add')    || n.includes('new')    || n.includes('update') || n.includes('delete')
               || n.includes('change') || n.includes('apply')  || n.includes('confirm')
               || n.includes('done')   || n.includes('finish')  || n.includes('complete')
               || n.includes('more')   || n.includes('action')  || n.includes('clone')
               || n.includes('remove') || n.includes('archive')
         })
+
 
         // ── Detect action-menu structure ─────────────────────────────────────
         // If there is a "More" / "Actions" / "Options" button on the page AND
@@ -3426,12 +3656,73 @@ function buildWebAppRagContext(chunks: string[]): string {
 
 // ── Normalise LLM output to GenerateResponse shape ───────────────────
 
+// ── Canonical action name map ─────────────────────────────────────────────────
+// AI models (especially non-gpt-4o) sometimes emit non-standard action names.
+// Map them to the canonical names understood by the execution worker.
+const ACTION_ALIASES: Record<string, string> = {
+  // TYPE aliases — most common hallucination is FILL_FORM
+  fill_form:     'TYPE',
+  fillform:      'TYPE',
+  fill_field:    'TYPE',
+  fillfield:     'TYPE',
+  enter:         'TYPE',
+  enter_text:    'TYPE',
+  set:           'TYPE',
+  set_text:      'TYPE',
+  settext:       'TYPE',
+  input_text:    'TYPE',
+  inputtext:     'TYPE',
+  write:         'TYPE',
+  type_text:     'TYPE',
+  // CLICK aliases
+  press:         'CLICK',
+  tap:           'CLICK',
+  submit:        'CLICK',
+  button_click:  'CLICK',
+  // SELECT aliases
+  choose:        'SELECT',
+  pick:          'SELECT',
+  dropdown:      'SELECT',
+  select_option: 'SELECT',
+  // NAVIGATE aliases
+  goto:          'NAVIGATE',
+  go_to:         'NAVIGATE',
+  open:          'NAVIGATE',
+  visit:         'NAVIGATE',
+  load:          'NAVIGATE',
+}
+
+function normaliseAction(raw: string): string {
+  const upper = raw.toUpperCase().trim()
+  const lower = raw.toLowerCase().trim()
+  // Already canonical — return immediately
+  const CANONICAL = new Set([
+    'NAVIGATE', 'CLICK', 'TYPE', 'FILL', 'INPUT', 'SELECT', 'LOOKUP',
+    'CHECKBOX', 'ASSERT_TEXT', 'ASSERT_URL', 'ASSERT_TOAST', 'WAIT',
+    'MULTI_SELECT', 'UPLOAD', 'SCROLL', 'SCREENSHOT', 'CLEARCOOKIES',
+  ])
+  if (CANONICAL.has(upper)) return upper
+  // Alias lookup
+  const mapped = ACTION_ALIASES[lower]
+  if (mapped) {
+    log.warn(`[GEN] normaliseAction: mapped non-standard action "${raw}" → "${mapped}"`)
+    return mapped
+  }
+  // Return upper-cased anyway — let the worker handle unknown gracefully
+  return upper
+}
+
 function normaliseResponse(raw: Record<string, unknown>): GenerateResponse {
   const steps = (Array.isArray(raw['steps']) ? raw['steps'] : []) as Step[]
+  // Normalize action names in every step before passing to the runner
+  const normalizedSteps = steps.map(s => ({
+    ...s,
+    action: normaliseAction(String(s.action ?? '')),
+  }))
   return {
     name:             String(raw['name']             ?? 'Unnamed Test'),
     description:      String(raw['description']      ?? ''),
-    steps:            renumberSteps(steps),
+    steps:            renumberSteps(normalizedSteps),
     priority:         String(raw['priority']         ?? 'medium'),
     preconditions:    Array.isArray(raw['preconditions'])
       ? (raw['preconditions'] as string[])
@@ -3439,6 +3730,7 @@ function normaliseResponse(raw: Record<string, unknown>): GenerateResponse {
     expected_outcome: String(raw['expected_outcome'] ?? ''),
   }
 }
+
 
 /**
  * Post-processing: ensure web app "create entity" tests have complete steps.
@@ -3507,6 +3799,48 @@ function ensureWebAppCreateSteps(
       log.info(`[GEN] Post-process: removed ${originalCount - result.steps.length} login/auth step(s). Remaining: ${result.steps.length}`)
       // Re-number remaining steps so ids are sequential
       result.steps = result.steps.map((step, idx) => ({ ...step, id: String(idx + 1) }))
+    }
+  }
+
+  // ── -1b. Strip cross-entity CLICK buttons (HARD GUARD) ──────────────────
+  // The LLM picks sidebar buttons for the WRONG entity (e.g. "+ New Lead"
+  // in an Account test). This catches them at the final output level.
+  {
+    const entityMatch = prompt
+      .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+      .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|form|page|module|entry|item|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+      .trim()
+    const entityHint = (entityMatch.match(/\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\b/)?.[1]
+      ?? entityMatch.split(/\s+/)[0] ?? '').trim()
+
+    if (entityHint && entityHint.length > 2) {
+      const entityLower = entityHint.toLowerCase()
+      const beforeCount = result.steps.length
+
+      result.steps = result.steps.filter(step => {
+        const action = (step.action ?? '').toUpperCase()
+        if (action !== 'CLICK') return true
+        const target = (step.target ?? '').toLowerCase().trim()
+        if (!target) return true
+
+        // Detect "new/create/add <entity>" pattern
+        const match = target.match(/\b(?:new|create|add)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+        if (!match) return true
+        const entityWord = match[1].trim()
+        if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
+
+        // Keep if entity matches
+        if (entityLower.includes(entityWord) || entityWord.includes(entityLower)) return true
+
+        // Cross-entity contamination → strip
+        log.warn(`[GEN] Post-process: stripped cross-entity CLICK "${step.target}" — button is for "${entityWord}", test is for "${entityHint}"`)
+        return false
+      })
+
+      if (result.steps.length < beforeCount) {
+        log.info(`[GEN] Post-process: removed ${beforeCount - result.steps.length} cross-entity CLICK step(s) for entity "${entityHint}"`)
+        result.steps = result.steps.map((step, idx) => ({ ...step, id: String(idx + 1) }))
+      }
     }
   }
 
@@ -4441,26 +4775,100 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
           log.info(`[GEN] Injected verified URL map: ${Object.keys(entityUrlMap).length} entities`)
         }
 
-        // Choose the right system prompt based on project type
-        const ragSystemPrompt = isWebAppProject
-          ? WEB_APP_RAG_SYSTEM_PROMPT
-              .replace('{rag_context}', ragContext)
-              .replace('{test_data_context}', webTestDataContext || '(No real records available — use realistic unique placeholders)')
-              .replace('{test_intent_instructions}', testIntentInstructions)
-              .replace('{multi_entity_instructions}', multiEntityInstructions)
-              .replace('{user_specified_values}', userSpecifiedValuesContext)
-          : MCP_RAG_SYSTEM_PROMPT.replace('{rag_context}', ragContext)
+        // ── Web App: route through STEP_GEN_MODEL agent for validated generation ──
+        // The runTestStepGeneratorAgent uses STEP_GEN_MODEL (env var, defaults to gpt-4o)
+        // and runs up to 3 self-correction loops with a 5-check validation gate:
+        //   ✅ Check 1: required field coverage (no missing REQUIRED fields)
+        //   ✅ Check 2: URL verification (only crawled paths used)
+        //   ✅ Check 3: button name exactness (actual button from page, e.g. "Create Account")
+        //   ✅ Check 4: locator type validity (LOOKUP uses label, SELECT uses options)
+        //   ✅ Check 5: data type alignment (phone/email/date formats)
+        // Non-webapp projects (Salesforce) continue using the direct LLM call below.
+        if (isWebAppProject) {
+          try {
+            const { runTestStepGeneratorAgent } = await import('../ai-agents/test-step-generator.agent.js')
+            const targetObjs = extractTargetObjects(prompt)
+            const entityFilter = targetObjs[0] // narrow metadata to primary entity
+
+            log.info(`[GEN] Web App: delegating to STEP_GEN_MODEL agent (entity="${entityFilter}", chunks=${chunks.length})`)
+
+            const agentOutput = await runTestStepGeneratorAgent({
+              projectId:    project_id,
+              testName:     prompt.trim().slice(0, 200),
+              description:  prompt,
+              entityFilter: entityFilter || undefined,
+            })
+
+            log.info(
+              `[GEN] STEP_GEN_MODEL agent done: ${agentOutput.steps.length} steps, ` +
+              `loops=${agentOutput.loopCount}, confidence=${agentOutput.confidence}, ` +
+              `passed=${agentOutput.validation.passed}`,
+            )
+
+            if (agentOutput.validation.issues.length > 0) {
+              log.warn(`[GEN] Agent validation issues: ${agentOutput.validation.issues.join('; ')}`)
+            }
+
+            // Map AgentStep_Playwright → Step (same shape, just ensure required fields)
+            const agentSteps: Step[] = agentOutput.steps.map((s, i) => ({
+              id:           String(i + 1),
+              action:       normaliseAction(s.action),
+              target:       s.target,
+              value:        s.value,
+              locator_type: s.locator_type,
+            }))
+
+            const agentNormalised: GenerateResponse = {
+              name:             prompt.trim().slice(0, 80),
+              description:      prompt,
+              steps:            agentSteps,
+              priority:         'medium',
+              preconditions:    ['User is already authenticated'],
+              expected_outcome: `${entityFilter ?? 'Entity'} created/updated successfully`,
+            }
+
+            agentNormalised.steps = validateFieldValueAlignment(agentNormalised.steps)
+            // Filter hallucinated fields (e.g., "Email" on Account form)
+            if (project_id) {
+              agentNormalised.steps = await filterNonExistentFieldSteps(agentNormalised.steps, project_id, entityFilter)
+            }
+            const agentResult = ensureWebAppCreateSteps(agentNormalised, prompt, true, ragContext, entityUrlMap)
+
+            log.info(`[GEN] Web App via STEP_GEN_MODEL: ${agentResult.steps.length} final steps`)
+            return { ...agentResult, rag_context_used: true, retrieved_chunks: chunks.length }
+
+          } catch (agentErr) {
+            log.warn({ err: agentErr }, '[GEN] STEP_GEN_MODEL agent failed — falling back to direct LLM')
+            // Fall through to direct LLM call below
+          }
+        }
+
+        // ── Non-webapp (Salesforce MCP) — direct LLM call ──────────────────────
+        const ragSystemPrompt = WEB_APP_RAG_SYSTEM_PROMPT
+          .replace('{rag_context}', ragContext)
+          .replace('{test_data_context}', webTestDataContext || '(No real records available — use realistic unique placeholders)')
+          .replace('{test_intent_instructions}', testIntentInstructions)
+          .replace('{multi_entity_instructions}', multiEntityInstructions)
+          .replace('{user_specified_values}', userSpecifiedValuesContext)
 
         const rawResult    = await invokeLlm(ragSystemPrompt, prompt, provider, model)
         const normalised   = normaliseResponse(rawResult)
-        // Post-process: fix field-value type misalignment (e.g. names in Amount fields)
+        // Filter hallucinated fields — runs for ALL project types (web app + Salesforce)
         if (isWebAppProject) {
           normalised.steps = validateFieldValueAlignment(normalised.steps)
         }
+        if (project_id) {
+          const directEntityHint = prompt
+            .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+            .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+            .trim().split(/\s+/)[0] ?? ''
+          normalised.steps = await filterNonExistentFieldSteps(normalised.steps, project_id, directEntityHint || undefined)
+        }
         const result       = ensureWebAppCreateSteps(normalised, prompt, isWebAppProject, ragContext, entityUrlMap)
 
-        log.info(`[GEN] ${isWebAppProject ? 'Web App' : 'MCP'} RAG generation successful with ${chunks.length} chunks`)
+        log.info(`[GEN] ${isWebAppProject ? 'Web App (direct LLM fallback)' : 'MCP'} RAG generation successful with ${chunks.length} chunks`)
         return { ...result, rag_context_used: true, retrieved_chunks: chunks.length }
+
         } // end inner if (chunks.length > 0)
       } else if (isWebAppProject) {
         log.info('[GEN] Web App: No RAG chunks found — falling back to standard with session instruction')
@@ -4908,6 +5316,14 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
     if (isWebAppProject) {
       normalised.steps = validateFieldValueAlignment(normalised.steps)
     }
+    // Filter hallucinated fields — runs for ALL project types (web app + Salesforce)
+    if (project_id) {
+      const promptEntityHint = prompt
+        .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+        .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+        .trim().split(/\s+/)[0] ?? ''
+      normalised.steps = await filterNonExistentFieldSteps(normalised.steps, project_id, promptEntityHint || undefined)
+    }
     return ensureWebAppCreateSteps(normalised, prompt, isWebAppProject, sfRagContext || webAppRagContext, globalEntityUrlMap)
   } catch (err: unknown) {
     // Auto-fallback to Claude if requested provider fails
@@ -4919,6 +5335,14 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
         const fallbackNormalised = normaliseResponse(rawResult)
         if (isWebAppProject) {
           fallbackNormalised.steps = validateFieldValueAlignment(fallbackNormalised.steps)
+        }
+        // Filter hallucinated fields — runs for ALL project types
+        if (project_id) {
+          const fbEntityHint = prompt
+            .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+            .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+            .trim().split(/\s+/)[0] ?? ''
+          fallbackNormalised.steps = await filterNonExistentFieldSteps(fallbackNormalised.steps, project_id, fbEntityHint || undefined)
         }
         return ensureWebAppCreateSteps(fallbackNormalised, prompt, isWebAppProject, sfRagContext || webAppRagContext, globalEntityUrlMap)
       } catch (claudeErr) {

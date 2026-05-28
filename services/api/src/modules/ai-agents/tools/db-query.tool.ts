@@ -136,8 +136,23 @@ export async function logAgentExecution(entry: {
   durationMs:    number
 }): Promise<void> {
   try {
-    await (prisma as any).agent_executions?.create({ data: entry })
-  } catch { /* table may not exist yet — migration pending */ }
+    await (prisma as any).agent_executions?.create({
+      data: {
+        project_id:     entry.projectId,
+        agent_name:     entry.agentName,
+        task_type:      entry.taskType,
+        input_summary:  entry.inputSummary,
+        output_summary: entry.outputSummary,
+        thoughts:       entry.thoughts,
+        hitl_invoked:   entry.hitlInvoked,
+        confidence:     entry.confidence,
+        tokens_used:    entry.tokensUsed,
+        duration_ms:    entry.durationMs,
+      }
+    })
+  } catch (err) {
+    log.warn({ err }, '[DB-TOOL] logAgentExecution failed')
+  }
 }
 
 export async function saveAiSuggestions(

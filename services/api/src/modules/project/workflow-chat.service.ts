@@ -12,6 +12,7 @@ import { StringOutputParser }    from '@langchain/core/output_parsers'
 import type { BaseChatModel }    from '@langchain/core/language_models/chat_models'
 import prisma                    from '../../shared/db/prisma.js'
 import { createModuleLogger }    from '../../shared/logger/index.js'
+import { buildFieldManifest, autoCorrectButtonNames } from '../ai-agents/tools/metadata-reader.tool.js'
 
 const log = createModuleLogger('workflow-chat')
 
@@ -83,6 +84,373 @@ function decodeDocContent(raw: string, maxChars = 6000): string {
   return raw.slice(0, maxChars)
 }
 
+// ─── BRD Entity Extraction & Orphan Detection (project-agnostic) ─────────────
+
+/**
+ * Extracts entity/module/workflow names from any BRD text.
+ *
+ * Works for any domain: CRM entities (Lead, Opportunity, Invoice),
+ * Logistics (Shipment, Booking, Delivery), Healthcare (Prescription, Visit),
+ * ERP (Purchase Order, GRN, BOM), etc.
+ *
+ * Heuristic approach — does NOT require domain knowledge:
+ *  1. Section headers: "## Invoice Management" → "Invoice Management"
+ *  2. Object noun patterns: "the Invoice is created", "create a Booking"
+ *  3. Bold/Title-case nouns that appear ≥2 times in the BRD
+ *  4. Workflow diagram labels: "CAMPAIGN → LEAD → ACCOUNT"
+ *
+ * Returns a Set of candidate entity names (de-duped, title-cased, min 3 chars).
+ */
+function parseBrdEntities(brdText: string): Set<string> {
+  if (!brdText || brdText.trim().length < 50) return new Set()
+
+  const candidates = new Set<string>()
+
+  // ── 1. Section / heading patterns ──────────────────────────────────────────
+  // Matches: "# Invoice", "## Quote Management", "### 3. Order Processing"
+  const headingRe = /^#+\s+(?:\d+\.?\s+)?([A-Z][A-Za-z\s&/\-]{2,40})$/gm
+  for (const m of brdText.matchAll(headingRe)) {
+    const raw = m[1].trim().replace(/\s+/g, ' ')
+    if (raw.length >= 3 && raw.length <= 50) candidates.add(raw)
+  }
+
+  // ── 2. ALL-CAPS diagram labels (workflow arrows like "CAMPAIGN → LEAD") ────
+  // Common in BRDs that embed ASCII workflow diagrams
+  const allCapsRe = /\b([A-Z][A-Z\s]{2,30})\b/g
+  for (const m of brdText.matchAll(allCapsRe)) {
+    const raw = m[1].trim().replace(/\s+/g, ' ')
+    // Skip common English all-caps words that aren't entities
+    const skipWords = new Set(['THE', 'AND', 'FOR', 'FROM', 'WITH', 'MUST', 'NOT', 'ALL',
+      'ARE', 'HAS', 'CAN', 'WILL', 'THIS', 'THAT', 'WHEN', 'THEN', 'INTO', 'UPON',
+      'SHOULD', 'SHALL', 'ONLY', 'ONCE', 'ALSO', 'BOTH', 'SUCH', 'EACH', 'SOME',
+      'NEW', 'OLD', 'KEY', 'END', 'NOTE', 'HITL', 'API', 'UI', 'URL', 'BRD', 'LLM'])
+    const parts = raw.split(/\s+/)
+    if (parts.every(p => !skipWords.has(p)) && raw.length >= 3 && raw.length <= 40) {
+      // Title-case it: "OPPORTUNITY PRODUCTS" → "Opportunity Products"
+      const titled = raw.replace(/\b\w+/g, w => w[0] + w.slice(1).toLowerCase())
+      candidates.add(titled)
+    }
+  }
+
+  // ── 3. Quoted / bold entity names: "**Invoice**", "`Quote`", '"Order"' ─────
+  const quotedRe = /(?:\*\*|__|`|")([A-Z][A-Za-z\s]{1,30})(?:\*\*|__|`|")/g
+  for (const m of brdText.matchAll(quotedRe)) {
+    const raw = m[1].trim()
+    if (raw.length >= 3 && /^[A-Z]/.test(raw)) candidates.add(raw)
+  }
+
+  // ── 4. Verb-Object patterns: "create an Invoice", "generate a Payment" ────
+  const verbObjectRe = /\b(?:create|generate|issue|submit|approve|process|manage|review|convert|send|record|update|delete|archive|view|list)\s+(?:a|an|the|new)?\s*([A-Z][A-Za-z\s]{2,30}?)(?=[,\.\s]|$)/gm
+  for (const m of brdText.matchAll(verbObjectRe)) {
+    const raw = m[1].trim().replace(/\s+/g, ' ')
+    if (raw.length >= 3 && raw.length <= 40 && /^[A-Z]/.test(raw)) candidates.add(raw)
+  }
+
+  // ── 5. Frequency filter — keep nouns appearing ≥2 times (reduces false positives)
+  const freqMap = new Map<string, number>()
+  const textLower = brdText.toLowerCase()
+  const confirmed = new Set<string>()
+  for (const cand of candidates) {
+    const count = (textLower.match(new RegExp(`\\b${cand.toLowerCase().replace(/[^a-z0-9\s]/g, '.')}\\b`, 'g')) ?? []).length
+    freqMap.set(cand, count)
+    if (count >= 2) confirmed.add(cand)
+  }
+  // Always keep heading-based entities (even if only mentioned once)
+  const headingRe2 = /^#+\s+(?:\d+\.?\s+)?([A-Z][A-Za-z\s&/\-]{2,40})$/gm
+  for (const m of brdText.matchAll(headingRe2)) {
+    const raw = m[1].trim().replace(/\s+/g, ' ')
+    if (raw.length >= 3) confirmed.add(raw)
+  }
+
+  // Strip generic non-entity terms
+  const genericTerms = new Set([
+    'Introduction', 'Overview', 'Summary', 'Description', 'Purpose', 'Scope',
+    'Background', 'Appendix', 'Glossary', 'References', 'Revision History',
+    'Table Of Contents', 'Requirements', 'Functional Requirements', 'Non Functional',
+    'Business Rules', 'Acceptance Criteria', 'User Stories', 'Use Cases',
+    'Document', 'Section', 'Phase', 'Stage', 'Step', 'Field', 'Button',
+    'System', 'Application', 'Platform', 'Module', 'Feature', 'Component',
+  ])
+
+  for (const term of genericTerms) confirmed.delete(term)
+
+  return confirmed
+}
+
+/**
+ * Finds BRD entities that the crawler COULD NOT reach.
+ *
+ * A BRD entity is "orphaned" (crawler-unreachable) when:
+ *   - It is mentioned in the BRD (via parseBrdEntities)
+ *   - BUT there is NO crawled page whose path contains the entity's slug form
+ *
+ * This is the universal fix for the "record-dependency" problem:
+ *   CRM: Invoice requires Order → crawler never navigated there
+ *   Logistics: Delivery Note requires Shipment → same issue
+ *   Healthcare: Prescription requires Patient Visit → same issue
+ *   ERP: Goods Receipt Note requires Purchase Order → same issue
+ *
+ * Returns { orphaned: string[], crawledEntityNames: string[] }
+ */
+function detectOrphanedBrdEntities(
+  brdEntities:  Set<string>,
+  crawledPaths: string[],
+): { orphaned: string[]; crawledEntityNames: string[] } {
+  // Slugify: "Opportunity Products" → ["opportunity", "products", "opportunity-products"]
+  const toSlugs = (name: string): string[] => {
+    const lower = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    const parts  = lower.split('-').filter(p => p.length > 2)
+    return [lower, ...parts]
+  }
+
+  // Build a set of all "entity tokens" present in crawled paths
+  const crawledTokens = new Set<string>()
+  const crawledEntityNames: string[] = []
+  for (const p of crawledPaths) {
+    const segments = p.toLowerCase().split('/').filter(Boolean)
+    for (const seg of segments) {
+      // Stem: remove trailing s/es/ies for plural matching
+      crawledTokens.add(seg)
+      if (seg.endsWith('ies'))  crawledTokens.add(seg.slice(0, -3) + 'y')
+      else if (seg.endsWith('es') && seg.length > 3) crawledTokens.add(seg.slice(0, -2))
+      else if (seg.endsWith('s')  && seg.length > 3) crawledTokens.add(seg.slice(0, -1))
+    }
+    // Derive readable entity name from path for reporting
+    const last = segments[segments.length - 1]
+    if (last && !['new', 'edit', 'create', 'list', 'view', 'show', 'index'].includes(last)) {
+      const readable = last.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+      crawledEntityNames.push(readable)
+    }
+  }
+
+  const orphaned: string[] = []
+  for (const entity of brdEntities) {
+    const slugs = toSlugs(entity)
+    // Consider "found" if ANY slug segment appears in crawled tokens
+    const found = slugs.some(slug => crawledTokens.has(slug))
+    if (!found) orphaned.push(entity)
+  }
+
+  return { orphaned, crawledEntityNames }
+}
+
+/**
+ * Builds the CRAWLER-UNREACHABLE ENTITIES block for the workflow generation prompt.
+ *
+ * This block explicitly tells the LLM:
+ *  - Which entities exist in the BRD but were NOT crawled by Playwright
+ *  - WHY they were missed (dependency on existing records)
+ *  - That it MUST generate full lifecycle flows for each one
+ *
+ * This is intentionally domain-neutral: it does not assume CRM or any specific
+ * domain — it derives the information purely from BRD content and crawled metadata.
+ */
+function buildOrphanedEntitiesBlock(orphaned: string[]): string {
+  if (orphaned.length === 0) return ''
+
+  const entityList = orphaned
+    .map(e => `  - ${e}`)
+    .join('\n')
+
+  return `
+═══════════════════════════════════════════════════════════════
+CRAWLER-UNREACHABLE ENTITIES (MANDATORY — generate flows for ALL)
+═══════════════════════════════════════════════════════════════
+The following entities/modules exist in the BRD but were NOT found
+in the crawled metadata. This is expected: these pages typically
+require existing records to be present (e.g., an Invoice page needs
+an existing Order; a Delivery Note needs an existing Shipment; a
+Prescription needs an existing Patient Visit). The Playwright crawler
+cannot create those prerequisite records, so these pages were never
+visited.
+
+YOU MUST generate flows for each of these entities, but ONLY using actions
+and processes that are explicitly documented in the metadata or BRD:
+${entityList}
+
+For each entity above:
+  a) CREATE flow — create a new record with all required fields
+     (infer required fields from the BRD section for this entity)
+  b) UPDATE flow — find existing record and modify key fields
+  c) STATUS TRANSITION flow — ONLY if the BRD explicitly lists status values
+     for this entity. Use ONLY the statuses described in the BRD — do NOT
+     invent statuses like "fulfilled", "shipped", "delivered" etc. unless
+     the BRD or metadata explicitly names them.
+  d) CROSS-MODULE flow — ONLY if the BRD explicitly describes a relationship
+     between this entity and another entity (e.g., "Quote is generated from
+     Opportunity"). Do NOT invent cross-module actions that are not documented.
+
+IMPORTANT GROUNDING RULES for these entities:
+  - Since crawl data is unavailable, derive page URL as: "/{entity-slug}" or "/{entity-slug}/new"
+    where entity-slug is the lowercase plural (e.g., "invoices", "delivery-notes", "prescriptions")
+  - If the BRD specifies a different URL pattern, use that instead
+  - For VERIFY steps, assert ONLY the states/statuses explicitly described in the BRD
+  - Do NOT hallucinate business processes, statuses, or actions from general industry knowledge.
+    If the BRD says nothing about "fulfillment" for Orders, do NOT generate a fulfillment flow.
+═══════════════════════════════════════════════════════════════
+`
+}
+
+/**
+ * After the LLM returns its flow list, check for BRD entities that got no flow generated.
+ * For each missing entity, inject a minimal CRUD fallback flow.
+ *
+ * This is the second safety net — even if the LLM ignores the orphaned-entities block,
+ * the post-processor ensures every BRD entity gets at least one flow in the output.
+ */
+function gapFillMissingEntityFlows(
+  flows:       Array<{ name: string; description: string }>,
+  brdEntities: Set<string>,
+): Array<{ name: string; description: string }> {
+  if (brdEntities.size === 0) return flows
+
+  // Check which entities already have a flow (fuzzy match on flow name)
+  const coveredEntities = new Set<string>()
+  for (const flow of flows) {
+    const flowNameLower = flow.name.toLowerCase()
+    for (const entity of brdEntities) {
+      const entityLower = entity.toLowerCase()
+      // Consider covered if the entity name appears in the flow name
+      if (flowNameLower.includes(entityLower) || entityLower.split(' ').every(w => w.length <= 2 || flowNameLower.includes(w))) {
+        coveredEntities.add(entity)
+      }
+    }
+  }
+
+  // Inject fallback flows for uncovered entities
+  const injected: Array<{ name: string; description: string }> = []
+  for (const entity of brdEntities) {
+    if (coveredEntities.has(entity)) continue
+
+    // Generate minimal CRUD flows for this entity
+    injected.push(
+      {
+        name:        `Create ${entity} With Required Fields`,
+        description: `Creates a new ${entity} record by filling all required fields as specified in the BRD. Verifies successful creation and that the record appears in the ${entity} list.`,
+      },
+      {
+        name:        `Update and Verify ${entity} Details`,
+        description: `Finds an existing ${entity} record and modifies its key editable fields. Verifies the changes are saved and reflected in the record detail view.`,
+      },
+    )
+
+    log.info({ entity }, '[WORKFLOW] Gap-fill: injected fallback flows for BRD entity not covered by LLM')
+  }
+
+  return [...flows, ...injected]
+}
+
+/**
+ * Classifies each crawled page by its UI role and extracts confirmed action capabilities.
+ *
+ * Page types derived automatically from metadata:
+ *   FORM     — has ≥1 required input field (create/edit screen)
+ *   LIST     — has ≥1 record-ID button (e.g. ENQ-0001, QUO-0002) but no required inputs
+ *   DASHBOARD— root path "/" or "/dashboard" with action-card buttons but no records
+ *   DETAIL   — has a mix of inputs and record-action buttons
+ *   UNKNOWN  — none of the above
+ *
+ * Returns a text block to inject into prompts so the LLM knows EXACTLY what UI
+ * actions are available on each page — eliminating hallucinated steps like
+ * "Click Add Charges" on a page that only has a record list.
+ */
+function buildPageUIConstraints(
+  pages: Array<{
+    path: string
+    buttons?: Array<{ name?: string }>
+    inputs?: Array<{ name?: string; required?: boolean }>
+    selects?: Array<{ name?: string }>
+  }>,
+): string {
+  if (pages.length === 0) return ''
+
+  // Regex patterns for record-ID buttons (ENQ-0001, QUO-004, BKG-12, INV-0001 etc.)
+  const RECORD_ID_PATTERN = /^[A-Z]{2,6}-?\d{1,6}$/
+
+  const lines: string[] = ['PAGE UI INVENTORY (confirmed elements only — do not use unlisted buttons/inputs):']
+
+  for (const page of pages) {
+    const path = page.path ?? '/'
+    const allButtons = (page.buttons ?? []).map(b => (b.name ?? '').trim()).filter(Boolean)
+    const allInputs  = (page.inputs  ?? []).map(i => (i.name ?? '').trim()).filter(Boolean)
+    const allSelects = (page.selects ?? []).map(s => (s.name ?? '').trim()).filter(Boolean)
+
+    // Classify buttons
+    const recordButtons = allButtons.filter(b => RECORD_ID_PATTERN.test(b.split('\n')[0]))
+    const navButtons    = allButtons.filter(b => {
+      const first = b.split('\n')[0]
+      return !RECORD_ID_PATTERN.test(first) &&
+             !['Previous', 'Next', 'Sign Out', 'Admin', 'Logout', 'Log Out', 'Close', 'Cancel'].includes(first) &&
+             !first.match(/^[A-Z]$/)  // single-letter avatar buttons
+    })
+    const requiredInputs = (page.inputs ?? []).filter(i => i.required).map(i => (i.name ?? '').trim()).filter(Boolean)
+
+    // Determine page type
+    let pageType: string
+    if (path === '/' || path === '/dashboard') {
+      pageType = 'DASHBOARD'
+    } else if (requiredInputs.length > 0 || allSelects.length > 0) {
+      pageType = 'FORM'
+    } else if (recordButtons.length > 0 && allInputs.length <= 1) {
+      // 1 input = usually a search box on a list page
+      pageType = 'LIST'
+    } else if (allInputs.length > 1) {
+      pageType = 'DETAIL/FORM'
+    } else {
+      pageType = 'UNKNOWN'
+    }
+
+    const lineParts = [`  • ${path} [${pageType}]`]
+
+    // ── Cross-entity button filter ──────────────────────────────────────
+    // The page's entity is derived from its path (e.g., /accounts → "account").
+    // Buttons like "+ New Lead" appearing on the /accounts page are from the
+    // navigation sidebar — NOT actions for the Account entity. Filter them out
+    // so the LLM doesn't use them when generating Account test cases.
+    const pathSegments = path.split('/').filter(Boolean)
+    // Entity slug: last meaningful segment, de-pluralized (accounts → account)
+    const pageEntitySlug = (pathSegments.find(s => !['new', 'create', 'add', 'edit', 'view', 'detail'].includes(s.toLowerCase())) ?? '')
+      .toLowerCase()
+      .replace(/s$/, '')  // simple de-plural: accounts → account
+
+    const isOtherEntityButton = (btnName: string): boolean => {
+      if (!pageEntitySlug || pageEntitySlug.length < 3) return false
+      const lower = btnName.toLowerCase()
+      const match = lower.match(/\b(?:new|create|add)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+      if (!match) return false
+      const entityWord = match[1].trim()
+      if (entityWord.length < 3) return false
+      // If the button's entity word doesn't match the page entity → it's cross-entity
+      return !pageEntitySlug.includes(entityWord) && !entityWord.includes(pageEntitySlug)
+    }
+
+    // Confirmed action buttons (not record IDs, not nav chrome, not cross-entity)
+    const actionButtons = navButtons.filter(b => {
+      const first = b.split('\n')[0]
+      const lower = first.toLowerCase()
+      if (['previous', 'next', 'sign out', 'admin', 'logout', 'log out', 'close', 'cancel'].includes(lower)) return false
+      // Exclude cross-entity sidebar buttons (e.g., "+ New Lead" on /accounts page)
+      if (isOtherEntityButton(first)) return false
+      return true
+    }).map(b => b.split('\n')[0]).slice(0, 8)
+    if (actionButtons.length > 0) lineParts.push(`    confirmed buttons: ${actionButtons.join(', ')}`)
+
+    // Record list (if LIST page — shows what records can be clicked)
+    if (recordButtons.length > 0) {
+      lineParts.push(`    record list: ${recordButtons.slice(0, 4).join(', ')}${recordButtons.length > 4 ? ` (+${recordButtons.length - 4} more)` : ''}`)
+      lineParts.push(`    ⚠ LIST page: generate NAVIGATE + CLICK record + VERIFY flows only. No CREATE/EDIT unless a "New" or "Create" button is listed above.`)
+    }
+
+    // Form fields
+    if (requiredInputs.length > 0) lineParts.push(`    required fields: ${requiredInputs.join(', ')}`)
+    if (allSelects.length > 0)     lineParts.push(`    dropdowns: ${allSelects.slice(0, 6).join(', ')}`)
+
+    lines.push(lineParts.join('\n'))
+  }
+
+  return lines.join('\n')
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -101,9 +469,11 @@ async function getProjectContext(projectId: string): Promise<{
   brdContent:           string
   existingTestsContent: string
   projectCategory:      string
+  pageConstraints:      string  // per-page UI inventory: page type + confirmed buttons/fields
+  testDataEntities:     Array<{ entity_name: string; record_count: number; source_url: string | null }>  // confirmed scraped entities
 }> {
   // ── Parallel DB fetches ──────────────────────────────────────────────────
-  const [project, integration, brdRow, jiraIntegration] = await Promise.all([
+  const [project, integration, brdRow, jiraIntegration, testDataRows] = await Promise.all([
     prisma.projects.findUnique({
       where:  { id: projectId },
       select: { name: true, category: true, description: true, type: true, base_url: true, brd_content: true, existing_tests_content: true, existing_tests_filename: true },
@@ -123,7 +493,22 @@ async function getProjectContext(projectId: string): Promise<{
       where:  { project_id: projectId },
       select: { jira_domain: true, jira_email: true, jira_token: true, jira_board_id: true },
     }),
+    // Fetch confirmed test-data entities (from web_test_data table).
+    // These are GROUND TRUTH — the UI scraper actually navigated to these entity pages
+    // and confirmed they exist. Entities like Invoice, Opportunity, Quote, Order, Contract
+    // will appear here even if the page crawler (metadata_raw_store) never reached them.
+    prisma.$queryRawUnsafe<Array<{ entity_name: string; record_count: number; source_url: string | null }>>(
+      `SELECT entity_name, record_count, source_url FROM web_test_data WHERE project_id = $1::uuid ORDER BY entity_name`,
+      projectId,
+    ).catch(() => [] as Array<{ entity_name: string; record_count: number; source_url: string | null }>),
   ])
+
+  // Parse test-data entities into a clean array for downstream use
+  const testDataEntities = (testDataRows ?? []).map(r => ({
+    entity_name:  r.entity_name,
+    record_count: r.record_count ?? 0,
+    source_url:   r.source_url ?? null,
+  }))
 
   const projectCategory = integration?.category ?? project?.category ?? 'unknown'
   const baseUrl         = integration?.base_url ?? project?.base_url ?? ''
@@ -371,15 +756,80 @@ async function getProjectContext(projectId: string): Promise<{
     ? `INTEGRATION TYPE: ${projectCategory.toUpperCase()} | BASE URL: ${baseUrl}\n${appTitleLine}\n`
     : `INTEGRATION TYPE: ${projectCategory.toUpperCase()}\n${appTitleLine}\n`
 
+  // ── Build per-page UI constraints from raw crawl metadata ────────────────
+  // This gives prompts a project-agnostic inventory of what's ACTUALLY clickable/typeable
+  // on each page, preventing hallucinated steps like "Click Add Charges" on a list page.
+  let pageConstraints = ''
+  try {
+    const rawRow = await prisma.metadata_raw_store.findFirst({
+      where:  { project_id: projectId, metadata_type: 'webpage' },
+      select: { raw_json: true },
+    })
+    const rawPages = ((rawRow?.raw_json as any)?.pages ?? []) as Array<{
+      path?: string; url?: string; title?: string
+      buttons?: Array<{ name?: string }>
+      inputs?: Array<{ name?: string; required?: boolean }>
+      selects?: Array<{ name?: string }>
+    }>
+
+    // Only include pages that are NOT 404 / error pages
+    const validPages = rawPages.filter(p => {
+      const title = (p.title ?? '').toLowerCase()
+      return !title.includes('404') &&
+             !title.includes('not found') &&
+             !title.includes('could not be found') &&
+             !title.includes('page not found')
+    }).map(p => ({
+      path:    p.path ?? p.url ?? '/',
+      buttons: p.buttons ?? [],
+      inputs:  p.inputs  ?? [],
+      selects: p.selects ?? [],
+    }))
+
+    // Deduplicate by path (keep first occurrence — they're usually identical)
+    const seenPaths = new Set<string>()
+    const dedupedPages = validPages.filter(p => {
+      if (seenPaths.has(p.path)) return false
+      seenPaths.add(p.path)
+      return true
+    })
+
+    if (dedupedPages.length > 0) {
+      pageConstraints = buildPageUIConstraints(dedupedPages)
+      log.info({ projectId, pageCount: dedupedPages.length }, '[WORKFLOW] Page UI constraints built from raw metadata')
+    }
+  } catch (err) {
+    log.warn({ err }, '[WORKFLOW] Failed to build page UI constraints — continuing without')
+  }
+
   // Use BRD content from: 1) dedicated brd table, 2) project.brd_content column
   const resolvedBrd = brdRow?.content ?? project?.brd_content ?? ''
 
   // Existing tests content — stored on the project row
   const resolvedExistingTests = project?.existing_tests_content ?? ''
 
-  // Append Jira stories to the metadata summary (within budget)
+  // ── Inject confirmed test-data entities into metadata summary ─────────────
+  // These are the DEFINITIVE entity list — the scraper confirmed they exist.
+  // They MUST appear in the metadata summary so the LLM generates workflows
+  // for ALL of them (Invoice, Opportunity, Quote, Order, Contract, etc.).
+  let testDataSection = ''
+  if (testDataEntities.length > 0) {
+    const entityLines = testDataEntities.map(e => {
+      const recordInfo = e.record_count > 0 ? ` (${e.record_count} records)` : ' (entity page confirmed, 0 records)'
+      return `  • ${e.entity_name}${recordInfo}`
+    })
+    testDataSection = `\n\nCONFIRMED APPLICATION ENTITIES (${testDataEntities.length} entities discovered via UI scraping — GROUND TRUTH):
+The following entities were confirmed by navigating to their pages in the live application.
+You MUST generate at least one workflow for EVERY entity listed below.
+Do NOT skip any entity — each one represents a real, navigable module in the application.
+${entityLines.join('\n')}`
+    log.info({ projectId, entityCount: testDataEntities.length, entities: testDataEntities.map(e => e.entity_name) },
+      '[WORKFLOW] Test-data entities injected into metadata summary')
+  }
+
+  // Append Jira stories + test-data entities to the metadata summary (within budget)
   const jiraSection = jiraStoriesSummary ? `\n\n${jiraStoriesSummary}` : ''
-  const fullMeta = capMeta(integrationHeader + metaSummary + jiraSection)
+  const fullMeta = capMeta(integrationHeader + metaSummary + testDataSection + jiraSection)
 
   log.info({
     projectId,
@@ -390,6 +840,8 @@ async function getProjectContext(projectId: string): Promise<{
     hasBrd: !!resolvedBrd,
     hasExistingTests: !!resolvedExistingTests,
     hasJiraStories: !!jiraStoriesSummary,
+    testDataEntityCount: testDataEntities.length,
+    pageConstraintsLength: pageConstraints.length,
   }, '[WORKFLOW] Project context resolved')
 
   return {
@@ -398,6 +850,8 @@ async function getProjectContext(projectId: string): Promise<{
     metadataSummary:      fullMeta,
     brdContent:           resolvedBrd,
     existingTestsContent: resolvedExistingTests,
+    pageConstraints,
+    testDataEntities,
   }
 }
 
@@ -413,8 +867,34 @@ export async function generateBusinessFlows(
   brdContent?: string,
 ): Promise<{ flows: BusinessFlow[] }> {
   const ctx = await getProjectContext(projectId)
-  const brd = decodeDocContent(brdContent ?? ctx.brdContent)
+  const brd = decodeDocContent(brdContent ?? ctx.brdContent, 15000)
   const existingTests = decodeDocContent(ctx.existingTestsContent)
+
+  // ── Detect crawler-unreachable BRD entities (project-agnostic) ─────────────
+  // Parse ALL entities from the BRD (any domain — CRM, Logistics, ERP, Healthcare…)
+  const brdEntities = parseBrdEntities(brd)
+
+  // Extract crawled page paths from metadata summary for comparison
+  const crawledPaths: string[] = []
+  for (const line of ctx.metadataSummary.split('\n')) {
+    // Matches "  • /invoices [LIST]" or "  • /opportunities/new [FORM]" etc.
+    const pathMatch = line.match(/•\s+(\/[^\s\[]+)/)
+    if (pathMatch) crawledPaths.push(pathMatch[1])
+  }
+
+  // Find entities in BRD that the crawler never reached
+  const { orphaned: orphanedEntities } = detectOrphanedBrdEntities(brdEntities, crawledPaths)
+
+  // Build the injection block for the prompt
+  const orphanedBlock = buildOrphanedEntitiesBlock(orphanedEntities)
+
+  log.info({
+    projectId,
+    brdEntityCount:    brdEntities.size,
+    crawledPathCount:  crawledPaths.length,
+    orphanedCount:     orphanedEntities.length,
+    orphanedEntities,
+  }, '[WORKFLOW] BRD entity analysis complete')
 
   const systemPrompt = `You are an expert QA Architect with deep knowledge of software testing across all domains.
 
@@ -423,88 +903,133 @@ You MUST pay close attention to the PROJECT NAME, DESCRIPTION, and TYPE to under
 Do NOT default to CRM/Sales flows unless the metadata explicitly shows CRM entities.
 A Business Flow is a complete end-to-end user journey that tests real business value — not a single page or button.
 
-⚠️ CRITICAL CONSTRAINT: You MUST derive ALL flows EXCLUSIVELY from the metadata provided below.
-Do NOT invent modules, pages, fields, or entities that are not listed in the metadata.
+CRITICAL CONSTRAINT: You MUST derive ALL flows from TWO primary sources:
+1. The crawled METADATA below (pages, fields, buttons, actions)
+2. The BRD / SPECIFICATION document (business modules, rules, and user journeys)
+If a module or entity is documented in the BRD but NOT in the crawled metadata,
+you MUST still generate flows for it — use the BRD field/entity details to construct the workflow steps.
+Do NOT invent modules that appear in NEITHER the metadata NOR the BRD.
 
-═══════════════════════════════════════════════════════
 PROJECT: ${ctx.projectName}
 ${ctx.metadataSummary}
-${brd ? `\nBRD / SPECIFICATION (use this to identify business rules and user journeys):\n${brd.slice(0, 8000)}` : ''}
+${brd ? `\nBRD / SPECIFICATION (PRIMARY SOURCE — use this to identify ALL business modules, rules, and user journeys):\n${brd.slice(0, 12000)}` : ''}
 ${existingTests ? `\nEXISTING TEST CASES / TEST PATTERNS (use to ensure coverage gaps are filled):\n${existingTests.slice(0, 3000)}` : ''}
-═══════════════════════════════════════════════════════
 
 METADATA INTERPRETATION GUIDE:
 - "fields:" lines = actual form fields you can interact with on that page
 - "buttons:" lines = actual clickable actions available
 - "actions:" lines = what operations are possible (fill_form, submit_form, click_button, etc.)
 - "inputs:" / "selects:" = form controls available on that specific page
+- Button labels with descriptions (e.g. "Enquiries - Manage freight enquiries") indicate navigation modules — generate flows for these modules.
 
+BRD-SOURCED MODULE DISCOVERY:
+- If the BRD defines modules (e.g., "Enquiries Module", "Quotations Module", "Bookings Module")
+  that have no corresponding crawled metadata page, you MUST STILL generate workflows for them.
+- Use the BRD field descriptions, status values, validation rules, and business rules to construct realistic flows.
+- For BRD-sourced modules, include:
+  a) Create flow — using the BRD required fields and validation rules
+  b) Update flow — using the BRD editable fields and change tracking requirements
+  c) Status transition flows — using the BRD status values (e.g., NEW, UNDER REVIEW, QUOTED, CLOSED)
+  d) Cross-module pipeline flows — linking related modules (e.g., Enquiry to Quotation to Booking)
+- Mark BRD-sourced flows in the description with the relevant BRD section for traceability.
+
+UI GROUNDING RULE (applies to every project):
+The following PAGE UI INVENTORY shows what is ACTUALLY available in the application.
+Before generating a workflow, check this inventory:
+- Pages labelled [LIST] show records only. Only generate NAVIGATE + VIEW DETAIL flows for them,
+  unless they also have a "New"/"Create" button listed — in which case also generate a create flow.
+- Pages labelled [FORM] have input fields — generate create/edit flows using only the listed fields.
+- Do NOT invent UI actions (buttons, form fields) that are not listed in the PAGE UI INVENTORY below.
+- If a BRD describes a feature (e.g. "Add Charges") but the corresponding page shows no such button,
+  that feature is SYSTEM-AUTOMATED — represent it as a VERIFY step (system result), not a user action.
+${ctx.pageConstraints ? `\n${ctx.pageConstraints}` : '(No crawled page data yet — derive flows from BRD and project description only.)'}
+${orphanedBlock}
 CRITICAL DOMAIN AWARENESS:
 - The APPLICATION TITLE and PROJECT NAME tell you what kind of application this is.
-- If the APPLICATION TITLE says "UEM" or "Endpoint Management" → this is a device/asset management tool, NOT a CRM.
-- If the APPLICATION TITLE says "ERP" → interpret modules as inventory, procurement, HR, etc.
-- URL paths MUST be interpreted in the context of the application's actual domain:
-  • In a UEM app: /accounts = organizational units, /contacts = managed devices/endpoints, /leads = device onboarding requests
-  • In an ERP app: /leads = procurement leads, /contacts = vendors/suppliers
-  • In a CRM app: /leads = sales leads, /contacts = customers
+- If the APPLICATION TITLE says "UEM" or "Endpoint Management" this is a device/asset management tool, NOT a CRM.
+- If the APPLICATION TITLE says "ERP" interpret modules as inventory, procurement, HR, etc.
+- URL paths MUST be interpreted in the context of the application actual domain:
+  In a UEM app: /accounts = organizational units, /contacts = managed devices/endpoints, /leads = device onboarding requests
+  In an ERP app: /leads = procurement leads, /contacts = vendors/suppliers
+  In a CRM app: /leads = sales leads, /contacts = customers
+  In a Logistics/Freight app: /enquiries = freight enquiries, /quotations = rate quotations, /bookings = shipment bookings
 - ALWAYS name your flows using the REAL DOMAIN terminology of this specific application.
   GOOD for UEM: "Enroll New Device via /contacts/new", "Register Organizational Unit via /accounts/create"
+  GOOD for Freight: "Create Freight Enquiry with Container Details", "Generate Quotation from Enquiry"
   BAD: "Create New Contact" (generic CRM language for a UEM app)
 
 MANDATORY GENERATION RULES:
-1. ✅ Generate flows for EVERY distinct page/entity/module explicitly visible in the metadata above.
-   - For web apps: use the page paths (•) as your module list — only generate flows for those paths.
+1. Generate flows for EVERY distinct page/entity/module visible in EITHER the metadata OR the BRD.
+   - For web apps: use the page paths AND navigation button labels as your module list.
+   - ADDITIONALLY: scan the BRD for modules, entities, or sections that describe functionality
+     not covered by crawled pages — generate flows for those as well.
    - For Salesforce: use the listed objects — only generate flows for those objects.
    - For APIs: generate flows based on available endpoints and data entities.
 
-2. ✅ For each module with form fields, include the FULL lifecycle:
+2. For each module with form fields, include the lifecycle — BUT only confirmed actions:
    a) Create flow — fill required fields and submit the form
    b) Edit/update flow — find an existing record and modify key fields
-   c) Delete/archive flow (if a delete button is present in metadata)
-   d) At least one cross-module flow linking related entities
+   c) Delete/archive flow — ONLY if a delete/archive button is confirmed in metadata or BRD
+   d) Cross-module flow — ONLY if a relationship between entities is documented in the metadata or BRD
 
-3. ✅ Use the actual field names from metadata to make flows specific.
+3. Use the actual field names from metadata or BRD to make flows specific.
    GOOD: "Register New Asset with Name, IP Address and OS Version"
+   GOOD: "Create Enquiry with place_of_receipt, port_of_loading and Container Details"
    GOOD: "Create New Record with all Required Fields on /accounts/create"
    BAD:  "Fill form and submit" — too vague
 
-4. ✅ Include flows that cover the buttons listed in metadata.
-   If "Approve" button exists → include an approval flow.
-   If "Send Invoice" button exists → include an invoice sending flow.
+4. Include flows that cover the buttons listed in metadata.
+   If "Approve" button exists include an approval flow.
+   If "Send Invoice" button exists include an invoice sending flow.
+   If "Enquiries" navigation button exists include enquiry CRUD flows.
 
-5. ✅ Include edge-case flows:
+5. Include edge-case flows:
    - Required field validation (submit form with missing required fields)
    - Duplicate record detection
    - Permission / access control (if roles are indicated)
 
-6. ❌ DO NOT generate flows for entities NOT present in the metadata.
-   If "Opportunity" page is not in the metadata list, do NOT generate an Opportunity flow.
+6. DO NOT generate flows for entities NOT present in EITHER the metadata OR the BRD.
+   If neither the metadata NOR the BRD mentions an entity, do NOT generate a flow for it.
 
-7. ❌ REJECT generic/vague flows:
+7. REJECT generic/vague flows:
    - "Verify UI is working" — REJECTED
    - "Test the dashboard" — REJECTED
    - "User login" — REJECTED (session is pre-managed)
    - "Verify navigation" — REJECTED
 
-8. ✅ Flow naming rules:
-   - 4–9 words, action-oriented, entity-specific, verb-first
+8. Flow naming rules:
+   - 4-9 words, action-oriented, entity-specific, verb-first
    GOOD: "Create Lead and Convert to Opportunity"
    GOOD: "Submit Invoice and Mark as Paid"
    GOOD: "Validate Required Fields on Account Creation Form"
+   GOOD: "Create Freight Enquiry with Container Validation"
    BAD:  "Test CRM Features" — too generic
 
-9. ✅ Generate 15–40 flows total — one per distinct page/entity in the metadata, plus cross-module flows. Prioritise business-critical journeys first.
+9. Generate 15-40 flows total — one per distinct page/entity in the metadata + BRD, plus cross-module flows. Prioritise business-critical journeys first.
 
-10. ✅ For each flow write a 1–2 sentence description that names:
-    - The specific page/module/entity involved (using exact names from metadata)
+10. For each flow write a 1-2 sentence description that names:
+    - The specific page/module/entity involved (using exact names from metadata or BRD)
     - The business outcome validated
+
+11. ANTI-HALLUCINATION RULE (CRITICAL — violations make tests non-executable):
+    Do NOT invent business processes, statuses, actions, or workflows from your general industry knowledge.
+    ONLY use processes and actions that are EXPLICITLY documented in:
+      - The crawled metadata (page paths, buttons, fields)
+      - The BRD / specification document
+      - The CONFIRMED APPLICATION ENTITIES list
+    Examples of HALLUCINATED flows (REJECTED):
+      - "Place Order and Verify Fulfillment" — REJECTED if "fulfillment" is not in the metadata or BRD
+      - "Process Payment and Verify Receipt" — REJECTED if "receipt" is not in the metadata or BRD
+      - "Ship Order and Track Delivery" — REJECTED if "shipping" or "delivery" is not in the metadata or BRD
+      - "Approve Invoice and Generate Tax Report" — REJECTED if "tax report" is not in the metadata or BRD
+    If in doubt, generate only CREATE and UPDATE flows for the entity — those are always safe.
 
 Return ONLY valid JSON with this exact shape (no markdown, no prose):
 {
   "flows": [
     {
       "name": "Concise action-oriented flow name",
-      "description": "1–2 sentences describing what this flow tests and why it matters for the business."
+      "description": "1-2 sentences describing what this flow tests and why it matters for the business."
     }
   ]
 }`
@@ -538,6 +1063,26 @@ Return ONLY valid JSON with this exact shape (no markdown, no prose):
         name:        String(f.name).trim(),
         description: String(f.description ?? '').trim(),
       }))
+
+    // ── Post-generation gap-fill (project-agnostic safety net) ────────────────
+    // Use BOTH sources for gap detection:
+    //   1. BRD entities (parsed from document)
+    //   2. Test-data entities (ground truth — scraper confirmed they exist)
+    // Every entity from EITHER source that has no matching flow gets a fallback CRUD flow.
+    const allKnownEntities = new Set(brdEntities)
+    for (const tde of ctx.testDataEntities) {
+      allKnownEntities.add(tde.entity_name)
+    }
+
+    const gapFilled = gapFillMissingEntityFlows(flows, allKnownEntities)
+    if (gapFilled.length > flows.length) {
+      log.info(
+        { injectedCount: gapFilled.length - flows.length, total: gapFilled.length,
+          brdEntityCount: brdEntities.size, testDataEntityCount: ctx.testDataEntities.length },
+        '[WORKFLOW] Gap-fill injected flows for entities missed by LLM (from BRD + test-data)',
+      )
+    }
+
     // ── Domain-aware relabeling for UEM apps ─────────────────────────────────
     // If the app title indicates UEM/Endpoint Management, replace CRM terminology
     // in flow names/descriptions with proper UEM domain language.
@@ -572,7 +1117,24 @@ Return ONLY valid JSON with this exact shape (no markdown, no prose):
         }))
       : flows
 
-    return { flows: relabeledFlows }
+    return { flows: relabeledFlows.length > flows.length ? relabeledFlows : gapFilled.map(f => ({
+      name: f.name
+        .replace(/\bLead\b/gi, isUEM ? 'Device Onboarding Request' : 'Lead')
+        .replace(/\bLeads\b/gi, isUEM ? 'Device Onboarding Requests' : 'Leads')
+        .replace(/\bContact\b/gi, isUEM ? 'Managed Endpoint' : 'Contact')
+        .replace(/\bContacts\b/gi, isUEM ? 'Managed Endpoints' : 'Contacts')
+        .replace(/\bAccount\b/gi, isUEM ? 'Organizational Unit' : 'Account')
+        .replace(/\bAccounts\b/gi, isUEM ? 'Organizational Units' : 'Accounts')
+        .replace(/\bOpportunity\b/gi, isUEM ? 'Deployment Opportunity' : 'Opportunity')
+        .replace(/\bOpportunities\b/gi, isUEM ? 'Deployment Opportunities' : 'Opportunities')
+        .replace(/\bCampaign\b/gi, isUEM ? 'Device Policy Campaign' : 'Campaign')
+        .replace(/\bCampaigns\b/gi, isUEM ? 'Device Policy Campaigns' : 'Campaigns')
+        .replace(/\bContract\b/gi, isUEM ? 'License Agreement' : 'Contract')
+        .replace(/\bContracts\b/gi, isUEM ? 'License Agreements' : 'Contracts')
+        .replace(/\bQuote\b/gi, isUEM ? 'Service Quote' : 'Quote')
+        .replace(/\bQuotes\b/gi, isUEM ? 'Service Quotes' : 'Quotes'),
+      description: f.description,
+    })) }
   } catch (err) {
     log.error({ err, raw }, '[WORKFLOW] Failed to generate business flows')
     return { flows: [] }
@@ -622,6 +1184,7 @@ PROJECT: ${ctx.projectName}
 SELECTED BUSINESS FLOW: "${flow}"
 AVAILABLE METADATA (pages / entities):
 ${ctx.metadataSummary}
+${ctx.pageConstraints ? `\nPAGE UI INVENTORY (confirmed elements per page — use to scope test steps accurately):\n${ctx.pageConstraints}` : ''}
 ${brd ? `\nBRD:\n${brd.slice(0, 3000)}` : ''}
 ${existingTests ? `\nEXISTING TEST PATTERNS (for context):\n${existingTests.slice(0, 1500)}` : ''}
 
@@ -810,7 +1373,7 @@ export async function generateTestSuite(params: {
 }): Promise<GenerateTestSuiteResult> {
   const { projectId, flows, brdContent } = params
   const ctx = await getProjectContext(projectId)
-  const brd = decodeDocContent(brdContent ?? ctx.brdContent)
+  const brd = decodeDocContent(brdContent ?? ctx.brdContent, 15000)
   const existingTests = decodeDocContent(ctx.existingTestsContent)
 
   const llm    = buildLlm()
@@ -846,7 +1409,30 @@ Return ONLY valid JSON:
     if (fb !== -1 && lb !== -1) jsonStr = jsonStr.slice(fb, lb + 1)
     const parsed = JSON.parse(jsonStr)
     if (Array.isArray(parsed.ordered)) {
-      orderedFlows = parsed.ordered.filter((x: any) => x.flow && x.order)
+      const selectedFlowNamesSet = new Set(flows.map((f) => f.toLowerCase().trim()))
+      const llmOrdered: Array<{ flow: string; order: number; rationale: string }> =
+        parsed.ordered.filter((x: any) => x.flow && x.order && selectedFlowNamesSet.has(x.flow.toLowerCase().trim()))
+
+      // Ensure ALL originally-selected flows are present — the LLM may drop some.
+      // Build a lookup of flows already returned by the LLM (case-insensitive match).
+      const llmFlowNames = new Set(llmOrdered.map((x) => x.flow.toLowerCase().trim()))
+      const nextOrder = llmOrdered.length + 1
+      const missingFlows = flows
+        .filter((f) => !llmFlowNames.has(f.toLowerCase().trim()))
+        .map((f, i) => ({
+          flow:      f,
+          order:     nextOrder + i,
+          rationale: 'User-selected flow (appended — not returned by ordering LLM)',
+        }))
+
+      orderedFlows = [...llmOrdered, ...missingFlows]
+
+      if (missingFlows.length > 0) {
+        log.warn(
+          { missingFlows: missingFlows.map((x) => x.flow) },
+          '[SUITE] LLM dropped flows during ordering — appended them at end',
+        )
+      }
     }
   } catch (err) {
     log.warn({ err }, '[SUITE] Flow ordering failed — using default order')
@@ -855,25 +1441,241 @@ Return ONLY valid JSON:
   // ── Step 2: Generate test cases per flow in parallel ────────────────────────
   const PER_FLOW_COUNT = Math.min(Math.max(4, Math.floor(20 / flows.length)), 8)
 
+  // ── Robust JSON extraction — handles common LLM formatting issues ──────────
+  function extractJsonArray(raw: string): FlowTestCase[] {
+    let cleaned = raw.trim()
+      .replace(/^```[a-z]*\n?/, '')   // strip opening code fence
+      .replace(/\n?```$/, '')          // strip closing code fence
+
+    // Strategy 1: Extract array directly
+    const fa = cleaned.indexOf('[')
+    const la = cleaned.lastIndexOf(']')
+    if (fa !== -1 && la !== -1) {
+      try {
+        return JSON.parse(cleaned.slice(fa, la + 1))
+      } catch { /* try next strategy */ }
+    }
+
+    // Strategy 2: Extract from { "testCases": [...] } wrapper
+    const fb = cleaned.indexOf('{')
+    const lb = cleaned.lastIndexOf('}')
+    if (fb !== -1 && lb !== -1) {
+      try {
+        const obj = JSON.parse(cleaned.slice(fb, lb + 1))
+        const arr = obj.testCases ?? obj.test_cases ?? obj.tests ?? obj.cases
+        if (Array.isArray(arr)) return arr
+      } catch { /* try next strategy */ }
+    }
+
+    // Strategy 3: Fix trailing commas before ] or }
+    try {
+      const fixed = cleaned
+        .replace(/,\s*([\]}])/g, '$1')    // remove trailing commas
+        .replace(/\n/g, ' ')              // collapse newlines
+      const fa2 = fixed.indexOf('[')
+      const la2 = fixed.lastIndexOf(']')
+      if (fa2 !== -1 && la2 !== -1) {
+        return JSON.parse(fixed.slice(fa2, la2 + 1))
+      }
+    } catch { /* fallthrough */ }
+
+    throw new Error(`Could not extract JSON array from LLM response (length=${raw.length})`)
+  }
+
+  // ── Metadata-driven fallback generator ──────────────────────────────────────
+  // When BOTH LLM attempts fail, generate basic CRUD test cases from the field
+  // manifest and URL map. This ensures no flow gets an empty group.
+  async function generateFallbackTestCases(
+    flowName: string,
+  ): Promise<FlowTestCase[]> {
+    // Extract entity name(s) from the flow name
+    const entityNames = flowName
+      .replace(/\b(create|update|edit|delete|view|add|manage|verify|test|check|and|link|to|with|for|from|new|a|an|the|record|records|successfully)\b/gi, '')
+      .trim()
+      .split(/\s+/)
+      .filter(w => w.length > 2)
+
+    if (entityNames.length === 0) {
+      // Cannot extract any entity — generate a single generic test
+      return [{
+        name: `Test ${flowName}`,
+        description: `Execute the "${flowName}" business flow end-to-end.`,
+        priority: 'medium',
+        steps: [
+          { id: '1', action: 'NAVIGATE', value: '/', locator_type: 'url' },
+          { id: '2', action: 'ASSERT_TEXT', target: flowName.split(/\s+/)[0], locator_type: 'text' },
+        ],
+        tags: [flowName],
+      }]
+    }
+
+    const testCases: FlowTestCase[] = []
+
+    for (const entityName of entityNames) {
+      // Try to load manifest for this entity
+      let manifest: Awaited<ReturnType<typeof buildFieldManifest>> = null
+      try {
+        manifest = await buildFieldManifest(projectId, entityName)
+      } catch { /* non-critical */ }
+
+      if (manifest && manifest.fields.length > 0) {
+        // Generate a create test using real field data
+        const requiredFields = manifest.fields.filter(f => f.required).slice(0, 6)
+        const fieldSteps = requiredFields.map((f, i) => ({
+          id: String(i + 2),
+          action: f.type === 'select' ? 'SELECT' : f.type === 'lookup' ? 'LOOKUP' : 'TYPE',
+          target: f.label,
+          value: f.sampleValue ?? (f.options?.[0] ?? `Test ${f.label}`),
+          locator_type: 'label',
+        }))
+
+        const submitStep = manifest.submitButton ? {
+          id: String(fieldSteps.length + 2),
+          action: 'CLICK',
+          target: manifest.submitButton,
+          locator_type: 'role',
+        } : {
+          id: String(fieldSteps.length + 2),
+          action: 'CLICK',
+          target: 'Save',
+          locator_type: 'role',
+        }
+
+        const verifyStep = {
+          id: String(fieldSteps.length + 3),
+          action: 'ASSERT_TEXT',
+          target: `${entityName} created successfully`,
+          locator_type: 'text',
+        }
+
+        testCases.push({
+          name: `Create ${entityName} with Required Fields`,
+          description: `Create a new ${entityName} record filling all required fields. Generated from field manifest as AI fallback.`,
+          priority: 'high',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: manifest.createUrl ?? `/${entityName.toLowerCase()}s/new`, locator_type: 'url' },
+            ...fieldSteps,
+            submitStep,
+            verifyStep,
+          ],
+          tags: [entityName, 'fallback'],
+        })
+
+        // Also generate a validation test
+        testCases.push({
+          name: `Validate Required Fields on ${entityName} Form`,
+          description: `Attempt to submit the ${entityName} form without filling required fields. Expected: validation errors appear.`,
+          priority: 'medium',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: manifest.createUrl ?? `/${entityName.toLowerCase()}s/new`, locator_type: 'url' },
+            submitStep,
+            { id: '3', action: 'ASSERT_TEXT', target: 'required', locator_type: 'text' },
+          ],
+          tags: [entityName, 'validation', 'fallback'],
+        })
+      } else {
+        // No manifest — generate minimal placeholder tests
+        testCases.push({
+          name: `Create ${entityName} Record`,
+          description: `Create a new ${entityName} record as part of the "${flowName}" flow.`,
+          priority: 'high',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: `/${entityName.toLowerCase()}s/new`, locator_type: 'url' },
+            { id: '2', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+          ],
+          tags: [entityName, 'fallback'],
+        })
+      }
+    }
+
+    // For multi-entity flows (e.g. "Create Contact and Link to Account"),
+    // add a cross-entity linking test case
+    if (entityNames.length >= 2) {
+      testCases.push({
+        name: flowName,  // Use the original flow name directly
+        description: `End-to-end test for the complete "${flowName}" business flow, covering all involved entities: ${entityNames.join(', ')}.`,
+        priority: 'high',
+        steps: entityNames.flatMap((en, i) => [
+          { id: String(i * 2 + 1), action: 'NAVIGATE', value: `/${en.toLowerCase()}s`, locator_type: 'url' },
+          { id: String(i * 2 + 2), action: 'ASSERT_TEXT', target: en, locator_type: 'text' },
+        ]),
+        tags: [...entityNames, 'cross-entity', 'fallback'],
+      })
+    }
+
+    log.info(
+      { flowName, entityNames, testCaseCount: testCases.length },
+      '[SUITE] Generated fallback test cases from field manifest',
+    )
+
+    return testCases
+  }
+
+  // ── Per-flow generation with 3-tier resilience ─────────────────────────────
   const groupResults = await Promise.allSettled(
     orderedFlows.map(async (entry) => {
-      const tcPrompt = `You are a senior QA Automation Engineer. 
+      const isListOnlyModule = /\s+List$/i.test(entry.flow)
+      const moduleDisplayName = entry.flow.replace(/\s*(Management|List|Module|Feature|Settings)$/i, '').trim()
+
+      const moduleScopeBlock = `
+## 🔴🔴🔴 MODULE SCOPE LOCK — NON-NEGOTIABLE 🔴🔴🔴
+You MUST generate test cases EXCLUSIVELY for the "${entry.flow}" business flow.
+Every single test case in your output MUST be 100% about "${entry.flow}" — nothing else.
+
+${isListOnlyModule ? `⚠️  "${moduleDisplayName}" is a READ-ONLY LIST — there is NO create/edit/delete form.
+✅ ONLY generate tests that navigate to the ${moduleDisplayName} list, verify records, search/filter.
+⛔ DO NOT generate Create, Edit, Delete tests for "${moduleDisplayName}".` : ''}
+
+⛔ FORBIDDEN — DO NOT generate test cases for ANY entity, page, or workflow that is NOT part of "${entry.flow}":
+• Do NOT generate tests for other workflows/modules even if the metadata mentions them.
+• Only the selected flow matters — ignore all other entities visible in the metadata or BRD.
+
+✅ Every test case NAME must contain the word "${moduleDisplayName}" (e.g. "Create ${moduleDisplayName}", "Delete ${moduleDisplayName}").
+## 🔴🔴🔴 END MODULE SCOPE LOCK 🔴🔴🔴
+`
+
+      const tcPrompt = `You are a senior QA Automation Engineer writing EXECUTABLE test cases.
 Generate exactly ${PER_FLOW_COUNT} test cases for this SPECIFIC BUSINESS FLOW: "${entry.flow}"
 
-PROJECT: ${ctx.projectName}
-AVAILABLE ENTITIES/PAGES:
-${ctx.metadataSummary}
-${brd ? `\nBRD:\n${brd.slice(0, 3000)}` : ''}
-${existingTests ? `\nEXISTING TEST PATTERNS (avoid duplicating, use as reference for naming conventions):\n${existingTests.slice(0, 2000)}` : ''}
+${moduleScopeBlock}
 
-RULES:
+PROJECT: ${ctx.projectName}
+${ctx.metadataSummary}
+${brd ? `\nBRD / BUSINESS RULES:\n${brd.slice(0, 4000)}` : ''}
+${existingTests ? `\nEXISTING TEST PATTERNS (naming/style reference only):\n${existingTests.slice(0, 2000)}` : ''}
+
+═══════════════════════════════════════════════════════
+UI GROUNDING RULES — violations make tests non-executable
+═══════════════════════════════════════════════════════
+
+RULE 1 — PAGE UI INVENTORY (actual UI elements confirmed by web crawl):
+${ctx.pageConstraints || '(No crawl data — derive steps from BRD only; use VERIFY for system-generated outcomes)'}
+
+RULE 2 — HOW TO READ THE INVENTORY:
+• [LIST] pages: only generate NAVIGATE + CLICK record + VERIFY steps.
+  DO NOT add CLICK "Create"/"Add" steps unless a "New" or "Create" button is shown in the confirmed buttons list.
+• [FORM] pages: use ONLY the listed required fields and dropdowns for TYPE/SELECT steps.
+• [DASHBOARD] pages: use ONLY the listed action buttons.
+• If the BRD describes a feature that has NO matching button in the inventory:
+  that feature is SYSTEM-AUTOMATED. Represent it as a VERIFY step showing the system result,
+  NOT as a user CLICK/TYPE step.
+
+RULE 3 — ALLOWED STEP ACTIONS:
+  NAVIGATE  — go to a URL path
+  CLICK     — click a button or link that is listed in the inventory for that page
+  TYPE      — type into an input field listed in the inventory for that page
+  SELECT    — choose from a dropdown listed in the inventory for that page
+  VERIFY    — assert a visible element, text, count, or state
+  WAIT      — wait for page load or a specific element to appear
+
+RULE 4 — GENERAL:
 - Test cases must be SPECIFIC to the "${entry.flow}" flow only
-- Each test case must end with an ASSERT step
-- Names must be action-oriented (verb + entity + outcome)
-- Cover happy path, edge cases, and at least 1 negative test
+- Each test case MUST end with a VERIFY step
+- Names: verb-first, entity-specific, outcome-clear
+- Cover: 1 happy path, 1 edge case/boundary, 1 validation/negative test
 - No login/auth steps — session is pre-established
 
-Return ONLY valid JSON array (no markdown):
+Return ONLY valid JSON array (no markdown, no prose):
 [
   {
     "name": "string",
@@ -881,42 +1683,231 @@ Return ONLY valid JSON array (no markdown):
     "priority": "high|medium|low",
     "steps": [
       { "id": "1", "action": "NAVIGATE", "value": "/path" },
-      { "id": "2", "action": "TYPE", "target": "Field Label", "value": "test value", "locator_type": "label" }
+      { "id": "2", "action": "CLICK", "target": "Button Name", "locator_type": "role" },
+      { "id": "3", "action": "TYPE", "target": "Field Label", "value": "test value", "locator_type": "label" },
+      { "id": "4", "action": "VERIFY", "target": "Success message or record visible", "locator_type": "text" }
     ],
-    "tags": ["FlowName", "CRUD"]
+    "tags": ["FlowName", "EntityName"]
   }
 ]`
-      const raw = await llm.pipe(parser).invoke([
-        new SystemMessage(tcPrompt),
-        new HumanMessage('Generate the test cases now. Return ONLY a valid JSON array.'),
-      ])
-      let jsonStr = raw.trim().replace(/^```[a-z]*\n?/, '').replace(/\n?```$/, '')
-      const fa = jsonStr.indexOf('['); const la = jsonStr.lastIndexOf(']')
-      if (fa !== -1 && la !== -1) jsonStr = jsonStr.slice(fa, la + 1)
-      const testCases: FlowTestCase[] = JSON.parse(jsonStr)
-      return { ...entry, testCases: Array.isArray(testCases) ? testCases : [] }
+
+      // ── Tier 1: Primary LLM call ─────────────────────────────────────────
+      let testCases: FlowTestCase[] = []
+      try {
+        const raw = await llm.pipe(parser).invoke([
+          new SystemMessage(tcPrompt),
+          new HumanMessage('Generate the test cases now. Return ONLY a valid JSON array.'),
+        ])
+        testCases = extractJsonArray(raw)
+        if (!Array.isArray(testCases) || testCases.length === 0) {
+          throw new Error('LLM returned empty or non-array result')
+        }
+      } catch (primaryErr) {
+        log.warn(
+          { err: primaryErr, flow: entry.flow },
+          '[SUITE] Tier 1 LLM failed — retrying with simplified prompt',
+        )
+
+        // ── Tier 2: Retry with a simpler, shorter prompt ───────────────────
+        try {
+          const retryPrompt = `Generate ${PER_FLOW_COUNT} test cases for: "${entry.flow}"
+Project: ${ctx.projectName}
+
+Return ONLY a valid JSON array — no markdown, no explanation:
+[{"name":"string","description":"string","priority":"high|medium|low","steps":[{"id":"1","action":"NAVIGATE","value":"/path"},{"id":"2","action":"CLICK","target":"Button","locator_type":"role"},{"id":"3","action":"VERIFY","target":"expected text","locator_type":"text"}],"tags":["tag"]}]`
+
+          const retryRaw = await llm.pipe(parser).invoke([
+            new SystemMessage(retryPrompt),
+            new HumanMessage('Generate now. ONLY JSON array output.'),
+          ])
+          testCases = extractJsonArray(retryRaw)
+          if (!Array.isArray(testCases) || testCases.length === 0) {
+            throw new Error('Retry also returned empty')
+          }
+          log.info({ flow: entry.flow, count: testCases.length }, '[SUITE] Tier 2 retry succeeded')
+        } catch (retryErr) {
+          log.warn(
+            { err: retryErr, flow: entry.flow },
+            '[SUITE] Tier 2 retry also failed — using metadata fallback',
+          )
+
+          // ── Tier 3: Metadata-driven fallback ─────────────────────────────
+          testCases = await generateFallbackTestCases(entry.flow)
+          log.info(
+            { flow: entry.flow, count: testCases.length },
+            '[SUITE] Tier 3 metadata fallback generated test cases',
+          )
+        }
+      }
+
+      // Final safety: filter to valid test cases only
+      testCases = testCases.filter(
+        (tc: any) => tc && typeof tc.name === 'string' && tc.name.trim(),
+      )
+
+      return { ...entry, testCases }
     })
   )
 
   // ── Step 3: Persist test cases to DB and collect IDs ────────────────────────
+  // VERIFY action normalization: generateTestSuite prompts use VERIFY which the
+  // execution worker doesn't recognise. Normalise to ASSERT_TEXT before persisting.
+  const ACTION_ALIASES_SUITE: Record<string, string> = {
+    verify: 'ASSERT_TEXT', check: 'ASSERT_TEXT', assert: 'ASSERT_TEXT',
+    fill_form: 'TYPE', enter: 'TYPE', set: 'TYPE', fillform: 'TYPE',
+    submit: 'CLICK', press: 'CLICK', tap: 'CLICK',
+    goto: 'NAVIGATE', open: 'NAVIGATE', visit: 'NAVIGATE',
+  }
+  function normaliseStepAction(step: unknown): unknown {
+    const s = step as Record<string, unknown>
+    const raw = String(s.action ?? '').toLowerCase().trim()
+    const mapped = ACTION_ALIASES_SUITE[raw]
+    if (mapped) return { ...s, action: mapped }
+    return { ...s, action: String(s.action ?? '').toUpperCase().trim() }
+  }
+
   const groups: FlowGroup[] = []
-  for (const result of groupResults) {
+  for (let ri = 0; ri < groupResults.length; ri++) {
+    const result = groupResults[ri]
+
+    // ── REJECTED flow: create a placeholder group so it appears in Review ─────
+    // Previously we silently skipped rejected flows — this caused the 1st suite
+    // to disappear from the Review & Filter page when its LLM call failed.
     if (result.status === 'rejected') {
-      log.warn({ err: result.reason }, '[SUITE] Flow generation failed')
+      const fallbackEntry = orderedFlows[ri]
+      log.warn(
+        { err: result.reason, flow: fallbackEntry?.flow },
+        '[SUITE] Flow generation failed — inserting empty placeholder group so it appears in Review'
+      )
+      if (fallbackEntry) {
+        groups.push({
+          flow:      fallbackEntry.flow,
+          order:     fallbackEntry.order,
+          rationale: fallbackEntry.rationale,
+          testCases: [],  // empty — will be visible in Review so user knows it failed
+        })
+      }
       continue
     }
+
     const { flow, order, rationale, testCases } = result.value
+
+    // Apply the exact same robust post-generation filter to each business flow group
+    let filteredCases = testCases
+    try {
+      const { filterTestCasesToModule } = await import('../test-case-generator/test-case-generator.service.js')
+      filteredCases = filterTestCasesToModule(testCases as any[], flow) as unknown as FlowTestCase[]
+      log.info({ flow, beforeCount: testCases.length, afterCount: filteredCases.length }, '[SUITE] Filtered test cases to flow module')
+    } catch (filterErr) {
+      log.warn({ filterErr, flow }, '[SUITE] Failed to filter test cases to flow module')
+    }
+
     const persisted: (FlowTestCase & { id?: string })[] = []
 
-    for (const tc of testCases) {
+    // ── Pre-compute field manifest for this flow to filter hallucinated fields ──
+    // Extract entity from the flow name (e.g., "Account Management" → "Account")
+    const flowEntityRaw = flow
+      .replace(/\b(management|creation|list|module|feature|workflow|process|handling|operations?)\b/gi, '')
+      .replace(/\b(create|update|edit|delete|view|add|manage|new)\b/gi, '')
+      .trim().split(/\s+/)[0] ?? ''
+    const flowEntity = flowEntityRaw.length > 2 ? flowEntityRaw : undefined
+
+    let flowManifest: Awaited<ReturnType<typeof buildFieldManifest>> = null
+    try {
+      flowManifest = await buildFieldManifest(projectId, flowEntity)
+      if (flowManifest) {
+        log.info(
+          { flow, entity: flowEntity, fieldCount: flowManifest.fields.length },
+          '[SUITE] Loaded field manifest for hallucination filtering'
+        )
+      }
+    } catch { /* non-critical — will skip filtering */ }
+
+    // Build case-insensitive set of known field labels from manifest
+    const knownFieldLabels = flowManifest?.fields?.length
+      ? new Set(flowManifest.fields.map(f => f.label.toLowerCase().trim()))
+      : null
+
+    const FIELD_ACTIONS = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
+
+    for (const tc of filteredCases) {
       try {
+        // Normalise inline step actions (VERIFY→ASSERT_TEXT, FILL_FORM→TYPE, etc.)
+        let normalisedSteps = Array.isArray(tc.steps)
+          ? tc.steps.map(normaliseStepAction)
+          : []
+
+        // ── Field hallucination filter ──────────────────────────────────────
+        // Remove TYPE/SELECT/LOOKUP steps for fields that don't exist in the
+        // real form (e.g., "Email" on Account form). This is the inline
+        // equivalent of Check 7 in runTestStepGeneratorAgent.
+        if (knownFieldLabels && knownFieldLabels.size > 0) {
+          const beforeCount = normalisedSteps.length
+          normalisedSteps = normalisedSteps.filter((s: any) => {
+            const action = String(s.action ?? '').toUpperCase()
+            if (!FIELD_ACTIONS.has(action)) return true  // keep non-field steps
+            const target = String(s.target ?? '').trim()
+            if (!target) return true
+            if (knownFieldLabels.has(target.toLowerCase())) return true  // field exists
+            // Field NOT in manifest → hallucinated → remove
+            log.warn(
+              { flow, tcName: tc.name, action, target },
+              '[SUITE] Removing hallucinated field step — field does NOT exist in the form manifest'
+            )
+            return false
+          })
+          if (normalisedSteps.length < beforeCount) {
+            log.info(
+              { flow, tcName: tc.name, removed: beforeCount - normalisedSteps.length, remaining: normalisedSteps.length },
+              '[SUITE] Hallucinated field steps removed'
+            )
+          }
+        }
+
+        // ── Cross-entity CLICK button filter ────────────────────────────────
+        // Strip CLICK steps that target buttons for a DIFFERENT entity
+        // (e.g., "+ New Lead" in a Contact test).
+        if (flowEntity && flowEntity.length > 2) {
+          const entityLower = flowEntity.toLowerCase()
+          const beforeClickCount = normalisedSteps.length
+          normalisedSteps = normalisedSteps.filter((s: any) => {
+            const action = String(s.action ?? '').toUpperCase()
+            if (action !== 'CLICK') return true
+            const target = String(s.target ?? '').toLowerCase().trim()
+            if (!target) return true
+            const match = target.match(/\b(?:new|create|add)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+            if (!match) return true
+            const entityWord = match[1].trim()
+            if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
+            if (entityLower.includes(entityWord) || entityWord.includes(entityLower)) return true
+            log.warn(
+              { flow, tcName: tc.name, target: s.target, entityWord, flowEntity },
+              '[SUITE] Removing cross-entity CLICK step — button is for a different entity',
+            )
+            return false
+          })
+          if (normalisedSteps.length < beforeClickCount) {
+            log.info(
+              { flow, tcName: tc.name, removed: beforeClickCount - normalisedSteps.length },
+              '[SUITE] Cross-entity CLICK steps removed',
+            )
+          }
+        }
+
+        // ── Button name auto-correction (CENTRALIZED) ─────────────────────
+        // Deterministically replaces LLM-invented button names (e.g. "Create
+        // New Account") with the REAL button from metadata (e.g. "+New Account").
+        if (flowEntity && flowEntity.length > 2) {
+          await autoCorrectButtonNames(normalisedSteps as Array<Record<string, any>>, projectId, flowEntity)
+        }
+
         const row = await prisma.test_cases.create({
           data: {
             name:        tc.name,
             description: tc.description ?? '',
             priority:    tc.priority ?? 'medium',
-            steps:       (tc.steps ?? []) as any,
-            status:      'active',
+            steps:       normalisedSteps as any,
+            status:      'review',
             project_id:  projectId,   // ← required so test-run service can resolve the project
           },
         })

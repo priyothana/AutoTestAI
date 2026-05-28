@@ -29,6 +29,7 @@ const log = createModuleLogger('healing-agent')
 
 export type FailureType =
   | 'STALE_LOCATOR'
+  | 'INVALID_FIELD'          // field doesn't exist on the entity form (hallucinated by LLM step gen)
   | 'MISSING_REQUIRED_FIELD'
   | 'DATA_TYPE_MISMATCH'
   | 'SESSION_EXPIRED'
@@ -72,6 +73,7 @@ IMPORTANT RULES:
 
 Failure classification:
 - STALE_LOCATOR: element exists but CSS/role changed
+- INVALID_FIELD: field does not exist on the entity form (hallucinated by step generator)
 - MISSING_REQUIRED_FIELD: form rejected save due to empty required field
 - DATA_TYPE_MISMATCH: wrong value format for field type
 - SESSION_EXPIRED: auth challenge appeared mid-test
@@ -80,7 +82,7 @@ Failure classification:
 
 Output ONLY valid JSON (no markdown fences):
 {
-  "failureType": "STALE_LOCATOR|MISSING_REQUIRED_FIELD|DATA_TYPE_MISMATCH|SESSION_EXPIRED|APP_BUG|UNKNOWN",
+  "failureType": "STALE_LOCATOR|INVALID_FIELD|MISSING_REQUIRED_FIELD|DATA_TYPE_MISMATCH|SESSION_EXPIRED|APP_BUG|UNKNOWN",
   "analysis": "one sentence root cause",
   "correctedSteps": [...step array...],
   "confidence": 0.0-1.0,
@@ -93,8 +95,26 @@ Output ONLY valid JSON (no markdown fences):
 function detectHeuristicFailure(
   failedStepError: string,
   logs:            string[],
+  failedStep?:     StepData,
 ): FailureType | null {
   const all = [failedStepError, ...logs].join(' ').toLowerCase()
+
+  // INVALID_FIELD: detect when a field-type step (TYPE/SELECT/LOOKUP/CHECKBOX)
+  // fails with locator-not-found — this is likely a hallucinated field, not a
+  // stale locator. Differentiated from STALE_LOCATOR by the step action type.
+  if (failedStep) {
+    const FIELD_ACTIONS = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
+    const stepAction = ((failedStep as any).action ?? '').toUpperCase()
+    if (
+      FIELD_ACTIONS.has(stepAction) &&
+      /locator|selector|could not find|no element|not.*found/i.test(all)
+    ) {
+      // This is a field-type step that can't find its target — likely INVALID_FIELD
+      // (will be confirmed by manifest check in the main function)
+      return 'INVALID_FIELD'
+    }
+  }
+
   if (/locator|selector|could not find|no element/i.test(all)) return 'STALE_LOCATOR'
   if (/required|cannot be blank|is mandatory|validation.*error/i.test(all)) return 'MISSING_REQUIRED_FIELD'
   if (/format|invalid.*date|not.*valid.*email|phone/i.test(all)) return 'DATA_TYPE_MISMATCH'
@@ -132,7 +152,7 @@ export async function runHealingAnalyzerAgent(
   // ── OBSERVE: heuristic fast-path ─────────────────────────────────────────
 
   thoughts.push('OBSERVE: running heuristic failure detector')
-  const heuristicType = detectHeuristicFailure(input.failedStepError, input.logs ?? [])
+  const heuristicType = detectHeuristicFailure(input.failedStepError, input.logs ?? [], input.failedStep)
 
   // ── OBSERVE: retrieve field manifest + similar past failures ─────────────
 
@@ -162,6 +182,45 @@ export async function runHealingAnalyzerAgent(
     }
     await saveAiSuggestions(input.testRunId, result)
     return result
+  }
+
+  // ── Fast path: INVALID_FIELD → strip the hallucinated step, no LLM needed ─
+  if (heuristicType === 'INVALID_FIELD' && manifest && manifest.fields.length > 0) {
+    const knownFields = new Set(manifest.fields.map(f => f.label.toLowerCase().trim()))
+    const failedTarget = ((input.failedStep as any).target ?? '').trim()
+    const isInvalid = failedTarget && !knownFields.has(failedTarget.toLowerCase())
+
+    if (isInvalid) {
+      thoughts.push(`THINK: INVALID_FIELD confirmed — "${failedTarget}" not in manifest (${manifest.fields.length} known fields)`)
+      // Build corrected steps with the hallucinated field step REMOVED
+      const correctedSteps = input.allSteps.filter(s =>
+        s.id !== input.failedStep.id
+      ).map((s, i) => ({ ...s, id: String(i + 1) }))
+
+      const availableFields = manifest.fields.map(f => f.label).slice(0, 10)
+      const result: FailureAnalysis = {
+        executionId:    input.executionId,
+        testCaseId:     input.testCaseId,
+        failureType:    'INVALID_FIELD',
+        analysis:       `Field "${failedTarget}" does not exist on the ${manifest.entityName} form. ` +
+                        `This field was hallucinated by the AI step generator and should be removed. ` +
+                        `Available fields: ${availableFields.join(', ')}`,
+        correctedSteps,
+        confidence:     0.95,
+        learnings:      [
+          `NEVER generate a step for field "${failedTarget}" on entity "${manifest.entityName}" — it does not exist`,
+          `Valid fields for ${manifest.entityName}: ${availableFields.join(', ')}`,
+        ],
+        hitlInvoked:    false,
+      }
+      await saveAiSuggestions(input.testRunId, result)
+
+      log.info(
+        { executionId: input.executionId, invalidField: failedTarget, entity: manifest.entityName },
+        '[HEAL-AGENT] INVALID_FIELD fast path — hallucinated field step removed from suggestions',
+      )
+      return result
+    }
   }
 
   // ── ACT: LLM-based RCA ───────────────────────────────────────────────────

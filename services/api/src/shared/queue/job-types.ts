@@ -56,6 +56,23 @@ export interface ExecutionContext {
   keycloakRefreshUrl?: string
   // Unix epoch ms — token valid-until timestamp (24h from issuance by default)
   keycloakTokenExpiresAt?: number
+
+  // ── Orchestrator configuration (Layer 2) — all optional with safe defaults ──
+  // Pre-scout gate: performs a quick element count before each step to surface
+  // selector failures early without waiting for full interaction timeout.
+  // Default: true (safe to leave enabled — adds ~15ms per step)
+  enablePreScout?: boolean
+  // Selector health gate: checks the SelectorRegistry before each step.
+  // Skips QUARANTINED selectors and routes to healed alternatives.
+  // Default: true
+  enableSelectorHealthGate?: boolean
+  // Retry strategy for the orchestrator's step-level retry layer.
+  // 'standard' = 2 attempts, 'aggressive' = 3 attempts, 'minimal' = 1 attempt
+  // Default: 'standard'
+  retryStrategy?: 'standard' | 'aggressive' | 'minimal'
+  // CDP-based DOM discovery for advanced self-healing (shadow DOM traversal).
+  // Default: false — opt-in only; requires --remote-debugging-port in launch args
+  enableCDP?: boolean
 }
 
 /** Individual test step — matches frontend/backend JSON shape */

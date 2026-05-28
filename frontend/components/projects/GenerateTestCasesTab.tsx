@@ -52,7 +52,7 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
     // ── Module selector state ─────────────────────────────────────────────────
     const [modules, setModules] = useState<string[]>([])
     const [modulesLoading, setModulesLoading] = useState(false)
-    const [selectedModule, setSelectedModule] = useState<string>("")
+    const [selectedModules, setSelectedModules] = useState<Set<string>>(new Set())
     const [dropdownOpen, setDropdownOpen] = useState(false)
     const [customModuleMode, setCustomModuleMode] = useState(false)
     const [customModuleInput, setCustomModuleInput] = useState("")
@@ -358,22 +358,24 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
         finally { setJiraLoading(false) }
     }
 
-    // Module selection helpers
-    const handleSelectModule = (mod: string) => {
+    // Module selection helpers (multi-select)
+    const toggleModule = (mod: string) => {
         if (mod === CUSTOM_MODULE_SENTINEL) {
             setCustomModuleMode(true)
             setDropdownOpen(false)
-        } else {
-            setSelectedModule(mod)
-            setCustomModuleMode(false)
-            setDropdownOpen(false)
+            return
         }
+        setSelectedModules(prev => {
+            const next = new Set(prev)
+            next.has(mod) ? next.delete(mod) : next.add(mod)
+            return next
+        })
     }
     const handleConfirmCustomModule = () => {
         const name = customModuleInput.trim()
         if (name) {
-            setSelectedModule(name)
             if (!modules.includes(name)) setModules(prev => [name, ...prev])
+            setSelectedModules(prev => { const n = new Set(prev); n.add(name); return n })
         }
         setCustomModuleMode(false)
         setCustomModuleInput("")
@@ -431,6 +433,14 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
         return next
     })
 
+    // Derive a comma-joined label for display
+    const selectedModulesArray = Array.from(selectedModules)
+    const selectedModuleLabel = selectedModulesArray.length === 0
+        ? ""
+        : selectedModulesArray.length <= 2
+            ? selectedModulesArray.join(", ")
+            : `${selectedModulesArray.slice(0, 2).join(", ")} +${selectedModulesArray.length - 2}`
+
     // ── Add selected to Tests: delete unselected, generate steps, then navigate ─
     const handleAddSelected = async () => {
         if (selectedIds.size === 0) { toast.error("Select at least one test case"); return }
@@ -451,7 +461,7 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
             const stepsRes = await fetch(`${API}/projects/${projectId}/generate-steps-for-selected`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ testCaseIds: Array.from(selectedIds), selectedModule: selectedModule || undefined }),
+                body: JSON.stringify({ testCaseIds: Array.from(selectedIds), selectedModule: selectedModulesArray[0] || undefined }),
             })
             if (stepsRes.ok) {
                 const stepsData = await stepsRes.json()
@@ -471,14 +481,43 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
 
     // ── Trigger generation ───────────────────────────────────────────────────
     const handleGenerate = async () => {
-        if (!selectedModule) { toast.error("Please select a module first"); return }
-        setGenerating(true); setJobData(null); setJobId(null)
+        if (selectedModules.size === 0) { toast.error("Please select at least one module"); return }
+        setGenerating(true); setJobData(null); setJobId(null); setReviewCases([]); setSelectedIds(new Set())
+
+        const modulesArr = Array.from(selectedModules)
+
+        // ── Multi-module path: call /generate-test-suite ──
+        if (modulesArr.length > 1) {
+            setJobData({ status: "running", progress: 10, message: `Generating test cases for ${modulesArr.length} workflows…`, generatedCount: 0, suiteName: `Suite – ${modulesArr.length} flows` })
+            try {
+                const res = await fetch(`${API}/projects/${projectId}/generate-test-suite`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ flows: modulesArr, brdContent: brdContent || undefined }),
+                })
+                if (!res.ok) throw new Error("Generation failed")
+                const d: { groups: { flow: string; order: number; rationale: string; testCases: GeneratedTestCase[] }[]; totalTestCases: number } = await res.json()
+                // Flatten all test cases for the review panel
+                const allCases: GeneratedTestCase[] = d.groups.flatMap(g => g.testCases.map(tc => ({ ...tc, id: (tc as any).id ?? '', name: tc.name, description: (tc as any).description ?? null, priority: (tc as any).priority ?? 'medium', steps: (tc as any).steps ?? [], status: 'active' })))
+                setReviewCases(allCases)
+                setSelectedIds(new Set(allCases.map(tc => tc.id).filter(Boolean)))
+                setJobData({ status: "completed", progress: 100, message: "Done!", generatedCount: d.totalTestCases, suiteName: `Suite – ${d.groups.length} flows`, testCaseIds: allCases.map(tc => tc.id).filter(Boolean) })
+                toast.success(`🎉 Generated ${d.totalTestCases} test cases across ${d.groups.length} flows!`)
+            } catch (e: any) {
+                toast.error(e?.message ?? "Generation failed")
+                setJobData({ status: "failed", progress: 0, message: "Generation failed", generatedCount: 0, suiteName: "", error: e?.message })
+            } finally { setGenerating(false) }
+            return
+        }
+
+        // ── Single-module path: call /generate-test-cases (original flow) ──
+        const singleModule = modulesArr[0]
         try {
             const res = await fetch(`${API}/projects/${projectId}/generate-test-cases`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    selectedModule,
+                    selectedModule: singleModule,
                     useJira,
                     brdContent: brdContent || undefined,
                     existingTestsContent: testsContent || undefined,
@@ -489,13 +528,13 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
             setJobId(data.jobId)
             setJobData({ status: "queued", progress: 0, message: "Queued…", generatedCount: 0, suiteName: data.suiteName })
             startPolling(data.jobId)
-            toast.success(`Generating test cases for "${selectedModule}"…`)
+            toast.success(`Generating test cases for "${singleModule}"…`)
         } catch { toast.error("Network error — is the API running?"); setGenerating(false) }
     }
 
     const sourcesActive = (brdContent ? 1 : 0) + (testsContent ? 1 : 0) + (useJira && jiraConfigured ? 1 : 0) + (metadataSynced ? 1 : 0)
     const isAddingSelected = confirming || generatingSteps
-    const activeModuleLabel = selectedModule || ""
+    const activeModuleLabel = selectedModuleLabel
 
     // ── Display helpers ────────────────────────────────────────────────────────
     const brdDisplayName   = brdFile?.name ?? brdPersistedName
@@ -665,15 +704,22 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
                 />
             </div>
 
-            {/* ── Module Selector ─────────────────────────────────────────── */}
+            {/* ── Module Selector (multi-select) ───────────────────────────── */}
             <div className="rounded-xl border-2 border-violet-200 dark:border-violet-800 bg-gradient-to-br from-violet-50/60 to-purple-50/40 dark:from-violet-950/20 dark:to-purple-950/10 p-5 space-y-3">
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                         <Layers className="h-4 w-4 text-violet-500" />
-                        <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Select Module</span>
-                        <span className="text-xs text-muted-foreground">(required — test cases will focus on this area)</span>
+                        <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Select Workflows</span>
+                        <span className="text-xs text-muted-foreground">(select one or more — test cases will be generated for each)</span>
                     </div>
-                    {modulesLoading && <span className="flex items-center gap-1 text-xs text-violet-500"><Loader2 className="h-3 w-3 animate-spin" />Generating modules…</span>}
+                    <div className="flex items-center gap-2">
+                        {selectedModules.size > 0 && (
+                            <Badge variant="outline" className="border-violet-400 text-violet-600 bg-violet-50 dark:bg-violet-950/30 dark:text-violet-300 dark:border-violet-700 text-xs">
+                                {selectedModules.size} selected
+                            </Badge>
+                        )}
+                        {modulesLoading && <span className="flex items-center gap-1 text-xs text-violet-500"><Loader2 className="h-3 w-3 animate-spin" />Generating modules…</span>}
+                    </div>
                 </div>
 
                 {/* Dropdown trigger */}
@@ -682,22 +728,34 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
                         <button
                             onClick={() => setDropdownOpen(v => !v)}
                             className={`w-full flex items-center justify-between px-4 py-3 rounded-lg border-2 transition-all duration-150 text-left ${
-                                selectedModule
+                                selectedModules.size > 0
                                     ? "border-violet-500 bg-white dark:bg-violet-950/30 shadow-sm shadow-violet-100 dark:shadow-violet-900/20"
                                     : "border-dashed border-violet-300 dark:border-violet-700 bg-white/60 dark:bg-black/10 hover:border-violet-400"
                             }`}>
                             <span className={`flex items-center gap-2 text-sm font-medium ${
-                                selectedModule ? "text-violet-700 dark:text-violet-200" : "text-muted-foreground"
+                                selectedModules.size > 0 ? "text-violet-700 dark:text-violet-200" : "text-muted-foreground"
                             }`}>
-                                {selectedModule
-                                    ? <><ChevronRight className="h-4 w-4 text-violet-500" />{selectedModule}</>
-                                    : "— Choose a module —"}
+                                {selectedModules.size > 0
+                                    ? <><Layers className="h-4 w-4 text-violet-500" />{selectedModuleLabel}</>
+                                    : "— Choose workflows to test —"}
                             </span>
                             <ChevronDown className={`h-4 w-4 text-violet-400 transition-transform duration-200 ${dropdownOpen ? "rotate-180" : ""}`} />
                         </button>
 
                         {dropdownOpen && (
-                            <div className="mt-2 w-full bg-white dark:bg-gray-900 border border-violet-200 dark:border-violet-800 rounded-xl shadow-sm overflow-hidden">
+                            <div className="mt-2 w-full bg-white dark:bg-gray-900 border border-violet-200 dark:border-violet-800 rounded-xl shadow-sm overflow-hidden z-20 absolute">
+                                {/* Select/Deselect all */}
+                                {modules.length > 0 && !modulesLoading && (
+                                    <div className="px-4 py-2 border-b border-violet-100 dark:border-violet-800 flex items-center justify-between bg-violet-50/50 dark:bg-violet-950/20">
+                                        <span className="text-xs text-muted-foreground">{modules.length} workflows available</span>
+                                        <button
+                                            onClick={() => setSelectedModules(selectedModules.size === modules.length ? new Set() : new Set(modules))}
+                                            className="text-xs font-semibold text-violet-600 dark:text-violet-400 hover:underline"
+                                        >
+                                            {selectedModules.size === modules.length ? "Deselect all" : "Select all"}
+                                        </button>
+                                    </div>
+                                )}
                                 <div className="max-h-64 overflow-y-auto">
                                     {modulesLoading ? (
                                         <div className="flex items-center justify-center gap-2 py-6 text-muted-foreground text-sm">
@@ -706,22 +764,29 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
                                     ) : modules.length === 0 ? (
                                         <div className="py-4 text-center text-sm text-muted-foreground">No modules found — add a custom one below</div>
                                     ) : (
-                                        modules.map((mod, i) => (
-                                            <button key={i} onClick={() => handleSelectModule(mod)}
-                                                className={`w-full text-left px-4 py-2.5 text-sm transition-colors flex items-center gap-2 ${
-                                                    selectedModule === mod
-                                                        ? "bg-violet-50 dark:bg-violet-900/30 text-violet-700 dark:text-violet-200 font-medium"
-                                                        : "hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300"
-                                                }`}>
-                                                {selectedModule === mod && <Check className="h-3.5 w-3.5 text-violet-500 shrink-0" />}
-                                                <span className={selectedModule === mod ? "" : "pl-5"}>{mod}</span>
-                                            </button>
-                                        ))
+                                        modules.map((mod, i) => {
+                                            const isSel = selectedModules.has(mod)
+                                            return (
+                                                <button key={i} onClick={() => toggleModule(mod)}
+                                                    className={`w-full text-left px-4 py-2.5 text-sm transition-colors flex items-center gap-3 ${
+                                                        isSel
+                                                            ? "bg-violet-50 dark:bg-violet-900/30 text-violet-700 dark:text-violet-200 font-medium"
+                                                            : "hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300"
+                                                    }`}>
+                                                    <div className={`w-4 h-4 rounded flex items-center justify-center flex-shrink-0 border-2 transition-colors ${
+                                                        isSel ? "bg-violet-600 border-violet-600" : "border-gray-300 dark:border-gray-600"
+                                                    }`}>
+                                                        {isSel && <Check className="h-2.5 w-2.5 text-white" />}
+                                                    </div>
+                                                    <span>{mod}</span>
+                                                </button>
+                                            )
+                                        })
                                     )}
                                 </div>
                                 {/* Add Custom Module */}
                                 <div className="border-t border-violet-100 dark:border-violet-800">
-                                    <button onClick={() => handleSelectModule(CUSTOM_MODULE_SENTINEL)}
+                                    <button onClick={() => toggleModule(CUSTOM_MODULE_SENTINEL)}
                                         className="w-full text-left px-4 py-2.5 text-sm text-violet-600 dark:text-violet-400 hover:bg-violet-50 dark:hover:bg-violet-900/20 flex items-center gap-2 font-medium">
                                         <Plus className="h-3.5 w-3.5" /> Add Custom Module
                                     </button>
@@ -743,7 +808,7 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
                         />
                         <Button size="sm" onClick={handleConfirmCustomModule} disabled={!customModuleInput.trim()}
                             className="bg-violet-600 hover:bg-violet-700 shrink-0">
-                            <Check className="h-4 w-4 mr-1" /> Use
+                            <Check className="h-4 w-4 mr-1" /> Add
                         </Button>
                         <Button size="sm" variant="ghost" onClick={() => { setCustomModuleMode(false); setCustomModuleInput("") }}>
                             <X className="h-4 w-4" />
@@ -751,14 +816,18 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
                     </div>
                 )}
 
-                {/* Selected module preview chip */}
-                {selectedModule && !customModuleMode && (
-                    <div className="flex items-center gap-2">
-                        <span className="text-xs text-muted-foreground">Generating for:</span>
-                        <span className="inline-flex items-center gap-1.5 bg-violet-600 text-white text-xs font-medium px-3 py-1 rounded-full">
-                            <Layers className="h-3 w-3" />{selectedModule}
-                            <button onClick={() => setSelectedModule("")} className="ml-1 hover:text-violet-200"><X className="h-3 w-3" /></button>
-                        </span>
+                {/* Selected modules preview chips */}
+                {selectedModules.size > 0 && !customModuleMode && (
+                    <div className="flex items-start gap-2">
+                        <span className="text-xs text-muted-foreground mt-1 shrink-0">Generating for:</span>
+                        <div className="flex flex-wrap gap-1.5">
+                            {selectedModulesArray.map(mod => (
+                                <span key={mod} className="inline-flex items-center gap-1 bg-violet-600 text-white text-xs font-medium px-2.5 py-0.5 rounded-full">
+                                    {mod}
+                                    <button onClick={() => setSelectedModules(prev => { const n = new Set(prev); n.delete(mod); return n })} className="ml-0.5 hover:text-violet-200"><X className="h-3 w-3" /></button>
+                                </span>
+                            ))}
+                        </div>
                     </div>
                 )}
             </div>
@@ -771,13 +840,17 @@ export default function GenerateTestCasesTab({ projectId, projectName, jiraConfi
                 </div>
                 <Button
                     size="lg"
-                    disabled={generating || !selectedModule}
+                    disabled={generating || selectedModules.size === 0}
                     onClick={handleGenerate}
                     className="bg-gradient-to-r from-violet-600 to-purple-600 hover:from-violet-700 hover:to-purple-700 text-white shadow-lg shadow-violet-200 dark:shadow-violet-900/30 px-8 disabled:opacity-50"
                 >
                     {generating
                         ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Generating…</>
-                        : <><Zap className="mr-2 h-4 w-4" />{selectedModule ? `Generate for "${selectedModule.slice(0,22)}${selectedModule.length>22?'…':''}"` : "Select a Module First"}</>}
+                        : selectedModules.size === 0
+                            ? <><Zap className="mr-2 h-4 w-4" />Select Workflows First</>
+                            : selectedModules.size === 1
+                                ? <><Zap className="mr-2 h-4 w-4" />Generate for "{selectedModulesArray[0].slice(0,22)}{selectedModulesArray[0].length > 22 ? '…' : ''}"</>
+                                : <><Sparkles className="mr-2 h-4 w-4" />Generate for {selectedModules.size} Workflows</>}
                 </Button>
             </div>
 

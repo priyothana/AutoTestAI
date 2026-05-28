@@ -1,22 +1,15 @@
 "use client"
 
 import { use, useState, useEffect } from "react"
-import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
-    LayoutDashboard,
-    FolderKanban,
-    TestTube2,
-    PlayCircle,
-    FileBarChart,
-    Settings,
     LogOut,
     Menu,
     Bell
 } from "lucide-react"
 import ThemeToggle from "@/components/shared/ThemeToggle"
 import Logo from "@/components/shared/Logo"
-import TestsIcon from "@/components/shared/TestsIcon"
+import Sidebar from "@/components/shared/Sidebar"
 
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
@@ -34,15 +27,6 @@ interface DashboardLayoutProps {
     children: React.ReactNode
     params: Promise<any>
 }
-
-const sidebarItems = [
-    { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
-    { name: "Environments", href: "/dashboard/projects", icon: FolderKanban },
-    { name: "Tests", href: "/dashboard/tests", icon: TestTube2, customIcon: true },
-    { name: "Execution", href: "/dashboard/execution", icon: PlayCircle },
-    { name: "Reports", href: "/dashboard/reports", icon: FileBarChart },
-    { name: "Settings", href: "/dashboard/settings", icon: Settings },
-]
 
 export default function DashboardLayout({ children, params }: DashboardLayoutProps) {
     use(params)
@@ -63,77 +47,8 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
     return (
         <div className="flex min-h-screen" style={{ backgroundColor: 'var(--color-bg-base)' }}>
             {/* Desktop Sidebar */}
-            <aside className="hidden w-64 md:block z-10" style={{ backgroundColor: 'var(--color-bg-elevated)', borderRight: '1px solid var(--color-border-sem)', boxShadow: 'var(--shadow-md)' }}>
-                <div className="flex h-16 items-center px-6" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
-                    <Link href="/dashboard" className="flex items-center">
-                        <Logo size="sm" />
-                    </Link>
-                </div>
-
-                <nav className="flex flex-col gap-1 px-3">
-                    <div className="px-3 mb-2 mt-4 text-xs font-semibold uppercase" style={{ color: 'var(--color-text-muted)', letterSpacing: '0.08em' }}>Main</div>
-                    {sidebarItems.map((item) => {
-                        const isActive = pathname === item.href
-                        return (
-                            <Link
-                                key={item.href}
-                                href={item.href}
-                                className="group flex items-center gap-3 rounded-md px-3 py-2.5 text-sm transition-all"
-                                style={isActive ? {
-                                    color: 'var(--color-brand)',
-                                    backgroundColor: 'var(--color-brand-light)',
-                                    borderLeft: '2px solid var(--color-brand)',
-                                    paddingLeft: '10px',
-                                    fontWeight: 500,
-                                    transitionDuration: 'var(--transition-fast)',
-                                } : {
-                                    color: 'var(--color-text-secondary)',
-                                    backgroundColor: 'transparent',
-                                    borderLeft: '2px solid transparent',
-                                    paddingLeft: '10px',
-                                    fontWeight: 400,
-                                    transitionDuration: 'var(--transition-fast)',
-                                }}
-                                onMouseEnter={e => {
-                                    if (!isActive) {
-                                        const el = e.currentTarget as HTMLAnchorElement
-                                        el.style.color = 'var(--color-text-primary)'
-                                        el.style.backgroundColor = 'var(--color-bg-overlay)'
-                                    }
-                                }}
-                                onMouseLeave={e => {
-                                    if (!isActive) {
-                                        const el = e.currentTarget as HTMLAnchorElement
-                                        el.style.color = 'var(--color-text-secondary)'
-                                        el.style.backgroundColor = 'transparent'
-                                    }
-                                }}
-                            >
-                                {item.customIcon ? (
-                                    <TestsIcon
-                                        className="h-4 w-4 flex-shrink-0"
-                                        active={isActive}
-                                        style={{
-                                            opacity: isActive ? 1 : 0.6,
-                                            color: isActive ? 'var(--color-brand)' : 'currentColor',
-                                            transition: 'opacity var(--transition-fast), color var(--transition-fast)',
-                                        }}
-                                    />
-                                ) : (
-                                    <item.icon
-                                        className="h-4 w-4 flex-shrink-0"
-                                        style={{
-                                            opacity: isActive ? 1 : 0.6,
-                                            color: isActive ? 'var(--color-brand)' : 'currentColor',
-                                            transition: 'opacity var(--transition-fast), color var(--transition-fast)',
-                                        }}
-                                    />
-                                )}
-                                {item.name}
-                            </Link>
-                        )
-                    })}
-                </nav>
+            <aside className="hidden md:block flex-shrink-0">
+                <Sidebar pathname={pathname} />
             </aside>
 
             <div className="flex flex-1 flex-col overflow-auto">
@@ -148,54 +63,8 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                         <span className="sr-only">Toggle menu</span>
                                     </Button>
                                 </SheetTrigger>
-                                <SheetContent side="left" className="w-64 p-0" style={{ backgroundColor: 'var(--color-bg-elevated)', borderRight: '1px solid var(--color-border-sem)' }}>
-                                    <div className="flex h-16 items-center px-6" style={{ borderBottom: '1px solid var(--color-border-sem)' }}>
-                                        <Logo size="sm" />
-                                    </div>
-                                    <nav className="flex flex-col gap-1 p-4">
-                                        {sidebarItems.map((item) => {
-                                            const isActiveMobile = pathname === item.href
-                                            return (
-                                            <Link
-                                                key={item.href}
-                                                href={item.href}
-                                                className="flex items-center gap-3 rounded-md py-2 text-sm"
-                                                style={isActiveMobile ? {
-                                                    color: 'var(--color-brand)',
-                                                    backgroundColor: 'var(--color-brand-light)',
-                                                    borderLeft: '2px solid var(--color-brand)',
-                                                    paddingLeft: '10px',
-                                                    paddingRight: '12px',
-                                                    fontWeight: 500,
-                                                } : {
-                                                    color: 'var(--color-text-secondary)',
-                                                    borderLeft: '2px solid transparent',
-                                                    paddingLeft: '10px',
-                                                    paddingRight: '12px',
-                                                }}
-                                            >
-                                                {item.customIcon ? (
-                                                    <TestsIcon
-                                                        className="h-4 w-4 flex-shrink-0"
-                                                        active={isActiveMobile}
-                                                        style={{
-                                                            opacity: isActiveMobile ? 1 : 0.6,
-                                                            color: isActiveMobile ? 'var(--color-brand)' : 'currentColor',
-                                                        }}
-                                                    />
-                                                ) : (
-                                                    <item.icon
-                                                        className="h-4 w-4 flex-shrink-0"
-                                                        style={{
-                                                            opacity: isActiveMobile ? 1 : 0.6,
-                                                            color: isActiveMobile ? 'var(--color-brand)' : 'currentColor',
-                                                        }}
-                                                    />
-                                                )}
-                                                {item.name}
-                                            </Link>
-                                        )})}
-                                    </nav>
+                                <SheetContent side="left" className="w-[280px] p-0" style={{ backgroundColor: 'transparent', border: 'none' }}>
+                                    <Sidebar pathname={pathname} mobile />
                                 </SheetContent>
                             </Sheet>
                         ) : (

@@ -2,7 +2,7 @@
  * Execution Agent — Phase 1, Agent 4  (upgraded)
  *
  * Wraps the existing execution.worker.ts pipeline with agentic intelligence:
- * - Classifies failures (including navigation-menu failures)
+ * - Classifies failures (including navigation-menu and invalid-field failures)
  * - Applies autonomous recovery strategies before calling HITL
  * - OBSERVE → THINK → ACT → REFLECT loop
  * - Logs all decisions to agent_executions for observability
@@ -10,6 +10,7 @@
  * LLM: OpenAI gpt-4o (used for failure classification and recovery planning)
  *
  * Recovery strategy priority (before HITL):
+ *   0. INVALID_FIELD             — field doesn't exist on entity form → auto-skip
  *   1. NAVIGATION_MENU_STRATEGY — multi-strategy DOM scan for nav items
  *   2. WAIT_AND_RETRY           — element loading / timing issue
  *   3. ALTERNATIVE_LOCATOR      — LLM suggests corrected selector
@@ -25,7 +26,14 @@ import { v4 as uuidv4 }          from 'uuid'
 import { createModuleLogger }    from '../../shared/logger/index.js'
 import { hitlTool }              from './tools/hitl.tool.js'
 import { logAgentExecution }     from './tools/db-query.tool.js'
+import { buildFieldManifest }    from './tools/metadata-reader.tool.js'
 import prisma                    from '../../shared/db/prisma.js'
+import {
+  getLabelCorrections,
+  saveLabelCorrection,
+  saveButtonMapping,
+  saveRequiredFields,
+} from '../self-healing/learning-registry.service.js'
 import type { StepData }         from '../../shared/queue/job-types.js'
 import type { HITLInput }        from './agent.types.js'
 
@@ -46,7 +54,9 @@ function buildLlm() {
 
 type FailureClass =
   | 'LOCATOR_NOT_FOUND'
-  | 'NAVIGATION_MENU'       // ← NEW: element is a nav/menu item
+  | 'INVALID_FIELD'          // field doesn't exist on the entity form (hallucinated by LLM)
+  | 'INVALID_TEST_DATA'     // step value is placeholder/garbage data (e.g. "-", "N/A")
+  | 'NAVIGATION_MENU'       // element is a nav/menu item
   | 'ELEMENT_NOT_VISIBLE'
   | 'UNEXPECTED_MODAL'
   | 'SESSION_EXPIRED'
@@ -139,7 +149,7 @@ A test step failed. Classify the failure and suggest the best recovery action.
 
 Output ONLY valid JSON (no markdown):
 {
-  "failureType": "LOCATOR_NOT_FOUND|NAVIGATION_MENU|ELEMENT_NOT_VISIBLE|UNEXPECTED_MODAL|SESSION_EXPIRED|TIMEOUT|ASSERTION_FAILED|UNKNOWN",
+  "failureType": "LOCATOR_NOT_FOUND|INVALID_FIELD|NAVIGATION_MENU|ELEMENT_NOT_VISIBLE|UNEXPECTED_MODAL|SESSION_EXPIRED|TIMEOUT|ASSERTION_FAILED|UNKNOWN",
   "recoveryAction": "WAIT_AND_RETRY|ALTERNATIVE_LOCATOR|DISMISS_MODAL|RE_AUTHENTICATE|SKIP_STEP|CALL_HITL",
   "reason": "one sentence explanation",
   "confidence": 0.0-1.0,
@@ -148,22 +158,177 @@ Output ONLY valid JSON (no markdown):
 
 interface RecoveryPlan {
   failureType:          FailureClass
-  recoveryAction:       'WAIT_AND_RETRY' | 'ALTERNATIVE_LOCATOR' | 'DISMISS_MODAL' | 'RE_AUTHENTICATE' | 'SKIP_STEP' | 'CALL_HITL'
+  recoveryAction:       'WAIT_AND_RETRY' | 'ALTERNATIVE_LOCATOR' | 'DISMISS_MODAL' | 'RE_AUTHENTICATE' | 'SKIP_STEP' | 'REGENERATE_AND_RETRY' | 'CALL_HITL'
   reason:               string
   confidence:           number
   alternativeLocator?:  string
   locatorSuggestions?:  LocatorSuggestion[]
+  availableFields?:     string[]   // populated when INVALID_FIELD — shows actual fields from manifest
+  correctedValue?:      string     // populated when INVALID_TEST_DATA — realistic replacement value
 }
 
 async function planRecovery(
   step:         StepData,
   errorMessage: string,
   pageHtml?:    string,
+  projectId?:   string,
+  executionId?: string,
 ): Promise<RecoveryPlan> {
   const cls = classifyFailure(errorMessage, step.target ?? undefined)
 
+  // ── INVALID_FIELD detection: check if a field-type step's target actually exists ──
+  // When a TYPE/SELECT/LOOKUP/CHECKBOX step fails with LOCATOR_NOT_FOUND, it could be
+  // because the field genuinely doesn't exist on the form (hallucinated by the LLM
+  // during step generation). Check the field manifest BEFORE trying alternative locators.
+  const FIELD_ACTIONS = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
+  const stepAction = ((step as any).action ?? '').toUpperCase()
+  const stepTarget = (step.target ?? '').trim()
+
+  if (
+    projectId &&
+    FIELD_ACTIONS.has(stepAction) &&
+    stepTarget &&
+    (cls === 'LOCATOR_NOT_FOUND' || cls === 'UNKNOWN')
+  ) {
+    try {
+      // Extract entity hint from the test case name
+      let entityHint: string | undefined
+      if (executionId) {
+        const run = await prisma.test_runs.findUnique({
+          where: { id: executionId },
+          select: {
+            test_case: {
+              select: { name: true }
+            }
+          }
+        })
+        const tcName = run?.test_case?.name
+        if (tcName) {
+          const rawHint = tcName
+            .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+            .replace(/\b(new|successfully|with|for|and|the|a|an|details|detail|record|records)\b/gi, '')
+            .trim()
+            .split(/\s+/)[0] ?? ''
+          if (rawHint.length > 2) {
+            entityHint = rawHint
+          }
+        }
+      }
+
+      const manifest = await buildFieldManifest(projectId, entityHint)
+      if (manifest && manifest.fields.length > 0) {
+        const knownFields = new Set(manifest.fields.map(f => f.label.toLowerCase().trim()))
+        const targetLower = stepTarget.toLowerCase().trim()
+
+        if (!knownFields.has(targetLower)) {
+          // Field does NOT exist in the manifest → INVALID_FIELD
+          const availableFieldNames = manifest.fields.map(f => f.label)
+          log.info(
+            { target: stepTarget, entity: manifest.entityName, availableFields: availableFieldNames.slice(0, 10) },
+            '[EXEC-AGENT] INVALID_FIELD detected — field not in manifest',
+          )
+          return {
+            failureType:    'INVALID_FIELD',
+            recoveryAction: 'SKIP_STEP',
+            reason:         `Field "${stepTarget}" does not exist on the ${manifest.entityName} form. ` +
+                            `This field was incorrectly generated by AI — it should be removed from the test case. ` +
+                            `Available fields: ${availableFieldNames.slice(0, 8).join(', ')}`,
+            confidence:     0.95,
+            availableFields: availableFieldNames,
+          }
+        }
+      }
+    } catch (manifestErr) {
+      log.warn({ manifestErr }, '[EXEC-AGENT] Field manifest check failed (non-fatal) — continuing with standard classification')
+    }
+  }
+
+  // ── INVALID_TEST_DATA detection: check if a field-type step has placeholder/garbage value ──
+  // When a TYPE/SELECT step fails, it might be because the value itself is invalid
+  // (e.g., "-", "N/A", empty, single char). Detect this and provide a corrected value.
+  if (
+    projectId &&
+    FIELD_ACTIONS.has(stepAction) &&
+    stepTarget &&
+    (cls === 'LOCATOR_NOT_FOUND' || cls === 'UNKNOWN' || cls === 'TIMEOUT')
+  ) {
+    const stepValue = ((step as any).value ?? '').trim()
+    const PLACEHOLDER_RE_EXEC = /^[-\u2013\u2014.?!_*#@~`\/\\]+$/
+    const NA_RE_EXEC = /^n\/?a$/i
+    const isPlaceholder = !stepValue || stepValue.length < 2 || PLACEHOLDER_RE_EXEC.test(stepValue) || NA_RE_EXEC.test(stepValue)
+
+    if (isPlaceholder) {
+      // Try to generate a corrected value from the manifest
+      let correctedValue: string | undefined
+      let entityHint: string | undefined
+
+      // Extract entity from test case name
+      if (executionId) {
+        try {
+          const run = await prisma.test_runs.findUnique({
+            where: { id: executionId },
+            select: { test_case: { select: { name: true } } },
+          })
+          const tcName = run?.test_case?.name
+          if (tcName) {
+            const rawHint = tcName
+              .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+              .replace(/\b(new|successfully|with|for|and|the|a|an|details|detail|record|records)\b/gi, '')
+              .trim().split(/\s+/)[0] ?? ''
+            if (rawHint.length > 2) entityHint = rawHint
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // Look up the field in the manifest to generate a realistic value
+      try {
+        const manifest = await buildFieldManifest(projectId, entityHint)
+        if (manifest && manifest.fields.length > 0) {
+          const targetLower = stepTarget.toLowerCase().trim()
+          const field = manifest.fields.find(f => f.label.toLowerCase().trim() === targetLower)
+
+          if (field) {
+            // Generate a realistic value based on field metadata
+            if (field.options?.length) {
+              correctedValue = field.options[0]
+            } else if (field.sampleValue) {
+              correctedValue = field.sampleValue
+            } else {
+              const label = field.label.toLowerCase()
+              if (/phone|mobile|tel/.test(label))          correctedValue = '+1 555-987-6543'
+              else if (/email/.test(label))                correctedValue = 'updated@autotest.com'
+              else if (/date/.test(label))                 correctedValue = '12/31/2026'
+              else if (/website|url|link/.test(label))     correctedValue = 'https://www.example.com'
+              else if (/amount|price|cost|revenue/.test(label)) correctedValue = '50000.00'
+              else if (/name|title/.test(label))           correctedValue = `Test ${entityHint ?? 'Record'} ${Date.now() % 10000}`
+              else                                         correctedValue = `Updated ${field.label}`
+            }
+          }
+        }
+      } catch { /* non-fatal */ }
+
+      log.info(
+        { target: stepTarget, originalValue: stepValue, correctedValue, entity: entityHint },
+        '[EXEC-AGENT] INVALID_TEST_DATA detected — placeholder value in step',
+      )
+
+      return {
+        failureType:    'INVALID_TEST_DATA',
+        recoveryAction: correctedValue ? 'REGENERATE_AND_RETRY' : 'SKIP_STEP',
+        reason:         `Field "${stepTarget}" has placeholder value "${stepValue}" — ` +
+                        (correctedValue
+                          ? `replacing with realistic value "${correctedValue}" from metadata.`
+                          : `no replacement value available from metadata — skipping step.`),
+        confidence:     correctedValue ? 0.90 : 0.80,
+        correctedValue,
+      }
+    }
+  }
+
   // Deterministic fast-path mapping
   const deterministicMap: Record<FailureClass, RecoveryPlan['recoveryAction']> = {
+    INVALID_FIELD:       'SKIP_STEP',            // field doesn't exist → auto-skip
+    INVALID_TEST_DATA:   'REGENERATE_AND_RETRY', // placeholder value → replace with real data
     NAVIGATION_MENU:     'ALTERNATIVE_LOCATOR',  // use smart locator tool
     LOCATOR_NOT_FOUND:   'ALTERNATIVE_LOCATOR',
     ELEMENT_NOT_VISIBLE: 'WAIT_AND_RETRY',
@@ -182,19 +347,41 @@ async function planRecovery(
       confidence:     cls === 'NAVIGATION_MENU' ? 0.85 : 0.8,
     }
 
-    // For navigation/locator failures: run smartLocatorTool to get alternative suggestions
-    if ((cls === 'NAVIGATION_MENU' || cls === 'LOCATOR_NOT_FOUND') && pageHtml) {
-      const suggestions = await smartLocatorTool(
-        step.target ?? '', errorMessage, pageHtml,
-      )
-      if (suggestions.length > 0) {
-        plan.alternativeLocator = suggestions[0].strategy
-        plan.locatorSuggestions = suggestions
-        plan.confidence = Math.max(plan.confidence, suggestions[0].confidence)
-        log.info(
-          { target: step.target, topSuggestion: suggestions[0].strategy },
-          '[EXEC-AGENT] smartLocatorTool returned suggestions',
+    // For navigation/locator failures: first check learning registry, then smartLocatorTool
+    if ((cls === 'NAVIGATION_MENU' || cls === 'LOCATOR_NOT_FOUND') && projectId) {
+      // LEARNING REGISTRY CHECK: try known label corrections before calling LLM
+      try {
+        const corrections = await getLabelCorrections(projectId)
+        if (corrections.has(stepTarget)) {
+          const correctedLabel = corrections.get(stepTarget)!
+          log.info(
+            { original: stepTarget, corrected: correctedLabel },
+            '[EXEC-AGENT] Label correction found in learning registry',
+          )
+          return {
+            failureType:        cls,
+            recoveryAction:     'ALTERNATIVE_LOCATOR',
+            reason:             `Learning registry correction: "${stepTarget}" \u2192 "${correctedLabel}"`,
+            confidence:         0.92,
+            alternativeLocator: correctedLabel,
+          }
+        }
+      } catch { /* Non-fatal */ }
+
+      // SMART LOCATOR: LLM-based alternative locator suggestions
+      if (pageHtml) {
+        const suggestions = await smartLocatorTool(
+          step.target ?? '', errorMessage, pageHtml,
         )
+        if (suggestions.length > 0) {
+          plan.alternativeLocator = suggestions[0].strategy
+          plan.locatorSuggestions = suggestions
+          plan.confidence = Math.max(plan.confidence, suggestions[0].confidence)
+          log.info(
+            { target: step.target, topSuggestion: suggestions[0].strategy },
+            '[EXEC-AGENT] smartLocatorTool returned suggestions',
+          )
+        }
       }
     }
 
@@ -279,7 +466,7 @@ export async function handleStepFailure(params: {
   thoughts.push(`OBSERVE: step "${failedStep.action} ${failedStep.target}" failed — "${errorMessage.slice(0, 120)}"`)
   thoughts.push(`OBSERVE: attempt ${attemptNum}, classifying failure`)
 
-  const plan = await planRecovery(failedStep, errorMessage, params.pageHtml)
+  const plan = await planRecovery(failedStep, errorMessage, params.pageHtml, params.projectId, executionId)
 
   thoughts.push(`THINK: failure=${plan.failureType}, action=${plan.recoveryAction}, confidence=${plan.confidence}`)
 
@@ -305,6 +492,29 @@ export async function handleStepFailure(params: {
       for (const s of plan.locatorSuggestions.slice(0, 3)) {
         suggestions.push(`  • ${s.strategy} (confidence: ${Math.round(s.confidence * 100)}%)`)
       }
+    }
+
+    if (plan.failureType === 'INVALID_FIELD') {
+      suggestions.push(
+        `⚠️ INVALID FIELD: "${failedStep.target}" does not exist on this entity\'s form.`,
+        'This step was incorrectly generated by AI and should be removed from the test case.',
+        'The field was hallucinated — it is not present in the form metadata.',
+      )
+      if (plan.availableFields && plan.availableFields.length > 0) {
+        suggestions.push(`Available fields on this form: ${plan.availableFields.slice(0, 10).join(', ')}`)
+      }
+      suggestions.push('Recommendation: Skip this step and remove it from the test case.')
+    }
+
+    if (plan.failureType === 'INVALID_TEST_DATA') {
+      suggestions.push(
+        `⚠️ INVALID TEST DATA: Field "${failedStep.target}" has placeholder value "${(failedStep as any).value ?? ''}"`,
+        'The AI generated garbage/placeholder data instead of realistic test values.',
+        plan.correctedValue
+          ? `Corrected value: "${plan.correctedValue}" (from entity metadata)`
+          : 'No replacement value available from metadata.',
+        'Recommendation: Re-generate test steps with valid data.',
+      )
     }
 
     if (plan.failureType === 'NAVIGATION_MENU') {
@@ -373,11 +583,13 @@ export async function handleStepFailure(params: {
 /**
  * Post-execution analysis — called after all steps complete.
  * Logs the run summary to agent_executions.
+ * ENHANCED: Now also saves learnings from execution results.
  */
 export async function analyzeExecution(
   executionId: string,
   projectId:   string,
   stepResults: StepResult[],
+  originalSteps?: StepData[],
 ): Promise<void> {
   const passed  = stepResults.filter(s => s.status === 'passed').length
   const failed  = stepResults.filter(s => s.status === 'failed').length
@@ -389,6 +601,15 @@ export async function analyzeExecution(
     { executionId, passed, failed, skipped, total, success },
     '[EXEC-AGENT] Execution analysis',
   )
+
+  // ── POST-EXECUTION LEARNING LOOP ──────────────────────────────────────────
+  if (originalSteps && originalSteps.length > 0) {
+    try {
+      await postExecutionLearning(projectId, executionId, originalSteps, stepResults)
+    } catch (err) {
+      log.warn({ err }, '[EXEC-AGENT] Post-execution learning failed (non-fatal)')
+    }
+  }
 
   await logAgentExecution({
     projectId,
@@ -402,4 +623,64 @@ export async function analyzeExecution(
     tokensUsed:    0,
     durationMs:    stepResults.reduce((s, r) => s + r.durationMs, 0),
   })
+}
+
+/**
+ * Post-execution learning feedback — saves button mappings, required fields,
+ * and label corrections from execution results.
+ */
+async function postExecutionLearning(
+  projectId:     string,
+  _executionId:  string,
+  originalSteps: StepData[],
+  stepResults:   StepResult[],
+): Promise<void> {
+  // Extract entity name from navigate step URL
+  let entityName = ''
+  for (const step of originalSteps) {
+    const action = ((step as any).action ?? '').toUpperCase()
+    if (action !== 'NAVIGATE') continue
+    const url = ((step as any).value ?? (step as any).target ?? '') as string
+    const sfMatch = url.match(/\/lightning\/o\/([^/]+)/i)
+    if (sfMatch) { entityName = sfMatch[1]; break }
+    const webMatch = url.match(/\/([a-z_-]+)\/(new|create|list|edit)/i)
+    if (webMatch) { entityName = webMatch[1]; break }
+  }
+  if (!entityName) return
+
+  const FIELD_ACTIONS  = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'FILL', 'MULTI_SELECT'])
+  const SUBMIT_PATTERNS = /^(save|create|submit|update|add|confirm|apply|done|ok)/i
+  const OPEN_PATTERNS   = /^(\+?\s*new|add|open|create new)/i
+
+  const passedFieldLabels: string[] = []
+
+  for (let i = 0; i < originalSteps.length; i++) {
+    const step   = originalSteps[i] as Record<string, any>
+    const result = stepResults[i]
+    if (!result || result.status !== 'passed') continue
+
+    const action = (step.action ?? '').toUpperCase()
+    const target = (step.target ?? '') as string
+
+    if (action === 'CLICK' && target) {
+      if (SUBMIT_PATTERNS.test(target)) {
+        saveButtonMapping(projectId, entityName, target, 'submit').catch(() => {})
+      } else if (OPEN_PATTERNS.test(target)) {
+        saveButtonMapping(projectId, entityName, target, 'open').catch(() => {})
+      }
+    }
+
+    if (FIELD_ACTIONS.has(action) && target) {
+      passedFieldLabels.push(target)
+    }
+  }
+
+  if (passedFieldLabels.length > 0) {
+    saveRequiredFields(projectId, entityName, passedFieldLabels).catch(() => {})
+  }
+
+  log.info(
+    { entityName, fieldsCached: passedFieldLabels.length },
+    '[EXEC-AGENT] Post-execution learning saved',
+  )
 }

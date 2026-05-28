@@ -314,6 +314,57 @@ export async function fillWebAppAutocomplete(
     return
   }
 
+  // ── Advanced Search fallback ────────────────────────────────────────────────
+  // Many CRM apps show "Advanced Search" / "Search More" / "Show All Results"
+  // when the inline dropdown doesn't have the value. This opens a modal/panel.
+  {
+    const advSearchBtn = page.locator(
+      'button:has-text("Advanced Search"), button:has-text("Search More"), ' +
+      'a:has-text("Show All Results"), a:has-text("See All"), ' +
+      'button:has-text("View All"), [data-action="advanced-search"]',
+    ).first()
+    if (await advSearchBtn.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      log.info(`[WEBAPP-AUTOCOMPLETE] Found Advanced Search trigger — clicking`)
+      await advSearchBtn.click()
+      await page.waitForTimeout(1_500)
+
+      // Search in the advanced modal/panel
+      const searchInput = page.locator(
+        '[role="dialog"] input[type="text"], [role="dialog"] input[type="search"], ' +
+        '.modal input[type="text"], .modal input[type="search"], ' +
+        '[class*="modal"] input[type="text"], [class*="search"] input[type="text"]',
+      ).first()
+      if (await searchInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await searchInput.fill(value)
+        await page.waitForTimeout(1_000)
+
+        // Click matching result row
+        const resultSelectors = [
+          `[role="dialog"] tr:has-text("${value}")`,
+          `[role="dialog"] [role="row"]:has-text("${value}")`,
+          `.modal tr:has-text("${value}")`,
+          `[role="dialog"] li:has-text("${value}")`,
+          `[role="dialog"] [role="option"]:has-text("${value}")`,
+        ]
+        for (const rSel of resultSelectors) {
+          const result = page.locator(rSel).first()
+          if (await result.isVisible({ timeout: 2_000 }).catch(() => false)) {
+            await result.scrollIntoViewIfNeeded().catch(() => {})
+            await result.click()
+            await page.waitForTimeout(500)
+            log.info(`[WEBAPP-AUTOCOMPLETE] ✅ Selected "${value}" via Advanced Search`)
+            return
+          }
+        }
+      }
+
+      // Close the modal if nothing was selected
+      await page.keyboard.press('Escape').catch(() => {})
+      await page.waitForTimeout(300)
+      log.warn(`[WEBAPP-AUTOCOMPLETE] Advanced Search opened but could not select "${value}"`)
+    }
+  }
+
   // No dropdown appeared — Tab-commit the typed value (free-text fields)
   log.warn(`[WEBAPP-AUTOCOMPLETE] No dropdown appeared for "${fieldLabel}" — Tab-committing typed value`)
   await page.keyboard.press('Tab')
@@ -418,7 +469,12 @@ export async function selectWebAppPicklist(
       if (await comboboxLoc.isVisible({ timeout: 1_500 }).catch(() => false)) {
         await comboboxLoc.scrollIntoViewIfNeeded().catch(() => {})
         await comboboxLoc.click()
-        await page.waitForTimeout(500)
+        // Smart wait: wait for dropdown/listbox panel to materialize
+        await page.waitForSelector(
+          '[role="listbox"], [role="menu"], .dropdown-menu, ul.options, [class*="dropdown"]',
+          { state: 'visible', timeout: 5_000 },
+        ).catch(() => {})
+        await page.waitForTimeout(300) // let animations finish
 
         // Check if it opened a native <select> (some frameworks use this)
         const tag = await comboboxLoc.evaluate((el) => el.tagName).catch(() => '')
@@ -426,16 +482,39 @@ export async function selectWebAppPicklist(
           if (await trySelect(comboboxLoc, `Strategy C (combobox is native select)`)) return
         }
 
-        const option = page.locator(
-          `[role="option"], [role="listbox"] li, ul[role="listbox"] > li, .dropdown-item`,
-        ).filter({ hasText: optionValue }).first()
-        if (await option.isVisible({ timeout: 3_000 }).catch(() => false)) {
-          await option.scrollIntoViewIfNeeded().catch(() => {})
-          await option.click()
+        // Try multiple option-click strategies
+        const optionStrategies = [
+          `[role="option"]:has-text("${optionValue}")`,
+          `[role="listbox"] li:has-text("${optionValue}")`,
+          `[role="listitem"]:has-text("${optionValue}")`,
+          `.dropdown-item:has-text("${optionValue}")`,
+          `li:has-text("${optionValue}")`,
+          `[data-value="${optionValue}"]`,
+        ]
+        let optionClicked = false
+        for (const oSel of optionStrategies) {
+          const opt = page.locator(oSel).first()
+          if (await opt.isVisible({ timeout: 1_500 }).catch(() => false)) {
+            await opt.scrollIntoViewIfNeeded().catch(() => {})
+            await opt.click()
+            await page.waitForTimeout(300)
+            log.info(`[WEBAPP-PICKLIST] ✅ Strategy C (role=combobox → option): selected "${optionValue}"`)
+            optionClicked = true
+            break
+          }
+        }
+        if (optionClicked) return
+
+        // Partial text fallback
+        const partialOpt = page.locator('[role="option"], li').filter({ hasText: optionValue }).first()
+        if (await partialOpt.isVisible({ timeout: 1_500 }).catch(() => false)) {
+          await partialOpt.scrollIntoViewIfNeeded().catch(() => {})
+          await partialOpt.click()
           await page.waitForTimeout(300)
-          log.info(`[WEBAPP-PICKLIST] ✅ Strategy C (role=combobox → option): selected "${optionValue}"`)
+          log.info(`[WEBAPP-PICKLIST] ✅ Strategy C (partial text fallback): selected "${optionValue}"`)
           return
         }
+
         await page.keyboard.press('Escape').catch(() => {})
         await page.waitForTimeout(200)
       }
@@ -466,18 +545,37 @@ export async function selectWebAppPicklist(
       }
 
       await cbFirst.click()
-      await page.waitForTimeout(500)
+      // Smart wait: wait for dropdown/listbox panel to materialize
+      await page.waitForSelector(
+        '[role="listbox"], [role="menu"], .dropdown-menu, ul.options, [class*="dropdown"]',
+        { state: 'visible', timeout: 5_000 },
+      ).catch(() => {})
+      await page.waitForTimeout(300) // let animations finish
 
-      const option = page.locator(
-        `[role="option"], [role="listbox"] li, ul[role="listbox"] > li, .dropdown-item, .select-option`,
-      ).filter({ hasText: optionValue }).first()
-      if (await option.isVisible({ timeout: 3_000 }).catch(() => false)) {
-        await option.scrollIntoViewIfNeeded().catch(() => {})
-        await option.click()
-        await page.waitForTimeout(300)
-        log.info(`[WEBAPP-PICKLIST] ✅ Strategy D2 (getByRole combobox → option "${lbl}"): selected "${optionValue}"`)
-        return
+      // Try multiple option-click strategies
+      const dOptionStrategies = [
+        `[role="option"]:has-text("${optionValue}")`,
+        `[role="listbox"] li:has-text("${optionValue}")`,
+        `[role="listitem"]:has-text("${optionValue}")`,
+        `.dropdown-item:has-text("${optionValue}")`,
+        `.select-option:has-text("${optionValue}")`,
+        `li:has-text("${optionValue}")`,
+        `[data-value="${optionValue}"]`,
+      ]
+      let dOptClicked = false
+      for (const oSel of dOptionStrategies) {
+        const opt = page.locator(oSel).first()
+        if (await opt.isVisible({ timeout: 1_500 }).catch(() => false)) {
+          await opt.scrollIntoViewIfNeeded().catch(() => {})
+          await opt.click()
+          await page.waitForTimeout(300)
+          log.info(`[WEBAPP-PICKLIST] ✅ Strategy D2 (getByRole combobox → option "${lbl}"): selected "${optionValue}"`)
+          dOptClicked = true
+          break
+        }
       }
+      if (dOptClicked) return
+
       await page.keyboard.press('Escape').catch(() => {})
       await page.waitForTimeout(200)
     } catch { /* try next */ }
@@ -897,7 +995,7 @@ export async function fillWebAppField(
   const strictVariants = labelVariants(fieldLabel)
   let loc: Locator | null = null
 
-  // getByLabel — exact then partial
+  // Strategy 1: getByLabel — exact then partial
   for (const exact of [true, false]) {
     try {
       const candidate = page.getByLabel(fieldLabel, { exact }).first()
@@ -907,7 +1005,15 @@ export async function fillWebAppField(
     } catch { /* try next */ }
   }
 
-  // getByPlaceholder
+  // Strategy 2: aria-label attribute (case-insensitive)
+  if (!loc) {
+    try {
+      const ariaLoc = page.locator(`[aria-label="${fieldLabel}" i]`).first()
+      if (await ariaLoc.isVisible({ timeout: 1_500 }).catch(() => false)) loc = ariaLoc
+    } catch { /* try next */ }
+  }
+
+  // Strategy 3: getByPlaceholder
   if (!loc) {
     try {
       const ph = page.getByPlaceholder(fieldLabel, { exact: false }).first()
@@ -915,7 +1021,7 @@ export async function fillWebAppField(
     } catch { /* try next */ }
   }
 
-  // name/id attributes
+  // Strategy 4: name/id attributes (snake_case + camelCase)
   if (!loc) {
     for (const lbl of strictVariants) {
       const snake = lbl.toLowerCase().replace(/\s+/g, '_')
@@ -932,15 +1038,111 @@ export async function fillWebAppField(
     }
   }
 
+  // Strategy 5: data-testid / data-cy / data-test attributes
+  if (!loc) {
+    const slug = fieldLabel.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
+    const snakeSlug = fieldLabel.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+    try {
+      const testIdLoc = page.locator(
+        `input[data-testid="${slug}" i], textarea[data-testid="${slug}" i], ` +
+        `input[data-cy="${slug}" i], textarea[data-cy="${slug}" i], ` +
+        `input[data-test="${slug}" i], textarea[data-test="${slug}" i], ` +
+        `input[data-testid="${snakeSlug}" i], input[data-cy="${snakeSlug}" i]`,
+      ).first()
+      if (await testIdLoc.isVisible({ timeout: 1_500 }).catch(() => false)) loc = testIdLoc
+    } catch { /* try next */ }
+  }
+
+  // Strategy 6: role + name combination
+  if (!loc) {
+    for (const role of ['textbox', 'spinbutton', 'combobox'] as const) {
+      try {
+        const roleLoc = page.getByRole(role, { name: fieldLabel, exact: false }).first()
+        if (await roleLoc.isVisible({ timeout: 1_500 }).catch(() => false)) { loc = roleLoc; break }
+      } catch { /* try next */ }
+    }
+  }
+
+  // Strategy 7: XPath label proximity (visible text + nearest input)
+  if (!loc) {
+    for (const lbl of strictVariants) {
+      try {
+        const xpLoc = page.locator(
+          `xpath=//label[contains(normalize-space(.),\"${lbl}\")]/following::input[not(@type=\"hidden\")][1]` +
+          `|//label[contains(normalize-space(.),\"${lbl}\")]/parent::*/descendant::input[not(@type=\"hidden\")][1]` +
+          `|//label[contains(normalize-space(.),\"${lbl}\")]/following::textarea[1]`,
+        ).first()
+        if (await xpLoc.isVisible({ timeout: 1_500 }).catch(() => false)) { loc = xpLoc; break }
+      } catch { /* try next */ }
+    }
+  }
+
   if (!loc) {
     // Last resort: try as autocomplete (unknown type often means autocomplete)
     try {
       await fillWebAppAutocomplete(page, fieldLabel, value)
       return
     } catch { /* not an autocomplete either */ }
+
+    // ── Label correction safety net ──────────────────────────────────────────
+    // If no field was found, the AI label may not match the actual page label.
+    // Scan visible page labels for a fuzzy match and retry once with the best match.
+    log.warn(`[WEBAPP-ENGINE] Field "${fieldLabel}" not found — attempting label correction`)
+    try {
+      const correctedLabel = await page.evaluate((targetLabel: string) => {
+        const root = document.querySelector(
+          '[role="dialog"][aria-modal="true"], [role="dialog"], .modal, [class*="modal"]',
+        ) || document.body
+        const allLabels = Array.from(root.querySelectorAll('label, legend'))
+          .map(el => el.textContent?.trim().replace(/^\*\s*/, '').trim() ?? '')
+          .filter(t => t.length > 1 && t.length < 80)
+
+        // Also collect aria-labels and placeholders
+        const inputs = Array.from(root.querySelectorAll('input, textarea, select'))
+        for (const inp of inputs) {
+          const al = inp.getAttribute('aria-label')?.trim()
+          if (al && al.length > 1) allLabels.push(al)
+          const ph = inp.getAttribute('placeholder')?.trim()
+          if (ph && ph.length > 1) allLabels.push(ph)
+        }
+
+        const unique = [...new Set(allLabels)]
+        const targetLower = targetLabel.toLowerCase()
+        const targetWords = new Set(targetLower.split(/\s+/))
+        let bestMatch = ''
+        let bestScore = 0
+
+        for (const pl of unique) {
+          const plLower = pl.toLowerCase()
+          if (plLower === targetLower) return ''  // already exact — should have been found
+          const plWords = new Set(plLower.split(/\s+/))
+          let overlap = 0
+          for (const w of targetWords) { if (plWords.has(w)) overlap++ }
+          const total = Math.max(targetWords.size, plWords.size)
+          let score = total > 0 ? overlap / total : 0
+          // Containment boost
+          if (plLower.includes(targetLower) || targetLower.includes(plLower)) {
+            score = Math.max(score, 0.7)
+          }
+          if (score > bestScore && score >= 0.5) {
+            bestScore = score
+            bestMatch = pl
+          }
+        }
+        return bestMatch
+      }, fieldLabel)
+
+      if (correctedLabel) {
+        log.info(`[WEBAPP-ENGINE] Label corrected: "${fieldLabel}" → "${correctedLabel}" — retrying fill`)
+        // Retry the entire fill with the corrected label (recursive, but only once)
+        await fillWebAppField(page, correctedLabel, value)
+        return
+      }
+    } catch { /* correction failed — throw original error */ }
+
     throw new Error(
       `[WEBAPP-ENGINE] Could not find field "${fieldLabel}". ` +
-      `Tried: getByLabel (exact/partial), getByPlaceholder, name/id attributes, autocomplete scan.`,
+      `Tried: getByLabel, aria-label, getByPlaceholder, name/id attrs, data-testid, role+name, XPath proximity, autocomplete scan, label correction.`,
     )
   }
 

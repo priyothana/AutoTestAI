@@ -56,6 +56,9 @@ model projects {
   test_data_sets             test_data_sets[]
   vector_embeddings          vector_embeddings[]
   web_test_data              web_test_data[]
+  selector_registry          selector_registry[]
+  execution_metrics          execution_metrics[]
+  metadata_canonical         metadata_canonical[]
 }
 
 model environments {
@@ -323,4 +326,82 @@ model agent_executions {
   @@index([agent_name], map: "idx_agent_executions_agent_name")
   @@index([created_at(sort: Desc)], map: "idx_agent_executions_created_at")
   @@index([project_id], map: "idx_agent_executions_project_id")
+}
+
+/// Selector health registry — Layer 4 Self-Healing Registry
+/// Tracks the health state of each field locator per project.
+/// Health states: HEALTHY → DEGRADED → BROKEN → QUARANTINE
+model selector_registry {
+  id                   String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id           String    @db.Uuid
+  field_name           String    @db.VarChar(255)
+  selector             String
+  selector_type        String    @db.VarChar(50)
+  health_status        String    @default("HEALTHY") @db.VarChar(20)
+  consecutive_failures Int       @default(0)
+  total_successes      Int       @default(0)
+  total_failures       Int       @default(0)
+  intent_description   String?
+  page_url             String?   @db.VarChar(512)
+  last_success_at      DateTime? @db.Timestamptz(6)
+  last_failure_at      DateTime? @db.Timestamptz(6)
+  last_healed_at       DateTime? @db.Timestamptz(6)
+  created_at           DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at           DateTime  @default(now()) @updatedAt @db.Timestamptz(6)
+  project              projects  @relation(fields: [project_id], references: [id])
+
+  @@unique([project_id, field_name, page_url])
+  @@index([project_id, health_status], map: "idx_selector_registry_project_health")
+  @@index([project_id, field_name], map: "idx_selector_registry_project_field")
+}
+
+/// Per-step execution metrics — Layer 2 Orchestrator observability
+model execution_metrics {
+  id              String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  execution_id    String   @db.Uuid
+  project_id      String   @db.Uuid
+  step_index      Int
+  action          String   @db.VarChar(50)
+  status          String   @db.VarChar(20)
+  duration_ms     Int
+  retry_count     Int      @default(0)
+  error_class     String?  @db.VarChar(50)
+  healed          Boolean  @default(false)
+  selector_used   String?
+  selector_health String?  @db.VarChar(20)
+  created_at      DateTime @default(now()) @db.Timestamptz(6)
+  project         projects @relation(fields: [project_id], references: [id])
+
+  @@index([execution_id], map: "idx_execution_metrics_execution_id")
+  @@index([project_id, created_at(sort: Desc)], map: "idx_execution_metrics_project_date")
+}
+
+/// Canonical Metadata Layer (Stage 3.5) — single entity-centric source of truth
+/// Consolidates metadata_normalized + web_test_data + execution_learnings + domain_models
+/// into one clean record per entity. Includes Knowledge Graph layer with cross-entity
+/// relationships and business rules. Eliminates multi-source merge at generation time
+/// and drastically reduces LLM hallucinations (wrong buttons, missing fields).
+model metadata_canonical {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  project_id            String   @db.Uuid
+  entity_name           String
+  entity_type           String                                    // 'form' | 'list_page' | 'web_page' | 'salesforce_object'
+  page_url              String?
+  required_fields       Json     @default("[]")
+  optional_fields       Json     @default("[]")
+  primary_action_button String?
+  all_buttons           Json     @default("[]")
+  form_fields           Json     @default("[]")
+  real_test_data        Json     @default("[]")
+  stable_locators       Json     @default("{}")
+  learned_rules         Json     @default("{}")
+  relationships         Json     @default("{}")                   // Knowledge Graph: {"Account": "required_lookup", "Contact": "related_list"}
+  business_rules        Json     @default("{}")                   // Knowledge Graph: {"stage_required": true, "close_date_must_be_future": "..."}
+  last_synced_at        DateTime @default(now()) @db.Timestamptz(6)
+  version               Int      @default(1)
+  project               projects @relation(fields: [project_id], references: [id], onDelete: Cascade)
+
+  @@unique([project_id, entity_name])
+  @@index([project_id], map: "idx_metadata_canonical_project")
+  @@map("metadata_canonical")
 }

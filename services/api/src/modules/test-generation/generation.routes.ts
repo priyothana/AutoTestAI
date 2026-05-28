@@ -48,8 +48,8 @@ export async function generationRoutes(app: FastifyInstance): Promise<void> {
   app.get('/ai/models', async (_req, reply) => {
     return reply.send({
       openai: {
-        default_model: 'gpt-4o-mini',
-        models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo'],
+        default_model: 'gpt-4o',
+        models: ['gpt-4o', 'gpt-4-turbo'],
       },
       claude: {
         default_model: 'claude-sonnet-4-20250514',

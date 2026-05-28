@@ -24,10 +24,15 @@ import { v4 as uuidv4 }               from 'uuid'
 import { createModuleLogger }         from '../../shared/logger/index.js'
 import { ragSearchTool }              from './tools/rag-search.tool.js'
 import { getProjectById, logAgentExecution } from './tools/db-query.tool.js'
+import { buildFieldManifest }         from './tools/metadata-reader.tool.js'
 import { hitlTool }                   from './tools/hitl.tool.js'
 import { runTestCaseGeneratorAgent }  from './test-case-generator.agent.js'
 import { runTestStepGeneratorAgent }  from './test-step-generator.agent.js'
 import { runHealingAnalyzerAgent }    from './healing-analyzer.agent.js'
+import {
+  getButtonMapping,
+  saveGenerationOutcome,
+} from '../self-healing/learning-registry.service.js'
 import type { HITLInput }             from './agent.types.js'
 
 const log = createModuleLogger('orchestrator-agent')
@@ -222,13 +227,70 @@ export async function runOrchestratorAgent(
       // ── Delegate to Test Step Generator Agent ──────────────────────────
       case 'GENERATE_STEPS': {
         agentsUsed.push('test-step-generator')
+
+        // ── PRE-GENERATION VALIDATION ────────────────────────────────────
+        const entityName = (parsed.params.entityName as string | undefined)
+          ?? (() => {
+            const testName = (parsed.params.testCaseName as string) ?? input.message
+            const stripped = testName
+              .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
+              .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional)\b/gi, '')
+              .trim()
+            const m = stripped.match(/\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\b/)
+            return m?.[1] ?? stripped.split(/\s+/)[0] ?? undefined
+          })()
+
+        if (entityName && entityName.length > 2) {
+          thoughts.push(`PRE-GEN: extracted entity "${entityName}" from test name`)
+
+          // Check metadata availability
+          try {
+            const [manifest, learnedButtons] = await Promise.all([
+              buildFieldManifest(input.projectId, entityName),
+              getButtonMapping(input.projectId, entityName),
+            ])
+
+            const testName = (parsed.params.testCaseName as string) ?? input.message
+            const isCreate = /^(create|add|new)\b/i.test(testName.trim())
+
+            if (isCreate && !manifest) {
+              thoughts.push(`PRE-GEN WARNING: no field manifest for "${entityName}" — generation may hallucinate fields`)
+            }
+            if (isCreate && manifest && manifest.requiredCount === 0) {
+              thoughts.push(`PRE-GEN WARNING: zero required fields for "${entityName}" — manifest may be incomplete`)
+            }
+            if (learnedButtons.submitButton) {
+              thoughts.push(`PRE-GEN: learned submit button for "${entityName}": "${learnedButtons.submitButton}"`)
+            }
+          } catch {
+            thoughts.push('PRE-GEN: metadata check failed (non-fatal) — proceeding')
+          }
+        }
+
+        // ── DELEGATE TO STEP GENERATOR ────────────────────────────────────
         const output = await runTestStepGeneratorAgent({
           projectId:    input.projectId,
           testCaseId:   parsed.params.testCaseId as string | undefined,
           testName:     (parsed.params.testCaseName as string) ?? input.message,
-          entityFilter: parsed.params.entityName as string | undefined,
+          entityFilter: entityName && entityName.length > 2 ? entityName : undefined,
           executionId:  input.executionId,
         })
+
+        // ── POST-GENERATION LEARNING FEEDBACK ─────────────────────────────
+        if (entityName && entityName.length > 2) {
+          saveGenerationOutcome(
+            input.projectId,
+            parsed.params.testCaseId as string ?? 'orchestrator',
+            {
+              testName:       (parsed.params.testCaseName as string) ?? input.message,
+              entityName,
+              passed:         output.validation.passed,
+              failureReasons: output.validation.issues,
+              stepCount:      output.steps.length,
+            },
+          ).catch(() => { /* non-fatal */ })
+        }
+
         result  = output
         summary = `Generated ${output.steps.length} steps — validation ${output.validation.passed ? '✅ passed' : '⚠️ failed'}`
         break

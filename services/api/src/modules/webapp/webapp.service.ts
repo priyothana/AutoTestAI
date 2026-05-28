@@ -45,6 +45,120 @@ const INPUT_TYPE_TEST_MAPPING: Record<string, string> = {
   textbox:  'text_input_test',
 }
 
+// ─── Dynamic Route Discovery Helpers ──────────────────────────────────────────
+
+/**
+ * Extract candidate route paths from BRD text by identifying module names.
+ * Looks for patterns like:
+ *   - "4.5 Enquiries Module" → /enquiries
+ *   - "FR-ENQ-01: Create Enquiry" → /enquiries
+ *   - "Quotations Module" → /quotations
+ *   - "Bookings Module" → /bookings
+ *
+ * Returns deduplicated paths with list + create + new variants.
+ */
+function extractRoutesFromBrd(brdText: string): string[] {
+  const routes: string[] = []
+
+  // Pattern 1: "X.Y ModuleName Module" section headings
+  const moduleRegex = /\d+\.\d+\s+(\w[\w\s]*?)\s+Module/gi
+  let match: RegExpExecArray | null
+  while ((match = moduleRegex.exec(brdText)) !== null) {
+    const moduleName = match[1].trim().toLowerCase().replace(/\s+/g, '-')
+    if (moduleName.length >= 3 && moduleName.length <= 30) {
+      routes.push(`/${moduleName}`)
+      routes.push(`/${moduleName}/create`)
+      routes.push(`/${moduleName}/new`)
+    }
+  }
+
+  // Pattern 2: "FR-XXX-NN: Action EntityName" functional requirements
+  const frRegex = /FR-([A-Z]{2,5})-\d+:\s*(?:Create|Update|List|View|Manage|Search)\s+(\w[\w\s]*?)(?:\s|$)/gi
+  while ((match = frRegex.exec(brdText)) !== null) {
+    const entityName = match[2].trim().toLowerCase().replace(/\s+/g, '-')
+    if (entityName.length >= 3 && entityName.length <= 30) {
+      // Pluralize if not already plural
+      const pluralized = entityName.endsWith('y')
+        ? entityName.slice(0, -1) + 'ies'  // Enquiry → enquiries
+        : entityName.endsWith('s')
+          ? entityName
+          : entityName + 's'
+      routes.push(`/${pluralized}`)
+      routes.push(`/${pluralized}/create`)
+      routes.push(`/${pluralized}/new`)
+    }
+  }
+
+  // Pattern 3: Explicit section headers like "Enquiries", "Quotations", "Bookings"
+  const headerRegex = /(?:^|\n)\s*(?:\d+\.?\d*\s+)?(\w+(?:\s\w+)?)\s*(?:Module|Section|Management)\b/gi
+  while ((match = headerRegex.exec(brdText)) !== null) {
+    const name = match[1].trim().toLowerCase().replace(/\s+/g, '-')
+    if (name.length >= 3 && name.length <= 30) {
+      routes.push(`/${name}`)
+      routes.push(`/${name}/create`)
+    }
+  }
+
+  return [...new Set(routes)]
+}
+
+/**
+ * Extract candidate route paths from button labels on previously crawled pages.
+ * STRICT mode: only accepts buttons that look like SPA sidebar navigation items.
+ * A nav item must have a two-line format: "Label\nDescription" where the description
+ * contains a navigation verb (manage, view, create, track etc.).
+ *
+ * Example match: "Enquiries\n\nManage freight enquiries" → /enquiries
+ * Example reject: "Add Item", "Create Opportunity", "AGS2", "ENQ-0002", "Back to List"
+ */
+function extractRoutesFromCrawledButtons(
+  pages: Array<{ buttons?: Array<{ name?: string }> }>,
+): string[] {
+  const NAV_DESCRIPTION_KEYWORDS = [
+    'manage', 'view', 'create', 'track', 'handle', 'monitor',
+    'browse', 'list', 'access', 'process', 'submit',
+  ]
+
+  const routes: string[] = []
+
+  for (const page of pages) {
+    for (const btn of (page.buttons ?? [])) {
+      const rawName = (btn.name ?? '').trim()
+      if (!rawName) continue
+
+      const lines = rawName.split('\n').map(l => l.trim()).filter(Boolean)
+
+      // STRICT: require at least 2 lines — nav items always have label + description
+      if (lines.length < 2) continue
+
+      const firstLine = lines[0]
+      const description = lines.slice(1).join(' ').toLowerCase()
+
+      // Description must contain a navigation verb
+      const hasNavDescription = NAV_DESCRIPTION_KEYWORDS.some(k => description.includes(k))
+      if (!hasNavDescription) continue
+
+      // Module name constraints: 3-25 chars, no digits, max 3 words
+      if (firstLine.length < 3 || firstLine.length > 25) continue
+      if (/\d/.test(firstLine)) continue // reject AGS2, DTA1, ENQ-0002 etc.
+      if (/^[A-Z]{2,5}[-\s]?\d/.test(firstLine)) continue
+      if (firstLine.split(/\s+/).length > 3) continue
+
+      const slug = firstLine
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, '')
+        .trim()
+        .replace(/\s+/g, '-')
+
+      if (slug && slug.length >= 3 && slug.length <= 25) {
+        routes.push(`/${slug}`)
+      }
+    }
+  }
+
+  return [...new Set(routes)]
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Stage 1 — Playwright Crawl → metadata_raw_store
 // ═══════════════════════════════════════════════════════════════════
@@ -130,9 +244,10 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
     }
   }
 
-  // ── Inject default CRM key routes when none configured ────────────────────
-  // Most CRM SPAs won't expose create/edit pages via nav links (they use "New" buttons).
-  // Without key routes, the crawler only captures the list pages and misses form metadata.
+  // ── Inject default key routes + dynamic BRD / button-derived routes ────────
+  // Base set: generic CRM form routes (good default for most web apps).
+  // We augment these with routes derived from the project's BRD content and
+  // any navigation buttons discovered on previously crawled pages.
   const DEFAULT_CRM_KEY_ROUTES = [
     '/accounts/create', '/accounts/new',
     '/contacts/create', '/contacts/new',
@@ -147,8 +262,56 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
     '/accounts', '/contacts', '/leads', '/opportunities',
   ]
   if (!keyRoutes || keyRoutes.length === 0) {
-    keyRoutes = DEFAULT_CRM_KEY_ROUTES
+    keyRoutes = [...DEFAULT_CRM_KEY_ROUTES]
     log.info('[WEB-SYNC] No key routes configured — injecting default CRM form routes')
+  }
+
+  // ── BRD-aware route extraction ─────────────────────────────────────────────
+  // Parse the project's BRD for module names and derive candidate routes.
+  // E.g., "4.5 Enquiries Module" → /enquiries, /enquiries/create, /enquiries/new
+  try {
+    const projectRow = await prisma.projects.findUnique({
+      where: { id: projectId },
+      select: { brd_content: true },
+    })
+    const brdText = projectRow?.brd_content ?? ''
+    if (brdText.length > 50) {
+      const brdRoutes = extractRoutesFromBrd(brdText)
+      if (brdRoutes.length > 0) {
+        const before = keyRoutes.length
+        for (const r of brdRoutes) {
+          if (!keyRoutes.includes(r)) keyRoutes.push(r)
+        }
+        log.info(`[WEB-SYNC] BRD-derived routes: added ${keyRoutes.length - before} new routes from BRD content`)
+      }
+    }
+  } catch (brdErr) {
+    log.warn({ err: brdErr }, '[WEB-SYNC] BRD route extraction failed — continuing without')
+  }
+
+  // ── Button-derived route extraction from previously crawled pages ──────────
+  // On continuation or re-sync runs, inspect buttons from already-crawled pages
+  // to discover navigation targets the default routes might miss.
+  try {
+    const existingRaw = await prisma.metadata_raw_store.findFirst({
+      where: { project_id: projectId, metadata_type: 'webpage' },
+      select: { raw_json: true },
+    })
+    const existingPages = ((existingRaw?.raw_json as any)?.pages ?? []) as Array<{
+      buttons?: Array<{ name?: string }>
+    }>
+    if (existingPages.length > 0) {
+      const buttonRoutes = extractRoutesFromCrawledButtons(existingPages)
+      if (buttonRoutes.length > 0) {
+        const before = keyRoutes.length
+        for (const r of buttonRoutes) {
+          if (!keyRoutes.includes(r)) keyRoutes.push(r)
+        }
+        log.info(`[WEB-SYNC] Button-derived routes: added ${keyRoutes.length - before} new routes from crawled page buttons`)
+      }
+    }
+  } catch (btnErr) {
+    log.warn({ err: btnErr }, '[WEB-SYNC] Button route extraction failed — continuing without')
   }
 
   // ── Run the incremental WebMetadataService crawler ─────────────────────────
@@ -286,7 +449,17 @@ export async function normalizeWebappMetadata(projectId: string): Promise<number
     const pages   = data.pages ?? []
 
     // Normalize page elements to compact, consistent shape
-    const normalizedPages = pages.map((pm: PageMetadata) => ({
+    // Skip 404/error pages — these are bad key routes that don't exist in the app
+    const validPages = pages.filter((pm: PageMetadata) => {
+      const title = (pm.title ?? '').toLowerCase()
+      return !title.includes('404') &&
+             !title.includes('not found') &&
+             !title.includes('could not be found') &&
+             !title.includes('page not found') &&
+             !title.includes('error')
+    })
+
+    const normalizedPages = validPages.map((pm: PageMetadata) => ({
       url:      pm.url,
       path:     pm.path,
       title:    pm.title,
@@ -326,7 +499,7 @@ export async function normalizeWebappMetadata(projectId: string): Promise<number
         project_id:      projectId,
         object_name:     baseUrl,
         entity_type:     'webapp_crawl',
-        label:           `${baseUrl} — ${pages.length} page(s) crawled`,
+        label:           `${baseUrl} — ${validPages.length} page(s) crawled`,
         structured_json: structured as object,
       },
     })
@@ -381,8 +554,41 @@ export async function buildWebappDomainModels(projectId: string): Promise<number
     const pages   = (Array.isArray(data.pages) ? data.pages : []) as Record<string, unknown>[]
     const baseUrl = String(data.base_url ?? record.object_name)
 
-    // Build per-page domain models
+    // Build per-page domain models — deduplicate by path first
+    // The crawler may have multiple entries for the same path (e.g., 23 /leads)
+    // due to incremental crawl merges. Keep only the entry with the most
+    // interactive elements (inputs + buttons + selects) per unique path.
+    const pagesByPath = new Map<string, Record<string, unknown>>()
     for (const page of pages) {
+      const path = String(page['path'] ?? '/')
+
+      // Skip /login pages — session is pre-managed, not a testable flow
+      if (path === '/login' || path.endsWith('/login')) continue
+
+      const existing = pagesByPath.get(path)
+      if (!existing) {
+        pagesByPath.set(path, page)
+      } else {
+        // Keep the page with more interactive elements
+        const existingCount =
+          (Array.isArray(existing['inputs']) ? existing['inputs'].length : 0) +
+          (Array.isArray(existing['buttons']) ? existing['buttons'].length : 0) +
+          (Array.isArray(existing['selects']) ? existing['selects'].length : 0)
+        const newCount =
+          (Array.isArray(page['inputs']) ? (page['inputs'] as unknown[]).length : 0) +
+          (Array.isArray(page['buttons']) ? (page['buttons'] as unknown[]).length : 0) +
+          (Array.isArray(page['selects']) ? (page['selects'] as unknown[]).length : 0)
+        if (newCount > existingCount) {
+          pagesByPath.set(path, page)
+        }
+      }
+    }
+
+    log.info(
+      `[WEB-SYNC] Domain build: ${pages.length} raw pages → ${pagesByPath.size} unique paths (deduplicated)`
+    )
+
+    for (const [, page] of pagesByPath) {
       const path    = String(page['path'] ?? '/')
       const inputs  = (Array.isArray(page['inputs'])  ? page['inputs']  : []) as Record<string, unknown>[]
       const buttons = (Array.isArray(page['buttons']) ? page['buttons'] : []) as Record<string, unknown>[]
@@ -576,6 +782,17 @@ export async function forceNormalizeWebapp(projectId: string): Promise<WebAppSyn
 
       const normalizedCount = await normalizeWebappMetadata(projectId)
       const domainCount     = await buildWebappDomainModels(projectId)
+
+      // Stage 3.5: Canonical + Knowledge Graph build (non-critical)
+      if (process.env.ENABLE_CANONICAL_METADATA !== 'false') {
+        try {
+          const { buildCanonicalMetadata } = await import('./canonical-builder.service.js')
+          await buildCanonicalMetadata(projectId)
+        } catch (canErr) {
+          log.warn({ err: canErr }, '[WEB-SYNC] Canonical + KG build failed (non-critical)')
+        }
+      }
+
       const embeddingCount  = await generateEmbeddings(projectId)
 
       await prisma.project_integrations.updateMany({
@@ -670,6 +887,17 @@ export async function syncWebappMetadata(projectId: string): Promise<WebAppSyncR
       const rawCount        = crawlResult.totalCrawledSoFar
       const normalizedCount = await normalizeWebappMetadata(projectId)
       const domainCount     = await buildWebappDomainModels(projectId)
+
+      // Stage 3.5: Canonical + Knowledge Graph build (non-critical)
+      if (process.env.ENABLE_CANONICAL_METADATA !== 'false') {
+        try {
+          const { buildCanonicalMetadata } = await import('./canonical-builder.service.js')
+          await buildCanonicalMetadata(projectId)
+        } catch (canErr) {
+          log.warn({ err: canErr }, '[WEB-SYNC] Canonical + KG build failed (non-critical)')
+        }
+      }
+
       const embeddingCount  = await generateEmbeddings(projectId)
 
       await prisma.project_integrations.updateMany({
