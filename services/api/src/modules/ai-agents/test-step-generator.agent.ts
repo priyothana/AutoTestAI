@@ -97,31 +97,50 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
       TYPE "SKU" or TYPE "Code"
       CLICK save/create button
 
-🔴 UPDATE OPERATION RULE (applies when test name contains "Update", "Edit", "Modify", OR "existing"):
-  - You MUST first navigate to the entity's LIST page and CLICK on an EXISTING RECORD BY NAME.
-  - Then CLICK the "Edit" button (or equivalent) to enter edit mode.
-  - Then modify at least 1 field with VALID, REALISTIC test data.
-  - Then CLICK the "Save" / "Update" button.
-  - Then ASSERT that the update was successful.
-  - MANDATORY SEQUENCE for Update operations:
-      1. NAVIGATE to the entity list page (e.g., /accounts)
-      2. CLICK on an existing record BY NAME — use a real name from REAL LOOKUP DATA or SAMPLE TEST DATA
-         ▶ This step MUST use locator_type: "text" and target: "<actual record name>" (e.g., "Acme Corp")
-         ▶ ⛔ A nav sidebar CLICK (role=link, name=Accounts) is NOT a record selection
-         ▶ ⛔ CLICK "Create Account" / "+ New Account" are CREATE buttons — FORBIDDEN in Update tests
-      3. CLICK the "Edit" button to enter edit mode
-      4. TYPE/SELECT modified values into at least 1 field
-      5. CLICK the save/update button (e.g., "Save", "Update Account")
-      6. ASSERT_TEXT or ASSERT_URL that the update succeeded
-  - A test case that does NOT select an existing record first WILL BE REJECTED.
+🔴 UPDATE / EDIT OPERATION RULE (applies when test name contains "Update", "Edit", "Modify", OR "existing"):
+  - Works for ANY entity: Account, Lead, Contact, Opportunity, Product, Invoice, Order, etc.
+  - MANDATORY SEQUENCE — follow these 7 steps for every Update/Edit test:
+      1. NAVIGATE to the entity LIST page
+         ▶ Use the LIST page URL (e.g., /accounts, /leads, /contacts) from the URL MAP
+         ▶ NEVER use the create/new URL (e.g., /accounts/new is FORBIDDEN for Update)
+      2. TYPE the record name into the search/filter field to locate the record
+         ▶ action: TYPE, locator_type: "placeholder" or "label"
+         ▶ Use the REAL RECORD NAME from REAL LOOKUP DATA or SAMPLE TEST DATA
+         ▶ If both are empty, use an entity-appropriate fallback (Account → "Acme Corp", Lead → "John Smith")
+         ▶ ⚠️ NEVER use status/stage words ("Prospect", "Active", "Closed") as a record name
+      3. CLICK on the record name to open the record's detail page
+         ▶ action: CLICK, target: "<record name>", locator_type: "text"
+         ▶ ⛔ nav sidebar CLICK (role=link, name=...) does NOT count as a record selection
+         ▶ ⛔ "Create <Entity>" / "+ New <Entity>" are CREATE buttons — FORBIDDEN here
+      4. CLICK the Edit button to enter edit mode
+         ▶ action: CLICK, locator_type: "role"
+         ▶ ⛔ NEVER click "Create <Entity>" here — that opens a create form, not an edit form
+      5. TYPE/SELECT at least 1 field with REALISTIC, VALID data
+         ▶ Use only fields from ALLOWED FIELDS in the manifest
+      6. CLICK the save/update button from the manifest button list
+      7. ASSERT_URL that the URL confirms the save was successful (redirected back to list page)
   - ⛔ ABSOLUTELY FORBIDDEN in Update tests:
-      - CLICK "Create Account" / "+ New Account" / "Create <Entity>" — these open a create form, NOT an edit form
-      - LOOKUP "Account Name" on the list page — this is a create-form step, not an update step
-      - Using the create form URL (/accounts/new) — update tests use the list URL (/accounts)
-  - ⚠️ NEVER use placeholder values like "-", "N/A", "test", "x", "123" as field values.
-  - ⚠️ ALWAYS use realistic values: real phone numbers, valid dropdown options, etc.
-  - If no REAL LOOKUP DATA is available, use the SAMPLE TEST DATA or BRD to find a realistic record name. If both are empty, use "Acme Corp" or "GlobalTech Ltd" as a fallback record name.
-  - ⚠️ NEVER use status/stage/type names (e.g. "Prospect", "Active", "Closed", "Prospecting", "Customer") as a record name.
+      - CLICK "Create <Entity>" / "+ New <Entity>" (opens a create form — completely wrong)
+      - Navigating to a /new or /create URL
+      - Skipping step 2 (search) or step 4 (Edit click)
+      - Using placeholder/dummy values: "-", "N/A", "123", "test", "x"
+
+🔴 DELETE OPERATION RULE (applies when test name contains "Delete", "Remove", "Archive", "Deactivate"):
+  - MANDATORY SEQUENCE for Delete operations:
+      1. NAVIGATE to the entity LIST page
+      2. TYPE the record name in the search box
+      3. CLICK on the record name to open the detail page
+      4. CLICK the Delete/Remove/Archive button
+      5. CLICK the confirmation button ("Confirm", "Yes", "OK") if a confirmation dialog appears
+      6. ASSERT_URL or ASSERT_TEXT that the record was deleted
+
+🔴 VIEW / OPEN OPERATION RULE (applies when test name contains "View", "Open", "Display", "Check Details"):
+  - MANDATORY SEQUENCE for View operations:
+      1. NAVIGATE to the entity LIST page
+      2. TYPE the record name in the search box
+      3. CLICK on the record name to open the detail page
+      4. ASSERT_TEXT or ASSERT_URL confirming the detail page is displayed
+  - Do NOT click Edit or Delete in a View-only test
 
 ╔══════════════════════════════════════════════════════════════╗
 ║  VALID ACTIONS — USE ONLY THESE EXACT STRINGS                ║
@@ -181,6 +200,12 @@ Anti-hallucination rules (ABSOLUTE):
 ╠══════════════════════════════════════════════════════════════╣
 ║ ❌ CLICK "Save" for Create ops   → ✅ Use the EXACT button  ║
 ║    e.g. "Create Opportunity"     from the button list       ║
+║ ❌ CLICK "Create X" in Update    → ✅ CLICK "Edit" instead  ║
+║    test for entity X             (Edit enters edit mode)   ║
+║ ❌ Skip Search step in Update    → ✅ TYPE in search box    ║
+║    (go straight to click record)    BEFORE clicking record  ║
+║ ❌ Skip Edit click in Update     → ✅ CLICK "Edit" AFTER    ║
+║    (fill fields without Edit)       opening the record      ║
 ║ ❌ TYPE on a lookup field        → ✅ Use LOOKUP action     ║
 ║ ❌ TYPE non-existent fields      → ✅ Only ALLOWED FIELDS   ║
 ║ ❌ Field steps BEFORE "open      → ✅ NAVIGATE → CLICK open ║
@@ -574,46 +599,56 @@ function validateSteps(
     }
   }
 
-  // Check 10: Update Operation — Existing Record Selection Guard
-  // For Update/Edit test cases, the step sequence MUST include selecting an existing record
-  // BEFORE any field-edit steps. Without this, the test navigates to a list page and tries
-  // to type into fields that don't exist (because no record is open for editing).
-  //
-  // IMPORTANT: A navigation sidebar CLICK (e.g., CLICK "role=link, name=Accounts") does NOT
-  // count as a record selection. We require at least one CLICK that targets a specific record
-  // name (not a nav link, not a create-flow button like "Create Account").
+  // Check 10: Update Operation — Full workflow guard (entity-agnostic)
+  // Validates: NAVIGATE (list) → TYPE (search) → CLICK (record) → CLICK (Edit) → field edits → CLICK (save) → ASSERT
+  // Works for any entity: Account, Lead, Contact, Opportunity, Product, etc.
   let check10 = true
+  const SEARCH_BOX_RE_C10 = /search|filter|find|query/i
+  // Wide match — catches "Edit", "Edit Account", "Edit Lead", "✏️ Edit"
+  const EDIT_BTN_RE_C10 = /\bedit\b|\bmodify\b/i
   const isUpdateOpForValidation = /\b(update|edit|modify|change)\b/i.test(testEntityHint ?? '')
   if (isUpdateOpForValidation) {
-    // Find the first field-edit step (TYPE/SELECT/LOOKUP/CHECKBOX)
     const FIELD_ACTIONS_C10 = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
-    const firstFieldIdx = steps.findIndex(s => FIELD_ACTIONS_C10.has((s.action ?? '').toUpperCase()))
+    // Find the first TRUE field-edit step — exclude TYPE steps targeting a search box
+    const firstFieldIdx = steps.findIndex(s => {
+      if (!FIELD_ACTIONS_C10.has((s.action ?? '').toUpperCase())) return false
+      if ((s.action ?? '').toUpperCase() === 'TYPE' && SEARCH_BOX_RE_C10.test(s.target ?? '')) return false
+      return true
+    })
+
     if (firstFieldIdx >= 0) {
-      // Check that there is at least one CLICK step BEFORE the first field step
-      // that is NOT a nav sidebar link and NOT a "create" action button.
-      // Nav sidebar CLICKs use role=link or role=menuitem and should NOT count as record selection.
-      const NAV_LINK_RE = /^role=(link|menuitem|tab)/i
-      const CREATE_FLOW_BTN_RE = /\b(create|new|add)\s+\w/i  // e.g. "Create Account", "+New Account"
-      const recordSelectionClicks = steps.slice(0, firstFieldIdx).filter(s => {
+      const NAV_LINK_RE   = /^role=(link|menuitem|tab)/i
+      const CREATE_BTN_RE = /\b(create|\+\s*new|new)\s+\w/i
+      const stepsBeforeField = steps.slice(0, firstFieldIdx)
+
+      // Record selection: CLICK that is NOT nav link, NOT create button, NOT edit button
+      const recordSelectionClicks = stepsBeforeField.filter(s => {
         if ((s.action ?? '').toUpperCase() !== 'CLICK') return false
         const target = (s.target ?? '').trim()
-        // Exclude nav sidebar links
         if (NAV_LINK_RE.test(target)) return false
-        // Exclude create-flow buttons
-        if (CREATE_FLOW_BTN_RE.test(target)) return false
-        // Exclude clicks targeting status words or placeholder/metadata values (e.g., text=Prospect, Prospecting)
-        const cleanTarget = target.replace(/^(text|css|role|placeholder|label|id|xpath)=/i, '').replace(/['"]/g, '').trim()
+        if (CREATE_BTN_RE.test(target)) return false
+        if (EDIT_BTN_RE_C10.test(target)) return false  // Edit btn ≠ record selection
+        const cleanTarget = target.replace(/^(text|css|role|placeholder|label|id|xpath)=/i, '').replace(/["']/g, '').trim()
         if (statusWords.test(cleanTarget) || /^(prospecting|qualification|closed|won|lost|new|pending)$/i.test(cleanTarget)) {
           return false
         }
         return true
       })
-      if (recordSelectionClicks.length === 0) {
+
+      // Also require CLICK on Edit button before field edits
+      const hasEditClick = stepsBeforeField.some(s =>
+        (s.action ?? '').toUpperCase() === 'CLICK' && EDIT_BTN_RE_C10.test(s.target ?? '')
+      )
+
+      const missingItems: string[] = []
+      if (recordSelectionClicks.length === 0) missingItems.push('CLICK on record name (e.g., CLICK "Acme Corp")')
+      if (!hasEditClick) missingItems.push('CLICK Edit button (e.g., CLICK "Edit")')
+
+      if (missingItems.length > 0) {
         issues.push(
-          `Update operation missing record selection: no valid record-opening CLICK found before field-edit step at position ${firstFieldIdx + 1}. ` +
-          `Navigation sidebar CLICKs (role=link) and create-button CLICKs do NOT count. ` +
-          `For Update operations, you MUST: NAVIGATE to list → CLICK on a specific existing record name → CLICK "Edit" → modify fields → CLICK save. ` +
-          `Add a CLICK step with the name of an existing ${testEntityHint ?? 'record'} (e.g., CLICK "Acme Corp") before editing fields.`
+          `Update operation missing required steps before field-edit at position ${firstFieldIdx + 1}: [${missingItems.join(' + ')}]. ` +
+          `MANDATORY SEQUENCE: NAVIGATE → TYPE in search box → CLICK record name → CLICK "Edit" → modify fields → CLICK save. ` +
+          `"Create <Entity>" / "+ New <Entity>" are FORBIDDEN in Update tests — use "Edit" to enter edit mode.`
         )
         check10 = false
       }
@@ -868,14 +903,61 @@ export async function runTestStepGeneratorAgent(
   // testName may be a short clean title ("Create Product") OR a full paragraph prompt.
   // We detect create intent anywhere in the string, not just at the start.
   const isUpdateOperation = /\b(update|edit|modify|change|updating|modifying|editing)\b/i.test(input.testName)
-    // \"existing <entity>\" is a clear update signal — e.g. \"To update the existing Account\"
+    // "existing <entity>" is a clear update signal — e.g. "To update the existing Account"
     || /\bexisting\s+\w+/i.test(input.testName)
-  // Create is only true when update is NOT detected — update intent takes priority
-  const isCreateOperation = !isUpdateOperation && (
+  // Delete/Remove: navigate → search → click → delete button → confirm
+  const isDeleteOperation = !isUpdateOperation &&
+    /\b(delete|remove|archive|deactivate|trash)\b/i.test(input.testName)
+  // View/Open: navigate → search → click → assert detail page
+  const isViewOperation = !isUpdateOperation && !isDeleteOperation &&
+    /\b(view|open|display|read|preview|check details|details of|see details)\b/i.test(input.testName)
+  // Create is only true when update/delete/view is NOT detected — update intent takes priority
+  const isCreateOperation = !isUpdateOperation && !isDeleteOperation && !isViewOperation && (
     /\b(create|add|new)\b/i.test(input.testName)
     || /\bcreating\b/i.test(input.testName)
     || /\bnew\s+(product|lead|contact|account|opportunity|quote|order|invoice|campaign|contract|record|entity)\b/i.test(input.testName)
   )
+
+  // ── Entity-specific record name fallbacks ─────────────────────────────────
+  const ENTITY_RECORD_FALLBACKS: Record<string, string> = {
+    account:     'Acme Corp',
+    lead:        'John Smith',
+    contact:     'Jane Doe',
+    opportunity: 'Q4 Enterprise Deal',
+    product:     'Premium Widget',
+    campaign:    'Summer Launch 2024',
+    invoice:     'INV-0001',
+    order:       'ORD-0001',
+    contract:    'CTR-0001',
+    quote:       'QT-0001',
+    case:        'CS-0001',
+    task:        'Follow Up Call',
+    project:     'Website Redesign',
+    vendor:      'GlobalSupply Ltd',
+    customer:    'TechCorp Inc',
+    employee:    'Alice Johnson',
+    user:        'testuser@example.com',
+  }
+  const entityKey = (resolvedEntityFilter ?? '').toLowerCase().trim()
+    .replace(/ies$/, 'y').replace(/ses$/, 's').replace(/s$/, '').trim()
+  const entityRecordFallback =
+    ENTITY_RECORD_FALLBACKS[entityKey] ??
+    ENTITY_RECORD_FALLBACKS[Object.keys(ENTITY_RECORD_FALLBACKS).find(k =>
+      entityKey.startsWith(k) || k.startsWith(entityKey)
+    ) ?? ''] ??
+    'Test Record'
+
+  // ── Resolve real edit button from manifest (entity-agnostic) ─────────────
+  const resolvedEditButton = manifest?.allButtons?.find(b => /\bedit\b/i.test(b)) ?? 'Edit'
+
+  // ── Resolve real search input hint from manifest (entity-agnostic) ────────
+  const resolvedSearchHint: string = (() => {
+    const searchField = manifest?.fields.find(f =>
+      /search|filter|find|query/i.test(f.label) && f.type === 'input'
+    )
+    if (searchField) return searchField.label
+    return resolvedEntityFilter ? `Search ${resolvedEntityFilter}s` : 'Search'
+  })()
 
   // Minimum field steps: Create needs ≥2, Update needs ≥1, others 0
   // Combined with manifest.requiredCount so real manifest always wins if higher.
@@ -1004,23 +1086,41 @@ export async function runTestStepGeneratorAgent(
           const reqFields = manifest.fields.filter(f => f.required)
           const reqList   = reqFields.map(f => `  ★ [${f.type.toUpperCase()}] "${f.label}"${f.options?.length ? ' (pick from: ' + f.options.slice(0,3).join(' | ') + ')' : ''}`).join('\n')
           if (isUpdateOperation) {
-            // Update-specific instructions
+            // Update-specific instructions — fully entity-agnostic
+            const listUrl = manifest?.createUrl
+              ? manifest.createUrl.replace(/\/(new|create|add)\b.*$/i, '')
+              : urlMap.paths.find(p => p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) && !/new|create|add/i.test(p))
+              ?? `/${(resolvedEntityFilter ?? 'records').toLowerCase()}s`
+
             return [
-              `🔴 UPDATE OPERATION — AVAILABLE FIELDS FOR EDITING:`,
-              reqList,
+              `🔴 UPDATE OPERATION — ENTITY: ${resolvedEntityFilter ?? 'record'}`,
               ``,
-              `This test UPDATES an existing ${resolvedEntityFilter ?? 'record'}.`,
-              `Rules:`,
-              `  1. NAVIGATE to the ${resolvedEntityFilter ?? 'entity'} list page first`,
-              `  2. CLICK on an existing record to open it (use a REAL name from SAMPLE TEST DATA or REAL LOOKUP DATA)`,
-              `     ▶ If both are empty/missing, use "Acme Corp" or "GlobalTech Ltd" as a fallback record name.`,
-              `     ▶ ⚠️ NEVER use status/stage names like "Prospect", "Active", "Closed" as a record name.`,
-              `  3. CLICK the "Edit" button to enter edit mode`,
-              `  4. Modify at least 1 field with REALISTIC, VALID data — NEVER use "-" or "N/A"`,
-              `  5. CLICK the save/update button`,
-              `  6. ASSERT the update was successful`,
-              `  ⚠️ CRITICAL: You MUST select an existing record BEFORE editing any fields`,
-              `  ⚠️ CRITICAL: Use REAL values — placeholder data like "-" WILL FAIL validation`,
+              `AVAILABLE FIELDS FOR EDITING (pick at least 1):`,
+              reqList || '  (all fields optional — pick any field to modify)',
+              ``,
+              `UPDATE WORKFLOW — follow these 7 steps EXACTLY:`,
+              `  1. NAVIGATE to: ${listUrl}`,
+              `     ▶ This is the LIST page. NEVER navigate to a /new, /create, or /add URL.`,
+              `  2. SEARCH STEP — TYPE the record name in the search input:`,
+              `     ▶ action: TYPE`,
+              `     ▶ target: "${resolvedSearchHint}"`,
+              `     ▶ locator_type: "placeholder"`,
+              `     ▶ value: <record name — use REAL LOOKUP DATA or SAMPLE TEST DATA, or "${entityRecordFallback}">`,
+              `     ▶ ⚠️ Do NOT use status words ("Active", "Closed", "Prospect") as a record name`,
+              `  3. CLICK the record name to open its detail page:`,
+              `     ▶ action: CLICK, target: <same record name as step 2>, locator_type: "text"`,
+              `     ▶ ⛔ DO NOT click "Create ${resolvedEntityFilter ?? 'Record'}" — FORBIDDEN`,
+              `  4. EDIT BUTTON — CLICK to enter edit mode:`,
+              `     ▶ action: CLICK`,
+              `     ▶ target: "${resolvedEditButton}"`,
+              `     ▶ locator_type: "role"`,
+              `     ▶ ⛔ NEVER use "Create ${resolvedEntityFilter ?? 'Record'}" — that opens a create form`,
+              `  5. Modify at least 1 field — pick from AVAILABLE FIELDS above. Use REALISTIC data.`,
+              `  6. CLICK the save button to save changes.`,
+              `  7. ASSERT_URL that the URL confirms the save succeeded (e.g., back to list page).`,
+              ``,
+              `⚠️ CRITICAL: ALL of steps 2, 3, 4 are MANDATORY. Skipping any one will FAIL validation.`,
+              `⚠️ CRITICAL: Step 4 MUST be CLICK "${resolvedEditButton}" — NOT "Create ${resolvedEntityFilter ?? 'Record'}".`,
             ].join('\n')
           }
           return [
@@ -1533,30 +1633,36 @@ export async function runTestStepGeneratorAgent(
 
     // 2c. Remove form field steps that appear BEFORE any record-selection CLICK
     // (i.e., field steps on the list page, where there is no open record yet)
-    // This catches the case where LLM generates: NAVIGATE → LOOKUP "Account Name" → CLICK "Create Account"
-    // which are create-form steps, not update steps.
+    // IMPORTANT: Search TYPE steps (target matches search|filter|find) are PRESERVED.
     {
       const FIELD_ACTIONS_2C = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
-      const NAV_LINK_RE_2C = /^role=(link|menuitem|tab)/i
-      const CREATE_BTN_RE_2C = /\b(create|new|add)\s+\w/i
+      const SEARCH_BOX_RE_2C = /search|filter|find|query/i
+      const NAV_LINK_RE_2C   = /^role=(link|menuitem|tab)/i
+      const CREATE_BTN_RE_2C = /\b(create|\+\s*new|new)\s+\w/i
+      const EDIT_BTN_RE_2C   = /\bedit\b|\bmodify\b/i
 
-      // Find the first record-selection CLICK (not a nav link, not a create button)
+      // Find the first record-selection CLICK: NOT nav link, NOT create button, NOT Edit button
       const firstRecordClickIdx = steps.findIndex(s => {
         if ((s.action ?? '').toUpperCase() !== 'CLICK') return false
         const target = (s.target ?? '').trim()
         if (NAV_LINK_RE_2C.test(target)) return false
         if (CREATE_BTN_RE_2C.test(target)) return false
+        if (EDIT_BTN_RE_2C.test(target)) return false  // Edit btn is NOT record selection
         return true
       })
 
       if (firstRecordClickIdx < 0) {
-        // No record-selection CLICK at all — also strip any rogue field steps that are clearly
-        // list-page or create-form steps (they cannot run without an open record)
+        // No record-selection CLICK found — strip orphaned field steps EXCEPT search steps
         const beforeC = steps.length
-        steps = steps.filter(s => !FIELD_ACTIONS_2C.has((s.action ?? '').toUpperCase()))
+        steps = steps.filter(s => {
+          if (!FIELD_ACTIONS_2C.has((s.action ?? '').toUpperCase())) return true
+          // Preserve search TYPE steps — valid even before a record is selected
+          if ((s.action ?? '').toUpperCase() === 'TYPE' && SEARCH_BOX_RE_2C.test(s.target ?? '')) return true
+          return false
+        })
         if (steps.length < beforeC) {
           steps = steps.map((s, i) => ({ ...s, id: String(i + 1) }))
-          thoughts.push(`SAFETY NET U 2c: stripped ${beforeC - steps.length} orphaned field steps — no record-selection CLICK found`)
+          thoughts.push(`SAFETY NET U 2c: stripped ${beforeC - steps.length} orphaned field steps (search steps preserved)`)
           log.warn(
             { projectId: input.projectId, stripped: beforeC - steps.length },
             '[STEP-GEN] ⚡ SAFETY NET U 2c: stripped orphaned field steps (no record selection)',
@@ -1565,70 +1671,133 @@ export async function runTestStepGeneratorAgent(
       }
     }
 
-    // 3. Check for missing record selection (no CLICK before field-edit steps)
+    // 3. Verify and inject the full Update workflow: search → record click → Edit → field edits
+    // Entity-agnostic: works for Account, Lead, Contact, Opportunity, etc.
     const FIELD_ACTIONS_SNU = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
-    const firstFieldIdx = steps.findIndex(s => FIELD_ACTIONS_SNU.has((s.action ?? '').toUpperCase()))
+    const SEARCH_BOX_RE_SNU = /search|filter|find|query/i
+    const NAV_LINK_RE_SNU   = /^role=(link|menuitem|tab)/i
+    const CREATE_BTN_RE_SNU = /\b(create|\+\s*new|new)\s+\w/i
+    // Wide match: "Edit", "Edit Account", "Edit Lead", "✏️ Edit"
+    const EDIT_BTN_RE_SNU   = /\bedit\b|\bmodify\b/i
+
+    // Find the first TRUE field-edit step (excludes search TYPE steps)
+    const firstFieldIdx = steps.findIndex(s => {
+      if (!FIELD_ACTIONS_SNU.has((s.action ?? '').toUpperCase())) return false
+      if ((s.action ?? '').toUpperCase() === 'TYPE' && SEARCH_BOX_RE_SNU.test(s.target ?? '')) return false
+      return true
+    })
+
+    // Resolve real record name (multi-source, entity-agnostic)
+    const resolveRecordName = (): string => {
+      if (sampleTestData) {
+        const nameKey = Object.keys(sampleTestData).find(k =>
+          /^(name|full.?name|display.?name|title|label|account.?name|first.?name|contact.?name|lead.?name)$/i.test(k)
+        )
+        const val = nameKey ? String(sampleTestData[nameKey] ?? '') : ''
+        if (val && val.length > 0 && val.length < 100) return val
+      }
+      if (realLookupValues.size > 0) {
+        const first = [...realLookupValues.values()][0]
+        if (first?.length) return first[0]
+      }
+      return entityRecordFallback
+    }
+
     if (firstFieldIdx >= 0) {
-      const clicksBeforeField = steps.slice(0, firstFieldIdx).filter(s =>
-        (s.action ?? '').toUpperCase() === 'CLICK'
+      const stepsBeforeField = steps.slice(0, firstFieldIdx)
+
+      const recordSelectionClicks = stepsBeforeField.filter(s => {
+        if ((s.action ?? '').toUpperCase() !== 'CLICK') return false
+        const t = (s.target ?? '').trim()
+        if (NAV_LINK_RE_SNU.test(t)) return false
+        if (CREATE_BTN_RE_SNU.test(t)) return false
+        if (EDIT_BTN_RE_SNU.test(t)) return false  // Edit btn ≠ record selection
+        return true
+      })
+      const hasSearchStep = stepsBeforeField.some(s =>
+        (s.action ?? '').toUpperCase() === 'TYPE' && SEARCH_BOX_RE_SNU.test(s.target ?? '')
       )
-      if (clicksBeforeField.length === 0) {
-        thoughts.push('SAFETY NET U: no CLICK steps before first field edit — injecting record selection steps')
+      const hasEditClick = stepsBeforeField.some(s =>
+        (s.action ?? '').toUpperCase() === 'CLICK' && EDIT_BTN_RE_SNU.test(s.target ?? '')
+      )
 
-        // Build record selection steps
-        const recordSelectionSteps: AgentStep_Playwright[] = []
+      const missingRecordClick = recordSelectionClicks.length === 0
+      const missingSearch      = !hasSearchStep
+      const missingEdit        = !hasEditClick
 
-        // Find a real record name from web_test_data
-        let existingRecordName = ''
-        if (sampleTestData) {
-          const nameKey = Object.keys(sampleTestData).find(k =>
-            /^(name|full.?name|display.?name|title|label|account.?name)$/i.test(k)
-          )
-          existingRecordName = nameKey ? String(sampleTestData[nameKey] ?? '') : ''
-        }
-        // Fallback: try realLookupValues
-        if (!existingRecordName && realLookupValues.size > 0) {
-          const firstLookupValues = [...realLookupValues.values()][0]
-          if (firstLookupValues?.length) existingRecordName = firstLookupValues[0]
-        }
+      if (missingRecordClick || missingSearch || missingEdit) {
+        thoughts.push(
+          `SAFETY NET U: missing steps — ` +
+          `search: ${hasSearchStep ? '✅' : '❌'}, ` +
+          `record click: ${!missingRecordClick ? '✅' : '❌'}, ` +
+          `Edit click: ${hasEditClick ? '✅' : '❌'} — injecting`
+        )
 
-        if (existingRecordName) {
-          // CLICK on the existing record to open it
-          recordSelectionSteps.push({
-            id: '', action: 'CLICK' as any, target: existingRecordName,
-            value: '', locator_type: 'text',
+        const existingRecordName = resolveRecordName()
+        const injectedSteps: AgentStep_Playwright[] = []
+
+        if (missingSearch) {
+          injectedSteps.push({
+            id: '', action: 'TYPE' as any,
+            target: resolvedSearchHint,
+            value:  existingRecordName,
+            locator_type: 'placeholder',
           })
-          // CLICK "Edit" button
-          const editButton = manifest?.allButtons?.find(b =>
-            /\bedit\b/i.test(b)
-          ) ?? 'Edit'
-          recordSelectionSteps.push({
-            id: '', action: 'CLICK' as any, target: editButton,
-            value: '', locator_type: 'role',
-          })
+        }
 
-          // Insert AFTER the last NAVIGATE, before the first field step
+        if (missingRecordClick) {
+          injectedSteps.push({
+            id: '', action: 'CLICK' as any,
+            target: existingRecordName,
+            value: '',
+            locator_type: 'text',
+          })
+        }
+
+        if (missingEdit) {
+          injectedSteps.push({
+            id: '', action: 'CLICK' as any,
+            target: resolvedEditButton,
+            value: '',
+            locator_type: 'role',
+          })
+        }
+
+        if (injectedSteps.length > 0) {
           let insertIdx = 0
-          for (let i = steps.length - 1; i >= 0; i--) {
+          for (let i = firstFieldIdx - 1; i >= 0; i--) {
             if ((steps[i].action ?? '').toUpperCase() === 'NAVIGATE') { insertIdx = i + 1; break }
           }
+          while (
+            insertIdx < steps.length &&
+            (steps[insertIdx].action ?? '').toUpperCase() === 'TYPE' &&
+            SEARCH_BOX_RE_SNU.test(steps[insertIdx].target ?? '')
+          ) { insertIdx++ }
 
-          steps.splice(insertIdx, 0, ...recordSelectionSteps)
+          steps.splice(insertIdx, 0, ...injectedSteps)
           steps = steps.map((s, i) => ({ ...s, id: String(i + 1) }))
 
           log.info(
-            { projectId: input.projectId, testName: input.testName, existingRecordName, injectedSteps: recordSelectionSteps.length },
-            '[STEP-GEN] ✅ SAFETY NET U: injected record selection steps for Update operation',
+            { projectId: input.projectId, entity: effectiveEntityHint, existingRecordName, editBtn: resolvedEditButton, injected: injectedSteps.length },
+            '[STEP-GEN] ✅ SAFETY NET U: injected missing steps for Update operation',
           )
-          thoughts.push(`SAFETY NET U: injected ${recordSelectionSteps.length} record selection steps (record: "${existingRecordName}")`)
-        } else {
-          log.warn(
-            { projectId: input.projectId, testName: input.testName },
-            '[STEP-GEN] ⚠️ SAFETY NET U: no existing record name found — cannot inject record selection',
+          thoughts.push(
+            `SAFETY NET U: injected ${injectedSteps.length} step(s) for entity "${effectiveEntityHint}" — ` +
+            `search("${resolvedSearchHint}"): ${missingSearch ? 'added' : 'present'}, ` +
+            `record click("${existingRecordName}"): ${missingRecordClick ? 'added' : 'present'}, ` +
+            `Edit("${resolvedEditButton}"): ${missingEdit ? 'added' : 'present'}`
           )
-          thoughts.push('SAFETY NET U: WARNING — no existing record name found in web_test_data or lookup values')
         }
       }
+    } else {
+      log.warn(
+        { projectId: input.projectId, testName: input.testName, entity: effectiveEntityHint },
+        '[STEP-GEN] ⚠️ SAFETY NET U: no field-edit steps found in Update test — may need more context',
+      )
+      thoughts.push(
+        `SAFETY NET U: WARNING — no field-edit steps found for entity "${effectiveEntityHint}"; ` +
+        `check that the manifest has at least 1 field and that the test name says "Update" or "Edit"`
+      )
     }
 
     // Re-run validation after Update safety net
