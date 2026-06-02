@@ -19,21 +19,27 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 // ── Mock LangChain.js ─────────────────────────────────────────────────
 
-const mockInvoke = vi.fn()
-
-vi.mock('@langchain/anthropic', () => ({
-  ChatAnthropic: vi.fn().mockImplementation(() => ({
-    pipe: vi.fn().mockReturnThis(),
-    invoke: mockInvoke,
-  })),
+const { mockInvoke } = vi.hoisted(() => ({
+  mockInvoke: vi.fn()
 }))
 
-vi.mock('@langchain/openai', () => ({
-  ChatOpenAI: vi.fn().mockImplementation(() => ({
-    pipe: vi.fn().mockReturnThis(),
-    invoke: mockInvoke,
-  })),
-}))
+vi.mock('@langchain/anthropic', () => {
+  return {
+    ChatAnthropic: class {
+      pipe = vi.fn().mockReturnThis()
+      invoke = mockInvoke
+    }
+  }
+})
+
+vi.mock('@langchain/openai', () => {
+  return {
+    ChatOpenAI: class {
+      pipe = vi.fn().mockReturnThis()
+      invoke = mockInvoke
+    }
+  }
+})
 
 vi.mock('@langchain/core/prompts', () => ({
   ChatPromptTemplate: {
@@ -233,8 +239,8 @@ describe('generation.service — generateTest', () => {
     await generateTest({ prompt: 'test', provider: 'claude', project_id: 'proj-123' })
 
     // The invoke call should include the session instruction in the prompt
-    const callArg = mockInvoke.mock.calls[0][0] as Record<string, string>
-    expect(callArg.userInput).toContain('MCP-connected project')
+    const messages = mockInvoke.mock.calls[0][0] as any[]
+    expect(messages[1].content).toContain('MCP-connected project')
   })
 
   it('adds OAuth session instruction for connected SF project without MCP', async () => {
@@ -246,8 +252,8 @@ describe('generation.service — generateTest', () => {
 
     await generateTest({ prompt: 'test', provider: 'claude', project_id: 'proj-456' })
 
-    const callArg = mockInvoke.mock.calls[0][0] as Record<string, string>
-    expect(callArg.userInput).toContain('OAuth connection')
+    const messages = mockInvoke.mock.calls[0][0] as any[]
+    expect(messages[1].content).toContain('OAuth connection')
   })
 
   // ── MCP RAG path ─────────────────────────────────────────────────

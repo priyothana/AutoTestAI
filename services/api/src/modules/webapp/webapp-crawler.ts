@@ -60,6 +60,8 @@ export interface PageMetadata {
   navigation_items: NavItemInfo[]
   source?: 'sitemap' | 'playwright'
   crawl_depth?: number
+  /** True if this page was detected as a login redirect and the actual content could not be crawled */
+  redirected_to_login?: boolean
 }
 
 export interface WebAppCrawlResult {
@@ -328,7 +330,8 @@ export class WebMetadataService {
       page.setDefaultNavigationTimeout(30_000)
 
       let pagesCrawled = 0
-      const isFirstRun = !isContinuation
+      let consecutiveLoginFailures = 0
+      const MAX_LOGIN_FAILURES = 3
 
       for (const url of toVisitThisRun) {
         if (visitedUrls.has(url)) {
@@ -336,14 +339,38 @@ export class WebMetadataService {
           continue
         }
 
+        // ── Abort early if too many consecutive auth failures ────────────
+        if (consecutiveLoginFailures >= MAX_LOGIN_FAILURES) {
+          log.error(
+            `[CRAWLER] ❌ Aborting crawl: ${consecutiveLoginFailures} consecutive pages ` +
+            `redirected to login — authentication is failing. Check credentials.`
+          )
+          break
+        }
+
         try {
           const source: 'sitemap' | 'playwright' = 'playwright'
           const pageMeta = await WebMetadataService._visitPage(
             page, url, baseUrl, credentials,
-            pagesCrawled === 0 && isFirstRun  // only attempt login on very first page
           )
 
           if (pageMeta) {
+            // ── Filter login-redirect pages ───────────────────────────────────────────────
+            // If the page was detected as a login redirect, do NOT store it.
+            // Track consecutive failures for early abort.
+            if (pageMeta.redirected_to_login) {
+              consecutiveLoginFailures++
+              visitedUrls.add(url)
+              log.warn(
+                `[CRAWLER] ⚠ Skipping login-redirect page: ${url} ` +
+                `(consecutive failures: ${consecutiveLoginFailures}/${MAX_LOGIN_FAILURES})`
+              )
+              continue
+            }
+
+            // Reset consecutive failure counter on successful crawl
+            consecutiveLoginFailures = 0
+
             // ── Filter 404 / error pages ─────────────────────────────────────────────────
             // Do not store pages that returned a 404 / not-found response.
             // These are bad routes from key_routes that don't exist in this app.
@@ -472,12 +499,127 @@ export class WebMetadataService {
     return result
   }
 
+  // ── Login Page Detection ───────────────────────────────────────────────────
+  // Detects if the current page is a login/auth page by checking URL, DOM,
+  // and visible form elements. Used universally on every page visit.
+
+  static async _isLoginPage(
+    page: import('playwright').Page,
+  ): Promise<{ isLogin: boolean; reason: string }> {
+    const currentUrl = page.url().toLowerCase()
+
+    // Check 1: URL path contains auth-related segments
+    const authPathPattern = /\/(login|signin|sign-in|sign_in|auth|authenticate|sso|oauth|cas|saml)\b/i
+    const urlIsAuth = authPathPattern.test(currentUrl)
+
+    // Check 2: Visible password field present
+    let hasVisiblePassword = false
+    try {
+      const pwdField = page.locator('input[type="password"]')
+      const pwdCount = await pwdField.count()
+      hasVisiblePassword = pwdCount > 0 && await pwdField.first().isVisible({ timeout: 1_000 }).catch(() => false)
+    } catch { /* non-critical */ }
+
+    // Check 3: Button text matches login keywords
+    let hasLoginButton = false
+    try {
+      for (const name of ['Log In', 'Login', 'Sign In', 'Sign in', 'Submit', 'Enter']) {
+        const btn = page.getByRole('button', { name, exact: false })
+        if (await btn.count() > 0 && await btn.first().isVisible({ timeout: 500 }).catch(() => false)) {
+          hasLoginButton = true
+          break
+        }
+      }
+    } catch { /* non-critical */ }
+
+    // Decision: login page if URL is auth-related AND has password field,
+    // OR if URL is auth-related AND has login button,
+    // OR if password field + login button (even without auth URL — handles redirects)
+    if (urlIsAuth && hasVisiblePassword) {
+      return { isLogin: true, reason: `URL contains auth path and has password field` }
+    }
+    if (urlIsAuth && hasLoginButton) {
+      return { isLogin: true, reason: `URL contains auth path and has login button` }
+    }
+    if (hasVisiblePassword && hasLoginButton) {
+      return { isLogin: true, reason: `Has password field and login button (likely auth redirect)` }
+    }
+
+    return { isLogin: false, reason: '' }
+  }
+
+  // ── Reusable Login Handler ────────────────────────────────────────────────
+  // Attempts to log in on the current page using provided credentials.
+  // Returns whether login succeeded (verified by checking the URL changed
+  // away from the login page).
+
+  static async _attemptLogin(
+    page: import('playwright').Page,
+    credentials: { username: string; password: string },
+  ): Promise<{ success: boolean; finalUrl: string }> {
+    const urlBeforeLogin = page.url()
+    log.info(`[CRAWLER] 🔐 Attempting auto-login on ${urlBeforeLogin}`)
+
+    try {
+      // Fill username
+      for (const sel of [
+        'input[type="email"]', 'input[name="username"]', 'input[name="email"]',
+        'input[name="user"]', 'input[name="login"]', 'input[id="username"]',
+        'input[id="email"]', 'input[type="text"]',
+      ]) {
+        try {
+          const f = page.locator(sel).first()
+          if (await f.isVisible({ timeout: 1_000 }).catch(() => false)) {
+            await f.fill(credentials.username)
+            break
+          }
+        } catch { /* try next */ }
+      }
+
+      // Fill password
+      const pwdField = page.locator('input[type="password"]')
+      if (await pwdField.count() > 0) {
+        await pwdField.first().fill(credentials.password)
+      }
+
+      // Click login button
+      for (const name of ['Log In', 'Login', 'Sign In', 'Submit', 'Sign in', 'Enter']) {
+        try {
+          const btn = page.getByRole('button', { name, exact: false })
+          if (await btn.count() > 0) {
+            await btn.first().click({ timeout: 5_000 })
+            break
+          }
+        } catch { /* try next */ }
+      }
+
+      // Wait for navigation to settle
+      await page.waitForTimeout(2_500)
+      await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {})
+
+      // Verify login success: URL should have changed away from the login page
+      const finalUrl = page.url()
+      const loginCheck = await WebMetadataService._isLoginPage(page)
+      if (loginCheck.isLogin) {
+        log.warn(`[CRAWLER] ❌ Login FAILED — still on login page: ${finalUrl}`)
+        return { success: false, finalUrl }
+      }
+
+      log.info(`[CRAWLER] ✅ Login succeeded — navigated to: ${finalUrl}`)
+      return { success: true, finalUrl }
+    } catch (loginErr) {
+      log.warn({ loginErr }, '[CRAWLER] Login attempt error')
+      return { success: false, finalUrl: page.url() }
+    }
+  }
+
+  // ── Visit Page (with auth redirect detection + re-login + retry) ──────────
+
   static async _visitPage(
     page: import('playwright').Page,
     url: string,
     baseUrl: string,
     credentials?: { username: string; password: string },
-    isFirstPage = false,
   ): Promise<PageMetadata | null> {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 })
@@ -487,44 +629,54 @@ export class WebMetadataService {
       return null
     }
 
-    if (isFirstPage && credentials) {
-      try {
-        const pwdField = page.locator('input[type="password"]')
-        const pwdCount = await pwdField.count()
-        if (pwdCount > 0 && await pwdField.first().isVisible()) {
-          log.info('[CRAWLER] Login page detected — performing auto-login')
+    // ── Auth redirect detection ──────────────────────────────────────────────
+    // Check if the page we landed on is actually a login page (redirect).
+    // If so, attempt login and retry navigating to the original target URL.
+    const loginCheck = await WebMetadataService._isLoginPage(page)
+    if (loginCheck.isLogin && credentials) {
+      log.info(`[CRAWLER] 🔄 Auth redirect detected for ${url}: ${loginCheck.reason}`)
 
-          for (const sel of [
-            'input[type="email"]', 'input[name="username"]', 'input[name="email"]',
-            'input[name="user"]', 'input[name="login"]', 'input[id="username"]',
-            'input[id="email"]', 'input[type="text"]',
-          ]) {
-            try {
-              const f = page.locator(sel).first()
-              if (await f.isVisible({ timeout: 1_000 }).catch(() => false)) {
-                await f.fill(credentials.username)
-                break
-              }
-            } catch { /* try next */ }
-          }
-
-          await pwdField.first().fill(credentials.password)
-
-          for (const name of ['Log In', 'Login', 'Sign In', 'Submit', 'Sign in']) {
-            try {
-              const btn = page.getByRole('button', { name, exact: false })
-              if (await btn.count() > 0) {
-                await btn.first().click({ timeout: 5_000 })
-                break
-              }
-            } catch { /* try next */ }
-          }
-
-          await page.waitForTimeout(2_000)
-          await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {})
+      const loginResult = await WebMetadataService._attemptLogin(page, credentials)
+      if (!loginResult.success) {
+        // Login failed — mark as redirected and return a stub page
+        log.warn(`[CRAWLER] Cannot authenticate — marking ${url} as login-redirect`)
+        return {
+          url, path: new URL(url).pathname || '/',
+          title: '', headings: [], buttons: [], links: [],
+          inputs: [], selects: [], testids: [], navigation_items: [],
+          redirected_to_login: true,
         }
-      } catch (loginErr) {
-        log.debug({ loginErr }, '[CRAWLER] Login check error (non-fatal)')
+      }
+
+      // Login succeeded — navigate back to the original target URL
+      try {
+        log.info(`[CRAWLER] Re-navigating to original target after login: ${url}`)
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 })
+        await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {})
+
+        // Final check: are we STILL on a login page after retry?
+        const retryCheck = await WebMetadataService._isLoginPage(page)
+        if (retryCheck.isLogin) {
+          log.warn(`[CRAWLER] Still on login page after re-navigation — marking ${url} as login-redirect`)
+          return {
+            url, path: new URL(url).pathname || '/',
+            title: '', headings: [], buttons: [], links: [],
+            inputs: [], selects: [], testids: [], navigation_items: [],
+            redirected_to_login: true,
+          }
+        }
+      } catch (retryErr) {
+        log.warn({ retryErr }, `[CRAWLER] Re-navigation failed for ${url}`)
+        return null
+      }
+    } else if (loginCheck.isLogin && !credentials) {
+      // No credentials available — mark as login redirect
+      log.warn(`[CRAWLER] Login page detected but no credentials available for ${url}`)
+      return {
+        url, path: new URL(url).pathname || '/',
+        title: '', headings: [], buttons: [], links: [],
+        inputs: [], selects: [], testids: [], navigation_items: [],
+        redirected_to_login: true,
       }
     }
 

@@ -832,8 +832,23 @@ ${crudEnforcement}${negativeEnforcement}
 
 // ── LLM factory (reuses same pattern as generation.service.ts) ────────────────
 
+function useAnthropic(): boolean {
+  const provider = (process.env.LLM_PROVIDER ?? '').toLowerCase()
+  if (provider === 'anthropic') return true
+  if (provider === 'openai')    return false
+  // No explicit provider — prefer OpenAI only if key is present
+  return !process.env.OPENAI_API_KEY
+}
+
 function buildLlm(): BaseChatModel {
-  const model = process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514'
+  if (!useAnthropic() && process.env.OPENAI_API_KEY) {
+    return new ChatOpenAI({
+      apiKey:      process.env.OPENAI_API_KEY,
+      model:       process.env.TC_GEN_MODEL ?? 'gpt-4o',
+      temperature: 0.7,
+    })
+  }
+  const model = process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514')
   return new ChatAnthropic({
     apiKey:      process.env.ANTHROPIC_API_KEY,
     model,
@@ -843,6 +858,15 @@ function buildLlm(): BaseChatModel {
 }
 
 function buildFallbackLlm(): BaseChatModel {
+  if (!useAnthropic() && process.env.OPENAI_API_KEY) {
+    const model = process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514')
+    return new ChatAnthropic({
+      apiKey:      process.env.ANTHROPIC_API_KEY,
+      model,
+      maxTokens:   8192,
+      temperature: 0.7,
+    })
+  }
   return new ChatOpenAI({
     apiKey:      process.env.OPENAI_API_KEY,
     model:       'gpt-4o',

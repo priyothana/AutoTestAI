@@ -247,7 +247,11 @@ IMPORTANT: Output ONLY valid JSON. No explanations outside the JSON structure. P
 // ─── LLM factory ──────────────────────────────────────────────────────────────
 
 function buildLlm(): BaseChatModel {
-  if (process.env.OPENAI_API_KEY) {
+  const provider = (process.env.LLM_PROVIDER ?? '').toLowerCase()
+  const useAnthropic = provider === 'anthropic' ||
+    (provider !== 'openai' && !process.env.OPENAI_API_KEY)
+
+  if (!useAnthropic && process.env.OPENAI_API_KEY) {
     return new ChatOpenAI({
       apiKey:      process.env.OPENAI_API_KEY,
       model:       'gpt-4o-mini',
@@ -256,7 +260,7 @@ function buildLlm(): BaseChatModel {
   }
   return new ChatAnthropic({
     apiKey:    process.env.ANTHROPIC_API_KEY,
-    model:     process.env.LLM_MODEL ?? 'claude-sonnet-4-5',
+    model:     process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
     maxTokens: 2048,
     temperature: 0.3,
   })

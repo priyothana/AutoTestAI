@@ -139,22 +139,21 @@ export default function NexusAssistant({
     // Mount: read saved position (SSR-safe)
     useEffect(() => {
         const rightEdge = window.innerWidth - 88
-        const centerY   = Math.round(window.innerHeight / 2) - 32
+        const defaultY  = window.innerHeight - 110
         const saved = localStorage.getItem(storageKey)
         if (saved) {
             try {
                 const p = JSON.parse(saved) as { x: number; y: number }
-                // Clamp: if the saved Y is in the bottom 15% of the viewport it would
-                // be hidden by footers/scrollbars — move it back to right-center.
-                const bottomThreshold = window.innerHeight * 0.85
-                const safePosY = p.y > bottomThreshold ? centerY : p.y
-                setPos({ x: p.x, y: safePosY })
+                // Clamp: ensure the saved position is within viewport bounds
+                const safePosX = Math.max(0, Math.min(window.innerWidth - 64, p.x))
+                const safePosY = Math.max(0, Math.min(window.innerHeight - 64, p.y))
+                setPos({ x: safePosX, y: safePosY })
                 setMounted(true)
                 return
             } catch { /* fallback to default */ }
         }
-        // Default: right-center of the viewport so it is always visible
-        setPos({ x: rightEdge, y: centerY })
+        // Default: right corner down of the page as default to display in UI
+        setPos({ x: rightEdge, y: defaultY })
         setMounted(true)
     }, [storageKey])
 

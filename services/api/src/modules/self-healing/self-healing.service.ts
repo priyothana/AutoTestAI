@@ -39,7 +39,7 @@ const log = createModuleLogger('self-healing-chat')
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const LLM_PROVIDER = (process.env.LLM_PROVIDER ?? 'anthropic').toLowerCase()
-const CHAT_MODEL   = process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514'
+const CHAT_MODEL   = process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514')
 
 // ── System prompt (port of Python HEALING_SYSTEM_PROMPT) ─────────────────────
 const HEALING_SYSTEM_PROMPT = `You are an expert Salesforce Lightning + Playwright test architect.

@@ -32,12 +32,14 @@ import type { ExecutionStepResult } from '../modules/execution/execution.schema.
 import { generateAiSuggestions } from '../modules/self-healing/self-healing.service.js'
 import { waitForResume, clearPause, resolvePause } from '../shared/execution/pause-gate.js'
 import { handleStepFailure } from '../modules/ai-agents/execution.agent.js'
+import { hitlAnalyze, hitlChat } from '../modules/test-run/hitl.service.js'
 import {
   fillWebAppField,
   selectWebAppPicklist,
   fillWebAppDate as fillWebAppDateField,
   fillWebAppCheckbox,
   extractWebAppLabel,
+
 } from './webapp-field-handler.js'
 
 const log = createModuleLogger('execution-worker')
@@ -5138,256 +5140,126 @@ async function setBrowserState(page: Page, state: 'running' | 'paused' | 'passed
   } catch { /* page may have navigated — non-fatal */ }
 }
 
-// ─── HITL: In-browser pause overlay ─────────────────────────────────────────
+// ─── HITL: In-browser AI chatbot overlay ──────────────────────────────────────
 
 /**
- * Injects a floating "Test Paused" overlay panel directly into the Playwright-
- * controlled browser window. The overlay has Resume and Skip buttons.
- *
- * PRIMARY communication channel:
- *   <a href="/autotest-hitl-signal?action=resume" target="hidden-iframe">
- *   Clicking a native <a> link is pure HTML — immune to LWS, CSP, and all
- *   JavaScript sandboxing. Playwright's page.route() intercepts the iframe's
- *   navigation at the CDP Fetch domain layer.
- *
- * BACKUP channels (JS-based, fire when JS is available):
- *   - page.exposeFunction('__autotestHitlSignal') — direct Node.js callback
- *   - document.body.setAttribute('data-autotest-hitl-action') — polled by Node.js
- *   - sessionStorage.setItem('autotest-hitl-action') — survives DOM issues
- *   - hidden checkbox inputs — polled by Node.js as additional detection
+ * Uses page.evaluate(STRING) — not page.evaluate(FUNCTION).
+ * tsx/esbuild injects __name() into every compiled JS construct.
+ * String content is never compiled — no __name injection possible.
+ * Dynamic values interpolated via JSON.stringify before sending.
  */
 async function injectPauseOverlay(
   page: Page,
   executionId: string,
   stepNum: number,
-  stepAction: string,
+  _stepAction: string,
   stepTarget: string,
   stepValue: string,
   errorMsg: string,
   timeoutMs: number,
-  aiFailureType?: string,
-  aiFailureReason?: string,
+  _aiFailureType?: string,
+  _aiFailureReason?: string,
+  _testCaseId?: string,
 ): Promise<void> {
+  const secs   = Math.floor(timeoutMs / 1000)
+  const tgt    = (stepTarget ?? '').replace(/</g, '&lt;')
+  const val    = (stepValue  ?? '').replace(/</g, '&lt;')
+  const errTxt = (errorMsg   || 'Step failed.').replace(/</g, '&lt;')
+  const minSec = String(Math.floor(secs / 60))
+  const remSec = String(secs % 60).padStart(2, '0')
+  const valHtml = val ? '<br><span style="color:#10b981;font-size:11px;display:inline-block;margin-top:2px">' + val + '</span>' : ''
+
+  const jStepNum  = JSON.stringify(stepNum)
+  const jTgt      = JSON.stringify(tgt)
+  const jVal      = JSON.stringify(valHtml)
+  const jErr      = JSON.stringify(errTxt)
+  const jMinSec   = JSON.stringify(minSec)
+  const jRemSec   = JSON.stringify(remSec)
+  const jSecs     = JSON.stringify(secs)
+
+  const script = `(function(){
+var stepNum=${jStepNum},tgt=${jTgt},valHtml=${jVal},errTxt=${jErr},minSec=${jMinSec},remSec=${jRemSec},secs=${jSecs};
+var prev=document.getElementById('autotest-pause-overlay');if(prev)prev.remove();
+var ps=document.getElementById('at-hitl-style');if(ps)ps.remove();
+document.body.removeAttribute('data-autotest-hitl-action');
+try{sessionStorage.removeItem('autotest-hitl-action');}catch(e){}
+
+var styleEl=document.createElement('style');
+styleEl.id='at-hitl-style';
+styleEl.textContent='@keyframes at-in{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}@keyframes at-fd{from{opacity:0}to{opacity:1}}@keyframes at-b{0%,60%,100%{transform:scale(0)}30%{transform:scale(1)}}#at-card{animation:at-in .3s cubic-bezier(.2,.8,.4,1) both}.at-msg{animation:at-fd .2s ease both}.at-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#d97706;margin:0 2px}.at-dot:nth-child(1){animation:at-b 1.1s 0s infinite}.at-dot:nth-child(2){animation:at-b 1.1s .2s infinite}.at-dot:nth-child(3){animation:at-b 1.1s .4s infinite}.at-abtn{display:block;text-decoration:none;text-align:center;user-select:none;-webkit-user-select:none;cursor:pointer;transition:filter .1s,transform .1s;font-family:inherit}.at-abtn:hover{filter:brightness(1.15)}.at-abtn:active{transform:scale(.96)}#at-inp{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);border-radius:8px;color:#e2e8f0;font-size:12px;padding:0 10px;height:34px;flex:1;box-sizing:border-box;font-family:inherit;outline:none}#at-inp:focus{border-color:#d97706;box-shadow:0 0 0 2px rgba(217,119,6,.2)}#at-inp::placeholder{color:#4b5563}#at-snd{background:linear-gradient(135deg,#d97706,#b45309);border:none;border-radius:8px;color:#fff;cursor:pointer;width:34px;height:34px;flex-shrink:0;font-size:14px}.at-chip{border:1px solid rgba(217,119,6,.4);background:rgba(217,119,6,.12);color:#fbbf24;font-size:10px;padding:3px 8px;border-radius:999px;cursor:pointer;font-family:inherit}.at-chip:hover{background:rgba(217,119,6,.28)}';
+document.head.appendChild(styleEl);
+
+var wrap=document.createElement('div');
+wrap.id='autotest-pause-overlay';
+wrap.style.cssText='position:fixed;bottom:20px;right:20px;z-index:2147483647;width:420px;max-width:calc(100vw - 36px);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif';
+
+wrap.innerHTML='<div id="at-card" style="background:linear-gradient(160deg,#0d1117,#161d2e);border:1px solid rgba(217,119,6,.45);border-radius:18px;overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,.8);display:flex;flex-direction:column;max-height:calc(100vh - 40px)">'
++'<div id="at-drag" style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:linear-gradient(135deg,#3b1500,#161d2e);border-bottom:1px solid rgba(217,119,6,.2);cursor:grab;flex-shrink:0;user-select:none;-webkit-user-select:none">'
++'<div style="width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;pointer-events:none">\u23f8</div>'
++'<div style="flex:1;pointer-events:none"><div style="display:flex;align-items:center;gap:6px"><span style="color:#fff;font-size:12px;font-weight:800;letter-spacing:.14em">NEXUS</span><span style="font-size:8px;padding:1px 6px;border-radius:999px;background:rgba(217,119,6,.22);color:#fbbf24;font-weight:700;border:1px solid rgba(217,119,6,.35)">HITL</span><span style="width:6px;height:6px;border-radius:50%;background:#f59e0b;display:inline-block"></span></div><div style="color:#d97706;font-size:10px;font-weight:600;margin-top:1px">Test Paused \u2014 Step '+stepNum+' needs action</div></div>'
++'<div style="display:flex;flex-direction:column;gap:2px;opacity:.3;pointer-events:none"><div style="display:flex;gap:2px"><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span></div><div style="display:flex;gap:2px"><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span></div></div></div>'
++'<div style="padding:9px 12px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0"><div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:8px 10px;margin-bottom:6px"><span style="color:#e2e8f0;font-size:12px;font-weight:700">Step '+stepNum+' \u2014 </span><span style="color:#fbbf24;font-size:12px;font-weight:700">'+tgt+'</span>'+valHtml+'</div><div style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.22);border-radius:8px;padding:7px 10px;max-height:52px;overflow-y:auto"><span style="color:#fca5a5;font-size:10.5px;line-height:1.5">'+errTxt+'</span></div></div>'
++'<div id="at-sugg" style="display:none;margin:8px 12px 0;padding:10px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);border-radius:10px;flex-shrink:0"><div style="display:flex;gap:7px;align-items:flex-start;margin-bottom:8px"><span style="font-size:14px;flex-shrink:0">\ud83d\udca1</span><div><div style="color:#86efac;font-size:9px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;margin-bottom:3px">AI Suggestion</div><div id="at-sugg-text" style="color:#e2e8f0;font-size:11px;line-height:1.5"></div></div></div><div style="display:flex;gap:6px"><button id="at-acc" class="at-abtn" style="flex:1;padding:7px 0;border-radius:7px;font-size:11px;font-weight:700;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;border:none">\u2713 Accept &amp; Resume</button><button id="at-rej" class="at-abtn" style="flex:1;padding:7px 0;border-radius:7px;font-size:11px;font-weight:600;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5">\u2717 Reject</button></div></div>'
++'<div id="at-chat" style="flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:7px;min-height:80px;max-height:190px"><div id="at-typing" style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0">\ud83e\udd16</div><div style="padding:8px 10px;border-radius:9px;border-top-left-radius:2px;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.25)"><span class="at-dot"></span><span class="at-dot"></span><span class="at-dot"></span></div></div></div>'
++'<div style="padding:8px 12px 10px;border-top:1px solid rgba(255,255,255,.07);flex-shrink:0"><div style="display:flex;gap:6px;align-items:center;margin-bottom:8px"><input id="at-inp" type="text" placeholder="Describe your fix\u2026"><button id="at-snd" style="width:34px;height:34px;display:flex;align-items:center;justify-content:center">\u27a4</button></div><div style="display:flex;gap:7px;margin-bottom:7px"><a id="autotest-resume-btn" class="at-abtn" href="/autotest-hitl-signal?action=resume" target="at-frame" style="flex:1;padding:10px 0;border-radius:9px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:12px;font-weight:700">\u25b6 Resume</a><a id="autotest-skip-btn" class="at-abtn" href="/autotest-hitl-signal?action=skip" target="at-frame" style="flex:1;padding:10px 0;border-radius:9px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:#cbd5e1;font-size:12px;font-weight:600">\u23ed Skip Step</a></div><a id="autotest-stop-btn" class="at-abtn" href="/autotest-hitl-signal?action=stop" target="at-frame" style="display:block;padding:9px 0;border-radius:9px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:12px;font-weight:700;box-sizing:border-box">\u23f9 Stop Testing</a><div style="margin-top:7px;text-align:center"><span style="color:#374151;font-size:10px">Auto-timeout in </span><span id="at-timer" style="color:#4b5563;font-size:10px;font-weight:600">'+minSec+':'+remSec+'</span></div></div>'
++'<iframe name="at-frame" style="display:none;width:0;height:0;border:none;position:absolute" aria-hidden="true"></iframe>'
++'<input type="checkbox" id="autotest-resume-chk" style="display:none;position:absolute">'
++'<input type="checkbox" id="autotest-skip-chk" style="display:none;position:absolute">'
++'<input type="checkbox" id="autotest-stop-chk" style="display:none;position:absolute">'
++'</div>';
+
+document.body.appendChild(wrap);
+
+var chatEl=document.getElementById('at-chat'),typingEl=document.getElementById('at-typing'),inpEl=document.getElementById('at-inp'),sndEl=document.getElementById('at-snd'),suggEl=document.getElementById('at-sugg'),suggTxt=document.getElementById('at-sugg-text'),accEl=document.getElementById('at-acc'),rejEl=document.getElementById('at-rej');
+var hist=[],busy=false,timerRef;
+
+var scrollBot=function(){chatEl.scrollTop=chatEl.scrollHeight;};
+var showTyping=function(v){typingEl.style.display=v?'flex':'none';if(v)scrollBot();};
+var showSugg=function(t){suggTxt.textContent=t;suggEl.style.display='block';};
+var hideSugg=function(){suggEl.style.display='none';};
+
+var userBubble=function(t){var d=document.createElement('div');d.className='at-msg';d.style.cssText='display:flex;justify-content:flex-end';var i=document.createElement('div');i.style.cssText='max-width:85%;padding:7px 10px;border-radius:9px;border-top-right-radius:2px;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;font-size:11px;line-height:1.5;word-break:break-word';i.textContent=t;d.appendChild(i);chatEl.insertBefore(d,typingEl);scrollBot();};
+
+var aiBubble=function(content,type,chips){var bc=type==='valid'?'rgba(34,197,94,.35)':type==='invalid'?'rgba(239,68,68,.35)':type==='clarify'?'rgba(59,130,246,.35)':'rgba(217,119,6,.3)';var bg=type==='valid'?'rgba(34,197,94,.07)':type==='invalid'?'rgba(239,68,68,.07)':type==='clarify'?'rgba(59,130,246,.07)':'rgba(217,119,6,.07)';var d=document.createElement('div');d.className='at-msg';d.style.cssText='display:flex;gap:7px;align-items:flex-start';var icon=document.createElement('div');icon.style.cssText='width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:2px';icon.textContent='\ud83e\udd16';var right=document.createElement('div');right.style.cssText='flex:1;min-width:0';var bubble=document.createElement('div');bubble.style.cssText='padding:7px 10px;border-radius:9px;border-top-left-radius:2px;background:'+bg+';border:1px solid '+bc+';color:#e2e8f0;font-size:11px;line-height:1.5;word-break:break-word';bubble.textContent=content;right.appendChild(bubble);if(chips&&chips.length){var cr=document.createElement('div');cr.style.cssText='display:flex;flex-wrap:wrap;gap:4px;margin-top:5px';for(var ci=0;ci<chips.length;ci++){(function(cv){var btn=document.createElement('button');btn.className='at-chip';btn.textContent=cv;btn.addEventListener('click',function(){doSend(cv);});cr.appendChild(btn);})(chips[ci]);}right.appendChild(cr);}d.appendChild(icon);d.appendChild(right);chatEl.insertBefore(d,typingEl);scrollBot();};
+
+var doSignal=function(action,btnId){clearInterval(timerRef);var btn=document.getElementById(btnId),card=document.getElementById('at-card');if(btn){btn.textContent='Processing\u2026';btn.style.opacity='.5';btn.style.pointerEvents='none';}if(card){card.style.opacity='.6';card.style.pointerEvents='none';}var chkId=action==='resume'?'autotest-resume-chk':action==='skip'?'autotest-skip-chk':'autotest-stop-chk';var chk=document.getElementById(chkId);if(chk)chk.checked=true;try{if(typeof window.__autotestHitlSignal==='function')window.__autotestHitlSignal(action);}catch(e){}document.body.setAttribute('data-autotest-hitl-action',action);try{sessionStorage.setItem('autotest-hitl-action',action);}catch(e){};};
+
+try{var rB=wrap.querySelector('#autotest-resume-btn'),sB=wrap.querySelector('#autotest-skip-btn'),xB=wrap.querySelector('#autotest-stop-btn');if(rB)rB.addEventListener('click',function(e){e.stopImmediatePropagation();doSignal('resume','autotest-resume-btn');},true);if(sB)sB.addEventListener('click',function(e){e.stopImmediatePropagation();doSignal('skip','autotest-skip-btn');},true);if(xB)xB.addEventListener('click',function(e){e.stopImmediatePropagation();doSignal('stop','autotest-stop-btn');},true);}catch(e){}
+
+if(accEl)accEl.addEventListener('click',function(){hideSugg();doSignal('resume','autotest-resume-btn');});
+if(rejEl)rejEl.addEventListener('click',function(){hideSugg();aiBubble("Suggestion rejected. Describe what you see.",'clarify');});
+
+var callAnalyze=function(){return new Promise(function(resolve){try{var fn=window.__hitlAnalyze;if(typeof fn!=='function')throw 0;fn().then(resolve).catch(function(){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data already exists','Page did not load','Wrong field label']});});}catch(e){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data already exists','Page did not load','Wrong field label']});}});};
+
+var callChat=function(text){return new Promise(function(resolve){try{var fn=window.__hitlChat;if(typeof fn!=='function')throw 0;fn(text,hist.slice(-6)).then(resolve).catch(function(){resolve({reply:"I couldn't process that. Describe what you see.",suggestion_type:'clarify'});});}catch(e){resolve({reply:"I couldn't process that. Describe what you see.",suggestion_type:'clarify'});}});};
+
+var doSend=function(text){text=text.trim();if(!text||busy)return;busy=true;sndEl.disabled=true;hideSugg();userBubble(text);hist.push({role:'user',content:text});showTyping(true);callChat(text).then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies);hist.push({role:'assistant',content:d.reply});if(d.suggested_action)showSugg(d.suggested_action);busy=false;sndEl.disabled=false;inpEl.focus();});};
+
+sndEl.addEventListener('click',function(){var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}});
+inpEl.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}}});
+
+showTyping(true);
+callAnalyze().then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies);hist.push({role:'assistant',content:d.reply});if(d.suggested_action)showSugg(d.suggested_action);inpEl.focus();});
+
+var dh=document.getElementById('at-drag');
+var dragOn=false,dragOX=0,dragOY=0,dragOL=0,dragOT=0;
+dh.addEventListener('mousedown',function(e){if(e.button!==0)return;if(wrap.style.bottom!=='auto'){var r=wrap.getBoundingClientRect();wrap.style.bottom='auto';wrap.style.right='auto';wrap.style.left=r.left+'px';wrap.style.top=r.top+'px';}dragOn=true;dragOX=e.clientX;dragOY=e.clientY;dragOL=parseInt(wrap.style.left||'0',10);dragOT=parseInt(wrap.style.top||'0',10);dh.style.cursor='grabbing';e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();},true);
+window.addEventListener('mousemove',function(e){if(!dragOn)return;var maxL=window.innerWidth-wrap.offsetWidth-4,maxT=window.innerHeight-wrap.offsetHeight-4;wrap.style.left=Math.max(4,Math.min(dragOL+e.clientX-dragOX,maxL))+'px';wrap.style.top=Math.max(4,Math.min(dragOT+e.clientY-dragOY,maxT))+'px';e.preventDefault();e.stopPropagation();},{capture:true,passive:false});
+window.addEventListener('mouseup',function(){if(!dragOn)return;dragOn=false;dh.style.cursor='grab';},true);
+
+var rem=secs,timerEl=document.getElementById('at-timer');
+timerRef=setInterval(function(){rem--;if(rem<=0){clearInterval(timerRef);return;}timerEl.textContent=Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0');},1000);
+})();`
+
   try {
-    await page.evaluate(
-      ({ stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs, aiFailureType, aiFailureReason }: {
-        stepNum: number; stepAction: string; stepTarget: string;
-        stepValue: string; errorMsg: string; timeoutMs: number;
-        aiFailureType?: string; aiFailureReason?: string
-      }) => {
-        // Remove any existing overlay
-        document.getElementById('autotest-pause-overlay')?.remove()
-        // Clear stale signals
-        document.body.removeAttribute('data-autotest-hitl-action')
-        try { sessionStorage.removeItem('autotest-hitl-action') } catch { }
-
-        const TIMEOUT_SECS = Math.floor(timeoutMs / 1000)
-        const overlay = document.createElement('div')
-        overlay.id = 'autotest-pause-overlay'
-        overlay.style.cssText = 'position:fixed;top:auto;bottom:24px;right:24px;left:auto;z-index:2147483647;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:auto'
-
-        const tgt = stepTarget ? stepTarget.replace(/</g, '&lt;') : stepAction
-        const val = stepValue ? stepValue.replace(/</g, '&lt;') : ''
-        const errTxt = (errorMsg || 'Failed \u2014 please complete this step manually.').replace(/</g, '&lt;')
-
-        // ── Overlay HTML ────────────────────────────────────────────────
-        // Resume/Skip/Stop are <a> tags targeting a hidden <iframe>.
-        // Clicking a native link is pure HTML — no JS event handlers needed.
-        // Playwright's page.route() intercepts the iframe request at CDP level.
-        // AI Diagnosis card (shown only when agent classified the failure)
-        // INVALID_FIELD gets a distinct orange/red warning card; other failures get the standard blue card
-        let aiCard = ''
-        if (aiFailureType === 'INVALID_FIELD') {
-          aiCard = `<div style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.4);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start">
-              <span style="font-size:16px;flex-shrink:0">⚠️</span>
-              <div style="flex:1;min-width:0">
-                <div style="color:#fbbf24;font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px">AI Diagnosis</div>
-                <div style="color:#fef3c7;font-size:12px;font-weight:600;margin-bottom:2px">INVALID FIELD FOR ENTITY</div>
-                <div style="color:#fde68a;font-size:11px;line-height:1.4;margin-bottom:4px">The field "${(stepTarget || '').replace(/</g, '&lt;')}" does not exist on this form.</div>
-                <div style="color:#d97706;font-size:10px;line-height:1.4">This step was incorrectly generated by AI and should be removed from the test case.</div>
-                ${aiFailureReason ? `<div style="color:#94a3b8;font-size:10px;line-height:1.4;margin-top:4px">${aiFailureReason.replace(/</g, '&lt;').slice(0, 180)}</div>` : ''}
-              </div>
-            </div>`
-        } else if (aiFailureType) {
-          aiCard = `<div style="background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.25);border-radius:10px;padding:10px 12px;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start">
-              <span style="font-size:16px;flex-shrink:0">🤖</span>
-              <div style="flex:1;min-width:0">
-                <div style="color:#a5b4fc;font-size:10px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px">AI Diagnosis</div>
-                <div style="color:#e0e7ff;font-size:12px;font-weight:600;margin-bottom:2px">${aiFailureType.replace(/_/g, ' ')}</div>
-                ${aiFailureReason ? `<div style="color:#94a3b8;font-size:11px;line-height:1.4">${aiFailureReason.replace(/</g, '&lt;').slice(0, 120)}</div>` : ''}
-              </div>
-            </div>`
-        }
-
-        overlay.innerHTML = `<div id="autotest-pause-card" style="background:linear-gradient(135deg,#1a1f2e 0%,#232941 100%);border:1px solid rgba(255,255,255,0.12);border-radius:20px;padding:28px 32px;width:420px;box-shadow:0 32px 80px rgba(0,0,0,0.6);position:relative;pointer-events:auto">
-          <style>@keyframes at-slide{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}} #autotest-pause-card{animation:at-slide .3s ease both} #autotest-pause-card a.at-btn:hover{filter:brightness(1.15)} #autotest-pause-card a.at-btn:active{transform:scale(.97);opacity:.8} #autotest-drag-handle:hover{background:rgba(255,255,255,0.06);border-radius:8px}</style>
-          <div id="autotest-drag-handle" style="display:flex;align-items:center;gap:10px;margin-bottom:16px;cursor:grab;user-select:none;-webkit-user-select:none;padding:4px 0;touch-action:none" title="Drag to move">
-            <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#f59e0b,#fbbf24);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;pointer-events:none">\u23F8</div>
-            <div style="flex:1;pointer-events:none">
-              <div style="color:#fff;font-size:16px;font-weight:700">Test Paused</div>
-              <div style="color:#94a3b8;font-size:11px">AutoTest AI \u2022 Human-in-the-Loop</div>
-            </div>
-            <div style="display:flex;flex-direction:column;gap:3px;padding:4px;opacity:0.4;flex-shrink:0;pointer-events:none" title="Drag to move">
-              <div style="display:flex;gap:3px"><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div></div>
-              <div style="display:flex;gap:3px"><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div></div>
-              <div style="display:flex;gap:3px"><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div><div style="width:4px;height:4px;background:#94a3b8;border-radius:50%"></div></div>
-            </div>
-          </div>
-          <div style="height:1px;background:rgba(255,255,255,0.08);margin-bottom:16px"></div>
-          ${aiCard}
-          <div style="margin-bottom:12px">
-            <div style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Action Required</div>
-            <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:12px 14px">
-              <span style="color:#f1f5f9;font-size:13px;font-weight:600">Step ${stepNum} &mdash; </span><span style="color:#fbbf24;font-size:13px;font-weight:600">${tgt}</span>${val ? '<br><span style="color:#10b981;font-size:13px;margin-top:4px;display:inline-block">' + val + '</span>' : ''}
-            </div>
-          </div>
-          <div style="margin-bottom:16px">
-            <div style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Error</div>
-            <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:10px 12px;color:#fca5a5;font-size:12px;line-height:1.5;max-height:64px;overflow-y:auto">${errTxt}</div>
-          </div>
-          <div style="background:rgba(255,255,255,0.03);border-left:3px solid #4ade80;border-radius:6px;padding:10px 12px;color:#cbd5e1;font-size:12px;line-height:1.5;margin-bottom:16px">Complete the step above manually, then click Resume or Skip.</div>
-          <iframe name="autotest-hitl-frame" style="display:none;width:0;height:0;border:none;position:absolute" aria-hidden="true"></iframe>
-          <input type="checkbox" id="autotest-resume-chk" style="display:none;position:absolute" aria-hidden="true">
-          <input type="checkbox" id="autotest-skip-chk" style="display:none;position:absolute" aria-hidden="true">
-          <input type="checkbox" id="autotest-stop-chk" style="display:none;position:absolute" aria-hidden="true">
-          <div style="display:flex;gap:10px;margin-bottom:10px">
-            <a id="autotest-resume-btn" class="at-btn" href="/autotest-hitl-signal?action=resume" target="autotest-hitl-frame" style="flex:1;padding:12px 0;border-radius:10px;border:none;cursor:pointer;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:14px;font-weight:700;box-shadow:0 4px 12px rgba(34,197,94,.3);transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;display:block;user-select:none;-webkit-user-select:none;line-height:1.2">\u25B6 Resume</a>
-            <a id="autotest-skip-btn" class="at-btn" href="/autotest-hitl-signal?action=skip" target="autotest-hitl-frame" style="flex:1;padding:12px 0;border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);color:#cbd5e1;font-size:14px;font-weight:600;transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;display:block;user-select:none;-webkit-user-select:none;line-height:1.2">\u23ED Skip Step</a>
-          </div>
-          <a id="autotest-stop-btn" class="at-btn" href="/autotest-hitl-signal?action=stop" target="autotest-hitl-frame" style="display:block;width:100%;padding:10px 0;border-radius:10px;cursor:pointer;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.35);color:#fca5a5;font-size:13px;font-weight:700;transition:filter .15s,transform .15s;pointer-events:auto;text-decoration:none;text-align:center;user-select:none;-webkit-user-select:none;line-height:1.2;box-sizing:border-box">\u23F9 Stop Testing</a>
-          <div style="margin-top:12px;text-align:center">
-            <span style="color:#475569;font-size:11px">Auto-timeout in </span><span id="autotest-timer" style="color:#64748b;font-size:11px;font-weight:600">${Math.floor(TIMEOUT_SECS / 60)}:${String(TIMEOUT_SECS % 60).padStart(2, '0')}</span>
-          </div>
-        </div>`
-
-        document.body.appendChild(overlay)
-
-        // ── Drag-to-move logic (Pointer Capture API) ─────────────────────────
-        // Uses setPointerCapture so ALL pointer events route directly to the
-        // drag handle element — no document-level listeners needed.
-        // Immune to Salesforce LWS which blocks document.addEventListener.
-        try {
-          const dh = document.getElementById('autotest-drag-handle')
-          if (dh) {
-            let _dragging = false
-            let _pid = -1
-            let _sx = 0, _sy = 0, _sl = 0, _st = 0
-
-            dh.addEventListener('pointerdown', (e: PointerEvent) => {
-              if (e.button !== 0) return
-              // Convert bottom/right anchoring to top/left on first drag
-              if (overlay.style.bottom !== 'auto') {
-                const r = overlay.getBoundingClientRect()
-                overlay.style.bottom = 'auto'
-                overlay.style.right = 'auto'
-                overlay.style.left = r.left + 'px'
-                overlay.style.top = r.top + 'px'
-              }
-              dh.setPointerCapture(e.pointerId)
-              _dragging = true
-              _pid = e.pointerId
-              _sx = e.clientX
-              _sy = e.clientY
-              _sl = parseInt(overlay.style.left || '0', 10)
-              _st = parseInt(overlay.style.top || '0', 10)
-              dh.style.cursor = 'grabbing'
-              e.preventDefault()
-              e.stopPropagation()
-            })
-
-            dh.addEventListener('pointermove', (e: PointerEvent) => {
-              if (!_dragging || e.pointerId !== _pid) return
-              const dx = e.clientX - _sx
-              const dy = e.clientY - _sy
-              const mxL = window.innerWidth - overlay.offsetWidth - 4
-              const mxT = window.innerHeight - overlay.offsetHeight - 4
-              overlay.style.left = Math.max(4, Math.min(_sl + dx, mxL)) + 'px'
-              overlay.style.top = Math.max(4, Math.min(_st + dy, mxT)) + 'px'
-            })
-
-            dh.addEventListener('pointerup', (e: PointerEvent) => {
-              if (!_dragging || e.pointerId !== _pid) return
-              _dragging = false
-              try { dh.releasePointerCapture(e.pointerId) } catch (_) { }
-              dh.style.cursor = 'grab'
-            })
-
-            dh.addEventListener('lostpointercapture', () => {
-              _dragging = false
-              dh.style.cursor = 'grab'
-            })
-          }
-        } catch (_dragErr) { /* drag setup non-fatal */ }
-
-        // Countdown timer
-        let remaining = TIMEOUT_SECS
-        const timerEl = document.getElementById('autotest-timer')
-        const timerInterval = setInterval(() => {
-          remaining--
-          if (remaining <= 0) { clearInterval(timerInterval); return }
-          if (timerEl) {
-            const m = Math.floor(remaining / 60)
-            const s = remaining % 60
-            timerEl.textContent = `${m}:${String(s).padStart(2, '0')}`
-          }
-        }, 1000)
-
-        // JS-based signal channels (backup — the <a> + iframe approach works
-        // without JavaScript, but these provide additional redundancy)
-        function handleAction(action: string, btnId: string) {
-          clearInterval(timerInterval)
-          const btn = document.getElementById(btnId) as HTMLElement | null
-          if (btn) { btn.textContent = 'Processing\u2026'; btn.style.opacity = '0.6'; btn.style.pointerEvents = 'none' }
-          const card = document.getElementById('autotest-pause-card') as HTMLElement | null
-          if (card) { card.style.opacity = '0.6'; card.style.pointerEvents = 'none' }
-          // Check hidden checkbox for DOM poll detection
-          const chkId = action === 'resume' ? 'autotest-resume-chk' : action === 'skip' ? 'autotest-skip-chk' : 'autotest-stop-chk'
-          const chk = document.getElementById(chkId) as HTMLInputElement | null
-          if (chk) chk.checked = true
-          // exposeFunction channel
-          try { if (typeof (window as any).__autotestHitlSignal === 'function') { (window as any).__autotestHitlSignal(action) } } catch { }
-          // DOM attribute
-          document.body.setAttribute('data-autotest-hitl-action', action)
-          // sessionStorage
-          try { sessionStorage.setItem('autotest-hitl-action', action) } catch { }
-        }
-
-        // Attach JS event handlers as ADDITIONAL channels (may fail in LWS — non-fatal)
-        try {
-          const resumeBtn = overlay.querySelector('#autotest-resume-btn')
-          const skipBtn = overlay.querySelector('#autotest-skip-btn')
-          const stopBtn = overlay.querySelector('#autotest-stop-btn')
-          if (resumeBtn) {
-            resumeBtn.addEventListener('click', (e) => {
-              e.stopPropagation(); e.stopImmediatePropagation()
-              handleAction('resume', 'autotest-resume-btn')
-            }, { capture: true })
-          }
-          if (skipBtn) {
-            skipBtn.addEventListener('click', (e) => {
-              e.stopPropagation(); e.stopImmediatePropagation()
-              handleAction('skip', 'autotest-skip-btn')
-            }, { capture: true })
-          }
-          if (stopBtn) {
-            stopBtn.addEventListener('click', (e) => {
-              e.stopPropagation(); e.stopImmediatePropagation()
-              handleAction('stop', 'autotest-stop-btn')
-            }, { capture: true })
-          }
-        } catch { /* LWS may block addEventListener — the <a>+iframe channel handles it */ }
-      },
-      { stepNum, stepAction, stepTarget, stepValue, errorMsg, timeoutMs, aiFailureType, aiFailureReason },
-    )
-    log.info(`[HITL] \u2705 Pause overlay injected for step ${stepNum} (execution ${executionId})`)
+    await page.evaluate(script)
+    log.info(`[HITL] ✅ AI chatbot overlay injected for step ${stepNum} (execution ${executionId})`)
   } catch (err) {
     log.warn({ err }, '[HITL] Could not inject in-browser pause overlay (non-fatal)')
   }
 }
 
-/**
- * Removes the HITL pause overlay from the Playwright browser DOM.
- */
+
 async function removePauseOverlay(page: Page): Promise<void> {
   try {
     await page.evaluate(() => document.getElementById('autotest-pause-overlay')?.remove())
@@ -5669,15 +5541,24 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
               .then(b => b.toString('base64')).catch(() => undefined)
 
             // Single recovery attempt — agent escalates to HITL on attemptNum >= 2
-            const recovery = await handleStepFailure({
-              executionId,
-              projectId,
-              failedStep: step as any,
-              errorMessage: result.error ?? result.message ?? 'Step failed',
-              screenshot: screenshotB64,
-              pageHtml,
-              attemptNum: 1,
-            })
+            // Hard 5-second timeout: if AI recovery hangs (slow LLM / DB), the banner
+            // auto-dismisses and we proceed directly to HITL without keeping the user waiting.
+            const RECOVERY_TIMEOUT_MS = 5_000
+            const recoveryTimeout = new Promise<{ action: string; hitlInvoked: boolean; failureType?: string; reason?: string }>(
+              (_, reject) => setTimeout(() => reject(new Error('Recovery timeout')), RECOVERY_TIMEOUT_MS)
+            )
+            const recovery = await Promise.race([
+              handleStepFailure({
+                executionId,
+                projectId,
+                failedStep: step as any,
+                errorMessage: result.error ?? result.message ?? 'Step failed',
+                screenshot: screenshotB64,
+                pageHtml,
+                attemptNum: 1,
+              }),
+              recoveryTimeout,
+            ])
 
             agentFailureType = recovery.failureType
             agentFailureReason = recovery.reason
@@ -5784,9 +5665,14 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
               agentRecovered = true // already paused via hitlTool
             }
           } catch (agentErr) {
-            log.warn({ agentErr }, '[EXEC-AGENT] Recovery attempt errored (non-fatal) — falling through to HITL overlay')
+            const isRecoveryTimeout = agentErr instanceof Error && agentErr.message === 'Recovery timeout'
+            if (isRecoveryTimeout) {
+              log.warn(`[EXEC-AGENT] ⏱ AI recovery timed out after 5s for step ${i + 1} — proceeding to HITL`)
+            } else {
+              log.warn({ agentErr }, '[EXEC-AGENT] Recovery attempt errored (non-fatal) — falling through to HITL overlay')
+            }
           } finally {
-            // Always remove the recovery banner
+            // Always remove the recovery banner (on success, error, or timeout)
             page.evaluate(() => document.getElementById('autotest-recovery-banner')?.remove()).catch(() => {})
           }
 
@@ -5811,6 +5697,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             data: {
               status: 'paused',
               logs: [...stepResults, { ...result, message: `⏸ Step ${i + 1} paused — waiting for manual completion` }],
+              screenshot_path: result.screenshot_path || null,
             },
           }).catch((e: unknown) => log.warn({ e }, '[HITL] Failed to write paused status'))
 
@@ -5851,7 +5738,53 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             }
           }
 
+          // ── Expose HITL AI functions (runs in Node.js, bypasses browser CSP) ──
+          // These are safe to register multiple times — Playwright ignores duplicates.
+          try {
+            await page.exposeFunction('__hitlAnalyze', async () => {
+              try {
+                const res = await hitlAnalyze({
+                  runId:        executionId,
+                  testCaseId:   testCaseId ?? '',
+                  pausedStep:   i + 1,
+                  errorMessage: result.error ?? result.message ?? null,
+                })
+                return res
+              } catch (e) {
+                log.warn({ e }, '[HITL-AI] analyze failed')
+                return {
+                  reply:           'I had trouble connecting. Describe what you see and I\'ll help.',
+                  suggestion_type: 'advice',
+                  quick_replies:   ['Element not visible', 'Data already exists', 'Page didn\'t load'],
+                }
+              }
+            })
+          } catch { /* already registered on re-inject — safe to ignore */ }
+
+          try {
+            await page.exposeFunction('__hitlChat', async (text: string, history: {role:string;content:string}[]) => {
+              try {
+                const res = await hitlChat({
+                  runId:        executionId,
+                  testCaseId:   testCaseId ?? '',
+                  pausedStep:   i + 1,
+                  errorMessage: result.error ?? result.message ?? null,
+                  instruction:  text,
+                  chatHistory:  (history ?? []) as any,
+                })
+                return res
+              } catch (e) {
+                log.warn({ e }, '[HITL-AI] chat failed')
+                return {
+                  reply:           'Something went wrong. Try again or click Resume/Skip.',
+                  suggestion_type: 'clarify',
+                }
+              }
+            })
+          } catch { /* already registered — safe to ignore */ }
+
           // ── Inject floating overlay ──────────────────────────
+
           const pauseTimeoutMs = 10 * 60 * 1000
           await injectPauseOverlay(
             page, executionId, i + 1,
@@ -5860,6 +5793,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             pauseTimeoutMs,
             agentFailureType,
             agentFailureReason,
+            testCaseId,
           )
           await setBrowserState(page, 'paused')
 
@@ -5877,6 +5811,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                 pauseTimeoutMs,
                 agentFailureType,
                 agentFailureReason,
+                testCaseId,
               )
               log.info(`[HITL] ♻️ Overlay re-injected after page navigation for step ${i + 1}`)
               await setBrowserState(page!, 'paused')
