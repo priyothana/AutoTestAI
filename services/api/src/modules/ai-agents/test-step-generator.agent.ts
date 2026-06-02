@@ -17,6 +17,7 @@
  * Max 3 self-correction loops before calling hitlTool.
  */
 import { ChatOpenAI }            from '@langchain/openai'
+import { ChatAnthropic }         from '@langchain/anthropic'
 import { HumanMessage, SystemMessage } from '@langchain/core/messages'
 import { StringOutputParser }    from '@langchain/core/output_parsers'
 import { v4 as uuidv4 }          from 'uuid'
@@ -43,9 +44,20 @@ const log = createModuleLogger('step-generator-agent')
 // ── LLM ───────────────────────────────────────────────────────────────────────
 
 function buildLlm() {
-  return new ChatOpenAI({
-    apiKey:      process.env.OPENAI_API_KEY,
-    model:       process.env.STEP_GEN_MODEL ?? 'gpt-4o',
+  const provider = (process.env.LLM_PROVIDER ?? '').toLowerCase()
+  const useAnthropic = provider === 'anthropic' ||
+    (provider !== 'openai' && !process.env.OPENAI_API_KEY)
+  if (!useAnthropic && process.env.OPENAI_API_KEY) {
+    return new ChatOpenAI({
+      apiKey:      process.env.OPENAI_API_KEY,
+      model:       process.env.STEP_GEN_MODEL ?? 'gpt-4o',
+      temperature: 0.1,
+      maxTokens:   4096,
+    })
+  }
+  return new ChatAnthropic({
+    apiKey:      process.env.ANTHROPIC_API_KEY,
+    model:       process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
     temperature: 0.1,
     maxTokens:   4096,
   })
@@ -71,7 +83,7 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
           - Navigation sidebars often show buttons for ALL entities — IGNORE buttons for other entities.
   E. Self-check: will my steps cover COUNT_REQUIRED fields? If not, add them.
 
-🔴 CREATE OPERATION RULE (applies when test name contains "Create" or "Add"):
+🔴 CREATE OPERATION RULE (applies when test name contains "Create", "New", or "Add"):
   - You MUST generate steps that FILL IN the entity's form fields (TYPE, SELECT, LOOKUP, CHECKBOX).
   - Minimum 2 field-filling steps — never just NAVIGATE + CLICK + ASSERT.
   - MANDATORY SEQUENCE for Create operations:
@@ -83,7 +95,19 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
       4. SELECT required dropdown fields (e.g., type, industry, status)
       5. LOOKUP required reference fields (e.g., parent account)
       6. CLICK the final save/create button (e.g., "Create Account", "Save")
-      7. ASSERT_URL that the page redirected back after saving
+      7. ✅ ASSERT that the record was SUCCESSFULLY CREATED by checking the DETAIL PAGE:
+         ▶ PRIMARY:  ASSERT_URL with a partial match for the entity detail URL pattern
+                     e.g., value: "/leads/" or "/lead/" or "/contacts/" (the page URL will contain
+                     an entity-path segment followed by a record ID after save)
+                     Example: { "action": "ASSERT_URL", "value": "/leads/" }
+         ▶ BACKUP:   ASSERT_TEXT for a key element visible ONLY on the detail page
+                     e.g., the record title (name typed in step 3), a "Lead Details" heading,
+                     or any unique field label that only appears on the record detail view.
+                     Example: { "action": "ASSERT_TEXT", "target": "John Smith", "locator_type": "text" }
+         ▶ You SHOULD include BOTH assertions for maximum coverage.
+         ▶ ⚠️ FORBIDDEN: ASSERT_URL with only the LIST page path (e.g. value: "/leads" without an
+                     ID segment) — the app DOES NOT redirect to the list page after creation;
+                     it redirects to the DETAIL PAGE of the newly created record.
   - ⚠️ CRITICAL ORDERING: Step 2 ("open form" click) MUST come BEFORE steps 3-5 (field filling).
      WRONG ORDER: NAVIGATE → TYPE → SELECT → CLICK "+New Account" ← WRONG
      RIGHT ORDER: NAVIGATE → CLICK "+New Account" → TYPE → SELECT → CLICK "Create Account"
@@ -96,6 +120,35 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
       TYPE "Description"
       TYPE "SKU" or TYPE "Code"
       CLICK save/create button
+      ASSERT_URL value: "/products/"  ← detail page URL pattern
+      ASSERT_TEXT target: "<product name typed above>"  ← record title on detail page
+
+╔══════════════════════════════════════════════════════════════════╗
+║  🔴 CREATE SUCCESS VALIDATION — HARD RULE (NEVER VIOLATE)        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  After a Create form is submitted, the app REDIRECTS to the      ║
+║  DETAIL PAGE of the newly created record — NOT to the list page. ║
+║  There is NO success toast. Do NOT assert a toast or list URL.   ║
+║                                                                  ║
+║  ✅ REQUIRED: Verify success by ONE or BOTH of these steps:      ║
+║  1. ASSERT_URL — partial match for the entity detail URL:        ║
+║       { "action": "ASSERT_URL", "value": "/leads/" }            ║
+║       { "action": "ASSERT_URL", "value": "/contacts/" }         ║
+║       { "action": "ASSERT_URL", "value": "/accounts/" }         ║
+║       (The actual URL will be /leads/123, /contacts/456, etc.)   ║
+║  2. ASSERT_TEXT — unique detail-page element:                    ║
+║       { "action": "ASSERT_TEXT",                                 ║
+║         "target": "<record name typed during creation>",         ║
+║         "locator_type": "text" }                                  ║
+║     OR assert a heading like "Lead Details", "Account Details"   ║
+║                                                                  ║
+║  ❌ FORBIDDEN final assertions for Create operations:            ║
+║  - ASSERT_URL with the EXACT list page path (e.g. "/leads")      ║
+║    because after creation the page IS NOT on the list — it is    ║
+║    on the detail page (e.g. "/leads/42").                        ║
+║  - ASSERT_TOAST — no toast is shown on success.                  ║
+║  - No assertion at all — NEVER end without verifying success.    ║
+╚══════════════════════════════════════════════════════════════════╝
 
 🔴 UPDATE / EDIT OPERATION RULE (applies when test name contains "Update", "Edit", "Modify", OR "existing"):
   - Works for ANY entity: Account, Lead, Contact, Opportunity, Product, Invoice, Order, etc.
@@ -656,19 +709,45 @@ function validateSteps(
   }
 
   // Check 11: Create operation step ordering guard
-  // For Create operations, the "open form" CLICK (e.g., "+New Account") MUST come
-  // BEFORE any TYPE/SELECT/LOOKUP field-filling steps. If it appears after field steps,
-  // the test will try to type into a form that isn't open yet.
+  // For Create operations:
+  //   a) The "open form" CLICK (e.g., "+New Account") MUST come BEFORE any TYPE/SELECT/LOOKUP
+  //      field-filling steps. If it appears after field steps, the test will try to type into
+  //      a form that isn't open yet.
+  //   b) NAVIGATE must go to the LIST page, NOT directly to a create/new URL. Navigating
+  //      directly to /leads/create bypasses the mandatory "+New Lead" CLICK step.
+  //   c) If field steps are present but no OPEN_FORM CLICK exists at all, flag it.
   let check11 = true
-  const isCreateOpForCheck11 = /\b(create|add|new)\b/i.test(testEntityHint ?? '')
+  const isCreateOpForCheck11 = minimumFieldSteps === 2 || /\b(create|add|new)\b/i.test(testEntityHint ?? '')
   if (isCreateOpForCheck11 && !isUpdateOpForValidation) {
     const FIELD_ACTIONS_C11 = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
     const SUBMIT_RE_C11 = /\b(create|save|submit|confirm|done|finish)\b/i
     const OPEN_FORM_RE_C11 = /\b(new|add|open)\b/i
+    // URL pattern that indicates navigating DIRECTLY to a create form — forbidden for Create tests
+    const CREATE_URL_RE_C11 = /\/(create|new|add)(?:[?|/]|$)/i
+
+    // Sub-check 11a: detect NAVIGATE directly to a create URL (e.g. /leads/create, /accounts/new)
+    const directCreateNav = steps.find(s =>
+      (s.action ?? '').toUpperCase() === 'NAVIGATE' &&
+      CREATE_URL_RE_C11.test(s.value ?? '')
+    )
+    if (directCreateNav) {
+      const badUrl = directCreateNav.value ?? ''
+      // Extract the list URL by stripping the /create|/new|/add suffix
+      const listUrl = badUrl.replace(/\/?(create|new|add)(\?.*)?$/i, '').replace(/\/$/, '') || '/'
+      issues.push(
+        `Create operation URL error: NAVIGATE "${badUrl}" goes DIRECTLY to the create form. ` +
+        `This bypasses the required CLICK "+ New <Entity>" step that opens the form. ` +
+        `REQUIRED ORDER: (1) NAVIGATE to the LIST page "${listUrl || '<list-url>'}" → ` +
+        `(2) CLICK "+ New <Entity>" button (from PRIMARY ACTION BUTTON or ALL PAGE BUTTONS) → ` +
+        `(3) TYPE/SELECT required fields → (4) CLICK submit button. ` +
+        `Change NAVIGATE target to "${listUrl || '<list-url>'}" and ADD a CLICK step for the "+ New <Entity>" button.`
+      )
+      check11 = false
+    }
 
     const firstFieldIdxC11 = steps.findIndex(s => FIELD_ACTIONS_C11.has((s.action ?? '').toUpperCase()))
     if (firstFieldIdxC11 > 0) {
-      // Look for an "open form" CLICK that appears AFTER the first field step
+      // Sub-check 11b: Look for an "open form" CLICK that appears AFTER the first field step
       const misplacedOpenFormIdx = steps.findIndex((s, idx) => {
         if (idx <= firstFieldIdxC11) return false
         if ((s.action ?? '').toUpperCase() !== 'CLICK') return false
@@ -685,17 +764,139 @@ function validateSteps(
         )
         check11 = false
       }
+
+      // Sub-check 11c: field steps exist but NO open-form CLICK appears before them
+      const hasOpenFormClickBefore = steps.slice(0, firstFieldIdxC11).some(s => {
+        if ((s.action ?? '').toUpperCase() !== 'CLICK') return false
+        const target = (s.target ?? '').toLowerCase()
+        return OPEN_FORM_RE_C11.test(target) && !SUBMIT_RE_C11.test(target)
+      })
+      if (!hasOpenFormClickBefore && !directCreateNav) {
+        // No open-form click found anywhere before field filling
+        issues.push(
+          `Create operation missing OPEN FORM step: field-filling starts at step ${firstFieldIdxC11 + 1} ` +
+          `but there is no preceding CLICK to open the create form. ` +
+          `REQUIRED ORDER: NAVIGATE to list page → CLICK "+ New <Entity>" button → TYPE/SELECT fields. ` +
+          `Add a CLICK step for the "+ New <Entity>" button BEFORE step ${firstFieldIdxC11 + 1}. ` +
+          `Check PRIMARY ACTION BUTTON or ALL PAGE BUTTONS for the exact button name.`
+        )
+        check11 = false
+      }
+    }
+  }
+
+  // Check 12: Submit vs Assertion ordering guard
+  // The submit CLICK (e.g. CLICK "Save", CLICK "Create Lead") MUST come BEFORE the final ASSERT_URL / ASSERT_TEXT step.
+  // If ASSERT_URL appears before the submit CLICK, the test will assert page redirection/success
+  // before the form is actually submitted, leading to a test failure.
+  let check12 = true
+  const submitClickIdx = steps.findIndex(s => {
+    if ((s.action ?? '').toUpperCase() !== 'CLICK') return false
+    const target = (s.target ?? '').toLowerCase()
+    return /\b(save|submit|create|confirm|finish)\b/i.test(target)
+  })
+  const assertIdx = steps.findIndex(s => (s.action ?? '').toUpperCase().startsWith('ASSERT'))
+  if (submitClickIdx !== -1 && assertIdx !== -1 && assertIdx < submitClickIdx) {
+    const submitTarget = steps[submitClickIdx]?.target ?? 'Save'
+    issues.push(
+      `Step ordering error: The save/submit button click "${submitTarget}" (step ${submitClickIdx + 1}) ` +
+      `appears AFTER the assertion step ${assertIdx + 1}. ` +
+      `REQUIRED ORDER: NAVIGATE → fill fields → CLICK submit button ("${submitTarget}") → ASSERT/Verify success. ` +
+      `Move the submit CLICK to step ${assertIdx + 1} and the assertion/verification step to the very end.`
+    )
+    check12 = false
+  }
+
+  // Check 13: Create operation — strong success validation gate
+  // For Create operations the app redirects to the DETAIL PAGE (e.g. /leads/42), NOT the list page.
+  // This check enforces that the final assertion either:
+  //   a) Uses ASSERT_URL with a partial entity-detail path (e.g. "/leads/") — not the bare list path
+  //   b) Uses ASSERT_TEXT to verify a record-specific element on the detail page
+  // A final assertion of ASSERT_URL with only the list page (e.g. value="/leads") is a FALSE
+  // POSITIVE: the page never lands on the list, so the assertion would either pass vacuously or fail
+  // in ways that mask a real failure (form error, page not redirected).
+  let check13 = true
+  const isCreateOpForCheck13 = minimumFieldSteps === 2 || /\b(create|add|new)\b/i.test(testEntityHint ?? '')
+  if (isCreateOpForCheck13 && !isUpdateOpForValidation) {
+    // Gather all final assertion steps (everything after the last submit CLICK)
+    const lastSubmitIdx = (() => {
+      for (let i = steps.length - 1; i >= 0; i--) {
+        const s = steps[i]
+        if ((s.action ?? '').toUpperCase() === 'CLICK' &&
+            /\b(save|submit|create|confirm|finish|done)\b/i.test(s.target ?? '')) {
+          return i
+        }
+      }
+      return -1
+    })()
+
+    const finalAssertionSteps = lastSubmitIdx >= 0
+      ? steps.slice(lastSubmitIdx + 1).filter(s => (s.action ?? '').toUpperCase().startsWith('ASSERT'))
+      : steps.filter(s => (s.action ?? '').toUpperCase().startsWith('ASSERT'))
+
+    if (finalAssertionSteps.length === 0) {
+      // No assertion at all after creation — always reject
+      issues.push(
+        `Create operation missing success validation: no ASSERT step found after the submit/create button. ` +
+        `REQUIRED: add ASSERT_URL with entity detail-page pattern (e.g. value: "/${(testEntityHint ?? 'record').toLowerCase()}s/" or "/leads/") ` +
+        `AND/OR ASSERT_TEXT with the record title visible on the detail page. ` +
+        `The app redirects to the detail page after creation — NEVER stays on the list page.`
+      )
+      check13 = false
+    } else {
+      // Check whether ALL final ASSERT_URL steps are using only a bare list-page path
+      // A bare list path looks like "/leads", "/contacts", "/accounts" (no trailing slash or ID)
+      // A detail-path looks like "/leads/", "/lead/", "/contacts/42", "/leads?id=" etc.
+      const BARE_LIST_PATH_RE = /^\/[a-z_-]+s?\/?$|^\/[a-z_-]+s?\?(?!.*\/)/i
+      const DETAIL_PATH_RE = /\/[a-z_-]+s?\/|id=|record|detail|view/i
+
+      const assertUrlSteps = finalAssertionSteps.filter(s => (s.action ?? '').toUpperCase() === 'ASSERT_URL')
+      const assertTextSteps = finalAssertionSteps.filter(s => (s.action ?? '').toUpperCase() === 'ASSERT_TEXT')
+
+      const hasDetailUrlAssertion = assertUrlSteps.some(s => {
+        const val = (s.value ?? '').trim()
+        // Passes if the value contains a detail path indicator (trailing slash after entity = partial match for /entity/ID)
+        return DETAIL_PATH_RE.test(val) || val.endsWith('/') || val.includes('/')
+          // A value like "/leads/" is correct — it ends with /
+          // A value like "/leads" (bare) is wrong — it is the list page
+          && !BARE_LIST_PATH_RE.test(val)
+      })
+      const hasDetailTextAssertion = assertTextSteps.length > 0
+
+      // If the only ASSERT_URL assertions use a bare list-page path, fail the check
+      const onlyBareListAssertion = assertUrlSteps.length > 0 &&
+        assertUrlSteps.every(s => {
+          const val = (s.value ?? '').trim()
+          // Bare list paths: "/leads", "/contacts", "/accounts" — no trailing / or ID segment
+          return BARE_LIST_PATH_RE.test(val) && !val.endsWith('/')
+        })
+
+      if (onlyBareListAssertion && !hasDetailTextAssertion) {
+        const badValue = assertUrlSteps[0]?.value ?? ''
+        const entityName = (testEntityHint ?? 'record').toLowerCase()
+        issues.push(
+          `Create operation weak final assertion: ASSERT_URL value "${badValue}" points to the LIST page, not the detail page. ` +
+          `After a successful Create, the app redirects to the DETAIL PAGE (e.g. /${entityName}s/42, /${entityName}/123). ` +
+          `REQUIRED: Change ASSERT_URL value to the entity detail path pattern (e.g. "/${entityName}s/" or "/${entityName}/") ` +
+          `OR add ASSERT_TEXT for the record title/name typed during creation. ` +
+          `Example correct steps:\n` +
+          `  { "action": "ASSERT_URL", "value": "/${entityName}s/" }   ← detail URL pattern\n` +
+          `  { "action": "ASSERT_TEXT", "target": "<name you typed>", "locator_type": "text" }  ← record title`
+        )
+        check13 = false
+      }
     }
   }
 
   return {
-    passed: check1 && check2 && check3 && check4 && check5 && check6 && check7 && check8 && check9 && check10 && check11,
+    passed: check1 && check2 && check3 && check4 && check5 && check6 && check7 && check8 && check9 && check10 && check11 && check12 && check13,
     checks: {
-      requiredFieldCoverage: check1,
-      urlVerification:       check2,
-      buttonNameExact:       check3,
-      locatorTypeValid:      check4,
-      dataTypeAlignment:     check5,
+      requiredFieldCoverage:     check1,
+      urlVerification:           check2,
+      buttonNameExact:           check3,
+      locatorTypeValid:          check4,
+      dataTypeAlignment:         check5,
+      createSuccessValidation:   check13,
     },
     issues,
   }
@@ -750,16 +951,24 @@ export async function runTestStepGeneratorAgent(
   // Detect entity name early for learning registry queries
   const entityHintForLearnings = input.entityFilter ?? (() => {
     const stripped = input.testName
+      // Strip leading verb (create, update, etc.)
       .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
-      .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+      // Strip conjunctions followed by another verb (e.g., "and Submit", "and Verify", "or Check")
+      .replace(/\b(and|or)\s+(submit|verify|check|save|confirm|cancel|click|navigate|launch|open|close|send|view|search|select|fill)\b/gi, '')
+      // Strip common filler words
+      .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful|happy|path|flow|scenario|case)\b/gi, '')
+      // Strip anything after a dash or hyphen (e.g., "- Happy Path")
+      .replace(/\s*[-–—].*$/, '')
       .trim()
     // Case-agnostic extraction: normalize to lowercase first so ALL-CAPS,
     // TitleCase, and mixed-case entity names all resolve correctly.
     // Verb-form stop words (creating, adding, etc.) prevent "Test creating a product" → "Creating"
     const STOP_WORDS = new Set([
-      'the','and','for','with','new','all','record','records','form','page','test','case',
+      'the','and','or','for','with','new','all','record','records','form','page','test','case',
       'creating','adding','editing','updating','deleting','viewing','checking','verifying',
       'testing','managing','making','submitting','saving','clicking','navigating',
+      'submit','verify','check','save','confirm','cancel','launch','open','close','send','search','select','fill',
+      'happy','path','flow','scenario','step','steps',
     ])
     const words = stripped.toLowerCase().split(/\s+/).filter(w => w.length >= 3 && !STOP_WORDS.has(w))
     const entity = words[0] ?? stripped.split(/\s+/)[0] ?? ''
@@ -773,20 +982,33 @@ export async function runTestStepGeneratorAgent(
   const resolvedEntityFilter = (() => {
     // Priority 1: explicitly passed entityFilter (truthy, length > 2)
     if (input.entityFilter && input.entityFilter.trim().length > 2) {
-      // Still normalize casing: "PRODUCT" → "Product"
       const ef = input.entityFilter.trim()
-      return ef.charAt(0).toUpperCase() + ef.slice(1).toLowerCase()
+      const efNorm = ef.charAt(0).toUpperCase() + ef.slice(1).toLowerCase()
+      // Discard if it is actually just a field name context (like "Last Name", "First Name", "Email")
+      const isFieldFilter = /^(last|first|email|phone|website|industry|status|type|subject|origin|description|amount|stage|date|currency)/i.test(efNorm)
+        || /\bname$/i.test(efNorm)
+      if (!isFieldFilter) {
+        return efNorm
+      }
     }
     // Priority 2: extract from test name (case-agnostic)
     const stripped = input.testName
+      // Strip leading verb (create, update, etc.)
       .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
-      .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
+      // Strip conjunctions followed by another verb (e.g., "and Submit", "and Verify", "or Check")
+      .replace(/\b(and|or)\s+(submit|verify|check|save|confirm|cancel|click|navigate|launch|open|close|send|view|search|select|fill)\b/gi, '')
+      // Strip common filler words
+      .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful|happy|path|flow|scenario|case)\b/gi, '')
+      // Strip anything after a dash or hyphen (e.g., "- Happy Path")
+      .replace(/\s*[-–—].*$/, '')
       .trim()
     // Expanded stop words: verb forms prevent "Test creating a product" → "Creating"
     const STOP_RE = new Set([
-      'the','and','for','with','new','all','record','records','form','page','test','case',
+      'the','and','or','for','with','new','all','record','records','form','page','test','case',
       'creating','adding','editing','updating','deleting','viewing','checking','verifying',
       'testing','managing','making','submitting','saving','clicking','navigating',
+      'submit','verify','check','save','confirm','cancel','launch','open','close','send','search','select','fill',
+      'happy','path','flow','scenario','step','steps',
     ])
     const words = stripped.toLowerCase().split(/\s+/).filter(w => w.length >= 3 && !STOP_RE.has(w))
     const entity = words[0] ?? stripped.split(/\s+/)[0] ?? ''
@@ -822,19 +1044,42 @@ export async function runTestStepGeneratorAgent(
     (async () => {
       if (!resolvedEntityFilter || resolvedEntityFilter.length < 2) return null
       try {
-        const row = await prisma.web_test_data.findFirst({
+        // Fetch multiple records to maximize chance of finding a real existing name
+        const rows = await prisma.web_test_data.findMany({
           where: {
             project_id:  input.projectId,
             entity_name: { contains: resolvedEntityFilter, mode: 'insensitive' },
           },
+          take: 3,
         })
-        if (row?.records && Array.isArray(row.records) && row.records.length > 0) {
-          return row.records[0] as Record<string, unknown>
+        for (const row of rows) {
+          if (row?.records && Array.isArray(row.records) && row.records.length > 0) {
+            return row.records[0] as Record<string, unknown>
+          }
         }
         return null
       } catch { return null }
     })(),
   ])
+
+  // Automatically discover list URLs from create URLs in the URL map
+  // e.g. if URL map has "/leads/new", we also allow "/leads" so Check 2 (URL verification)
+  // doesn't block the agent when it is forced by Check 11 to use the list page first.
+  const CREATE_URL_PATTERN = /\/(create|new|add)(?:[?|/]|$)/i
+  const derivedListPaths: string[] = []
+  for (const path of urlMap.paths) {
+    if (CREATE_URL_PATTERN.test(path)) {
+      const listPath = path.replace(/\/?(create|new|add)(\?.*)?$/i, '').replace(/\/$/, '')
+      const listPathWithSlash = listPath.startsWith('/') ? listPath : `/${listPath}`
+      if (listPath && listPath !== path && !urlMap.paths.includes(listPath) && !urlMap.paths.includes(listPathWithSlash)) {
+        derivedListPaths.push(listPathWithSlash)
+      }
+    }
+  }
+  if (derivedListPaths.length > 0) {
+    urlMap.paths.push(...derivedListPaths)
+    log.info({ derivedListPaths, projectId: input.projectId }, '[STEP-GEN] Injected derived list URLs into URL map')
+  }
 
   // ── Fetch real lookup values for all lookup fields in the manifest ────────
   // For each lookup field (e.g., "User", "Account", "Role"), query web_test_data
@@ -913,8 +1158,8 @@ export async function runTestStepGeneratorAgent(
     /\b(view|open|display|read|preview|check details|details of|see details)\b/i.test(input.testName)
   // Create is only true when update/delete/view is NOT detected — update intent takes priority
   const isCreateOperation = !isUpdateOperation && !isDeleteOperation && !isViewOperation && (
-    /\b(create|add|new)\b/i.test(input.testName)
-    || /\bcreating\b/i.test(input.testName)
+    /\b(create|creation|add|new|register|registration|signup|sign-up|generation|generate)\b/i.test(input.testName)
+    || /\b(creating|registering|signing\s*up|generating)\b/i.test(input.testName)
     || /\bnew\s+(product|lead|contact|account|opportunity|quote|order|invoice|campaign|contract|record|entity)\b/i.test(input.testName)
   )
 
@@ -975,8 +1220,23 @@ export async function runTestStepGeneratorAgent(
           `You MUST generate at least ${minimumFieldSteps} TYPE/SELECT/LOOKUP/CHECKBOX steps for form fields.`,
           `Typical create-form fields include: name/title, description, type/category, status, and any`,
           `entity-specific fields mentioned in the BRD. Do NOT skip field-filling steps.`,
+          ``,
+          `🔴 SUGGESTED BUTTON NAMES FOR ${input.entityFilter ?? 'entity'} CREATE FLOW:`,
+          `  - OPEN FORM CLICK: "+ New ${input.entityFilter ?? 'Lead'}" (or "+New ${input.entityFilter ?? 'Lead'}", "New ${input.entityFilter ?? 'Lead'}", "New")`,
+          `  - SUBMIT CLICK: "Save" (or "Create ${input.entityFilter ?? 'Lead'}", "Submit")`,
         ].join('\n')
-      : '(no field manifest — use RAG metadata only)'
+      : isUpdateOperation
+        ? [
+            `(no pre-crawled field manifest available for this entity)`,
+            ``,
+            `🔴 NO-MANIFEST INSTRUCTION — YOU MUST SEARCH AND UPDATE:`,
+            `Use the BRD/SPECIFICATION and PROJECT METADATA sections to discover how to edit the ${input.entityFilter ?? 'entity'}.`,
+            ``,
+            `🔴 SUGGESTED BUTTON NAMES FOR ${input.entityFilter ?? 'entity'} UPDATE FLOW:`,
+            `  - EDIT BUTTON CLICK: "Edit"`,
+            `  - SAVE BUTTON CLICK: "Save" (or "Save & New")`,
+          ].join('\n')
+        : '(no field manifest — use RAG metadata only)'
 
   // For Update operations: ensure the list page URL is in the URL map
   // The crawler may only have the create page (/account/new) but Update operations
@@ -1063,6 +1323,39 @@ export async function runTestStepGeneratorAgent(
       ].join('\n')
     : ''
 
+  // ── Build existing record name text block for Update/Search operations ───────
+  // For update/search tests, the LLM MUST use a real record name that exists in the app.
+  // This block provides the ground truth so the LLM never invents a name.
+  const existingRecordNameForPrompt = (() => {
+    if (!isUpdateOperation) return null
+    if (sampleTestData) {
+      const nameKey = Object.keys(sampleTestData).find(k =>
+        /^(name|full.?name|display.?name|title|label|account.?name|contact.?name|lead.?name|company.?name|subject|first.?name)$/i.test(k)
+      ) ?? Object.keys(sampleTestData).find(k => /name$/i.test(k) && !/id$/i.test(k))
+      const val = nameKey ? String(sampleTestData[nameKey] ?? '') : ''
+      if (val && val.length > 0 && val.length < 100) return val
+    }
+    if (realLookupValues.size > 0) {
+      const first = [...realLookupValues.values()][0]
+      if (first?.length) return first[0]
+    }
+    return null
+  })()
+
+  const existingRecordsText = existingRecordNameForPrompt
+    ? [
+        `=== EXISTING RECORD TO SEARCH (MANDATORY for Update/Search operations) ===`,
+        `⚠️  The following REAL record exists in the application. Use THIS EXACT name`,
+        `   for the TYPE step (search input) AND the CLICK step (record selection).`,
+        ``,
+        `  ✅ Record name to use: "${existingRecordNameForPrompt}"`,
+        ``,
+        `⛔ FORBIDDEN: Do NOT invent record names like "Acme Corporation", "John Smith",`,
+        `   "Test Record", or any name not listed above.`,
+        `⛔ The search step value AND the record click target MUST BOTH be: "${existingRecordNameForPrompt}"`,
+      ].join('\n')
+    : ''
+
   // Pre-compute whether the manifest has required fields that need explicit enumeration in prompt.
   // This is used by the CREATE OPERATION CONSTRAINT block below.
   const hasMissingRequiredFieldsForPrompt = manifest != null && manifest.fields.some(f => f.required)
@@ -1072,6 +1365,7 @@ export async function runTestStepGeneratorAgent(
     manifestText,
     learningsText,   // ← Past learnings: failures, button mappings, corrections
     lookupValuesText, // ← Real lookup values from web_test_data — MANDATORY for LOOKUP steps
+    existingRecordsText, // ← Real existing record name for Update/Search ops — MANDATORY
     sampleDataText,  // ← Sample test data for realistic values
     ragText,
     brdText ? `=== BRD / SPECIFICATION (business rules to follow) ===\n${brdText}` : '',
@@ -1105,10 +1399,11 @@ export async function runTestStepGeneratorAgent(
               `     ▶ action: TYPE`,
               `     ▶ target: "${resolvedSearchHint}"`,
               `     ▶ locator_type: "placeholder"`,
-              `     ▶ value: <record name — use REAL LOOKUP DATA or SAMPLE TEST DATA, or "${entityRecordFallback}">`,
+              `     ▶ value: "${existingRecordNameForPrompt ?? entityRecordFallback}"`,
+              `     ▶ ⛔ MANDATORY: use EXACTLY this record name — do NOT change it or invent a new one`,
               `     ▶ ⚠️ Do NOT use status words ("Active", "Closed", "Prospect") as a record name`,
               `  3. CLICK the record name to open its detail page:`,
-              `     ▶ action: CLICK, target: <same record name as step 2>, locator_type: "text"`,
+              `     ▶ action: CLICK, target: "${existingRecordNameForPrompt ?? entityRecordFallback}", locator_type: "text"`,
               `     ▶ ⛔ DO NOT click "Create ${resolvedEntityFilter ?? 'Record'}" — FORBIDDEN`,
               `  4. EDIT BUTTON — CLICK to enter edit mode:`,
               `     ▶ action: CLICK`,
@@ -1123,6 +1418,10 @@ export async function runTestStepGeneratorAgent(
               `⚠️ CRITICAL: Step 4 MUST be CLICK "${resolvedEditButton}" — NOT "Create ${resolvedEntityFilter ?? 'Record'}".`,
             ].join('\n')
           }
+          // Derive the entity detail-page URL pattern hint for the final assertion
+          const entityLower = (resolvedEntityFilter ?? 'record').toLowerCase()
+          const detailUrlHint = `/${entityLower}s/`  // e.g. /leads/, /contacts/, /accounts/
+          const detailUrlAlt  = `/${entityLower}/`   // e.g. /lead/, /contact/
           return [
             `🔴 MANDATORY FIELDS — YOU MUST GENERATE A STEP FOR EVERY ★ FIELD BELOW:`,
             reqList,
@@ -1131,8 +1430,22 @@ export async function runTestStepGeneratorAgent(
             `Rules:`,
             `  1. Generate one TYPE/SELECT/LOOKUP step per ★ field above — NO SKIPPING`,
             `  2. Use the EXACT label string shown (e.g. "${reqFields[0]?.label ?? 'Field'}")`,
-            `  3. Sequence: NAVIGATE → fill all ★ fields → CLICK submit → ASSERT_URL`,
+            `  3. Sequence: NAVIGATE → CLICK open-form btn → fill all ★ fields → CLICK submit → ASSERT success`,
             `  4. Missing even ONE ★ field will FAIL validation and trigger re-generation`,
+            ``,
+            `🔴 CREATE SUCCESS VALIDATION — MANDATORY (final 1-2 steps after submit):`,
+            `  The app redirects to the DETAIL PAGE after creation (NOT the list page, NO toast).`,
+            `  You MUST add BOTH of these final steps:`,
+            `  Step A — ASSERT_URL (detail page pattern):`,
+            `    { "action": "ASSERT_URL", "value": "${detailUrlHint}" }`,
+            `    OR: { "action": "ASSERT_URL", "value": "${detailUrlAlt}" }`,
+            `    ⚠️ The URL after save will be "${detailUrlHint}42" or similar — NOT "${detailUrlHint.replace(/\/$/, '')}" (bare list).`,
+            `    ✅ Using "${detailUrlHint}" (with trailing slash) correctly matches "/leads/42" as a contains check.`,
+            `  Step B — ASSERT_TEXT (record title or unique detail field):`,
+            `    { "action": "ASSERT_TEXT", "target": "<the name/title you typed in step 3>", "locator_type": "text" }`,
+            `    OR: { "action": "ASSERT_TEXT", "target": "${resolvedEntityFilter ?? 'Record'} Details", "locator_type": "text" }`,
+            `  ❌ FORBIDDEN: ASSERT_URL value "${detailUrlHint.replace(/\/$/, '')}" (bare list page — will never match after redirect)`,
+            `  ❌ FORBIDDEN: ASSERT_TOAST — no toast is shown on successful creation`,
           ].join('\n')
         })()
       : '',
@@ -1180,13 +1493,23 @@ export async function runTestStepGeneratorAgent(
     steps = steps.map((s, i) => ({ ...s, id: String(i + 1) }))
 
     // Extract entity hint from test name for Check 3b (cross-entity button guard)
-    // e.g. "Create New Account Successfully" → "Account"
+    // e.g. "Create and Submit New Campaign - Happy Path" → "Campaign"
     // Case-agnostic entity hint extraction for Check 3b (cross-entity button guard)
     // Handles ALL-CAPS, TitleCase, and mixed-case entity names identically.
-    const STOP_HINT = new Set(['new','successfully','with','for','and','the','a','an'])
+    const STOP_HINT = new Set([
+      'new','successfully','with','for','and','or','the','a','an',
+      'submit','verify','check','save','confirm','cancel','launch','open','close','send','search','select','fill',
+      'happy','path','flow','scenario','step','steps',
+      'creating','adding','editing','updating','deleting','viewing','checking','verifying',
+      'testing','managing','making','submitting','saving','clicking','navigating',
+    ])
     const entityHintRaw = input.testName
       .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
-      .replace(/\b(new|successfully|with|for|and|the|a|an)\b/gi, '')
+      // Strip conjunctions followed by a verb (e.g., "and Submit", "or Verify")
+      .replace(/\b(and|or)\s+(submit|verify|check|save|confirm|cancel|click|navigate|launch|open|close|send|view|search|select|fill)\b/gi, '')
+      .replace(/\b(new|successfully|with|for|and|or|the|a|an|happy|path|flow|scenario)\b/gi, '')
+      // Strip anything after a dash/hyphen (e.g., "- Happy Path")
+      .replace(/\s*[-\u2013\u2014].*$/, '')
       .trim()
       .toLowerCase()
       .split(/\s+/)
@@ -1197,7 +1520,9 @@ export async function runTestStepGeneratorAgent(
     const testEntityHint = entityHintNorm.length > 2 ? entityHintNorm : (input.entityFilter ?? '')
     const testNameForValidation = isUpdateOperation
       ? `update ${testEntityHint}`
-      : testEntityHint
+      : isCreateOperation
+        ? `create ${testEntityHint}`
+        : testEntityHint
 
     validation = validateSteps(
       steps,
@@ -1409,6 +1734,7 @@ export async function runTestStepGeneratorAgent(
 
         // Re-run validation after injection
         const entityHintRe = effectiveEntityHint || input.entityFilter || ''
+        const testNameRe = isCreateOperation ? `create ${entityHintRe}` : entityHintRe
         validation = validateSteps(
           steps,
           manifest.requiredCount ?? 0,
@@ -1416,7 +1742,7 @@ export async function runTestStepGeneratorAgent(
           manifest.submitButton,
           manifest.allButtons,
           manifest.fields,
-          entityHintRe,
+          testNameRe,
           minimumFieldSteps,
         )
         thoughts.push(`SAFETY NET 0: re-validation ${validation.passed ? '✅ PASSED' : '❌ still failing'} — ${validation.issues.join('; ')}`)
@@ -1689,17 +2015,27 @@ export async function runTestStepGeneratorAgent(
 
     // Resolve real record name (multi-source, entity-agnostic)
     const resolveRecordName = (): string => {
+      // Priority 1: sampleTestData from web_test_data for the entity being tested
+      // This contains REAL existing records in the application
       if (sampleTestData) {
+        // Try multiple key patterns to find the record's display name
         const nameKey = Object.keys(sampleTestData).find(k =>
-          /^(name|full.?name|display.?name|title|label|account.?name|first.?name|contact.?name|lead.?name)$/i.test(k)
+          /^(name|full.?name|display.?name|title|label|account.?name|contact.?name|lead.?name|company.?name|subject|first.?name)$/i.test(k)
         )
-        const val = nameKey ? String(sampleTestData[nameKey] ?? '') : ''
+        // Also try: any key that ends with 'name'
+        const nameKeyFallback = !nameKey
+          ? Object.keys(sampleTestData).find(k => /name$/i.test(k) && !/id$/i.test(k))
+          : undefined
+        const resolvedKey = nameKey ?? nameKeyFallback
+        const val = resolvedKey ? String(sampleTestData[resolvedKey] ?? '') : ''
         if (val && val.length > 0 && val.length < 100) return val
       }
+      // Priority 2: real lookup values already fetched for lookup fields
       if (realLookupValues.size > 0) {
         const first = [...realLookupValues.values()][0]
         if (first?.length) return first[0]
       }
+      // Priority 3: fallback — may not exist in app, but better than empty
       return entityRecordFallback
     }
 

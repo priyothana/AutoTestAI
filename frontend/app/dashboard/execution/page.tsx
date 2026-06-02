@@ -304,23 +304,30 @@ export default function ExecutionPage() {
                                                         </div>
                                                         <div className="border-l border-gray-100 dark:border-gray-800 pl-6">
                                                             <h4 className="text-sm font-semibold mb-2 text-blue-700 dark:text-blue-400">Final Screenshot</h4>
-                                                            {run.screenshot_path ? (
-                                                                <div className="rounded-md border bg-gray-50 dark:bg-black overflow-hidden group relative max-w-[300px]">
-                                                                    <img
-                                                                        src={`${process.env.NEXT_PUBLIC_API_URL}${run.screenshot_path}`}
-                                                                        alt="Execution Screenshot"
-                                                                        className="w-full h-auto object-contain cursor-zoom-in"
-                                                                        onClick={() => window.open(`${process.env.NEXT_PUBLIC_API_URL}${run.screenshot_path}`, '_blank')}
-                                                                    />
-                                                                    <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[10px] p-1 text-center opacity-0 group-hover:opacity-100 transition-opacity">
-                                                                        Click to enlarge
+                                                            {(() => {
+                                                                const finalSs = run.screenshot_path || (
+                                                                    run.logs && Array.isArray(run.logs)
+                                                                        ? (run.logs as any[]).slice().reverse().find((l: any) => l.screenshot_path)?.screenshot_path
+                                                                        : null
+                                                                );
+                                                                return finalSs ? (
+                                                                    <div className="rounded-md border bg-gray-50 dark:bg-black overflow-hidden group relative max-w-[300px]">
+                                                                        <img
+                                                                            src={finalSs.startsWith('http') ? finalSs : `${process.env.NEXT_PUBLIC_API_URL}${finalSs.startsWith('/') ? '' : '/'}${finalSs}`}
+                                                                            alt="Execution Screenshot"
+                                                                            className="w-full h-auto object-contain cursor-zoom-in"
+                                                                            onClick={() => window.open(finalSs.startsWith('http') ? finalSs : `${process.env.NEXT_PUBLIC_API_URL}${finalSs.startsWith('/') ? '' : '/'}${finalSs}`, '_blank')}
+                                                                        />
+                                                                        <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[10px] p-1 text-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                                                            Click to enlarge
+                                                                        </div>
                                                                     </div>
-                                                                </div>
-                                                            ) : (
-                                                                <div className="h-[150px] max-w-[300px] border-2 border-dashed rounded-md flex flex-col items-center justify-center text-muted-foreground bg-gray-50/50">
-                                                                    <p className="text-[10px]">No screenshot available</p>
-                                                                </div>
-                                                            )}
+                                                                ) : (
+                                                                    <div className="h-[150px] max-w-[300px] border-2 border-dashed rounded-md flex flex-col items-center justify-center text-muted-foreground bg-gray-50/50">
+                                                                        <p className="text-[10px]">No screenshot available</p>
+                                                                    </div>
+                                                                );
+                                                            })()}
                                                         </div>
                                                     </div>
                                                 </div>

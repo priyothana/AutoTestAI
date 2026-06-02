@@ -138,7 +138,7 @@ function buildLlm(provider = 'openai'): BaseChatModel {
   // Fallback: Anthropic Claude (only if ANTHROPIC_API_KEY is configured)
   return new ChatAnthropic({
     apiKey:    process.env.ANTHROPIC_API_KEY,
-    model:     process.env.LLM_MODEL ?? 'claude-sonnet-4-5',
+    model:     process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
     maxTokens: 2048,
     temperature: 0.3,
   })

@@ -3,7 +3,7 @@
 import { useState, useEffect, use, useRef } from "react"
 import { useSearchParams } from "next/navigation"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter } from "next/navigation" 
 import {
     Play,
     Save,
@@ -20,8 +20,6 @@ import {
     Code2,
     MonitorPlay,
     CheckCircle,
-    SkipForward,
-    Square,
 } from "lucide-react"
 import { format } from "date-fns"
 
@@ -49,6 +47,7 @@ import { toast } from "sonner"
 import JiraImportPanel from "@/components/projects/JiraImportPanel"
 import AiFixAssistant from "@/components/tests/AiFixAssistant"
 import NexusAssistant, { type TestStep as NexusTestStep } from "@/components/tests/NexusAssistant"
+import HitlChatPanel from "@/components/tests/HitlChatPanel"
 
 // Step Type
 type TestStep = {
@@ -92,6 +91,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     // HITL interactive state
     const [isPaused, setIsPaused] = useState(false)
     const [pausedStepIndex, setPausedStepIndex] = useState<number | null>(null)
+    const [pausedErrorMessage, setPausedErrorMessage] = useState<string | null>(null)
     const [activeRunId, setActiveRunId] = useState<string | null>(null)
     const [isResumingPause, setIsResumingPause] = useState(false)
     const [projects, setProjects] = useState<Project[]>([])
@@ -351,11 +351,13 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         isRunningRef.current = false
         setIsPaused(false)
         setPausedStepIndex(null)
+        setPausedErrorMessage(null)
         setExecutionStatus('idle')
         if (type === "success") toast.success(message, { id: toastId })
         else if (type === "error") toast.error(message, { id: toastId })
         else if (type === "info") toast.info(message, { id: toastId })
         else toast.warning(message, { id: toastId })
+
 
         // On timeout/warning, do one final fetch so the result panel is shown
         // if the test actually finished while we were waiting.
@@ -466,11 +468,18 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         const logs = statusData.logs ?? []
                         const lastLog = logs[logs.length - 1]
                         const pausedStep = lastLog?.step ?? null
+                        // Extract error from the failing log entry (.error field)
+                        const failingLog = [...logs].reverse().find((l: any) =>
+                            l.status === 'failed' || l.status === 'error'
+                        )
+                        const errMsg = failingLog?.error || failingLog?.message || null
                         setIsPaused(true)
                         setPausedStepIndex(pausedStep)
+                        setPausedErrorMessage(errMsg)
                         setExecutionStatus('paused')
+                        setLastRunResult(statusData)
                         toast.warning(
-                            `⏸ Step ${pausedStep ?? '?'} needs manual help — see banner below`,
+                            `⏸ Step ${pausedStep ?? '?'} needs manual help — see AI assistant`,
                             { id: runToastId, duration: Infinity }
                         )
                         return // keep polling so we can detect resume
@@ -480,6 +489,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     if (isPaused && status === 'running') {
                         setIsPaused(false)
                         setPausedStepIndex(null)
+                        setPausedErrorMessage(null)
                         setExecutionStatus('running')
                         toast.loading('▶ Continuing from next step...', { id: runToastId })
                         return
@@ -572,6 +582,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             setIsRunning(false)
             isRunningRef.current = false
             setIsPaused(false)
+            setPausedErrorMessage(null)
             if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
             if (pollTimeoutRef.current) { clearTimeout(pollTimeoutRef.current); pollTimeoutRef.current = null }
         }
@@ -601,6 +612,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
         }
         // Reset all running/paused state and return to test page (clear state)
         stopRunning('run-stop', '⏹ Test stopped — browser closed.', 'warning')
+        setPausedErrorMessage(null)
     }
 
 
@@ -623,6 +635,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             } else {
                 setIsPaused(false)
                 setPausedStepIndex(null)
+                setPausedErrorMessage(null)
                 toast.success(action === 'resume' ? '▶ Continuing test...' : '⏭ Step skipped — continuing...')
             }
         } catch (e) {
@@ -956,32 +969,16 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         )}
                     </div>
 
-                    {/* Pause action panel — only shown when paused */}
+                    {/* Pause status strip — compact; full interaction is in the AI panel */}
                     {executionStatus === 'paused' && (
-                        <div className="px-4 py-3 flex items-start gap-4">
+                        <div className="px-4 py-2.5 flex items-center gap-3">
                             <div className="flex-1">
                                 <p className="font-semibold text-amber-800 dark:text-amber-200 text-sm">
-                                    ⏸ Step {pausedStepIndex ?? '?'} is stuck — manual intervention needed
+                                    ⏸ Step {pausedStepIndex ?? '?'} is paused — the AI Assistant has opened to help
                                 </p>
-                                <p className="text-amber-700 dark:text-amber-300 text-xs mt-1">
-                                    The browser window is open and waiting. Complete the action manually in Chrome,
-                                    then click <strong>Resume</strong>. Or click <strong>Skip</strong> to skip this step.
+                                <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5">
+                                    Use the NEXUS HITL panel on the right to get AI guidance, then resume.
                                 </p>
-                                <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5 font-mono">
-                                    ⚠️  Step editing is locked while paused. You have up to 10 minutes.
-                                </p>
-                            </div>
-                            <div className="flex flex-col gap-2 flex-shrink-0">
-                                <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white gap-1" onClick={() => handlePauseAction('resume')} disabled={isResumingPause}>
-                                    {isResumingPause ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle className="h-3 w-3" />}
-                                    Resume
-                                </Button>
-                                <Button size="sm" variant="outline" className="border-amber-400 text-amber-700 hover:bg-amber-100 gap-1" onClick={() => handlePauseAction('skip')} disabled={isResumingPause}>
-                                    <SkipForward className="h-3 w-3" /> Skip step
-                                </Button>
-                                <Button size="sm" variant="outline" className="border-red-400 text-red-600 hover:bg-red-50 gap-1" onClick={handleStopTest} disabled={isResumingPause}>
-                                    <Square className="h-3 w-3 fill-current" /> Stop
-                                </Button>
                             </div>
                         </div>
                     )}
@@ -1581,26 +1578,33 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                             {/* Screenshot */}
                             <div className="p-6 bg-gray-50/30 dark:bg-black/10">
                                 <h3 className="font-semibold mb-4">Final Screenshot</h3>
-                                {lastRunResult.screenshot_path ? (
-                                    <div className="rounded-lg border bg-white dark:bg-black overflow-hidden shadow-sm group relative">
-                                            <img
-                                                src={lastRunResult.screenshot_path.startsWith('http') ? lastRunResult.screenshot_path : `${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path.startsWith('/') ? '' : '/'}${lastRunResult.screenshot_path}`}
-                                                alt="Test Run Screenshot"
-                                                className="w-full h-auto object-contain max-h-[400px]"
-                                            />
-                                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                                                <Button variant="secondary" size="sm" asChild>
-                                                    <a href={lastRunResult.screenshot_path.startsWith('http') ? lastRunResult.screenshot_path : `${process.env.NEXT_PUBLIC_API_URL}${lastRunResult.screenshot_path.startsWith('/') ? '' : '/'}${lastRunResult.screenshot_path}`} target="_blank" rel="noreferrer">
-                                                        View Full Size
-                                                    </a>
-                                                </Button>
-                                            </div>
-                                    </div>
-                                ) : (
-                                    <div className="h-[200px] border-2 border-dashed rounded-lg flex flex-col items-center justify-center text-muted-foreground bg-gray-50/50">
-                                        <p className="text-sm">No screenshot captured</p>
-                                    </div>
-                                )}
+                                {(() => {
+                                    const finalSs = lastRunResult.screenshot_path || (
+                                        lastRunResult.logs && Array.isArray(lastRunResult.logs)
+                                            ? lastRunResult.logs.slice().reverse().find((l: any) => l.screenshot_path)?.screenshot_path
+                                            : null
+                                    );
+                                    return finalSs ? (
+                                        <div className="rounded-lg border bg-white dark:bg-black overflow-hidden shadow-sm group relative">
+                                             <img
+                                                 src={finalSs.startsWith('http') ? finalSs : `${process.env.NEXT_PUBLIC_API_URL}${finalSs.startsWith('/') ? '' : '/'}${finalSs}`}
+                                                 alt="Test Run Screenshot"
+                                                 className="w-full h-auto object-contain max-h-[400px]"
+                                             />
+                                             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                                 <Button variant="secondary" size="sm" asChild>
+                                                     <a href={finalSs.startsWith('http') ? finalSs : `${process.env.NEXT_PUBLIC_API_URL}${finalSs.startsWith('/') ? '' : '/'}${finalSs}`} target="_blank" rel="noreferrer">
+                                                         View Full Size
+                                                     </a>
+                                                 </Button>
+                                             </div>
+                                         </div>
+                                    ) : (
+                                         <div className="h-[200px] border-2 border-dashed rounded-lg flex flex-col items-center justify-center text-muted-foreground bg-gray-50/50">
+                                             <p className="text-sm">No screenshot captured</p>
+                                         </div>
+                                    );
+                                })()}
                             </div>
                         </div>
                     </CardContent>
@@ -1674,6 +1678,21 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     })
                 }}
             />
+
+            {/* ── HITL AI Chatbot Panel (auto-opens when test is paused) ─── */}
+            {executionStatus === 'paused' && activeRunId && (
+                <HitlChatPanel
+                    runId={activeRunId}
+                    testCaseId={currentId}
+                    pausedStep={pausedStepIndex}
+                    errorMessage={pausedErrorMessage}
+                    onResume={async () => handlePauseAction('resume')}
+                    onSkip={async () => handlePauseAction('skip')}
+                    onStop={handleStopTest}
+                    isActioning={isResumingPause}
+                />
+            )}
         </div>
     )
 }
+

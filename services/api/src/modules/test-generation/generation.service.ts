@@ -1112,7 +1112,7 @@ function buildLlm(provider: string, model?: string): BaseChatModel {
   }
 
   if (providerLower === 'claude') {
-    const modelName = model ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514')
+    const modelName = model ?? (process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-20250514'))
     return new ChatAnthropic({
       apiKey: process.env.ANTHROPIC_API_KEY,
       model:  modelName,
@@ -4232,6 +4232,18 @@ function ensureWebAppCreateSteps(
 
   // B2. Fallback: Try TYPE/CLICK step targets (e.g., "Campaign Name", "New Campaign")
   if (!entityName) {
+    // ── FIELD-QUALIFIER BLACKLIST ──
+    // Words that commonly prefix "Name" but are NOT entity names.
+    // "Last Name" → "Last" is a field qualifier, NOT the entity.
+    // "Lead Name" → "Lead" IS the entity.
+    const FIELD_QUALIFIER_WORDS = new Set([
+      'first', 'last', 'middle', 'full', 'nick', 'maiden', 'given', 'family',
+      'company', 'email', 'phone', 'mobile', 'fax', 'street', 'city', 'state',
+      'country', 'zip', 'postal', 'billing', 'shipping', 'mailing',
+      'user', 'display', 'file', 'folder', 'tag', 'label', 'field',
+      'product', 'item', 'task', 'event', 'note',  // ambiguous — skip in this context
+    ])
+
     for (const step of result.steps) {
       const action = (step.action ?? '').toUpperCase()
       const target = String(step.target ?? '')
@@ -4239,6 +4251,12 @@ function ensureWebAppCreateSteps(
         // "Campaign Name" → "Campaign", "Account Name" → "Account"
         const fieldMatch = target.match(/^([A-Z][a-z]+)\s+Name$/i)
         if (fieldMatch) {
+          const candidate = fieldMatch[1].toLowerCase()
+          // Skip field qualifiers — they are NOT entity names
+          if (FIELD_QUALIFIER_WORDS.has(candidate)) {
+            log.info(`[GEN] Post-process: skipped field qualifier "${fieldMatch[1]}" from TYPE field "${target}" — not an entity`)
+            continue   // keep looking at other steps
+          }
           entityName = fieldMatch[1].charAt(0).toUpperCase() + fieldMatch[1].slice(1).toLowerCase()
           entityExtractedFromSteps = true
           log.info(`[GEN] Post-process: entity "${entityName}" extracted from TYPE field "${target}"`)
@@ -4477,6 +4495,10 @@ function ensureWebAppCreateSteps(
  */
 export async function generateTest(data: GenerateRequest): Promise<GenerateResponse> {
   const { prompt, provider = 'claude', model, project_id } = data
+  const providerLower = provider.toLowerCase().trim()
+  if (providerLower !== 'openai' && providerLower !== 'claude') {
+    throw { statusCode: 400, message: `Unsupported provider '${provider}'. Use 'openai' or 'claude'.` }
+  }
 
   log.info(`[GEN] Prompt: "${prompt.substring(0, 80)}" | provider=${provider} | project=${project_id ?? 'none'}`)
 
@@ -5203,7 +5225,7 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
 
           // Build synthetic page metadata
           const LOOKUP_FIELDS = /^(account|contact|owner|parent|manager|assigned|lead|opportunity|vendor|customer|partner|report\s*to|bill\s*to|ship\s*to|related\s*to|company)$/i
-          const REQUIRED_FIELDS = /^(account|contact|name|close\s*date|company|status|stage|opportunity\s*name|account\s*name|lead\s*name|contact\s*name)$/i
+          const REQUIRED_FIELDS = /^(account|contact|name|first\s*name|last\s*name|email|close\s*date|company|status|stage|opportunity\s*name|account\s*name|lead\s*name|contact\s*name)$/i
 
           const lines: string[] = [
             '=== WEB APPLICATION PAGE METADATA ===',

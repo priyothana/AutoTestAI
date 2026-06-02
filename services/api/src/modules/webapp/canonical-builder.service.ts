@@ -418,8 +418,26 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
       const path = (page.path ?? '').trim()
       if (!path || path === '/') continue
 
-      // Skip login/auth pages
+      // Skip login/auth pages — by URL pattern
       if (/^\/(login|logout|signin|signout|signup|register|auth|callback|oauth)\b/i.test(path)) continue
+
+      // Skip login/auth pages — by content analysis (defense-in-depth)
+      // Catches pages where the URL doesn't contain /login but the content
+      // is entirely login-page pollution due to an auth redirect.
+      const pageInputs  = page.inputs ?? []
+      const pageButtons = page.buttons ?? []
+      if (pageInputs.length > 0 && pageInputs.length <= 3) {
+        const loginFieldPattern = /\b(password|username|email|user|login|user_?name|user_?id|passwd|e-?mail|signin)\b/i
+        const allLoginFields = pageInputs.every(inp =>
+          loginFieldPattern.test(inp.locator ?? '') || (inp.type ?? '').toLowerCase() === 'password'
+        )
+        const loginBtnPattern = /\b(log\s*in|login|sign\s*in|signin|submit|enter|authenticate)\b/i
+        const hasLoginBtn = pageButtons.some(btn => loginBtnPattern.test(btn.name ?? ''))
+        if (allLoginFields && hasLoginBtn) {
+          log.info(`[CANONICAL] ⚠ Skipping login-polluted page: ${path} (all fields are login-related)`)
+          continue
+        }
+      }
 
       const inputCount  = (page.inputs ?? []).length
       const selectCount = (page.selects ?? []).length
@@ -662,14 +680,45 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
             1
           )
           ON CONFLICT (project_id, entity_name) DO UPDATE SET
-            entity_type           = EXCLUDED.entity_type,
-            page_url              = EXCLUDED.page_url,
-            required_fields       = EXCLUDED.required_fields,
-            optional_fields       = EXCLUDED.optional_fields,
-            primary_action_button = EXCLUDED.primary_action_button,
-            all_buttons           = EXCLUDED.all_buttons,
-            form_fields           = EXCLUDED.form_fields,
-            real_test_data        = EXCLUDED.real_test_data,
+            entity_type           = CASE
+                                      -- Prefer 'form' type over 'list_page'/'web_page'
+                                      WHEN EXCLUDED.entity_type = 'form' THEN EXCLUDED.entity_type
+                                      WHEN metadata_canonical.entity_type = 'form' THEN metadata_canonical.entity_type
+                                      ELSE EXCLUDED.entity_type
+                                    END,
+            page_url              = CASE
+                                      WHEN EXCLUDED.entity_type = 'form' THEN EXCLUDED.page_url
+                                      WHEN metadata_canonical.entity_type = 'form' THEN metadata_canonical.page_url
+                                      ELSE EXCLUDED.page_url
+                                    END,
+            required_fields       = CASE
+                                      -- Only update required_fields if the new data has more fields
+                                      -- OR the existing data is not a form (list_page search bars etc.)
+                                      WHEN jsonb_array_length(EXCLUDED.required_fields) >= jsonb_array_length(COALESCE(metadata_canonical.required_fields, '[]'::jsonb))
+                                        OR metadata_canonical.entity_type != 'form'
+                                      THEN EXCLUDED.required_fields
+                                      ELSE metadata_canonical.required_fields
+                                    END,
+            optional_fields       = CASE
+                                      WHEN jsonb_array_length(EXCLUDED.form_fields) >= jsonb_array_length(COALESCE(metadata_canonical.form_fields, '[]'::jsonb))
+                                        OR metadata_canonical.entity_type != 'form'
+                                      THEN EXCLUDED.optional_fields
+                                      ELSE metadata_canonical.optional_fields
+                                    END,
+            primary_action_button = COALESCE(EXCLUDED.primary_action_button, metadata_canonical.primary_action_button),
+            all_buttons           = CASE
+                                      WHEN jsonb_array_length(EXCLUDED.form_fields) >= jsonb_array_length(COALESCE(metadata_canonical.form_fields, '[]'::jsonb))
+                                        OR metadata_canonical.entity_type != 'form'
+                                      THEN EXCLUDED.all_buttons
+                                      ELSE metadata_canonical.all_buttons
+                                    END,
+            form_fields           = CASE
+                                      -- Always keep the version with MORE form fields
+                                      WHEN jsonb_array_length(EXCLUDED.form_fields) >= jsonb_array_length(COALESCE(metadata_canonical.form_fields, '[]'::jsonb))
+                                      THEN EXCLUDED.form_fields
+                                      ELSE metadata_canonical.form_fields
+                                    END,
+            real_test_data        = COALESCE(EXCLUDED.real_test_data, metadata_canonical.real_test_data),
             stable_locators       = EXCLUDED.stable_locators,
             learned_rules         = EXCLUDED.learned_rules,
             relationships         = EXCLUDED.relationships,

@@ -31,7 +31,7 @@ const log = createModuleLogger('metadata-reader-tool')
 export const REQUIRED_FIELD_OVERRIDE_MAP: Record<string, string[]> = {
   // CRM core objects
   product:          ['name', 'currency'],
-  lead:             ['last name', 'company', 'lead status', 'status'],
+  lead:             ['first name', 'last name', 'company', 'email', 'lead status', 'status'],
   opportunity:      ['opportunity name', 'name', 'stage', 'close date', 'account name'],
   contact:          ['last name'],
   account:          ['account name', 'name'],
@@ -122,6 +122,111 @@ export function applyRequiredFieldOverrides(
   return result
 }
 
+/**
+ * Helper to determine if a manifest is actually just an auth/login page.
+ * Detects if the fields are only login-related fields and/or the button is a login button.
+ *
+ * Uses SUBSTRING matching (not exact match) so labels like:
+ *   "Enter your email", "Enter your password", "Enter your username"
+ * are all correctly identified as login fields.
+ */
+function isLoginManifest(
+  fields: FieldEntry[],
+  submitButton?: string,
+  allButtons?: string[],
+): boolean {
+  if (fields.length === 0) return false
+
+  // Broad substring patterns for login-related field labels
+  const loginLabelPattern = /\b(password|passwd|username|user_?name|user_?id|email|e-?mail|sign.?in|remember|forgot)\b/i
+
+  const isAllLoginFields = fields.every(f => {
+    const label = f.label.toLowerCase().trim()
+    return loginLabelPattern.test(label)
+  })
+
+  // Also check if ALL labels are just 3 or fewer words long and login-like (handles "Enter your X")
+  const isAllShortLoginFields = fields.length <= 3 && fields.every(f => {
+    const label = f.label.toLowerCase().trim()
+    // Accept patterns: "enter your email", "your password", "email address", etc.
+    return loginLabelPattern.test(label)
+      || /^(enter|type|input)\s+your\s+(email|password|username)/.test(label)
+      || /^(email|password|username)\s*(address|field|input)?$/.test(label)
+  })
+
+  const hasLoginButton = [
+    ...(submitButton ? [submitButton] : []),
+    ...(allButtons ?? []),
+  ].some(b => /\b(log\s*in|sign\s*in|signin|login|authenticate)\b/i.test(b))
+
+  const hasPasswordField = fields.some(f => /password|passwd/i.test(f.label))
+
+  return (isAllLoginFields || isAllShortLoginFields) && (hasLoginButton || hasPasswordField)
+}
+
+/**
+ * Standard, robust typical fields dictionary for common business entities.
+ * Used as a fallback when pre-crawled metadata is empty or discarded due to auth redirect.
+ */
+export const TYPICAL_FIELDS_BY_ENTITY: Record<string, FieldEntry[]> = {
+  lead: [
+    { label: 'First Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Last Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Company', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Email', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Phone', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Lead Source', type: 'select', required: false, locatorType: 'label', options: ['Web', 'Phone Inquiry', 'Partner Referral', 'Other'] },
+    { label: 'Status', type: 'select', required: false, locatorType: 'label', options: ['New', 'Contacted', 'Working', 'Nurturing', 'Unqualified', 'Qualified'] },
+  ],
+  account: [
+    { label: 'Account Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Phone', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Website', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Industry', type: 'select', required: false, locatorType: 'label', options: ['Technology', 'Finance', 'Logistics', 'Healthcare', 'Other'] },
+    { label: 'Type', type: 'select', required: false, locatorType: 'label', options: ['Customer', 'Partner', 'Prospect', 'Other'] },
+  ],
+  contact: [
+    { label: 'First Name', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Last Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Email', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Phone', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Account Name', type: 'lookup', required: false, locatorType: 'label' },
+  ],
+  opportunity: [
+    { label: 'Opportunity Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Account Name', type: 'lookup', required: true, locatorType: 'label' },
+    { label: 'Close Date', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Stage', type: 'select', required: true, locatorType: 'label', options: ['Prospecting', 'Qualification', 'Needs Analysis', 'Proposal/Price Quote', 'Negotiation/Review', 'Closed Won', 'Closed Lost'] },
+    { label: 'Amount', type: 'input', required: false, locatorType: 'label' },
+  ],
+  product: [
+    { label: 'Product Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Product Code', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Currency', type: 'select', required: true, locatorType: 'label', options: ['USD', 'EUR', 'GBP', 'INR'] },
+    { label: 'Active', type: 'checkbox', required: false, locatorType: 'label' },
+    { label: 'Description', type: 'textarea', required: false, locatorType: 'label' },
+  ],
+  campaign: [
+    { label: 'Campaign Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Status', type: 'select', required: true, locatorType: 'label', options: ['Planned', 'In Progress', 'Completed', 'Aborted'] },
+    { label: 'Type', type: 'select', required: true, locatorType: 'label', options: ['Conference', 'Webinar', 'Email', 'Other'] },
+    { label: 'Start Date', type: 'input', required: true, locatorType: 'label' },
+    { label: 'End Date', type: 'input', required: false, locatorType: 'label' },
+  ],
+  case: [
+    { label: 'Subject', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Status', type: 'select', required: true, locatorType: 'label', options: ['New', 'Working', 'Escalated', 'Closed'] },
+    { label: 'Origin', type: 'select', required: true, locatorType: 'label', options: ['Phone', 'Email', 'Web'] },
+    { label: 'Description', type: 'textarea', required: false, locatorType: 'label' },
+  ],
+  quote: [
+    { label: 'Quote Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Opportunity', type: 'lookup', required: true, locatorType: 'label' },
+    { label: 'Expiration Date', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Status', type: 'select', required: false, locatorType: 'label', options: ['Draft', 'In Review', 'Presented', 'Accepted', 'Rejected'] },
+  ],
+}
+
 // ── Field manifest builder ────────────────────────────────────────────────────
 
 /**
@@ -192,7 +297,24 @@ export async function buildFieldManifest(
           for (const inp of page.inputs ?? []) {
             if (!inp.locator) continue
             // Domain-neutral lookup detection — covers CRM, logistics, ERP, HR, etc.
-            const isLookup = /\b(owner|parent|manager|vendor|supplier|customer|account|contact|entity|organization|person|employee|agent|location|department)\b/i.test(inp.locator)
+            // IMPORTANT: Only mark as lookup when the field is a STANDALONE entity reference
+            // (e.g., "Account", "Owner", "Parent Account") — NOT when the label ends with "Name"
+            // (e.g., "Account Name" is a plain text field for the account's name, not a lookup).
+            // Also respect explicit type from the crawler if present.
+            const crawlerType = (inp as any).type as string | undefined
+            let isLookup = false
+            if (crawlerType && /^(reference|lookup|relation|related)$/i.test(crawlerType)) {
+              isLookup = true
+            } else if (!crawlerType || crawlerType.toLowerCase() === 'input' || crawlerType.toLowerCase() === 'text') {
+              // Only infer lookup when the locator is a standalone entity name
+              // (does NOT end with bare " name" — that suffix signals a text identity field)
+              const locLower = inp.locator.toLowerCase().trim()
+              const isStandaloneEntityRef = /\b(owner|parent|manager|vendor|supplier|customer|contact|entity|organization|person|employee|agent|location|department)\b/i.test(inp.locator)
+                && !/\bname\s*$/i.test(inp.locator)  // "Account Name" ends with Name → NOT a lookup
+              // "Account" alone (without "Name" suffix) IS a lookup reference field
+              const isAccountRef = /^account$/i.test(locLower) || /^parent account$/i.test(locLower)
+              isLookup = isStandaloneEntityRef || isAccountRef
+            }
             fields.push({
               label:       inp.locator,
               type:        isLookup ? 'lookup' : 'input',
@@ -297,6 +419,16 @@ export async function buildFieldManifest(
           // Apply required-field overrides (crawler may have missed HTML required attrs)
           const patchedFields = applyRequiredFieldOverrides(fields, entityName)
 
+          // Discard if it's a redirected login manifest but the requested entity is NOT auth-related
+          const isAuthEntity = /^(user|login|auth|session|signup|register)/i.test(entityFilter ?? '')
+          if (!isAuthEntity && isLoginManifest(patchedFields, submitBtn?.name, allButtonNames)) {
+            log.warn(
+              { projectId, entityFilter, source: 'webapp_crawl' },
+              '[META-TOOL] buildFieldManifest: Discarding redirected login manifest for non-auth entity',
+            )
+            continue
+          }
+
           return {
             entityName,
             requiredCount: patchedFields.filter(f => f.required).length,
@@ -396,11 +528,27 @@ export async function buildFieldManifest(
             const valStr = String(val ?? '')
             const keyLower = key.toLowerCase().trim()
 
-            // Infer field type from key name and value shape
+            // Infer field type from key name and value shape.
+            // IMPORTANT: Fields ending with " Name" (e.g., "Account Name", "Contact Name") are plain
+            // text identity fields — NOT lookup references — even though their label contains
+            // an entity word like "account" or "contact".
             let fieldType: FieldEntry['type'] = 'input'
-            if (/^(true|false)$/i.test(valStr))                                           fieldType = 'checkbox'
-            else if (/\b(owner|parent|manager|vendor|supplier|customer|account|contact)\b/i.test(key)) fieldType = 'lookup'
-            else if (/\b(status|type|category|stage|priority|level|source|industry|sector|currency)\b/i.test(key)) fieldType = 'select'
+            if (/^(true|false)$/i.test(valStr)) {
+              fieldType = 'checkbox'
+            } else if (/\b(status|type|category|stage|priority|level|source|industry|sector|currency)\b/i.test(key)) {
+              fieldType = 'select'
+            } else if (
+              // Only flag as lookup when the key is a STANDALONE entity reference (no " Name" suffix)
+              /\b(owner|parent|manager|vendor|supplier|customer|contact)\b/i.test(key) &&
+              !/\bname\s*$/i.test(key)
+            ) {
+              fieldType = 'lookup'
+            } else if (
+              // "account" alone or "parent account" are lookup references; "Account Name" is NOT
+              /^(account|parent account)$/i.test(key.trim())
+            ) {
+              fieldType = 'lookup'
+            }
 
             // Determine if required — either from REQUIRED_MAP or treat first 3 fields as required
             const isReq = requiredFields.includes(keyLower) || requiredFields.length === 0
@@ -476,6 +624,42 @@ export async function buildFieldManifest(
         }
       } catch (pathCErr) {
         log.warn({ pathCErr }, '[META-TOOL] Path C (web_test_data) failed (non-fatal)')
+      }
+    }
+
+    // ── Path D: Pre-defined Synthetic business manifest fallbacks ────────────
+    // If the database has absolutely no crawled/normalized metadata, Salesforce fields,
+    // or test data for the entity, or if it was discarded as a login redirect,
+    // we construct a clean synthetic manifest from TYPICAL_FIELDS_BY_ENTITY so the
+    // anti-hallucination allowed-fields boundary doesn't prevent generating proper steps.
+    if (entityFilter && entityFilter.length > 1) {
+      const entityKeyLower = entityFilter.toLowerCase().trim()
+        .replace(/ies$/, 'y').replace(/ses$/, 's').replace(/s$/, '').trim()
+      
+      const typicalFields = TYPICAL_FIELDS_BY_ENTITY[entityKeyLower]
+        ?? TYPICAL_FIELDS_BY_ENTITY[
+             Object.keys(TYPICAL_FIELDS_BY_ENTITY).find(k =>
+               entityKeyLower.startsWith(k) || k.startsWith(entityKeyLower)
+             ) ?? ''
+           ]
+      
+      if (typicalFields) {
+        const entityName = entityFilter.charAt(0).toUpperCase() + entityFilter.slice(1)
+        const reqCount = typicalFields.filter(f => f.required).length
+        // Generate entity-specific button names (e.g. "Create Lead", not generic "Save")
+        const submitBtn = `Create ${entityName}`
+        const openBtn   = `+ New ${entityName}`
+        log.info(
+          { projectId, entityFilter, fieldCount: typicalFields.length, requiredCount: reqCount },
+          '[META-TOOL] buildFieldManifest: using pre-defined SYNTHETIC manifest fallback (anti-hallucination)',
+        )
+        return {
+          entityName,
+          requiredCount: reqCount,
+          fields:        typicalFields,
+          submitButton:  submitBtn,
+          allButtons:    [submitBtn, openBtn, 'Save', 'Cancel'],
+        }
       }
     }
 
@@ -693,15 +877,22 @@ async function tryCanonicalManifest(
 ): Promise<FieldManifest | null> {
   if (!entityFilter || entityFilter.length < 2) return null
 
-  // Query canonical table — case-insensitive entity name match
-  const canonical = await prisma.metadata_canonical.findFirst({
+  // Query canonical table — prefer form-type records over list pages, then most recent
+  // This ensures we always get the create-form record (with actual form fields)
+  // instead of the list-page record (which has navigation buttons but no form fields).
+  const canonicalRows = await prisma.metadata_canonical.findMany({
     where: {
       project_id:  projectId,
       entity_name: { contains: entityFilter, mode: 'insensitive' },
     },
+    orderBy: { last_synced_at: 'desc' },
+    take: 10,
   })
 
-  if (!canonical) return null
+  if (canonicalRows.length === 0) return null
+
+  // Prefer form-type entities first, then fall back to any type
+  const canonical = canonicalRows.find(r => r.entity_type === 'form') ?? canonicalRows[0]
 
   // Map canonical fields to FieldEntry[]
   const formFields   = (canonical.form_fields ?? []) as Array<Record<string, unknown>>
@@ -737,6 +928,20 @@ async function tryCanonicalManifest(
 
   if (fields.length === 0) return null  // no fields → not useful as a manifest
 
+  // ── Guard: list_page records with ONLY search-bar fields are not form manifests ──
+  // List pages have a search input (e.g. "Search leads...") but no actual form fields.
+  // These should NOT be used as a form field manifest — fall through to TYPICAL_FIELDS_BY_ENTITY.
+  const isOnlySearchBarFields = fields.every(f =>
+    /^search\b|\.{3}$|search\s+\w/i.test(f.label.trim())
+  )
+  if (isOnlySearchBarFields) {
+    log.info(
+      { projectId, entityFilter, entityType: canonical.entity_type },
+      '[META-TOOL] tryCanonicalManifest: skipping list_page/search-only canonical — will use TYPICAL_FIELDS fallback',
+    )
+    return null
+  }
+
   // Inject sample values from real_test_data if not already present
   if (sampleData.length > 0) {
     const sampleRecord = sampleData[0] as Record<string, unknown>
@@ -760,6 +965,16 @@ async function tryCanonicalManifest(
 
   // Apply required-field overrides for any fields the crawler may have missed
   const patchedFields = applyRequiredFieldOverrides(fields, canonical.entity_name)
+
+  // Discard if it's a redirected login manifest but the requested entity is NOT auth-related
+  const isAuthEntity = /^(user|login|auth|session|signup|register)/i.test(entityFilter ?? '')
+  if (!isAuthEntity && isLoginManifest(patchedFields, canonical.primary_action_button ?? undefined, allButtons)) {
+    log.warn(
+      { projectId, entityFilter, source: 'canonical' },
+      '[META-TOOL] tryCanonicalManifest: Discarding redirected login manifest for non-auth entity',
+    )
+    return null
+  }
 
   return {
     entityName:    canonical.entity_name,
@@ -821,6 +1036,17 @@ export async function autoCorrectButtonNames(
   entityHint?: string,
 ): Promise<Array<Record<string, any>>> {
   if (!steps || steps.length === 0) return steps
+
+  // Sanitize entityHint to prevent field name context (like "Last Name", "First Name", "Company")
+  // from being used as a business entity, which would mangle button name corrections.
+  if (entityHint) {
+    const efNorm = entityHint.trim().charAt(0).toUpperCase() + entityHint.trim().slice(1).toLowerCase()
+    const isFieldFilter = /^(last|first|email|phone|website|industry|status|type|subject|origin|description|amount|stage|date|currency)/i.test(efNorm)
+      || /\bname$/i.test(efNorm)
+    if (isFieldFilter) {
+      entityHint = undefined
+    }
+  }
 
   // ── Step 1: Resolve metadata field & button ground truth ───────────────────
   let realOpenBtn: string | null = null

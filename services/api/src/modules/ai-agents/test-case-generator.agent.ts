@@ -11,6 +11,7 @@
  * HITL: Triggered if no metadata found or focus areas are ambiguous
  */
 import { ChatOpenAI }                from '@langchain/openai'
+import { ChatAnthropic }             from '@langchain/anthropic'
 import { HumanMessage, SystemMessage } from '@langchain/core/messages'
 import { StringOutputParser }         from '@langchain/core/output_parsers'
 
@@ -125,12 +126,23 @@ export interface TestCaseGenOutput {
   hitlInvoked: boolean
 }
 
-// ── LLM ────────────────────────────────────────────────────────────────────────
+// ── LLM ──────────────────────────────────────────────────────────────────────────
 
 function buildLlm() {
-  return new ChatOpenAI({
-    apiKey:      process.env.OPENAI_API_KEY,
-    model:       process.env.TC_GEN_MODEL ?? 'gpt-4o',
+  const provider = (process.env.LLM_PROVIDER ?? '').toLowerCase()
+  const useAnthropic = provider === 'anthropic' ||
+    (provider !== 'openai' && !process.env.OPENAI_API_KEY)
+  if (!useAnthropic && process.env.OPENAI_API_KEY) {
+    return new ChatOpenAI({
+      apiKey:      process.env.OPENAI_API_KEY,
+      model:       process.env.TC_GEN_MODEL ?? 'gpt-4o',
+      temperature: 0.3,
+      maxTokens:   3000,
+    })
+  }
+  return new ChatAnthropic({
+    apiKey:      process.env.ANTHROPIC_API_KEY,
+    model:       process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
     temperature: 0.3,
     maxTokens:   3000,
   })

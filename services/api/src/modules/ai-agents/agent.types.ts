@@ -146,11 +146,12 @@ export interface AgentStep_Playwright {
 export interface StepValidationResult {
   passed:   boolean
   checks: {
-    requiredFieldCoverage: boolean
-    urlVerification:       boolean
-    buttonNameExact:       boolean
-    locatorTypeValid:      boolean
-    dataTypeAlignment:     boolean
+    requiredFieldCoverage:   boolean
+    urlVerification:         boolean
+    buttonNameExact:         boolean
+    locatorTypeValid:        boolean
+    dataTypeAlignment:       boolean
+    createSuccessValidation: boolean
   }
   issues: string[]               // human-readable failure descriptions
 }

@@ -18,26 +18,39 @@ const log = createModuleLogger('workflow-chat')
 
 // ─── LLM factory ─────────────────────────────────────────────────────────────
 
+/**
+ * Returns true when Anthropic should be preferred over OpenAI.
+ * Controlled by LLM_PROVIDER env var: 'anthropic' → use Anthropic.
+ * Falls back to Anthropic whenever OpenAI key is missing.
+ */
+function useAnthropic(): boolean {
+  const provider = (process.env.LLM_PROVIDER ?? '').toLowerCase()
+  if (provider === 'anthropic') return true
+  if (provider === 'openai')    return false
+  // No explicit provider — prefer OpenAI only if key is present
+  return !process.env.OPENAI_API_KEY
+}
+
 function buildLlm(): BaseChatModel {
-  if (process.env.OPENAI_API_KEY) {
+  if (!useAnthropic() && process.env.OPENAI_API_KEY) {
     return new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY, model: 'gpt-4o-mini', temperature: 0.4, maxTokens: 2048 })
   }
   return new ChatAnthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
-    model:  process.env.LLM_MODEL ?? 'claude-sonnet-4-5',
+    model:  process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
     maxTokens: 2048,
     temperature: 0.4,
   })
 }
 
-/** Dedicated LLM for workflow discovery — uses gpt-4o for richer analysis. */
+/** Dedicated LLM for workflow discovery — uses a high-capability model for richer analysis. */
 function buildDiscoveryLlm(): BaseChatModel {
-  if (process.env.OPENAI_API_KEY) {
+  if (!useAnthropic() && process.env.OPENAI_API_KEY) {
     return new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY, model: 'gpt-4o', temperature: 0.3, maxTokens: 3000 })
   }
   return new ChatAnthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
-    model:  process.env.LLM_MODEL ?? 'claude-sonnet-4-5',
+    model:  process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
     maxTokens: 3000,
     temperature: 0.3,
   })

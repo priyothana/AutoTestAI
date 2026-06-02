@@ -429,6 +429,41 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
  *
  * Returns count of normalized records created.
  */
+/**
+ * Detects if a crawled page is actually a login/auth page based on its content.
+ * This is a universal filter that works regardless of the entity type.
+ * It catches pages that the crawler may have scraped before auth-redirect detection
+ * was in place (existing polluted data) or that slipped through edge cases.
+ */
+function isLoginPageData(pm: PageMetadata): boolean {
+  // Explicit flag from crawler (Layer 1)
+  if ((pm as any).redirected_to_login === true) return true
+
+  // URL-based check
+  const path = (pm.path ?? pm.url ?? '').toLowerCase()
+  const isAuthUrl = /\/(login|signin|sign-in|sign_in|auth|authenticate|sso|oauth|cas|saml)\b/.test(path)
+
+  // Content-based check: are ALL inputs login-related?
+  const loginInputPatterns = /\b(password|username|email|user|login|user_?name|user_?id|passwd|e-?mail|signin)\b/i
+  const allInputsAreLogin = pm.inputs.length > 0 &&
+    pm.inputs.length <= 4 &&
+    pm.inputs.every(inp => {
+      const name = (inp.name ?? inp.locator ?? '').toLowerCase()
+      return loginInputPatterns.test(name) || inp.tag === 'password'
+    })
+
+  // Button-based check: does the primary button look like a login action?
+  const loginButtonNames = /\b(log\s*in|login|sign\s*in|signin|submit|enter|authenticate)\b/i
+  const hasLoginButton = pm.buttons.some(btn => loginButtonNames.test(btn.name ?? ''))
+
+  // Decision: login page if URL is auth AND inputs are login-related,
+  // OR if all inputs are login-related AND there's a login button (auth redirect without URL change)
+  if (isAuthUrl && allInputsAreLogin) return true
+  if (allInputsAreLogin && hasLoginButton && pm.inputs.length <= 3) return true
+
+  return false
+}
+
 export async function normalizeWebappMetadata(projectId: string): Promise<number> {
   log.info(`[WEB-SYNC] Stage 2: Normalization started for project ${projectId}`)
 
@@ -448,16 +483,32 @@ export async function normalizeWebappMetadata(projectId: string): Promise<number
     const baseUrl = data.base_url ?? raw.api_name
     const pages   = data.pages ?? []
 
-    // Normalize page elements to compact, consistent shape
-    // Skip 404/error pages — these are bad key routes that don't exist in the app
+    // ── Filter 1: Skip 404/error pages ──────────────────────────────────
+    // These are bad key routes that don't exist in the app
+    let discardedLoginPages = 0
     const validPages = pages.filter((pm: PageMetadata) => {
       const title = (pm.title ?? '').toLowerCase()
-      return !title.includes('404') &&
-             !title.includes('not found') &&
-             !title.includes('could not be found') &&
-             !title.includes('page not found') &&
-             !title.includes('error')
+      const is404 = title.includes('404') ||
+             title.includes('not found') ||
+             title.includes('could not be found') ||
+             title.includes('page not found') ||
+             title.includes('error')
+      if (is404) return false
+
+      // ── Filter 2: Skip login/auth pages (universal) ─────────────────
+      // Prevents login-page pollution from reaching canonical metadata
+      if (isLoginPageData(pm)) {
+        discardedLoginPages++
+        log.info(`[WEB-SYNC] ⚠ Discarding login page: ${pm.path || pm.url}`)
+        return false
+      }
+
+      return true
     })
+
+    if (discardedLoginPages > 0) {
+      log.warn(`[WEB-SYNC] Discarded ${discardedLoginPages} login-redirect page(s) during normalization for ${baseUrl}`)
+    }
 
     const normalizedPages = validPages.map((pm: PageMetadata) => ({
       url:      pm.url,
