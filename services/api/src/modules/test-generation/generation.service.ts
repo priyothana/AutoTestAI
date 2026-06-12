@@ -1387,12 +1387,47 @@ function extractTargetObjects(prompt: string): string[] {
   
   const targets = new Set<string>()
 
+  // ── Phase 0: "a/an <Entity> record/detail" noun-phrase pattern ───────────────
+  // Handles description-style prompts like:
+  //   "Verify that a bank detail record can be created..."
+  //   "Ensure a bank_detail entry is saved..."
+  // Extracts the entity noun before "record", "detail", "entry", "form", "module"
+  // Uses case-insensitive matching on the raw prompt (lowercase version).
+  const ENTITY_RECORD_PATTERNS = [
+    /\b(?:a|an)\s+([a-z]+(?:\s+[a-z]+)?)\s+(?:record|detail|entry|form|module|item|entity)\b/g,
+    /\b([a-z]+(?:\s+[a-z]+)?)\s+(?:record|module|entity)\s+(?:can\s+be|is|was|has\s+been)\b/g,
+    /\b([a-z]+(?:[\s_][a-z]+)+)\s+(?:data|info|information)\b/g,
+  ]
+  for (const pattern of ENTITY_RECORD_PATTERNS) {
+    for (const match of lower.matchAll(pattern)) {
+      const phrase = (match[1] ?? '').trim()
+      if (!phrase || phrase.length < 3) continue
+      const pWords = phrase.split(/[\s_]+/)
+      if (pWords.length >= 2) {
+        // Add TitleCase phrase AND underscore slug
+        const titled = pWords.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+        targets.add(titled)   // "Bank Detail"
+        const slug = pWords.map(w => w.toLowerCase()).filter(w => w.length > 1).join('_')
+        targets.add(slug)     // "bank_detail"
+      } else if (!skipWords.has(phrase)) {
+        targets.add(phrase.charAt(0).toUpperCase() + phrase.slice(1))
+      }
+    }
+  }
+
   // ── Phase 1: Multi-word compound entity extraction (highest priority) ───────
   // Matches 2-4 consecutive non-stop words after a verb or before an action word.
   // This handles entities like "Terms and Conditions", "Invoice Custom Fields",
-  // "Credit Notes", etc., which are compound noun phrases.
-  const COMPOUND_AFTER_VERB = /\b(?:create|update|edit|delete|view|add|manage)\s+(?:a\s+|an\s+|new\s+)?([A-Z][a-zA-Z]+(?:\s+(?:and\s+|&\s+)?[A-Z][a-zA-Z]+){1,3})\b/g
-  const COMPOUND_BEFORE_ACTION = /\b([A-Z][a-zA-Z]+(?:\s+(?:and\s+|&\s+)?[A-Z][a-zA-Z]+){1,3})\s+(?:successfully|details?|list|management|page|form)\b/g
+  // "Credit Notes", "Bank Detail", etc., which are compound noun phrases.
+  // Extended verb list now includes verify/check/ensure/confirm so description-style
+  // prompts like "Verify that a bank detail..." also extract the entity.
+  // ⚠ CASE-INSENSITIVE flag added: test-case names use TitleCase ("Create Bank Detail")
+  // while description prompts use lowercase ("create bank detail"). The /i flag makes
+  // both verb and trailing keyword matching work regardless of casing.
+  // The captured group is relaxed to [A-Za-z]+ so TitleCase nouns like "Bank", "Detail" match.
+  const COMPOUND_AFTER_VERB = /\b(?:create|update|edit|delete|view|add|manage|verify|check|ensure|confirm|open|submit|save|fill)\s+(?:a\s+|an\s+|that\s+a\s+|that\s+an\s+|new\s+)?([A-Za-z][a-zA-Z]+(?:\s+(?:and\s+|&\s+)?[A-Za-z][a-zA-Z]+){1,3})\b/gi
+  const COMPOUND_BEFORE_ACTION = /\b([A-Za-z][a-zA-Z]+(?:\s+(?:and\s+|&\s+)?[A-Za-z][a-zA-Z]+){1,3})\s+(?:successfully|details?|list|management|page|form)\b/gi
+
 
   for (const pattern of [COMPOUND_AFTER_VERB, COMPOUND_BEFORE_ACTION]) {
     for (const match of prompt.matchAll(pattern)) {
@@ -1400,6 +1435,26 @@ function extractTargetObjects(prompt: string): string[] {
       if (phrase && phrase.split(/\s+/).length >= 2) {
         // Add the FULL phrase AND each word as individual targets
         targets.add(phrase)
+        // ── Phase 1b: Also add underscore-slug form of the compound phrase ──
+        // e.g. "Bank Detail" → "bank_detail" so TYPICAL_FIELDS_BY_ENTITY and
+        // REQUIRED_FIELD_OVERRIDE_MAP lookups succeed for compound entity names
+        // stored with underscore keys (e.g. /custom/bank_detail URL pattern).
+        const SLUG_STOP_WORDS = new Set([
+          // Grammatical stop words
+          'a', 'an', 'the', 'and', 'or', 'of', 'in', 'on', 'to', 'for', 'with', 'by', 'at', 'from', 'as', 'is', 'are',
+          // Common test-case qualifier words (not entity names)
+          'all', 'required', 'fields', 'field', 'successfully', 'success', 'valid', 'invalid',
+          'new', 'create', 'update', 'edit', 'delete', 'add', 'get', 'set',
+          'test', 'case', 'step', 'record', 'form', 'entry', 'item',
+        ])
+        const words = phrase.split(/\s+/).map((w: string) => w.toLowerCase().replace(/[^a-z]/g, ''))
+        const contentWords = words.filter((w: string) => w.length > 0 && !SLUG_STOP_WORDS.has(w))
+        if (contentWords.length >= 2) {
+          targets.add(contentWords.join('_'))   // e.g. "bank_detail"
+          // Also try the first-two-word slug in case of 3+ content words
+          targets.add(contentWords.slice(0, 2).join('_'))
+        }
+
         for (const word of phrase.split(/\s+/)) {
           const w = word.toLowerCase().replace(/[^a-z]/g, '')
           if (w.length > 2 && !skipWords.has(w)) targets.add(w.charAt(0).toUpperCase() + w.slice(1))
@@ -1442,6 +1497,9 @@ function extractTargetObjects(prompt: string): string[] {
   // ── Phase 5: Format and deduplicate ──────────────────────────────────────────
   const formattedTargets = Array.from(targets).map(t => {
     if (t.toLowerCase().endsWith('__c')) return t  // preserve __c casing
+    // Underscore-slug forms (e.g. "bank_detail"): keep lowercase so they match
+    // TYPICAL_FIELDS_BY_ENTITY and REQUIRED_FIELD_OVERRIDE_MAP dict keys exactly.
+    if (t.includes('_') && !t.includes(' ')) return t.toLowerCase()
     // Multi-word phrases: TitleCase each word
     if (t.includes(' ')) return t.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ')
     return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()
@@ -1450,6 +1508,7 @@ function extractTargetObjects(prompt: string): string[] {
   // Sort: longer (more specific) phrases first so they get priority in matching
   return Array.from(new Set(formattedTargets)).sort((a, b) => b.length - a.length)
 }
+
 
 // ── Resolve object API name with __c suffix fallback ─────────────────
 
@@ -3062,17 +3121,40 @@ function buildEntityAnalysisHeader(
   const SUBMENU_ACTIONS   = /^(delete|remove|archive|clone|duplicate|deactivate|disable|export)$/i
   const SUBMIT_VERBS      = /create|save|submit|add|new|update|delete|change|apply|confirm|done|finish|complete|more|action/i
 
+  // ── PRIORITY 1: Verified button from entityUrlMap (web_test_data.create_button_name) ──
+  // This is scraped directly from the live UI — it is the GROUND TRUTH button name.
+  // It overrides everything else. Example: "+ Add Contact" beats any crawled button.
+  const verifiedCreateBtnName = (() => {
+    const lowerEntity = resolvedEntity.toLowerCase()
+    for (const [name, info] of Object.entries(entityUrlMap)) {
+      const nLower = name.toLowerCase()
+      const matched =
+        nLower === lowerEntity ||
+        nLower === lowerEntity + 's' ||
+        nLower.includes(lowerEntity) ||
+        lowerEntity.includes(nLower)
+      if (matched) {
+        const btn = typeof info === 'string' ? undefined : (info.buttonName || info.openButtonName)
+        if (btn?.trim()) return btn.trim()
+      }
+    }
+    return null
+  })()
+
   const submitBtns = buttons.filter(b => {
     const n = String(b['name'] ?? '').toLowerCase()
     return SUBMIT_VERBS.test(n)
   })
 
-  if (submitBtns.length > 0) {
-    const hasMenuBtn = submitBtns.some(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))
-    const menuBtnName = hasMenuBtn
-      ? String(submitBtns.find(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))?.['name'] ?? 'More')
-      : null
+  // Determine primary button name: verified DB name wins over crawled page data
+  let primaryBtnName: string = verifiedCreateBtnName ?? ''
+  const hasMenuBtn = submitBtns.some(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))
+  const menuBtnName = hasMenuBtn
+    ? String(submitBtns.find(b => ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()))?.['name'] ?? 'More')
+    : null
 
+  if (!primaryBtnName && submitBtns.length > 0) {
+    // Fallback: pick best button from crawled page data
     // For CREATE tests: prefer create/add/save buttons
     // For UPDATE tests: prefer update/save/change buttons
     const preferredBtn = (() => {
@@ -3086,12 +3168,14 @@ function buildEntityAnalysisHeader(
         ?? submitBtns.find(b => /save/i.test(String(b['name'] ?? '')))
         ?? submitBtns.find(b => !ACTION_MENU_NAMES.test(String(b['name'] ?? '').trim()) && !SUBMENU_ACTIONS.test(String(b['name'] ?? '').trim()))
     })()
+    primaryBtnName = preferredBtn ? String(preferredBtn['name'] ?? '').trim() : ''
+  }
 
-    const primaryBtnName = preferredBtn ? String(preferredBtn['name'] ?? '').trim() : ''
-
+  if (primaryBtnName || submitBtns.length > 0) {
     card.push('⚡ BUTTONS:')
     if (primaryBtnName) {
-      card.push(`   ⚡ SUBMIT BUTTON: "${primaryBtnName}"  (locator_type: role)`)
+      const srcNote = verifiedCreateBtnName ? '  ← VERIFIED from live UI scrape — use EXACTLY as shown' : ''
+      card.push(`   ⚡ SUBMIT BUTTON: "${primaryBtnName}"  (locator_type: role)${srcNote}`)
       card.push(`      ← COPY THIS NAME EXACTLY — this is the ONLY valid submit button name`)
     }
     if (menuBtnName) {
@@ -3154,7 +3238,38 @@ async function buildWebAppStructuredContext(
       allPages.push(...pages)
     }
 
-    if (allPages.length === 0) return buildWebAppRagContext(rawChunks)
+    // ── CRITICAL: Strip login / auth pages before ANY scoring ─────────────
+    // If the crawler ran without an active session, it may have stored the login
+    // page (path="/" or "/login") as the only page. These must NEVER be used as
+    // context for entity creation tests — they produce login steps instead of
+    // the real form steps (e.g. email/password instead of First Name/Last Name).
+    const LOGIN_PATH_RE = /^(\/?$|\/?(login|signin|sign-in|sign_in|auth|authenticate|session|sso|oauth|callback|register|signup|sign-up|forgot-password|reset-password)(\/.*)?$)/i
+    const LOGIN_INPUT_LABELS_RE = /\b(password|passwd)\b/i
+
+    const isLoginPage = (page: Record<string, unknown>): boolean => {
+      const path = String(page['path'] ?? '').trim()
+      const title = String(page['title'] ?? '').toLowerCase()
+      // Path-based detection
+      if (LOGIN_PATH_RE.test(path)) return true
+      // Title-based detection ("Login", "Sign In", "Welcome — Please Log In")
+      if (/\b(log\s*in|sign\s*in|authentication|log into)\b/i.test(title)) return true
+      // Field-based detection: page has password input → it's a login/auth page
+      const inputs = Array.isArray(page['inputs']) ? page['inputs'] as Record<string, unknown>[] : []
+      const hasPasswordField = inputs.some(i => LOGIN_INPUT_LABELS_RE.test(String(i['locator'] ?? i['name'] ?? '')))
+      if (hasPasswordField) return true
+      return false
+    }
+
+    const nonLoginPages = allPages.filter(p => !isLoginPage(p))
+    const filteredPages = nonLoginPages.length > 0 ? nonLoginPages : allPages
+    if (nonLoginPages.length < allPages.length) {
+      log.warn(
+        { projectId, loginPagesRemoved: allPages.length - nonLoginPages.length, remaining: nonLoginPages.length },
+        '[GEN] buildWebAppStructuredContext: stripped login/auth pages from context — they must not pollute entity creation steps'
+      )
+    }
+
+    if (filteredPages.length === 0) return buildWebAppRagContext(rawChunks)
 
     // ── Load real entity records from web_test_data ──────────────────────
     // Build a map: entityNameLower → first record (flat field→value map)
@@ -3194,7 +3309,7 @@ async function buildWebAppStructuredContext(
     //   +20 — path contains a CREATE/NEW indicator → strongly prefer for CREATE tests
     //   +25 — path contains an EDIT/UPDATE indicator → strongly prefer for UPDATE tests
     //   +2  — entity appears in page title
-    const scoredPages = allPages.map(page => {
+    const scoredPages = filteredPages.map(page => {
       const path  = String(page['path']  ?? '').toLowerCase()
       const title = String(page['title'] ?? '').toLowerCase()
       let score = 0
@@ -3214,6 +3329,255 @@ async function buildWebAppStructuredContext(
     // If nothing scored, fall back to the top-5 overall so we never return
     // a completely empty context — but log a warning so this is visible.
     const relevantPages = scoredPages.filter(s => s.score > 0)
+
+    // ── CRITICAL SAFETY NET: No relevant pages found ─────────────────────
+    // When the crawler has no pages for the target entity in metadata_normalized,
+    // try to build a synthetic RAG context from OTHER sources before serving
+    // unrelated crawled pages (which cause login-step hallucinations).
+    //
+    // PRIORITY ORDER:
+    //   1. metadata_canonical — real DB record with exact form fields + button name
+    //   2. TYPICAL_FIELDS_BY_ENTITY — built-in reference fields (safe generic fallback)
+    //   3. top-5 non-login pages (last resort — may still cause irrelevant steps)
+    if (relevantPages.length === 0) {
+      log.warn(
+        `[GEN] buildWebAppStructuredContext: no crawled pages match targets [${targetLowers.join(', ')}] — ` +
+        `trying metadata_canonical → TYPICAL_FIELDS_BY_ENTITY synthetic fallback`
+      )
+
+      // ── PRIORITY 1: metadata_canonical ─────────────────────────────────
+      // The canonical table is built by the metadata sync from real crawl data.
+      // It has exact form_fields, required_fields, primary_action_button, page_url.
+      for (const target of targetLowers) {
+        try {
+          const canonRows = await prisma.metadata_canonical.findMany({
+            where: {
+              project_id:  projectId,
+              entity_name: { contains: target, mode: 'insensitive' },
+            },
+            orderBy: { last_synced_at: 'desc' },
+            take: 5,
+          })
+
+          const canon = canonRows.find(r => r.entity_type === 'form') ?? canonRows[0]
+          if (!canon) continue
+
+          const formFields   = (canon.form_fields   ?? []) as Array<Record<string, unknown>>
+          const reqFields    = (canon.required_fields ?? []) as Array<Record<string, unknown>>
+          const optFields    = (canon.optional_fields ?? []) as Array<Record<string, unknown>>
+
+          // Prefer form_fields; fall back to req + opt
+          const allCanonFields = formFields.length > 0
+            ? formFields
+            : [...reqFields, ...optFields]
+
+          if (allCanonFields.length === 0) continue
+
+          const entityName   = canon.entity_name
+          const submitBtn    = canon.primary_action_button ?? `Create ${entityName}`
+          const canonPageUrl = canon.page_url ?? ''
+
+          // Resolve verified URL from entityUrlMap or canonical page_url
+          const urlInfo = Object.entries(entityUrlMap).find(([name]) => {
+            const nLower = name.toLowerCase()
+            const tLower = target.toLowerCase()
+            return nLower === tLower || nLower === tLower + 's' || nLower.includes(tLower) || tLower.includes(nLower)
+          })?.[1]
+
+          let listPath   = urlInfo ? (typeof urlInfo === 'string' ? urlInfo : urlInfo.path) : `/${target}s`
+          // canonical page_url is usually the CREATE path (e.g. /contacts/new)
+          const createPath = canonPageUrl || `${listPath}/new`
+          // Derive list path from create path (strip /new suffix)
+          if (!urlInfo) listPath = createPath.replace(/\/(new|create|add)(\/.*)?$/, '') || listPath
+          const verifiedBtn = (urlInfo && typeof urlInfo !== 'string') ? (urlInfo.buttonName || urlInfo.openButtonName) : null
+
+          log.info(
+            { projectId, entityName, fieldCount: allCanonFields.length, submitBtn, createPath, listPath },
+            '[GEN] buildWebAppStructuredContext: using metadata_canonical as fallback (no crawled pages for entity)'
+          )
+
+          const synLines: string[] = [
+            `=== WEB APPLICATION PAGE METADATA (from metadata_canonical for "${entityName}") ===`,
+            `This data was scraped from the live application. Use EXACT field labels and button names.`,
+            '',
+            `╔══════════════════════════════════════════════════════════════════════════════╗`,
+            `║  ENTITY ANALYSIS CARD                                                        ║`,
+            `╚══════════════════════════════════════════════════════════════════════════════╝`,
+            '',
+            `🏷️  ENTITY: ${entityName}`,
+            '',
+            `📄 PAGE URLS:`,
+            `   List Page:   ${listPath}`,
+            `   Create Page: ${createPath}`,
+            `   Edit Page:   ${listPath}/:id/edit`,
+            '',
+            `🔑 FIELD CATALOG:`,
+            `   (🔥 = REQUIRED  |  ✅ = OPTIONAL)`,
+            '',
+          ]
+
+          for (const f of allCanonFields) {
+            const label   = String(f['label'] ?? '')
+            const type    = String(f['type']  ?? 'input')
+            const req     = Boolean(f['required'] ?? false)
+            const opts    = Array.isArray(f['options']) ? f['options'].map(String) : []
+            const tag     = req ? '🔥 REQUIRED' : '✅ OPTIONAL '
+            const ftype   = type === 'select' ? 'SELECT' : type === 'lookup' ? 'LOOKUP' : 'INPUT '
+            const optsStr = opts.length ? `  → options: ${opts.slice(0, 5).join(' | ')}` : ''
+            const entityLowerKey = target.replace(/ies$/, 'y').replace(/ses$/, 's').replace(/s$/, '').trim()
+            const sample  = (testDataMap.get(entityLowerKey) ?? testDataMap.get(entityLowerKey + 's'))?.[label]
+            const sStr    = sample ? `  ⚡ USE: "${sample}"` : ''
+            synLines.push(`   ${tag} ${ftype} "${label}"  locator_type: label${optsStr}${sStr}`)
+          }
+
+          synLines.push('')
+          synLines.push(`⚡ BUTTONS:`)
+          const finalBtn = verifiedBtn ?? submitBtn
+          synLines.push(`   ⚡ SUBMIT BUTTON: "${finalBtn}"  (locator_type: role)  ← VERIFIED from live UI scrape — use EXACTLY as shown`)
+          synLines.push(`      ← COPY THIS NAME EXACTLY — this is the ONLY valid submit button name`)
+          synLines.push('')
+          synLines.push('══════════════════════════════════════════════════════════════════════════════')
+          synLines.push('END OF ENTITY ANALYSIS CARD')
+          synLines.push('══════════════════════════════════════════════════════════════════════════════')
+          synLines.push('')
+          synLines.push(`--- Page: ${listPath} ---`)
+          synLines.push(`  ⚡ SUBMIT / ACTION BUTTONS:`)
+          synLines.push(`    ⚡ BUTTON NAME: "${finalBtn}"`)
+          synLines.push('')
+          synLines.push(`--- Page: ${createPath} ---`)
+          const reqF = allCanonFields.filter(f => Boolean(f['required']))
+          const optF = allCanonFields.filter(f => !Boolean(f['required']))
+          if (reqF.length > 0) {
+            synLines.push('  ⚠ REQUIRED Fields (MUST fill — test WILL FAIL if omitted):')
+            for (const f of reqF) {
+              const label  = String(f['label'] ?? '')
+              const opts   = Array.isArray(f['options']) ? f['options'].map(String) : []
+              const entityLowerKey = target.replace(/ies$/, 'y').replace(/ses$/, 's').replace(/s$/, '').trim()
+              const sample = (testDataMap.get(entityLowerKey) ?? testDataMap.get(entityLowerKey + 's'))?.[label]
+              const optsStr = opts.length ? `  [VALID OPTIONS: ${opts.slice(0, 5).join(' | ')}]` : ''
+              const sStr   = sample ? `  ⚡ SAMPLE VALUE: "${sample}"` : ''
+              synLines.push(`    [REQUIRED] locator: "${label}"  locator_type: "label"  tag: input${optsStr}${sStr}`)
+            }
+          }
+          if (optF.length > 0) {
+            synLines.push('  Optional Fields:')
+            for (const f of optF.slice(0, 8)) {
+              synLines.push(`    [OPTIONAL] locator: "${String(f['label'] ?? '')}"  locator_type: "label"  tag: input`)
+            }
+          }
+          synLines.push('  ⚡ SUBMIT / ACTION BUTTONS — COPY THESE NAMES EXACTLY:')
+          synLines.push(`    ⚡ BUTTON NAME: "${finalBtn}"`)
+          synLines.push('')
+          synLines.push('=== END OF WEB APPLICATION PAGE METADATA ===')
+
+          return synLines.join('\n')
+        } catch (canonErr) {
+          log.warn({ err: canonErr }, '[GEN] metadata_canonical fallback failed — continuing to TYPICAL_FIELDS')
+        }
+      }
+
+      // ── PRIORITY 2: TYPICAL_FIELDS_BY_ENTITY ────────────────────────────
+      // Built-in reference fields (generic — only if canonical has no data).
+      const { TYPICAL_FIELDS_BY_ENTITY } = await import('../ai-agents/tools/metadata-reader.tool.js')
+
+      // Try each target in priority order
+      for (const target of targetLowers) {
+        const entityKey = target.replace(/ies$/, 'y').replace(/ses$/, 's').replace(/s$/, '').trim()
+        const typicalFields = TYPICAL_FIELDS_BY_ENTITY[entityKey]
+          ?? TYPICAL_FIELDS_BY_ENTITY[Object.keys(TYPICAL_FIELDS_BY_ENTITY).find(k =>
+               entityKey.startsWith(k) || k.startsWith(entityKey)
+             ) ?? '']
+
+        if (typicalFields) {
+          const entityName   = target.charAt(0).toUpperCase() + target.slice(1)
+          const submitBtn    = `+ Add ${entityName}`
+          // Try entityUrlMap for verified URL & button
+          const urlInfo = Object.entries(entityUrlMap).find(([name]) => {
+            const nLower = name.toLowerCase()
+            return nLower === entityKey || nLower === entityKey + 's' || nLower.includes(entityKey) || entityKey.includes(nLower)
+          })?.[1]
+
+          const listPath   = urlInfo ? (typeof urlInfo === 'string' ? urlInfo : urlInfo.path) : `/${target}s`
+          const createPath = `${listPath}/new`
+          const verifiedBtn = urlInfo && typeof urlInfo !== 'string' ? (urlInfo.buttonName || urlInfo.openButtonName) : null
+
+          log.info(
+            { projectId, entityKey, fieldCount: typicalFields.length, verifiedBtn, listPath },
+            '[GEN] buildWebAppStructuredContext: using TYPICAL_FIELDS_BY_ENTITY synthetic fallback (no crawl data for entity)'
+          )
+
+          const syntheticLines: string[] = [
+            `=== WEB APPLICATION PAGE METADATA (SYNTHETIC — no crawl data for "${entityName}") ===`,
+            `The following metadata is a built-in reference for ${entityName} entities.`,
+            `Use the EXACT field labels below. Do NOT invent other fields.`,
+            '',
+            `╔══════════════════════════════════════════════════════════════════════════════╗`,
+            `║  ENTITY ANALYSIS CARD — SYNTHETIC (no live crawl data available)            ║`,
+            `╚══════════════════════════════════════════════════════════════════════════════╝`,
+            '',
+            `🏷️  ENTITY: ${entityName}`,
+            '',
+            `📄 PAGE URLS:`,
+            `   List Page:   ${listPath}`,
+            `   Create Page: ${createPath}`,
+            '',
+            `🔑 FIELD CATALOG:`,
+            `   (🔥 = REQUIRED  |  ✅ = OPTIONAL)`,
+            '',
+          ]
+
+          for (const f of typicalFields) {
+            const tag = f.required ? '🔥 REQUIRED' : '✅ OPTIONAL '
+            const ftype = f.type === 'select' ? 'SELECT' : f.type === 'lookup' ? 'LOOKUP' : 'INPUT '
+            const opts = f.options?.length ? `  → options: ${f.options.slice(0, 5).join(' | ')}` : ''
+            const sample = (testDataMap.get(entityKey) ?? testDataMap.get(entityKey + 's'))?.[f.label]
+            const sampleStr = sample ? `  ⚡ USE: "${sample}"` : ''
+            syntheticLines.push(`   ${tag} ${ftype} "${f.label}"  locator_type: label${opts}${sampleStr}`)
+          }
+
+          syntheticLines.push('')
+          syntheticLines.push(`⚡ BUTTONS:`)
+          syntheticLines.push(`   ⚡ SUBMIT BUTTON: "${verifiedBtn ?? submitBtn}"  (locator_type: role)`)
+          syntheticLines.push(`      ← COPY THIS NAME EXACTLY — this is the ONLY valid submit button name`)
+          syntheticLines.push('')
+          syntheticLines.push('══════════════════════════════════════════════════════════════════════════════')
+          syntheticLines.push('END OF ENTITY ANALYSIS CARD')
+          syntheticLines.push('══════════════════════════════════════════════════════════════════════════════')
+          syntheticLines.push('')
+          syntheticLines.push(`--- Page: ${listPath} ---`)
+          syntheticLines.push(`  ⚡ SUBMIT / ACTION BUTTONS:`)
+          syntheticLines.push(`    ⚡ BUTTON NAME: "${verifiedBtn ?? submitBtn}"`)
+          syntheticLines.push('')
+          syntheticLines.push(`--- Page: ${createPath} ---`)
+          const reqFields = typicalFields.filter(f => f.required)
+          const optFields = typicalFields.filter(f => !f.required)
+          if (reqFields.length > 0) {
+            syntheticLines.push('  ⚠ REQUIRED Fields (MUST fill — test WILL FAIL if omitted):')
+            for (const f of reqFields) {
+              const sampleRaw = (testDataMap.get(entityKey) ?? testDataMap.get(entityKey + 's'))?.[f.label]
+              const sStr = sampleRaw ? `  ⚡ SAMPLE VALUE: "${sampleRaw}"` : ''
+              const opts = f.options?.length ? `  [VALID OPTIONS: ${f.options.slice(0, 5).join(' | ')}]` : ''
+              syntheticLines.push(`    [REQUIRED] locator: "${f.label}"  locator_type: "label"  tag: input${opts}${sStr}`)
+            }
+          }
+          if (optFields.length > 0) {
+            syntheticLines.push('  Optional Fields:')
+            for (const f of optFields.slice(0, 6)) {
+              syntheticLines.push(`    [OPTIONAL] locator: "${f.label}"  locator_type: "label"  tag: input`)
+            }
+          }
+          syntheticLines.push('  ⚡ SUBMIT / ACTION BUTTONS — COPY THESE NAMES EXACTLY:')
+          syntheticLines.push(`    ⚡ BUTTON NAME: "${verifiedBtn ?? submitBtn}"`)
+          syntheticLines.push('')
+          syntheticLines.push('=== END OF WEB APPLICATION PAGE METADATA ===')
+
+          return syntheticLines.join('\n')
+        }
+      }
+
+      // No TYPICAL_FIELDS match either — serve top-5 non-login pages as last resort
+      log.warn(`[GEN] buildWebAppStructuredContext: no TYPICAL_FIELDS match for [${targetLowers.join(', ')}] — serving top-5 non-login pages (last resort)`)
+    }
 
     // Intent-aware page filtering:
     // • CREATE tests → strongly prefer create/new pages (filter out list pages)
@@ -3425,12 +3789,32 @@ async function buildWebAppStructuredContext(
         pageLines.push('  ├─────────────────────────────────────────────────────────────────┤')
 
         // Submit button
+        // PRIORITY: entityUrlMap verified button (create_button_name from DB) > crawled page buttons
         let submitButtonName = ''
-        if (submitBtns.length > 0) {
-          const rawLocator  = String(submitBtns[0]['locator'] ?? submitBtns[0]['name'] ?? '')
-          const nameMatch   = rawLocator.match(/name=(.+)$/)
-          submitButtonName  = (nameMatch ? nameMatch[1].trim() : String(submitBtns[0]['name'] ?? '')).trim()
+        // Check entityUrlMap first — it has the real button name scraped from live UI
+        const pageEntityKey = path.split('/').filter(s => s && !/^(new|create|add|edit|list|index|all|\d+)$/i.test(s)).slice(-1)[0]?.toLowerCase() ?? ''
+        if (pageEntityKey) {
+          for (const [name, info] of Object.entries(entityUrlMap)) {
+            const nLower = name.toLowerCase()
+            if (nLower === pageEntityKey || nLower === pageEntityKey + 's' || nLower.includes(pageEntityKey) || pageEntityKey.includes(nLower)) {
+              const btn = typeof info === 'string' ? undefined : (info.buttonName || info.openButtonName)
+              if (btn?.trim()) { submitButtonName = btn.trim(); break }
+            }
+          }
         }
+        // Fallback: pick the best-matching button from crawled page buttons
+        if (!submitButtonName && submitBtns.length > 0) {
+          const SUBMIT_ACTION_MENU = /^(more|actions?|options?|settings?)$/i
+          const SUBMIT_SUBMENU = /^(delete|remove|archive|clone|duplicate|deactivate|disable|export)$/i
+          const bestBtn = submitBtns.find(b => /create|add|submit/i.test(String(b['name'] ?? '')))
+            ?? submitBtns.find(b => /save/i.test(String(b['name'] ?? '')))
+            ?? submitBtns.find(b => !SUBMIT_ACTION_MENU.test(String(b['name'] ?? '').trim()) && !SUBMIT_SUBMENU.test(String(b['name'] ?? '').trim()))
+            ?? submitBtns[0]
+          const rawLocator = String(bestBtn?.['locator'] ?? bestBtn?.['name'] ?? '')
+          const nameMatch  = rawLocator.match(/name=(.+)$/)
+          submitButtonName = (nameMatch ? nameMatch[1].trim() : String(bestBtn?.['name'] ?? '')).trim()
+        }
+
         if (submitButtonName) {
           pageLines.push(`  │ Step ${stepNum} │ CLICK  │ [SUBMIT BUTTON] target: "${submitButtonName}" (locator_type: "role") │`)
           pageLines.push(`  │         ← COPY THIS NAME EXACTLY — do NOT use "Save" or any other name                     │`)
@@ -4682,6 +5066,25 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
           if (!hasFormFields) {
             log.info(`[GEN] Web App: ${chunks.length} RAG chunks found but NONE contain form field metadata — falling through to standard path for field inference`)
             chunks = [] // clear so we fall through
+          } else {
+            // ── Additional entity relevance check ─────────────────────────────────
+            // Chunks may have form fields but belong to the WRONG entity (e.g. stale
+            // campaign/lead chunks when bank_detail is requested). Verify at least
+            // one chunk URL matches any target entity path segment.
+            const targetPathTokens = targetObjs.map(t => t.toLowerCase().replace(/\s+/g, '_'))
+            const hasEntityMatch = chunks.some(c => {
+              const lower = c.toLowerCase()
+              return targetPathTokens.some(tok =>
+                lower.includes(`/${tok}`) || lower.includes(`_${tok}`) || lower.includes(`${tok}_`)
+              )
+            })
+            if (!hasEntityMatch) {
+              log.info(
+                `[GEN] Web App: RAG chunks have form fields but DON'T match targets [${targetObjs.join(', ')}] — ` +
+                `chunks are from a different entity (stale embeddings). Clearing to use canonical fallback.`
+              )
+              chunks = []
+            }
           }
         }
 
@@ -4990,6 +5393,80 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
     try {
       const targetObjs = extractTargetObjects(prompt)
       log.info(`[GEN] Standard path: Web App — building structured context, targets=[${targetObjs.join(', ')}]`)
+
+      // ── PRIORITY 0: metadata_canonical direct lookup ────────────────────────
+      // Check canonical table FIRST. This is faster and more accurate than
+      // buildWebAppStructuredContext when crawled pages are missing or stale
+      // (e.g. after a base URL change where old embeddings reference the old domain).
+      // If found, we skip buildWebAppStructuredContext entirely to avoid the
+      // domain_models fallback accidentally returning unrelated entity fields.
+      const targetLowersForCanon = targetObjs.map(t => t.toLowerCase())
+      let canonContextBuilt = false
+      for (const target of targetLowersForCanon) {
+        try {
+          const canonRows = await prisma.metadata_canonical.findMany({
+            where: {
+              project_id,
+              entity_name: { contains: target, mode: 'insensitive' },
+            },
+            orderBy: { last_synced_at: 'desc' },
+            take: 3,
+          })
+          const canon = canonRows.find(r => r.entity_type === 'form') ?? canonRows[0]
+          if (!canon) continue
+
+          const formFields  = (canon.form_fields   ?? []) as Array<Record<string, unknown>>
+          const reqFields   = (canon.required_fields ?? []) as Array<Record<string, unknown>>
+          const optFields   = (canon.optional_fields ?? []) as Array<Record<string, unknown>>
+          const allFields   = formFields.length > 0 ? formFields : [...reqFields, ...optFields]
+          if (allFields.length === 0) continue
+
+          const entityName  = canon.entity_name
+          const submitBtn   = canon.primary_action_button ?? `Create ${entityName}`
+          const pageUrl     = canon.page_url ?? `/custom/${entityName}`
+          const listPath    = pageUrl.replace(/\/(new|create|add)(\/.*)?$/, '') || pageUrl
+
+          const parts: string[] = [
+            `=== WEB APPLICATION PAGE METADATA (metadata_canonical: "${entityName}") ===`,
+            `Use EXACT field labels and button names. Navigate to the create page listed below.`,
+            '',
+            `📄 PAGE URLS:`,
+            `   List/Entity Page: ${listPath}`,
+            `   Create Page:      ${pageUrl}`,
+            '',
+            `--- Page: ${pageUrl} ---`,
+          ]
+
+          const req = allFields.filter(f => Boolean(f['required']))
+          const opt = allFields.filter(f => !Boolean(f['required']))
+
+          if (req.length > 0) {
+            parts.push('  ⚠ REQUIRED Fields (MUST fill — test WILL FAIL if omitted):')
+            for (const f of req) {
+              parts.push(`    [REQUIRED] locator: "${String(f['label'] ?? '')}"  locator_type: "label"  tag: input`)
+            }
+          }
+          if (opt.length > 0) {
+            parts.push('  Optional Fields:')
+            for (const f of opt.slice(0, 10)) {
+              parts.push(`    [OPTIONAL] locator: "${String(f['label'] ?? '')}"  locator_type: "label"  tag: input`)
+            }
+          }
+          parts.push(`  ⚡ SUBMIT / ACTION BUTTONS:`)
+          parts.push(`    ⚡ BUTTON NAME: "${submitBtn}"  (locator_type: role)`)
+          parts.push('')
+          parts.push('=== END OF WEB APPLICATION PAGE METADATA ===')
+
+          webAppRagContext = parts.join('\n')
+          canonContextBuilt = true
+          log.info(`[GEN] Standard path (PRIORITY-0): using metadata_canonical for "${entityName}" — ${allFields.length} fields, btn="${submitBtn}", url="${pageUrl}"`)
+          break
+        } catch (canonErr) {
+          log.warn({ err: canonErr }, '[GEN] Standard path: metadata_canonical lookup failed — continuing')
+        }
+      }
+
+      if (!canonContextBuilt) {
       // buildWebAppStructuredContext pulls from metadata_normalized and scores pages
       // by relevance to the target entity, then formats them with exact locator info.
       const structured = await buildWebAppStructuredContext(project_id, targetObjs, [], testIntent, globalEntityUrlMap)
@@ -5056,10 +5533,12 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
           log.info('[GEN] Standard path: web app project has no crawled domain models yet')
         }
       }
+      } // end if (!canonContextBuilt)
     } catch (err) {
       log.warn({ err }, '[GEN] Standard path: non-critical web app metadata injection error')
     }
   }
+
 
 
   // ── On-demand live page scrape (web app, no metadata) ─────────────────
@@ -5082,6 +5561,36 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
       for (const ent of [...entityCandidates].reverse()) {
         candidatePaths.push(`/${ent}s/create`, `/${ent}s/new`, `/${ent}/create`, `/${ent}/new`, `/${ent}s/add`)
       }
+
+      // ── Also try compound (underscore/hyphen slug) entity paths ──────────────
+      // e.g. "Bank Detail" → try /custom/bank_detail, /bank_details/create, etc.
+      // This handles CRM-D style entities stored under /custom/* routes.
+      const contentCandidates = wordsAfterVerb.filter(w => w.length > 2 && !SKIP_WORDS.has(w))
+      if (contentCandidates.length >= 2) {
+        // Build slug forms from consecutive word pairs and triples
+        for (let i = 0; i < contentCandidates.length - 1; i++) {
+          const underSlug  = contentCandidates.slice(i, i + 2).join('_')  // bank_detail
+          const hyphenSlug = contentCandidates.slice(i, i + 2).join('-')  // bank-detail
+          const noSlug     = contentCandidates.slice(i, i + 2).join('')   // bankdetail
+          // /custom/* path family (common in many CRM/ERP webapps)
+          candidatePaths.unshift(
+            `/custom/${underSlug}`,
+            `/custom/${underSlug}s`,
+            `/custom/${hyphenSlug}`,
+          )
+          // Standard path variants
+          candidatePaths.push(
+            `/${underSlug}s/create`, `/${underSlug}/create`, `/${underSlug}s/new`, `/${underSlug}/new`,
+            `/${hyphenSlug}s/create`, `/${hyphenSlug}/create`, `/${noSlug}s/create`, `/${noSlug}/create`,
+          )
+        }
+        if (contentCandidates.length >= 3) {
+          const triSlug = contentCandidates.slice(0, 3).join('_')
+          candidatePaths.unshift(`/custom/${triSlug}`, `/custom/${triSlug}s`)
+          candidatePaths.push(`/${triSlug}s/create`, `/${triSlug}/create`)
+        }
+      }
+
 
       if (candidatePaths.length > 0) {
         // 2. Get project credentials

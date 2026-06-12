@@ -244,6 +244,7 @@ export class BrowserPool {
     const context = await browser.newContext({
       viewport:          { width: 1280, height: 800 },
       deviceScaleFactor: 1,   // Prevent Retina/HiDPI 2× zoom on macOS
+      ignoreHTTPSErrors: true, // Bypass SSL errors (e.g. ERR_SSL_PROTOCOL_ERROR, self-signed certs)
       ...(storageState ? { storageState } : {}),
     })
 

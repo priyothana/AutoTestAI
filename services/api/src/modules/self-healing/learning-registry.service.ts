@@ -231,10 +231,12 @@ export async function saveGenerationOutcome(
   try {
     const normalizedEntity = outcome.entityName.toLowerCase().trim()
 
+    const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(testCaseId)
+
     await prisma.execution_learnings.create({
       data: {
         project_id:       projectId,
-        test_case_id:     testCaseId,
+        test_case_id:     isValidUuid ? testCaseId : null,
         learning_type:    'generation_outcome',
         object_name:      normalizedEntity,
         field_name:       outcome.testName.slice(0, 255),

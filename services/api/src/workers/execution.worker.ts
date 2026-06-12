@@ -77,6 +77,44 @@ function sessionExists(projectId: string): boolean {
   try { return fs.existsSync(p) && fs.statSync(p).size > 10 } catch { return false }
 }
 
+/**
+ * Read the stored session file and return auth-bearing localStorage entries.
+ * Filters out pure UI-preference keys (theme, language, layout) that are not auth data.
+ */
+function readSessionLocalStorage(projectId: string): Array<{ origin: string; key: string; value: string }> {
+  try {
+    const raw = fs.readFileSync(getSessionPath(projectId), 'utf-8')
+    const state = JSON.parse(raw) as {
+      cookies: unknown[]
+      origins: Array<{ origin: string; localStorage?: Array<{ name: string; value: string }> }>
+    }
+    const AUTH_KEY = /token|auth|session|jwt|user|credential|login|access|refresh|id_token|bearer|apikey|api_key|identity/i
+    const UI_KEY = /theme|lang|locale|color|layout|sidebar|dark|light|pref|setting|collapse|sort|filter|page|size|view|tab/i
+    const result: Array<{ origin: string; key: string; value: string }> = []
+    for (const origin of (state.origins ?? [])) {
+      for (const item of (origin.localStorage ?? [])) {
+        if (AUTH_KEY.test(item.name) && !UI_KEY.test(item.name) && item.value.length > 10) {
+          result.push({ origin: origin.origin, key: item.name, value: item.value })
+        }
+      }
+    }
+    return result
+  } catch { return [] }
+}
+
+/**
+ * Returns true if the stored session has actual auth data —
+ * i.e. cookies OR auth-bearing localStorage tokens (not just UI preferences like theme).
+ */
+function sessionHasAuthData(projectId: string): boolean {
+  try {
+    const raw = fs.readFileSync(getSessionPath(projectId), 'utf-8')
+    const state = JSON.parse(raw) as { cookies: unknown[]; origins: unknown[] }
+    if ((state.cookies as unknown[]).length > 0) return true
+    return readSessionLocalStorage(projectId).length > 0
+  } catch { return false }
+}
+
 async function saveSession(projectId: string, browserCtx: BrowserContext): Promise<void> {
   try {
     await browserCtx.storageState({ path: getSessionPath(projectId) })
@@ -4736,84 +4774,165 @@ async function loginToSalesforce(
   }
 }
 
-// ─── WebApp login ─────────────────────────────────────────────────────────────
+// ─── WebApp login ─────────────────────────────────────────────────────────────────────────────────
 
 async function loginToWebApp(
   page: Page,
   browserCtx: BrowserContext,
   context: ExecutionJob['context'],
   projectId: string,
+  hasStoredSession = false,
 ): Promise<void> {
   if (!context.webLoginUrl || !context.webUsername || !context.webPassword) {
-    log.info('[EXEC-WEB] No web credentials configured — skipping login')
+    log.info('[EXEC-WEB] No web credentials configured - skipping login')
     return
   }
 
   const strategy = context.webLoginStrategy ?? 'form'
-  log.info(`[EXEC-WEB] Logging in via strategy="${strategy}" to ${context.webLoginUrl}`)
+  // Tracks whether we've already navigated to the login page (e.g. from basic_auth fallthrough
+  // or session validation check) so we don't double-navigate in the form login section.
+  let alreadyOnLoginPage = false
 
+  // HTTP Basic Auth: credentials are not stored in storageState (HTTP headers, not cookies).
+  // Re-auth on every run. Use setHTTPCredentials() for true HTTP Basic Auth apps.
+  // IMPORTANT: some apps are tagged 'basic_auth' but actually use a form login (email/password).
+  // After navigating, we check if a form appeared and fill it — handles both cases.
   if (strategy === 'basic_auth') {
-    const url = new URL(context.webLoginUrl)
-    url.username = context.webUsername
-    url.password = context.webPassword
-    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 30_000 })
-    await page.waitForTimeout(2_000)
-    await saveSession(projectId, browserCtx)
-    log.info('[EXEC-WEB] ✅ Basic auth login complete')
-    return
+    log.info(`[EXEC-WEB] Basic auth login to ${context.webLoginUrl}`)
+    try {
+      await browserCtx.setHTTPCredentials({ username: context.webUsername, password: context.webPassword })
+    } catch (credErr) {
+      log.warn({ credErr }, '[EXEC-WEB] setHTTPCredentials failed (non-fatal) — will try form login if available')
+    }
+
+    await page.goto(context.webLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await page.waitForTimeout(2_500)
+
+    // Check if the page rendered a form-based login (app may ignore HTTP Basic Auth headers)
+    const hasPasswordField = await page.locator('input[type="password"]').first()
+      .isVisible({ timeout: 3_000 }).catch(() => false)
+
+    if (!hasPasswordField) {
+      // True HTTP Basic Auth — credentials were accepted via headers, app loaded
+      await saveSession(projectId, browserCtx)
+      log.info(`[EXEC-WEB] Basic auth (HTTP headers) complete -> ${page.url()}`)
+      return
+    }
+
+    // App shows a form login — fall through to form-based login below.
+    // This handles apps incorrectly tagged as 'basic_auth' that use email/password forms.
+    log.info('[EXEC-WEB] basic_auth: page shows a login form — switching to form login strategy')
+    // Mark that we are already on the login page — skip redundant navigation below
+    alreadyOnLoginPage = true
+    // (falls through to form login code below)
   }
 
-  // ── Form-based login ────────────────────────────────────────────────────────
-  await page.goto(context.webLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-  // Give SPAs (React/Vue/Angular) extra time to mount the login form in the DOM
-  await page.waitForTimeout(3_000)
+  // Form login: try stored session first.
+  // SPAs store auth tokens in localStorage. storageState saves it, but tokens must be
+  // injected via addInitScript() BEFORE app JS runs - otherwise the SPA finds localStorage
+  // empty and redirects to login (even though storageState was loaded correctly).
+  if (hasStoredSession && sessionHasAuthData(projectId)) {
+    const storedTokens = readSessionLocalStorage(projectId)
 
-  // ── Already logged in guard ─────────────────────────────────────────────
-  // If the login URL redirected to the home/dashboard (valid session), there
-  // will be NO password field. Check this FIRST before filling any input —
-  // otherwise the generic 'input[type="text"]' fallback fills the global
-  // search bar with the email address.
-  const alreadyLoggedIn = !(await page.locator('input[type="password"]').first().isVisible({ timeout: 3_000 }).catch(() => false))
+    if (storedTokens.length > 0) {
+      // localStorage-based auth: inject tokens before every page load via addInitScript
+      log.info(
+        { tokenKeys: storedTokens.map(t => t.key) },
+        '[EXEC-WEB] localStorage auth tokens found - injecting via addInitScript',
+      )
+      const tokenSnapshot = storedTokens.map(t => ({ key: t.key, value: t.value }))
+      await browserCtx.addInitScript(
+        (tokens: Array<{ key: string; value: string }>) => {
+          try {
+            for (const t of tokens) {
+              if (!localStorage.getItem(t.key)) localStorage.setItem(t.key, t.value)
+            }
+          } catch { /* blocked in sandboxed iframes - ignore */ }
+        },
+        tokenSnapshot,
+      )
+      log.info('[EXEC-WEB] addInitScript set - localStorage tokens injected on every page load')
+
+      const targetUrl = context.baseUrl || context.webLoginUrl
+      try {
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 })
+        await page.waitForTimeout(2_500)
+
+        const pwdField = await page.locator('input[type="password"]').first()
+          .isVisible({ timeout: 3_000 }).catch(() => false)
+        if (!pwdField) {
+          log.info(`[EXEC-WEB] localStorage session valid - skipping credential login (${page.url()})`)
+          return
+        }
+
+        const injected = await page.evaluate(
+          (keys: string[]) => keys.some(k => !!localStorage.getItem(k)),
+          storedTokens.map(t => t.key),
+        ).catch(() => false)
+        log.warn(injected
+          ? '[EXEC-WEB] Token injected but app shows login form - session expired. Falling back to credentials'
+          : '[EXEC-WEB] Tokens missing after nav - app clears storage on load. Falling back to credentials')
+        alreadyOnLoginPage = true
+      } catch (navErr) {
+        log.warn({ navErr }, '[EXEC-WEB] Session nav failed - falling back to credentials')
+      }
+
+    } else {
+      // Cookie-based session: validate by checking if app requires re-login
+      const checkUrl = context.baseUrl || context.webLoginUrl
+      log.info(`[EXEC-WEB] Cookie-based session - validating at ${checkUrl}`)
+      try {
+        await page.goto(checkUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
+        await page.waitForTimeout(2_000)
+        const pwdVisible = await page.locator('input[type="password"]').first()
+          .isVisible({ timeout: 3_000 }).catch(() => false)
+        if (!pwdVisible) {
+          log.info(`[EXEC-WEB] Cookie session valid - skipping credential login (${page.url()})`)
+          return
+        }
+        log.info('[EXEC-WEB] Cookie session expired - falling back to credential login')
+        alreadyOnLoginPage = true
+      } catch (cookieErr) {
+        log.warn({ cookieErr }, '[EXEC-WEB] Cookie session check failed - falling back to credentials')
+      }
+    }
+  } else if (hasStoredSession) {
+    log.info('[EXEC-WEB] Stored session has no auth data (UI prefs only) - proceeding with credential login')
+  }
+
+  // Full credential (form) login fallback
+  log.info(`[EXEC-WEB] Logging in via strategy="form" to ${context.webLoginUrl}`)
+  if (!alreadyOnLoginPage) {
+    await page.goto(context.webLoginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+    await page.waitForTimeout(3_000)
+  } else {
+    // Already on the login page — just wait briefly for any pending renders
+    await page.waitForTimeout(500)
+  }
+
+  // Already-logged-in guard: if no password field visible, session is active
+  const alreadyLoggedIn = !(await page.locator('input[type="password"]').first()
+    .isVisible({ timeout: 3_000 }).catch(() => false))
   if (alreadyLoggedIn) {
-    log.info('[EXEC-WEB] ✅ Already authenticated (no password field) — skipping login')
+    log.info('[EXEC-WEB] Already authenticated (no password field) - skipping login')
     return
   }
 
-  // Broad locator covering all common login field patterns.
-  // input[type="text"] is the last fallback — catches generic CRM/SaaS text inputs
-  // that don’t declare type="email" or a recognised name/id attribute.
   const usernameSelectors = [
-    'input[type="email"]',
-    'input[name="email"]',
-    'input[name="username"]',
-    'input[name="user"]',
-    'input[name="login"]',
-    'input[id="email"]',
-    'input[id="username"]',
-    'input[id="user"]',
-    'input[placeholder*="email" i]',
-    'input[placeholder*="username" i]',
-    'input[placeholder*="user" i]',
-    'input[autocomplete="username"]',
-    'input[autocomplete="email"]',
-    // Generic text input — last resort, picks the first visible text field on the page
-    'input[type="text"]',
+    'input[type="email"]', 'input[name="email"]', 'input[name="username"]',
+    'input[name="user"]', 'input[name="login"]', 'input[id="email"]',
+    'input[id="username"]', 'input[id="user"]', 'input[placeholder*="email" i]',
+    'input[placeholder*="username" i]', 'input[placeholder*="user" i]',
+    'input[autocomplete="username"]', 'input[autocomplete="email"]', 'input[type="text"]',
   ]
-  const passwordSelectors = [
-    'input[type="password"]',
-  ]
-
   const usernameInput = page.locator(usernameSelectors.join(', ')).first()
-  const passwordInput = page.locator(passwordSelectors.join(', ')).first()
+  const passwordInput = page.locator('input[type="password"]').first()
 
   const formFound = await usernameInput.isVisible({ timeout: 10_000 }).catch(() => false)
   if (!formFound) {
-    // Non-fatal: stored session cookies may still be valid from a previous run.
-    // The test steps will fail with a meaningful error at the right step if login is truly required.
     log.warn(
-      `[EXEC-WEB] ⚠️  Login form not detected at ${context.webLoginUrl} after 10s. ` +
-      'Continuing with stored session (if any). ' +
-      'If tests fail, verify the Login URL in Integration → Session & Login settings.'
+      `[EXEC-WEB] Login form not detected at ${context.webLoginUrl} after 10s. ` +
+      'Continuing with stored session (if any). If tests fail, verify the Login URL.',
     )
     return
   }
@@ -4821,9 +4940,8 @@ async function loginToWebApp(
   await usernameInput.fill(context.webUsername)
   log.info('[EXEC-WEB] Filled username/email')
 
-  const pwdVisible = await passwordInput.isVisible({ timeout: 5_000 }).catch(() => false)
-  if (!pwdVisible) {
-    // Some apps render password field after username submit (e.g. Google-style)
+  const pwdVisible2 = await passwordInput.isVisible({ timeout: 5_000 }).catch(() => false)
+  if (!pwdVisible2) {
     await page.keyboard.press('Enter')
     await page.waitForTimeout(1_500)
   }
@@ -4833,10 +4951,9 @@ async function loginToWebApp(
     await passwordInput.fill(context.webPassword)
     log.info('[EXEC-WEB] Filled password')
   } else {
-    log.warn('[EXEC-WEB] ⚠️  Password field not visible after 8s — skipping password fill')
+    log.warn('[EXEC-WEB] Password field not visible after 8s - skipping password fill')
   }
 
-  // Submit — prefer explicit submit button, fall back to Enter
   const submitBtn = page.locator(
     'button[type="submit"], input[type="submit"], ' +
     'button:has-text("Sign in"), button:has-text("Log in"), ' +
@@ -4850,19 +4967,17 @@ async function loginToWebApp(
     await page.keyboard.press('Enter')
   }
 
-  // Wait for navigation (post-login redirect)
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => { })
   await page.waitForTimeout(2_000)
 
-  // Verify we actually left the login page
   const currentUrl = page.url()
   const loginHostname = (() => { try { return new URL(context.webLoginUrl).hostname } catch { return '' } })()
   const isStillOnLoginPage = currentUrl === context.webLoginUrl ||
     (currentUrl.includes('/login') && loginHostname !== '' && currentUrl.includes(loginHostname))
   if (isStillOnLoginPage) {
-    log.warn(`[EXEC-WEB] ⚠️  Still on login URL after submit: ${currentUrl}. Credentials may be invalid.`)
+    log.warn(`[EXEC-WEB] Still on login URL after submit: ${currentUrl}. Credentials may be invalid.`)
   } else {
-    log.info(`[EXEC-WEB] ✅ Form login succeeded → ${currentUrl}`)
+    log.info(`[EXEC-WEB] Form login succeeded -> ${currentUrl}`)
   }
 
   await saveSession(projectId, browserCtx)
@@ -5178,77 +5293,291 @@ async function injectPauseOverlay(
   const jSecs     = JSON.stringify(secs)
 
   const script = `(function(){
+try {
 var stepNum=${jStepNum},tgt=${jTgt},valHtml=${jVal},errTxt=${jErr},minSec=${jMinSec},remSec=${jRemSec},secs=${jSecs};
+
+/* Remove existing overlay */
 var prev=document.getElementById('autotest-pause-overlay');if(prev)prev.remove();
 var ps=document.getElementById('at-hitl-style');if(ps)ps.remove();
-document.body.removeAttribute('data-autotest-hitl-action');
+if(document.body)document.body.removeAttribute('data-autotest-hitl-action');
 try{sessionStorage.removeItem('autotest-hitl-action');}catch(e){}
 
+/* Inject CSS */
 var styleEl=document.createElement('style');
 styleEl.id='at-hitl-style';
-styleEl.textContent='@keyframes at-in{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}@keyframes at-fd{from{opacity:0}to{opacity:1}}@keyframes at-b{0%,60%,100%{transform:scale(0)}30%{transform:scale(1)}}#at-card{animation:at-in .3s cubic-bezier(.2,.8,.4,1) both}.at-msg{animation:at-fd .2s ease both}.at-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#d97706;margin:0 2px}.at-dot:nth-child(1){animation:at-b 1.1s 0s infinite}.at-dot:nth-child(2){animation:at-b 1.1s .2s infinite}.at-dot:nth-child(3){animation:at-b 1.1s .4s infinite}.at-abtn{display:block;text-decoration:none;text-align:center;user-select:none;-webkit-user-select:none;cursor:pointer;transition:filter .1s,transform .1s;font-family:inherit}.at-abtn:hover{filter:brightness(1.15)}.at-abtn:active{transform:scale(.96)}#at-inp{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);border-radius:8px;color:#e2e8f0;font-size:12px;padding:0 10px;height:34px;flex:1;box-sizing:border-box;font-family:inherit;outline:none}#at-inp:focus{border-color:#d97706;box-shadow:0 0 0 2px rgba(217,119,6,.2)}#at-inp::placeholder{color:#4b5563}#at-snd{background:linear-gradient(135deg,#d97706,#b45309);border:none;border-radius:8px;color:#fff;cursor:pointer;width:34px;height:34px;flex-shrink:0;font-size:14px}.at-chip{border:1px solid rgba(217,119,6,.4);background:rgba(217,119,6,.12);color:#fbbf24;font-size:10px;padding:3px 8px;border-radius:999px;cursor:pointer;font-family:inherit}.at-chip:hover{background:rgba(217,119,6,.28)}';
-document.head.appendChild(styleEl);
+styleEl.textContent=
+  '@keyframes at-in{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}'+
+  '@keyframes at-fd{from{opacity:0}to{opacity:1}}'+
+  '@keyframes at-b{0%,60%,100%{transform:scale(0)}30%{transform:scale(1)}}'+
+  '#at-card{animation:at-in .35s cubic-bezier(.2,.8,.4,1) both}'+
+  '.at-msg{animation:at-fd .2s ease both}'+
+  '.at-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#d97706;margin:0 2px}'+
+  '.at-dot:nth-child(1){animation:at-b 1.1s 0s infinite}'+
+  '.at-dot:nth-child(2){animation:at-b 1.1s .2s infinite}'+
+  '.at-dot:nth-child(3){animation:at-b 1.1s .4s infinite}'+
+  '.at-chip{border:1px solid rgba(217,119,6,.4);background:rgba(217,119,6,.12);color:#fbbf24;font-size:10px;padding:3px 8px;border-radius:999px;cursor:pointer;font-family:inherit}'+
+  '.at-chip:hover{background:rgba(217,119,6,.28)}';
+(document.head||document.documentElement).appendChild(styleEl);
 
-var wrap=document.createElement('div');
-wrap.id='autotest-pause-overlay';
-wrap.style.cssText='position:fixed;bottom:20px;right:20px;z-index:2147483647;width:420px;max-width:calc(100vw - 36px);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif';
+/* Host container — fixed to viewport, appended to <html> to bypass body overflow:hidden */
+var host=document.createElement('div');
+host.id='autotest-pause-overlay';
+host.setAttribute('style',
+  'all:initial !important;position:fixed !important;bottom:20px !important;right:20px !important;'+
+  'z-index:2147483647 !important;width:380px !important;max-width:calc(100vw - 32px) !important;'+
+  'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif !important;'+
+  'display:block !important;pointer-events:auto !important;box-sizing:border-box !important'
+);
 
-wrap.innerHTML='<div id="at-card" style="background:linear-gradient(160deg,#0d1117,#161d2e);border:1px solid rgba(217,119,6,.45);border-radius:18px;overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,.8);display:flex;flex-direction:column;max-height:calc(100vh - 40px)">'
-+'<div id="at-drag" style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:linear-gradient(135deg,#3b1500,#161d2e);border-bottom:1px solid rgba(217,119,6,.2);cursor:grab;flex-shrink:0;user-select:none;-webkit-user-select:none">'
-+'<div style="width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;pointer-events:none">\u23f8</div>'
-+'<div style="flex:1;pointer-events:none"><div style="display:flex;align-items:center;gap:6px"><span style="color:#fff;font-size:12px;font-weight:800;letter-spacing:.14em">NEXUS</span><span style="font-size:8px;padding:1px 6px;border-radius:999px;background:rgba(217,119,6,.22);color:#fbbf24;font-weight:700;border:1px solid rgba(217,119,6,.35)">HITL</span><span style="width:6px;height:6px;border-radius:50%;background:#f59e0b;display:inline-block"></span></div><div style="color:#d97706;font-size:10px;font-weight:600;margin-top:1px">Test Paused \u2014 Step '+stepNum+' needs action</div></div>'
-+'<div style="display:flex;flex-direction:column;gap:2px;opacity:.3;pointer-events:none"><div style="display:flex;gap:2px"><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span></div><div style="display:flex;gap:2px"><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span><span style="width:3px;height:3px;background:#94a3b8;border-radius:50%;display:block"></span></div></div></div>'
-+'<div style="padding:9px 12px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0"><div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:8px 10px;margin-bottom:6px"><span style="color:#e2e8f0;font-size:12px;font-weight:700">Step '+stepNum+' \u2014 </span><span style="color:#fbbf24;font-size:12px;font-weight:700">'+tgt+'</span>'+valHtml+'</div><div style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.22);border-radius:8px;padding:7px 10px;max-height:52px;overflow-y:auto"><span style="color:#fca5a5;font-size:10.5px;line-height:1.5">'+errTxt+'</span></div></div>'
-+'<div id="at-sugg" style="display:none;margin:8px 12px 0;padding:10px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);border-radius:10px;flex-shrink:0"><div style="display:flex;gap:7px;align-items:flex-start;margin-bottom:8px"><span style="font-size:14px;flex-shrink:0">\ud83d\udca1</span><div><div style="color:#86efac;font-size:9px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;margin-bottom:3px">AI Suggestion</div><div id="at-sugg-text" style="color:#e2e8f0;font-size:11px;line-height:1.5"></div></div></div><div style="display:flex;gap:6px"><button id="at-acc" class="at-abtn" style="flex:1;padding:7px 0;border-radius:7px;font-size:11px;font-weight:700;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;border:none">\u2713 Accept &amp; Resume</button><button id="at-rej" class="at-abtn" style="flex:1;padding:7px 0;border-radius:7px;font-size:11px;font-weight:600;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.3);color:#fca5a5">\u2717 Reject</button></div></div>'
-+'<div id="at-chat" style="flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:7px;min-height:80px;max-height:190px"><div id="at-typing" style="display:flex;align-items:center;gap:6px"><div style="width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0">\ud83e\udd16</div><div style="padding:8px 10px;border-radius:9px;border-top-left-radius:2px;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.25)"><span class="at-dot"></span><span class="at-dot"></span><span class="at-dot"></span></div></div></div>'
-+'<div style="padding:8px 12px 10px;border-top:1px solid rgba(255,255,255,.07);flex-shrink:0"><div style="display:flex;gap:6px;align-items:center;margin-bottom:8px"><input id="at-inp" type="text" placeholder="Describe your fix\u2026"><button id="at-snd" style="width:34px;height:34px;display:flex;align-items:center;justify-content:center">\u27a4</button></div><div style="display:flex;gap:7px;margin-bottom:7px"><a id="autotest-resume-btn" class="at-abtn" href="/autotest-hitl-signal?action=resume" target="at-frame" style="flex:1;padding:10px 0;border-radius:9px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:12px;font-weight:700">\u25b6 Resume</a><a id="autotest-skip-btn" class="at-abtn" href="/autotest-hitl-signal?action=skip" target="at-frame" style="flex:1;padding:10px 0;border-radius:9px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:#cbd5e1;font-size:12px;font-weight:600">\u23ed Skip Step</a></div><a id="autotest-stop-btn" class="at-abtn" href="/autotest-hitl-signal?action=stop" target="at-frame" style="display:block;padding:9px 0;border-radius:9px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:12px;font-weight:700;box-sizing:border-box">\u23f9 Stop Testing</a><div style="margin-top:7px;text-align:center"><span style="color:#374151;font-size:10px">Auto-timeout in </span><span id="at-timer" style="color:#4b5563;font-size:10px;font-weight:600">'+minSec+':'+remSec+'</span></div></div>'
-+'<iframe name="at-frame" style="display:none;width:0;height:0;border:none;position:absolute" aria-hidden="true"></iframe>'
-+'<input type="checkbox" id="autotest-resume-chk" style="display:none;position:absolute">'
-+'<input type="checkbox" id="autotest-skip-chk" style="display:none;position:absolute">'
-+'<input type="checkbox" id="autotest-stop-chk" style="display:none;position:absolute">'
-+'</div>';
+/* Main card */
+var inner=document.createElement('div');
+inner.id='at-card';
+inner.setAttribute('style',
+  'background:linear-gradient(160deg,#0d1117,#161d2e) !important;'+
+  'border:1px solid rgba(217,119,6,.5) !important;border-radius:16px !important;'+
+  'overflow:hidden !important;box-shadow:0 24px 64px rgba(0,0,0,.85) !important;'+
+  'display:flex !important;flex-direction:column !important;max-height:calc(100vh - 44px) !important'
+);
 
-document.body.appendChild(wrap);
+/* Header */
+var hdr=document.createElement('div');
+hdr.id='at-drag';
+hdr.setAttribute('style','display:flex;align-items:center;gap:10px;padding:11px 14px;background:linear-gradient(135deg,#3b1500,#161d2e);border-bottom:1px solid rgba(217,119,6,.2);cursor:grab;flex-shrink:0;user-select:none;-webkit-user-select:none');
+var hdrIcon=document.createElement('div');
+hdrIcon.setAttribute('style','width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0');
+hdrIcon.textContent='\u23f8';
+var hdrText=document.createElement('div');
+hdrText.setAttribute('style','flex:1');
+var hdrTitle=document.createElement('div');
+hdrTitle.setAttribute('style','color:#fff;font-size:11px;font-weight:800;letter-spacing:.12em;display:flex;align-items:center;gap:5px');
+hdrTitle.textContent='NEXUS ';
+var badge=document.createElement('span');
+badge.setAttribute('style','font-size:8px;padding:1px 5px;border-radius:999px;background:rgba(217,119,6,.22);color:#fbbf24;font-weight:700;border:1px solid rgba(217,119,6,.35)');
+badge.textContent='HITL';
+hdrTitle.appendChild(badge);
+var hdrSub=document.createElement('div');
+hdrSub.setAttribute('style','color:#d97706;font-size:10px;font-weight:600;margin-top:2px');
+hdrSub.textContent='Step '+stepNum+' paused \u2014 needs action';
+hdrText.appendChild(hdrTitle);hdrText.appendChild(hdrSub);
+/* Close button — hides the overlay, test keeps running */
+var closeBtn=document.createElement('button');
+closeBtn.setAttribute('style','background:none;border:none;cursor:pointer;color:rgba(217,119,6,.6);font-size:14px;width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-left:auto;transition:background .15s');
+closeBtn.innerHTML='\u00d7';
+closeBtn.title='Hide panel (test keeps running)';
+closeBtn.onmouseenter=function(){closeBtn.style.background='rgba(239,68,68,.18)';closeBtn.style.color='#fca5a5';};
+closeBtn.onmouseleave=function(){closeBtn.style.background='none';closeBtn.style.color='rgba(217,119,6,.6)';};
+closeBtn.addEventListener('click',function(e){e.stopPropagation();host.style.display='none';clearInterval(timerRef);});
+hdr.appendChild(hdrIcon);hdr.appendChild(hdrText);hdr.appendChild(closeBtn);
 
-var chatEl=document.getElementById('at-chat'),typingEl=document.getElementById('at-typing'),inpEl=document.getElementById('at-inp'),sndEl=document.getElementById('at-snd'),suggEl=document.getElementById('at-sugg'),suggTxt=document.getElementById('at-sugg-text'),accEl=document.getElementById('at-acc'),rejEl=document.getElementById('at-rej');
+/* Step info section */
+var info=document.createElement('div');
+info.setAttribute('style','padding:9px 12px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0');
+var stepBox=document.createElement('div');
+stepBox.setAttribute('style','background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:7px 10px;margin-bottom:6px');
+var stepLabel=document.createElement('span');
+stepLabel.setAttribute('style','color:#e2e8f0;font-size:12px;font-weight:700');
+stepLabel.textContent='Step '+stepNum+' \u2014 ';
+var stepTarget=document.createElement('span');
+stepTarget.setAttribute('style','color:#fbbf24;font-size:12px;font-weight:700');
+stepTarget.textContent=tgt;
+stepBox.appendChild(stepLabel);stepBox.appendChild(stepTarget);
+if(valHtml){var vSpan=document.createElement('span');vSpan.setAttribute('style','color:#10b981;font-size:11px;display:block;margin-top:2px');vSpan.textContent=valHtml;stepBox.appendChild(vSpan);}
+var errBox=document.createElement('div');
+errBox.setAttribute('style','background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.22);border-radius:8px;padding:7px 10px;max-height:52px;overflow-y:auto');
+var errSpan=document.createElement('span');
+errSpan.setAttribute('style','color:#fca5a5;font-size:10px;line-height:1.5');
+errSpan.textContent=errTxt;
+errBox.appendChild(errSpan);
+info.appendChild(stepBox);info.appendChild(errBox);
+
+/* Chat area */
+var chatEl=document.createElement('div');
+chatEl.id='at-chat';
+chatEl.setAttribute('style','flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:6px;min-height:80px;max-height:180px');
+var typingEl=document.createElement('div');
+typingEl.id='at-typing';
+typingEl.setAttribute('style','display:flex;align-items:center;gap:6px');
+var typingIcon=document.createElement('div');
+typingIcon.setAttribute('style','width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0');
+typingIcon.textContent='\ud83e\udd16';
+var typingBubble=document.createElement('div');
+typingBubble.setAttribute('style','padding:8px 10px;border-radius:9px;border-top-left-radius:2px;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.25)');
+for(var di=0;di<3;di++){var dot=document.createElement('span');dot.className='at-dot';typingBubble.appendChild(dot);}
+typingEl.appendChild(typingIcon);typingEl.appendChild(typingBubble);
+chatEl.appendChild(typingEl);
+
+/* Footer */
+var footer=document.createElement('div');
+footer.setAttribute('style','padding:8px 12px 10px;border-top:1px solid rgba(255,255,255,.07);flex-shrink:0');
+
+var inpRow=document.createElement('div');
+inpRow.setAttribute('style','display:flex;gap:6px;align-items:center;margin-bottom:7px');
+var inpEl=document.createElement('input');
+inpEl.id='at-inp';inpEl.type='text';inpEl.placeholder='Describe your fix\u2026';
+inpEl.setAttribute('style','background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);border-radius:8px;color:#e2e8f0;font-size:12px;padding:0 10px;height:34px;flex:1;box-sizing:border-box;font-family:inherit;outline:none');
+var sndEl=document.createElement('button');
+sndEl.id='at-snd';
+sndEl.setAttribute('style','background:linear-gradient(135deg,#d97706,#b45309);border:none;border-radius:8px;color:#fff;cursor:pointer;width:34px;height:34px;flex-shrink:0;font-size:14px;display:flex;align-items:center;justify-content:center');
+sndEl.textContent='\u27a4';
+inpRow.appendChild(inpEl);inpRow.appendChild(sndEl);
+
+var actionRow=document.createElement('div');
+actionRow.setAttribute('style','display:flex;gap:6px;margin-bottom:6px');
+var rBtn=document.createElement('button');
+rBtn.id='autotest-resume-btn';
+rBtn.setAttribute('style','flex:1;padding:9px 0;border-radius:9px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit');
+rBtn.textContent='\u25b6 Resume';
+var sBtn=document.createElement('button');
+sBtn.id='autotest-skip-btn';
+sBtn.setAttribute('style','flex:1;padding:9px 0;border-radius:9px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:#cbd5e1;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit');
+sBtn.textContent='\u23ed Skip';
+actionRow.appendChild(rBtn);actionRow.appendChild(sBtn);
+
+var xBtn=document.createElement('button');
+xBtn.id='autotest-stop-btn';
+xBtn.setAttribute('style','width:100%;padding:8px 0;border-radius:9px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;box-sizing:border-box');
+xBtn.textContent='\u23f9 Stop Testing';
+
+var timerDiv=document.createElement('div');
+timerDiv.setAttribute('style','margin-top:6px;text-align:center');
+var timerLbl=document.createElement('span');timerLbl.setAttribute('style','color:#4b5563;font-size:10px');timerLbl.textContent='Auto-timeout in ';
+var timerEl=document.createElement('span');timerEl.id='at-timer';timerEl.setAttribute('style','color:#6b7280;font-size:10px;font-weight:600');timerEl.textContent=minSec+':'+remSec;
+timerDiv.appendChild(timerLbl);timerDiv.appendChild(timerEl);
+
+footer.appendChild(inpRow);footer.appendChild(actionRow);footer.appendChild(xBtn);footer.appendChild(timerDiv);
+
+/* Assemble tree */
+inner.appendChild(hdr);inner.appendChild(info);inner.appendChild(chatEl);inner.appendChild(footer);
+host.appendChild(inner);
+
+/* CRITICAL: append to <html> tag, not <body>, to bypass overflow:hidden/clip on body */
+document.documentElement.appendChild(host);
+console.log('[NEXUS-HITL] Overlay mounted, step='+stepNum);
+
+/* === Logic === */
 var hist=[],busy=false,timerRef;
-
 var scrollBot=function(){chatEl.scrollTop=chatEl.scrollHeight;};
 var showTyping=function(v){typingEl.style.display=v?'flex':'none';if(v)scrollBot();};
-var showSugg=function(t){suggTxt.textContent=t;suggEl.style.display='block';};
-var hideSugg=function(){suggEl.style.display='none';};
 
-var userBubble=function(t){var d=document.createElement('div');d.className='at-msg';d.style.cssText='display:flex;justify-content:flex-end';var i=document.createElement('div');i.style.cssText='max-width:85%;padding:7px 10px;border-radius:9px;border-top-right-radius:2px;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;font-size:11px;line-height:1.5;word-break:break-word';i.textContent=t;d.appendChild(i);chatEl.insertBefore(d,typingEl);scrollBot();};
+var userBubble=function(t){
+  var d=document.createElement('div');d.className='at-msg';d.setAttribute('style','display:flex;justify-content:flex-end');
+  var b=document.createElement('div');b.setAttribute('style','max-width:85%;padding:7px 10px;border-radius:9px;border-top-right-radius:2px;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;font-size:11px;line-height:1.5;word-break:break-word');
+  b.textContent=t;d.appendChild(b);chatEl.insertBefore(d,typingEl);scrollBot();
+};
 
-var aiBubble=function(content,type,chips){var bc=type==='valid'?'rgba(34,197,94,.35)':type==='invalid'?'rgba(239,68,68,.35)':type==='clarify'?'rgba(59,130,246,.35)':'rgba(217,119,6,.3)';var bg=type==='valid'?'rgba(34,197,94,.07)':type==='invalid'?'rgba(239,68,68,.07)':type==='clarify'?'rgba(59,130,246,.07)':'rgba(217,119,6,.07)';var d=document.createElement('div');d.className='at-msg';d.style.cssText='display:flex;gap:7px;align-items:flex-start';var icon=document.createElement('div');icon.style.cssText='width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:2px';icon.textContent='\ud83e\udd16';var right=document.createElement('div');right.style.cssText='flex:1;min-width:0';var bubble=document.createElement('div');bubble.style.cssText='padding:7px 10px;border-radius:9px;border-top-left-radius:2px;background:'+bg+';border:1px solid '+bc+';color:#e2e8f0;font-size:11px;line-height:1.5;word-break:break-word';bubble.textContent=content;right.appendChild(bubble);if(chips&&chips.length){var cr=document.createElement('div');cr.style.cssText='display:flex;flex-wrap:wrap;gap:4px;margin-top:5px';for(var ci=0;ci<chips.length;ci++){(function(cv){var btn=document.createElement('button');btn.className='at-chip';btn.textContent=cv;btn.addEventListener('click',function(){doSend(cv);});cr.appendChild(btn);})(chips[ci]);}right.appendChild(cr);}d.appendChild(icon);d.appendChild(right);chatEl.insertBefore(d,typingEl);scrollBot();};
+var parseStepFromOption=function(txt){
+  var navM=txt.match(/navigat\\w*\\s+(?:step\\s+)?to\\s+['"]?(\\/[\\w\\-_./?#=&%]*|[\\w\\-_]+(?:\\/[\\w\\-_.]+)+)['"]?/i);
+  if(navM){var u=navM[1].startsWith('/')?navM[1]:'/'+navM[1];return{action:'NAVIGATE',target:u,value:''};}
+  var lookM=txt.match(/(?:LOOKUP|SELECT)\\s+(?:\\S+\\s+){0,4}?(?:the\\s+)?['"]?([A-Za-z][A-Za-z ]{2,30}?)['"]?\\s*field/i);
+  if(lookM)return{action:'LOOKUP',target:lookM[1].trim(),value:''};
+  var fillM=txt.match(/(?:fill\\s+in|populate|enter|select)\\s+(?:the\\s+)?['"]?([A-Za-z][A-Za-z ]{1,30}?)['"]?\\s*(?:field|dropdown|input)/i);
+  if(fillM)return{action:'LOOKUP',target:fillM[1].trim(),value:''};
+  return null;
+};
 
-var doSignal=function(action,btnId){clearInterval(timerRef);var btn=document.getElementById(btnId),card=document.getElementById('at-card');if(btn){btn.textContent='Processing\u2026';btn.style.opacity='.5';btn.style.pointerEvents='none';}if(card){card.style.opacity='.6';card.style.pointerEvents='none';}var chkId=action==='resume'?'autotest-resume-chk':action==='skip'?'autotest-skip-chk':'autotest-stop-chk';var chk=document.getElementById(chkId);if(chk)chk.checked=true;try{if(typeof window.__autotestHitlSignal==='function')window.__autotestHitlSignal(action);}catch(e){}document.body.setAttribute('data-autotest-hitl-action',action);try{sessionStorage.setItem('autotest-hitl-action',action);}catch(e){};};
+var showOptionCards=function(opts,container){
+  if(!opts||!opts.length)return;
+  var oc=document.createElement('div');oc.setAttribute('style','display:flex;flex-direction:column;gap:5px;margin-top:8px');
+  for(var oi=0;oi<opts.length;oi++){(function(opt){
+    var card=document.createElement('div');card.setAttribute('style','border:1px solid rgba(34,197,94,.35);border-radius:9px;overflow:hidden');
+    var lbl=document.createElement('div');lbl.setAttribute('style','padding:6px 10px;font-size:10.5px;color:#e2e8f0;line-height:1.4');lbl.textContent=opt;
+    var btn=document.createElement('button');btn.setAttribute('style','width:100%;padding:6px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:11px;font-weight:700;border:none;cursor:pointer;font-family:inherit');
+    btn.textContent='\u2713 Apply & Resume Testing';
+    btn.addEventListener('click',function(){
+      var parsed=parseStepFromOption(opt);
+      var sa=parsed?parsed.action:'NAVIGATE',st=parsed?parsed.target:opt,sv=parsed?parsed.value:'';
+      btn.textContent='Applying\u2026';btn.style.opacity='.6';btn.style.pointerEvents='none';
+      try{if(typeof window.__hitlApplyStep==='function'){window.__hitlApplyStep(opt,sa,st,sv).then(function(){doSignal('resume');}).catch(function(){doSignal('resume');});}else{doSignal('resume');}}catch(e){doSignal('resume');}
+    });
+    card.appendChild(lbl);card.appendChild(btn);oc.appendChild(card);
+  })(opts[oi]);}
+  container.appendChild(oc);
+};
 
-try{var rB=wrap.querySelector('#autotest-resume-btn'),sB=wrap.querySelector('#autotest-skip-btn'),xB=wrap.querySelector('#autotest-stop-btn');if(rB)rB.addEventListener('click',function(e){e.stopImmediatePropagation();doSignal('resume','autotest-resume-btn');},true);if(sB)sB.addEventListener('click',function(e){e.stopImmediatePropagation();doSignal('skip','autotest-skip-btn');},true);if(xB)xB.addEventListener('click',function(e){e.stopImmediatePropagation();doSignal('stop','autotest-stop-btn');},true);}catch(e){}
+var aiBubble=function(content,type,chips,options,proposedStep){
+  var bc=type==='valid'?'rgba(34,197,94,.35)':type==='invalid'?'rgba(239,68,68,.35)':type==='clarify'?'rgba(59,130,246,.35)':'rgba(217,119,6,.3)';
+  var bg=type==='valid'?'rgba(34,197,94,.07)':type==='invalid'?'rgba(239,68,68,.07)':type==='clarify'?'rgba(59,130,246,.07)':'rgba(217,119,6,.07)';
+  var d=document.createElement('div');d.className='at-msg';d.setAttribute('style','display:flex;gap:7px;align-items:flex-start');
+  var icon=document.createElement('div');icon.setAttribute('style','width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:2px');icon.textContent='\ud83e\udd16';
+  var right=document.createElement('div');right.setAttribute('style','flex:1;min-width:0');
+  var bubble=document.createElement('div');bubble.setAttribute('style','padding:7px 10px;border-radius:9px;border-top-left-radius:2px;background:'+bg+';border:1px solid '+bc+';color:#e2e8f0;font-size:11px;line-height:1.5;word-break:break-word');
+  bubble.textContent=content;right.appendChild(bubble);
+  /* ── proposed_step: show a prominent Accept & Resume card ── */
+  if(proposedStep&&proposedStep.action){
+    var ps=proposedStep;
+    var pcard=document.createElement('div');
+    pcard.setAttribute('style','margin-top:8px;border:2px solid rgba(34,197,94,.5);border-radius:10px;overflow:hidden;background:rgba(22,163,74,.05)');
+    var phdr=document.createElement('div');
+    phdr.setAttribute('style','padding:5px 10px;background:rgba(22,163,74,.12);display:flex;align-items:center;gap:5px');
+    var picon=document.createElement('span');picon.textContent='\ud83d\udccc';picon.setAttribute('style','font-size:11px');
+    var ptitle=document.createElement('span');ptitle.setAttribute('style','font-size:9px;font-weight:800;letter-spacing:.1em;color:#4ade80;text-transform:uppercase');ptitle.textContent='Step to Insert';
+    phdr.appendChild(picon);phdr.appendChild(ptitle);
+    var pbody=document.createElement('div');pbody.setAttribute('style','padding:6px 10px;display:flex;align-items:center;gap:6px');
+    var pact=document.createElement('span');
+    var actColors={NAVIGATE:'#38bdf8',CLICK:'#fb923c',TYPE:'#a78bfa',LOOKUP:'#34d399',SELECT:'#34d399',WAIT:'#94a3b8',NAVIGATE2:'#38bdf8'};
+    var actColor=actColors[ps.action]||'#fbbf24';
+    pact.setAttribute('style','font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;background:'+actColor+'22;border:1px solid '+actColor+'55;color:'+actColor);pact.textContent=ps.action;
+    var ptgt=document.createElement('span');ptgt.setAttribute('style','font-size:11px;color:#e2e8f0;font-weight:600;word-break:break-all');ptgt.textContent=ps.target||(ps.label||'');
+    pbody.appendChild(pact);pbody.appendChild(ptgt);
+    var pnote=document.createElement('p');pnote.setAttribute('style','padding:2px 10px 4px;font-size:9px;color:#4ade80;margin:0');pnote.textContent='Will be inserted before step '+stepNum+' and run first';
+    var pbtn=document.createElement('button');
+    pbtn.setAttribute('style','width:100%;padding:9px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:5px');
+    pbtn.innerHTML='<span>\u2713</span><span>Accept & Resume Testing</span>';
+    pbtn.addEventListener('click',function(){
+      pbtn.textContent='Applying\u2026';pbtn.style.opacity='.6';pbtn.style.pointerEvents='none';
+      try{
+        if(typeof window.__hitlApplyStep==='function'){
+          window.__hitlApplyStep(ps.label||ps.target,ps.action,ps.target,ps.value||'').then(function(){doSignal('resume');}).catch(function(){doSignal('resume');});
+        }else{doSignal('resume');}
+      }catch(e){doSignal('resume');}
+    });
+    pcard.appendChild(phdr);pcard.appendChild(pbody);pcard.appendChild(pnote);pcard.appendChild(pbtn);
+    right.appendChild(pcard);
+  } else if(options&&options.length){showOptionCards(options,right);}
+  else if(chips&&chips.length){
+    var cr=document.createElement('div');cr.setAttribute('style','display:flex;flex-wrap:wrap;gap:4px;margin-top:5px');
+    for(var ci=0;ci<chips.length;ci++){(function(cv){var btn=document.createElement('button');btn.className='at-chip';btn.textContent=cv;btn.addEventListener('click',function(){doSend(cv);});cr.appendChild(btn);})(chips[ci]);}
+    right.appendChild(cr);
+  }
+  d.appendChild(icon);d.appendChild(right);chatEl.insertBefore(d,typingEl);scrollBot();
+};
 
-if(accEl)accEl.addEventListener('click',function(){hideSugg();doSignal('resume','autotest-resume-btn');});
-if(rejEl)rejEl.addEventListener('click',function(){hideSugg();aiBubble("Suggestion rejected. Describe what you see.",'clarify');});
+var doSignal=function(action){
+  clearInterval(timerRef);
+  inner.style.opacity='.65';inner.style.pointerEvents='none';
+  try{if(typeof window.__autotestHitlSignal==='function')window.__autotestHitlSignal(action);}catch(e){}
+  if(document.body)document.body.setAttribute('data-autotest-hitl-action',action);
+  try{sessionStorage.setItem('autotest-hitl-action',action);}catch(e){}
+};
 
-var callAnalyze=function(){return new Promise(function(resolve){try{var fn=window.__hitlAnalyze;if(typeof fn!=='function')throw 0;fn().then(resolve).catch(function(){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data already exists','Page did not load','Wrong field label']});});}catch(e){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data already exists','Page did not load','Wrong field label']});}});};
+var doSend=function(text){
+  text=text.trim();if(!text||busy)return;busy=true;sndEl.disabled=true;
+  userBubble(text);hist.push({role:'user',content:text});showTyping(true);
+  callChat(text).then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies,d.options,d.proposed_step);hist.push({role:'assistant',content:d.reply});busy=false;sndEl.disabled=false;inpEl.focus();});
+};
 
-var callChat=function(text){return new Promise(function(resolve){try{var fn=window.__hitlChat;if(typeof fn!=='function')throw 0;fn(text,hist.slice(-6)).then(resolve).catch(function(){resolve({reply:"I couldn't process that. Describe what you see.",suggestion_type:'clarify'});});}catch(e){resolve({reply:"I couldn't process that. Describe what you see.",suggestion_type:'clarify'});}});};
-
-var doSend=function(text){text=text.trim();if(!text||busy)return;busy=true;sndEl.disabled=true;hideSugg();userBubble(text);hist.push({role:'user',content:text});showTyping(true);callChat(text).then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies);hist.push({role:'assistant',content:d.reply});if(d.suggested_action)showSugg(d.suggested_action);busy=false;sndEl.disabled=false;inpEl.focus();});};
-
+rBtn.addEventListener('click',function(e){e.stopPropagation();doSignal('resume');});
+sBtn.addEventListener('click',function(e){e.stopPropagation();doSignal('skip');});
+xBtn.addEventListener('click',function(e){e.stopPropagation();doSignal('stop');});
 sndEl.addEventListener('click',function(){var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}});
 inpEl.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}}});
 
+var callAnalyze=function(){return new Promise(function(resolve){try{var fn=window.__hitlAnalyze;if(typeof fn!=='function')throw 0;fn().then(resolve).catch(function(){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data exists','Page did not load','Wrong field']});});}catch(e){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data exists','Page did not load','Wrong field']});}});};
+var callChat=function(text){return new Promise(function(resolve){try{var fn=window.__hitlChat;if(typeof fn!=='function')throw 0;fn(text,hist.slice(-6)).then(resolve).catch(function(){resolve({reply:"Could not process. Describe what you see.",suggestion_type:'clarify'});});}catch(e){resolve({reply:"Could not process. Describe what you see.",suggestion_type:'clarify'});}});};
+
+var dragOn=false,dragOX=0,dragOY=0;
+hdr.addEventListener('mousedown',function(e){if(e.button!==0)return;if(host.style.bottom!=='auto'){var r=host.getBoundingClientRect();host.style.bottom='auto';host.style.right='auto';host.style.left=r.left+'px';host.style.top=r.top+'px';}dragOn=true;dragOX=e.clientX-host.getBoundingClientRect().left;dragOY=e.clientY-host.getBoundingClientRect().top;hdr.style.cursor='grabbing';e.preventDefault();},true);
+window.addEventListener('mousemove',function(e){if(!dragOn)return;var ml=window.innerWidth-host.offsetWidth-4,mt=window.innerHeight-host.offsetHeight-4;host.style.left=Math.max(4,Math.min(e.clientX-dragOX,ml))+'px';host.style.top=Math.max(4,Math.min(e.clientY-dragOY,mt))+'px';e.preventDefault();},{capture:true,passive:false});
+window.addEventListener('mouseup',function(){if(!dragOn)return;dragOn=false;hdr.style.cursor='grab';},true);
+
+var rem=secs;
+timerRef=setInterval(function(){rem--;if(rem<=0){clearInterval(timerRef);return;}if(timerEl)timerEl.textContent=Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0');},1000);
+
 showTyping(true);
-callAnalyze().then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies);hist.push({role:'assistant',content:d.reply});if(d.suggested_action)showSugg(d.suggested_action);inpEl.focus();});
+callAnalyze().then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies,d.options,d.proposed_step);hist.push({role:'assistant',content:d.reply});inpEl.focus();});
+console.log('[NEXUS-HITL] Initialised for step '+stepNum);
 
-var dh=document.getElementById('at-drag');
-var dragOn=false,dragOX=0,dragOY=0,dragOL=0,dragOT=0;
-dh.addEventListener('mousedown',function(e){if(e.button!==0)return;if(wrap.style.bottom!=='auto'){var r=wrap.getBoundingClientRect();wrap.style.bottom='auto';wrap.style.right='auto';wrap.style.left=r.left+'px';wrap.style.top=r.top+'px';}dragOn=true;dragOX=e.clientX;dragOY=e.clientY;dragOL=parseInt(wrap.style.left||'0',10);dragOT=parseInt(wrap.style.top||'0',10);dh.style.cursor='grabbing';e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();},true);
-window.addEventListener('mousemove',function(e){if(!dragOn)return;var maxL=window.innerWidth-wrap.offsetWidth-4,maxT=window.innerHeight-wrap.offsetHeight-4;wrap.style.left=Math.max(4,Math.min(dragOL+e.clientX-dragOX,maxL))+'px';wrap.style.top=Math.max(4,Math.min(dragOT+e.clientY-dragOY,maxT))+'px';e.preventDefault();e.stopPropagation();},{capture:true,passive:false});
-window.addEventListener('mouseup',function(){if(!dragOn)return;dragOn=false;dh.style.cursor='grab';},true);
-
-var rem=secs,timerEl=document.getElementById('at-timer');
-timerRef=setInterval(function(){rem--;if(rem<=0){clearInterval(timerRef);return;}timerEl.textContent=Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0');},1000);
+}catch(err){console.error('[NEXUS-HITL] INIT ERROR:',err&&err.message||String(err));}
 })();`
 
   try {
@@ -5318,8 +5647,8 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     const isInteractive = context.interactive === true
     browser = await chromium.launch(
       isInteractive
-        ? { headless: false, args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox'] }
-        : { headless: true },
+        ? { headless: false, args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox', '--ignore-certificate-errors'] }
+        : { headless: true, args: ['--ignore-certificate-errors', '--no-sandbox', '--disable-setuid-sandbox'] },
     )
     if (isInteractive) log.info(`[EXEC] 🖥️  Interactive (headed) browser launched for ${executionId}`)
 
@@ -5337,7 +5666,12 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     }
 
     // ── Load or create browser context ───────────────────────────
-    if (hasSession) {
+    // Only load storageState if the session has actual auth data.
+    // Sessions with only UI prefs (theme, etc.) are not valid auth sessions.
+    const isWebApp = isWebAppCategory(context.projectCategory)
+    const useStoredSession = hasSession && (!isWebApp || sessionHasAuthData(projectId))
+
+    if (useStoredSession) {
       log.info(`[SESSION] Loading stored session for project ${projectId}`)
       try {
         browserContext = await browser.newContext({
@@ -5422,7 +5756,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           // re-authenticate to ensure validity — stale cookies silently block test steps.
           log.info(`[SESSION] Running web app form login (hasStoredSession=${hasSession})`)
           try {
-            await loginToWebApp(page!, browserContext!, context, projectId)
+            await loginToWebApp(page!, browserContext!, context, projectId, hasSession)
           } catch (loginErr) {
             log.error({ loginErr }, '[SESSION] Web app login failed — test cannot proceed')
             throw loginErr
@@ -5783,6 +6117,57 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             })
           } catch { /* already registered — safe to ignore */ }
 
+          // ── Expose __hitlApplyStep ────────────────────────────────────────
+          // Called by the overlay "Accept & Resume Testing" button.
+          // Inserts the confirmed step into the DB BEFORE the paused step, then
+          // settles the pause gate.  The gate-resolve handler below (lines after
+          // the Promise) re-fetches the updated steps and adjusts i so the new
+          // step runs FIRST, followed by the originally-failing step.
+          //
+          // We use a closure flag so the resume handler knows a step was injected.
+          let hitlStepInserted = false
+          try {
+            await page.exposeFunction('__hitlApplyStep', async (optionText: string, stepAction: string, stepTarget: string, stepValue: string) => {
+              log.info({ optionText, stepAction, stepTarget, stepValue }, '[HITL-APPLY] User accepted AI proposal — inserting step')
+              try {
+                const finalAction = (stepAction || 'NAVIGATE').toUpperCase()
+                const finalTarget = stepTarget || optionText
+                const finalValue  = stepValue  || ''
+
+                if (testCaseId && finalTarget) {
+                  const tc = await prisma.test_cases.findUnique({ where: { id: testCaseId } })
+                  if (tc) {
+                    const dbSteps = (tc.steps as unknown as Record<string, unknown>[]) ?? []
+                    const insertIdx = i   // insert BEFORE the paused step (0-based)
+                    const newStep = {
+                      id:     `hitl-${Date.now()}`,
+                      action: finalAction,
+                      target: finalTarget,
+                      value:  finalValue,
+                    }
+                    const patched = [
+                      ...dbSteps.slice(0, insertIdx),
+                      newStep,
+                      ...dbSteps.slice(insertIdx),
+                    ]
+                    await prisma.test_cases.update({
+                      where: { id: testCaseId },
+                      data:  { steps: patched as any },
+                    })
+                    hitlStepInserted = true
+                    log.info({ newStep, insertIdx }, '[HITL-APPLY] ✅ Step inserted into DB at index ' + insertIdx)
+                  }
+                }
+              } catch (dbErr) {
+                log.warn({ dbErr }, '[HITL-APPLY] Step DB insert failed — resuming anyway')
+              }
+              // Unblock the worker gate
+              if (hitlSettleFn) hitlSettleFn('resume')
+              return { ok: true }
+            })
+          } catch { /* already registered on re-inject — safe to ignore */ }
+
+
           // ── Inject floating overlay ──────────────────────────
 
           const pauseTimeoutMs = 10 * 60 * 1000
@@ -5932,30 +6317,95 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             break
           }
 
-          // Remove overlay
+          // ── Post-pause: handle resume / skip ──────────────────────────────
+
           await removePauseOverlay(page)
           await setBrowserState(page, 'running')
 
           if (pauseAction === 'skip') {
-            // A skipped step means the test cannot be fully verified — mark as failed
-            finalStatus = 'FAILED'
-            if (!firstFailedLocator) {
-              firstFailedLocator = step.target ?? ''
-            }
+            // User-skipped steps do NOT mark the overall run as FAILED.
+            // Only true step failures (non-recoverable, non-skipped) should do that.
+            // firstFailedLocator is also left unchanged so a later real failure
+            // can still be captured correctly.
             stepResults[stepResults.length - 1] = {
               ...result, status: 'skipped',
               message: `Step ${i + 1} skipped by user (interactive mode)`, error: null,
             }
-            log.info(`[HITL] Step ${i + 1} skipped — finalStatus set to FAILED, continuing to step ${i + 2}`)
+            log.info(`[HITL] Step ${i + 1} skipped — continuing to step ${i + 2}`)
             continue
           }
 
-          // resume: mark as manually completed
-          stepResults[stepResults.length - 1] = {
-            ...result, status: 'passed',
-            message: `Step ${i + 1} completed manually by user (interactive mode)`, error: null,
+          // ── RESUME: re-fetch steps from DB so the newly-inserted step is visible ──
+          //
+          // THE FIX: context.steps is a frozen BullMQ snapshot. If the user clicked
+          // "Accept & Resume", a new step was written to test_cases.steps in Postgres
+          // but context.steps never saw it. We must re-sync NOW.
+          //
+          // Case A — step was inserted (hitlStepInserted=true):
+          //   DB: [s0, s_new, s_paused, s2, …]  ← s_new at position i
+          //   We splice into context.steps in-place, then set i-- so the for-loop's
+          //   i++ brings us back to position i (s_new) on the next iteration.
+          //   Execution order: s_new → s_paused (retried) → s2 …
+          //
+          // Case B — plain Resume (no step inserted, hitlStepInserted=false):
+          //   The user fixed something manually in the browser. Re-fetch in case
+          //   the dashboard also patched a step, then retry position i as-is.
+          //
+          if (testCaseId) {
+            try {
+              const freshTc = await prisma.test_cases.findUnique({
+                where:  { id: testCaseId },
+                select: { steps: true },
+              })
+              if (freshTc && Array.isArray(freshTc.steps)) {
+                const freshRaw = freshTc.steps as any[]
+                // Rebuild into StepData shape
+                const freshSteps: typeof context.steps = freshRaw.map((s: any) => ({
+                  id:           s.id    ?? `step-${Date.now()}-${Math.random()}`,
+                  action:       (s.action ?? '').toUpperCase(),
+                  target:       s.target ?? '',
+                  value:        s.value  ?? '',
+                  locator_type: s.locator_type ?? undefined,
+                  sf_field_type: s.sf_field_type ?? undefined,
+                }))
+
+                const prevLen = context.steps.length
+                // Splice in-place so the for-loop reference is updated
+                context.steps.splice(0, context.steps.length, ...freshSteps)
+
+                if (hitlStepInserted || freshSteps.length > prevLen) {
+                  // A step was inserted before position i.
+                  // Decrement i so that after the for-loop's i++, we run position i
+                  // (the newly inserted step) next.
+                  i--
+                  log.info(
+                    `[HITL] ✅ Steps re-synced from DB (${prevLen} → ${freshSteps.length}). ` +
+                    `New step at index ${i + 1} will run BEFORE retry of step ${i + 2}.`
+                  )
+                } else {
+                  // No new step — worker will retry position i (the failing step) as-is.
+                  // Decrement i so after i++ the loop body runs position i again.
+                  i--
+                  log.info(
+                    `[HITL] ✅ Steps re-synced (length unchanged). Retrying step ${i + 2} (index ${i + 1}).`
+                  )
+                }
+              }
+            } catch (refetchErr) {
+              log.warn({ refetchErr }, '[HITL] Could not re-fetch steps after resume — retrying current step')
+              // Still retry the current step even if re-fetch failed
+              i--
+            }
+          } else {
+            // No testCaseId — can't re-fetch; retry current step
+            i--
           }
-          log.info(`[HITL] Step ${i + 1} marked as manually completed — continuing`)
+
+          // Remove the stale failed result — the step will be re-executed from the top of the loop
+          stepResults.pop()
+          hitlStepInserted = false
+          log.info(`[HITL] Resuming. Next iteration starts at index ${i + 1} (step ${i + 2}).`)
+          // `continue` increments i by 1 (the for-loop's i++) then runs the loop body
           continue
         }
 

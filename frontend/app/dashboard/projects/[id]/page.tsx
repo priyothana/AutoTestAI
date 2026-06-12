@@ -578,8 +578,10 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                     })
                 }
 
-                // Done: last_synced_at set AND embeddings exist (crawl + pipeline complete)
-                const isDone = status.last_synced_at != null && status.embedding_count > 0
+                // Done: last_synced_at set AND embeddings exist AND crawl is no longer running
+                // NOTE: has_more_pages=true means the crawler is still processing continuation jobs;
+                // stale embeddings from a previous sync must NOT trigger a false "done" here.
+                const isDone = status.last_synced_at != null && status.embedding_count > 0 && !status.has_more_pages
 
                 if (isDone) {
                     consecutiveDoneChecks++
@@ -720,10 +722,47 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         }
     }
 
+    const handleClearTestData = async () => {
+        if (!confirm('Remove all test data entities for this project? This cannot be undone.')) return
+        try {
+            const res = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/test-data`,
+                { method: 'DELETE' }
+            )
+            const data = await res.json()
+            if (res.ok) {
+                setTestDataEntities([])
+                toast.success(data.message || 'All test data cleared')
+            } else {
+                toast.error(data.detail || 'Failed to clear test data')
+            }
+        } catch {
+            toast.error('Failed to clear test data')
+        }
+    }
+
+    const handleDeleteTestDataEntity = async (entityName: string) => {
+        try {
+            const res = await fetch(
+                `${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/test-data/${encodeURIComponent(entityName)}`,
+                { method: 'DELETE' }
+            )
+            if (res.ok) {
+                setTestDataEntities((prev: any[]) => prev.filter((e: any) => e.entity_name !== entityName))
+                toast.success(`Removed entity "${entityName}"`)
+            } else {
+                const data = await res.json()
+                toast.error(data.detail || `Failed to remove "${entityName}"`)
+            }
+        } catch {
+            toast.error(`Failed to remove "${entityName}"`)
+        }
+    }
 
     const handleTestDataFileUpload = async (file: File) => {
         setUploadResult(null)
         setUploadError(null)
+
 
         // Validate it's a JSON file
         if (!file.name.endsWith('.json') && file.type !== 'application/json') {
@@ -1428,7 +1467,11 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                             {integration?.sync_counts && (
                                 <div className="grid gap-4 md:grid-cols-4">
                                     {[
-                                        { label: "Pages Crawled", count: integration.sync_counts.raw_count, color: "text-blue-600" },
+                                        { 
+                                            label: "Pages Crawled", 
+                                            count: integration.sync_counts.pages_crawled ?? integration.sync_counts.raw_count, 
+                                            color: "text-blue-600" 
+                                        },
                                         { label: "Normalized", count: integration.sync_counts.normalized_count, color: "text-indigo-600" },
                                         { label: "Domain Models", count: integration.sync_counts.domain_model_count, color: "text-purple-600" },
                                         { label: "Embeddings", count: integration.sync_counts.embedding_count, color: "text-green-600" },
@@ -2467,17 +2510,29 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                         </Badge>
                                     )}
                                 </div>
-                                <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={handleExtractTestData}
-                                    disabled={testDataExtracting || testDataLoading}
-                                    className="text-violet-700 border-violet-300 hover:bg-violet-50"
-                                >
-                                    {testDataExtracting
-                                        ? <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />Extracting…</>
-                                        : <><Search className="mr-2 h-3.5 w-3.5" />Extract from UI</>}
-                                </Button>
+                                <div className="flex items-center gap-2">
+                                    {testDataEntities.length > 0 && (
+                                        <Button
+                                            variant="outline"
+                                            size="sm"
+                                            onClick={handleClearTestData}
+                                            className="text-red-600 border-red-200 hover:bg-red-50 dark:hover:bg-red-950/20 text-xs"
+                                        >
+                                            <Trash2 className="mr-1 h-3 w-3" />Clear All
+                                        </Button>
+                                    )}
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={handleExtractTestData}
+                                        disabled={testDataExtracting || testDataLoading}
+                                        className="text-violet-700 border-violet-300 hover:bg-violet-50"
+                                    >
+                                        {testDataExtracting
+                                            ? <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />Extracting…</>
+                                            : <><Search className="mr-2 h-3.5 w-3.5" />Extract from UI</>}
+                                    </Button>
+                                </div>
                             </div>
                             <CardDescription>
                                 Real records from your app are used by the AI to generate test steps with valid values.
@@ -2494,11 +2549,12 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                 <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Records</th>
                                                 <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Source</th>
                                                 <th className="text-left px-4 py-2.5 font-medium text-violet-800 dark:text-violet-300">Last Updated</th>
+                                                <th className="w-8 px-2 py-2.5"></th>
                                             </tr>
                                         </thead>
                                         <tbody>
                                             {testDataEntities.map((e, i) => (
-                                                <tr key={e.entity_name} className={i % 2 === 0 ? 'bg-white dark:bg-transparent' : 'bg-violet-50/40 dark:bg-violet-950/10'}>
+                                                <tr key={e.entity_name} className={`group ${i % 2 === 0 ? 'bg-white dark:bg-transparent' : 'bg-violet-50/40 dark:bg-violet-950/10'}`}>
                                                     <td className="px-4 py-2.5 font-medium">{e.entity_name}</td>
                                                     <td className="px-4 py-2.5"><Badge variant="outline" className="font-mono">{e.record_count}</Badge></td>
                                                     <td className="px-4 py-2.5">
@@ -2510,6 +2566,15 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                                         }
                                                     </td>
                                                     <td className="px-4 py-2.5 text-muted-foreground text-xs">{new Date(e.last_extracted_at).toLocaleDateString()}</td>
+                                                    <td className="px-2 py-2.5 text-right">
+                                                        <button
+                                                            onClick={() => handleDeleteTestDataEntity(e.entity_name)}
+                                                            title={`Remove "${e.entity_name}"`}
+                                                            className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-500 transition-all"
+                                                        >
+                                                            <X className="h-3.5 w-3.5" />
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                         </tbody>
@@ -2521,6 +2586,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                     No test data yet. Extract from UI or upload a JSON file below.
                                 </div>
                             )}
+
                             <div className="space-y-3">
                                 <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
                                     <span>📤</span> Upload Sample Test Data

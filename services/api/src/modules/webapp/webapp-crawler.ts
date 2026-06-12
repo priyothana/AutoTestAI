@@ -91,6 +91,13 @@ export interface CrawlOptions {
   keyRoutes?: string[]
   enableDeepCrawl?: boolean
   /**
+   * Login strategy for the app:
+   *   'form'       — standard HTML form login (default)
+   *   'basic_auth' — HTTP Basic Authentication (sends credentials via browser context httpCredentials)
+   *   'keycloak'   — Keycloak SSO (token injected into sessionStorage)
+   */
+  loginStrategy?: string
+  /**
    * Restored CrawlState from DB — passed on continuation runs.
    * If undefined, this is the first run and state is seeded fresh.
    */
@@ -107,11 +114,125 @@ function normalizeUrl(url: string, baseUrl: string): string | null {
     if (parsed.origin !== baseParsed.origin) return null
     if (!['http:', 'https:'].includes(parsed.protocol)) return null
 
-    return parsed.origin + parsed.pathname
+    // Preserve hash for hash-routed SPAs (e.g. Vue Router, React HashRouter).
+    // Without this, all #/leads, #/contacts etc. collapse to the same base URL
+    // and no new routes are discovered after the first page.
+    const hash = parsed.hash  // e.g. '#/leads' or ''
+    return parsed.origin + parsed.pathname + hash
   } catch {
     return null
   }
 }
+
+/**
+ * Derive route slugs from navigation item text labels.
+ * Used as a fallback for SPAs where nav buttons have single-word text
+ * (no multi-line description) — e.g. a sidebar item "Leads" → /leads.
+ * Skips generic words, short strings, numbers, and record IDs.
+ */
+function deriveRoutesFromNavItems(
+  navItems: Array<{ text?: string; href?: string }>,
+  baseUrl: string,
+): string[] {
+  const SKIP_WORDS = new Set([
+    'home', 'back', 'next', 'cancel', 'close', 'ok', 'yes', 'no',
+    'save', 'submit', 'delete', 'edit', 'add', 'new', 'create',
+    'search', 'filter', 'export', 'import', 'upload', 'download',
+    'logout', 'login', 'profile', 'help', 'more',
+    'menu', 'user', 'users',
+    // Note: 'dashboard', 'overview', 'admin' intentionally NOT skipped—they are valid CRM module routes
+  ])
+
+  const candidates: string[] = []
+
+  for (const item of navItems) {
+    // If the nav item already has a real href with a path/hash, use that directly
+    if (item.href && item.href.length > 0) {
+      const norm = normalizeUrl(item.href, baseUrl)
+      if (norm && norm !== normalizeUrl(baseUrl, baseUrl)) {
+        candidates.push(norm)
+        continue
+      }
+    }
+
+    // Fall back: derive a slug from the label text
+    const rawText = (item.text ?? '').trim().split('\n')[0].trim()
+    if (!rawText || rawText.length < 3 || rawText.length > 30) continue
+    if (/\d/.test(rawText)) continue                      // skip record IDs
+    if (/^[A-Z]{2,5}[-\s]?\d/.test(rawText)) continue    // skip codes like ENQ-001
+    if (rawText.split(/\s+/).length > 3) continue         // skip long phrases
+
+    const slug = rawText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-')
+    if (!slug || slug.length < 3 || SKIP_WORDS.has(slug)) continue
+
+    const candidateUrl = normalizeUrl(`/${slug}`, baseUrl)
+    if (candidateUrl) candidates.push(candidateUrl)
+  }
+
+  return [...new Set(candidates)]
+}
+
+/**
+ * Deep-route expansion: for a successfully crawled module list page (e.g. /leads),
+ * generate create-form and detail-page variants to be queued for crawling.
+ *
+ * Produces:
+ *   - /{module}/create  and  /{module}/new   (create form routes)
+ *   - /{module}/{uuid}  (one representative detail page, scanned from page links)
+ *
+ * Only fires for simple one-segment paths that look like CRM entity lists.
+ * Skips detail pages themselves (two-segment paths) to avoid infinite expansion.
+ */
+function deriveDetailRoutes(
+  pageMeta: { url: string; links: Array<{ locator?: string }> },
+  baseUrl: string,
+): string[] {
+  const candidates: string[] = []
+
+  try {
+    const urlPath = new URL(pageMeta.url).pathname
+    const segments = urlPath.split('/').filter(Boolean)
+
+    // Only expand top-level module paths like /leads, /accounts (one segment)
+    if (segments.length !== 1) return []
+
+    const module = segments[0]
+
+    // Skip if the segment looks like a UUID, numeric ID, or generic word
+    if (/^[0-9a-f-]{8,}$/i.test(module)) return []
+    if (/^\d+$/.test(module)) return []
+    if (['login', 'logout', 'auth', 'callback', 'home', 'index', 'organization'].includes(module)) return []
+
+    // ── Create / New routes ──────────────────────────────────────────────────
+    for (const suffix of ['create', 'new']) {
+      const u = normalizeUrl(`/${module}/${suffix}`, baseUrl)
+      if (u) candidates.push(u)
+    }
+
+    // ── Detail page: scan links for one representative /{module}/{uuid} URL ──
+    const UUID_RE   = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    const NUM_ID_RE = /^\d{1,15}$/
+
+    for (const link of pageMeta.links) {
+      if (!link.locator?.startsWith('http')) continue
+      try {
+        const parsed = new URL(link.locator)
+        const lSegs  = parsed.pathname.split('/').filter(Boolean)
+        if (lSegs.length === 2 && lSegs[0] === module) {
+          const id = lSegs[1]
+          if (UUID_RE.test(id) || NUM_ID_RE.test(id)) {
+            candidates.push(link.locator)  // one representative detail page per entity
+            break
+          }
+        }
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+
+  return [...new Set(candidates)]
+}
+
+
 
 /**
  * Derive navigable route paths from button labels on a crawled page.
@@ -123,6 +244,7 @@ function normalizeUrl(url: string, baseUrl: string): string | null {
  * Example reject:  "Add Item", "Create Opportunity", "AGS2", "ENQ-0002"
  */
 function deriveRoutesFromButtons(buttons: ElementInfo[], baseUrl: string): string[] {
+
   const candidates: string[] = []
 
   for (const btn of buttons) {
@@ -179,14 +301,26 @@ export class WebMetadataService {
    * Fetch and parse an XML sitemap into a list of URLs.
    * Recursively handles sitemap index files up to depth 2.
    */
-  static async detectAndFetchSitemap(baseUrl: string, customSitemapUrl?: string, depth = 0): Promise<string[]> {
+  static async detectAndFetchSitemap(
+    baseUrl: string,
+    customSitemapUrl?: string,
+    depth = 0,
+    credentials?: { username: string; password: string },
+  ): Promise<string[]> {
     if (depth > 2) return []
 
     const targetUrl = customSitemapUrl || baseUrl.replace(/\/$/, '') + '/sitemap.xml'
     log.info(`[CRAWLER] Checking sitemap at ${targetUrl} (depth ${depth})`)
 
+    const headers: Record<string, string> = {}
+    if (credentials) {
+      // Include Basic Auth header so password-protected sitemaps are accessible
+      headers['Authorization'] = 'Basic ' +
+        Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')
+    }
+
     try {
-      const response = await fetch(targetUrl, { signal: AbortSignal.timeout(10000) })
+      const response = await fetch(targetUrl, { signal: AbortSignal.timeout(10000), headers })
       if (!response.ok) return []
 
       const xmlText = await response.text()
@@ -199,7 +333,7 @@ export class WebMetadataService {
         const loc = match[1].trim()
         if (loc.endsWith('.xml') && depth < 2) {
           // It's a sitemap index
-          const childUrls = await WebMetadataService.detectAndFetchSitemap(baseUrl, loc, depth + 1)
+          const childUrls = await WebMetadataService.detectAndFetchSitemap(baseUrl, loc, depth + 1, credentials)
           results.push(...childUrls)
         } else {
           const norm = normalizeUrl(loc, baseUrl)
@@ -232,9 +366,11 @@ export class WebMetadataService {
       sitemapUrl,
       keyRoutes = [],
       enableDeepCrawl = false,
+      loginStrategy = 'form',
       initialState,
     } = options
 
+    const isBasicAuth = loginStrategy === 'basic_auth'
     const runLimit = perRunLimit ?? maxPages ?? 50
 
     // ── Restore or initialise crawl state ───────────────────────────────────
@@ -258,8 +394,8 @@ export class WebMetadataService {
       runCount    = 0
       log.info('[CRAWLER] First run — seeding from sitemap + base URL')
 
-      // 1. Sitemap discovery
-      const sitemapUrls = await WebMetadataService.detectAndFetchSitemap(baseUrl, sitemapUrl)
+      // 1. Sitemap discovery (with credentials for protected sitemaps)
+      const sitemapUrls = await WebMetadataService.detectAndFetchSitemap(baseUrl, sitemapUrl, 0, credentials)
       if (sitemapUrls.length > 0) {
         log.info(`[CRAWLER] Discovered ${sitemapUrls.length} routes from sitemap`)
         for (const url of sitemapUrls) {
@@ -312,26 +448,70 @@ export class WebMetadataService {
       const { chromium } = await import('playwright')
       browser = await chromium.launch({ headless: true })
 
-      const context = authSessionPath
-        ? await (async () => {
-            try {
-              const ctx = await browser!.newContext({ storageState: authSessionPath })
-              log.info(`[CRAWLER] Loaded auth session from ${authSessionPath}`)
-              return ctx
-            } catch {
-              log.warn('[CRAWLER] Failed to load auth session — starting fresh context')
-              return browser!.newContext()
-            }
-          })()
-        : await browser.newContext()
+      // ── Build Playwright browser context ─────────────────────────────────
+      // For basic_auth: inject httpCredentials so the browser automatically handles
+      // the HTTP 401/WWW-Authenticate challenge without any DOM form interaction.
+      // For form-based: standard context (with optional saved session state).
+      let context: import('playwright').BrowserContext
+
+      if (isBasicAuth && credentials) {
+        log.info(`[CRAWLER] Using HTTP Basic Authentication for ${baseUrl}`)
+        context = await browser.newContext({
+          httpCredentials: {
+            username: credentials.username,
+            password: credentials.password,
+          },
+        })
+      } else if (authSessionPath) {
+        try {
+          context = await browser.newContext({ storageState: authSessionPath })
+          log.info(`[CRAWLER] Loaded auth session from ${authSessionPath}`)
+        } catch {
+          log.warn('[CRAWLER] Failed to load auth session — starting fresh context')
+          context = await browser.newContext()
+        }
+      } else {
+        context = await browser.newContext()
+      }
 
       const page = await context.newPage()
       page.setDefaultTimeout(20_000)
       page.setDefaultNavigationTimeout(30_000)
 
+      // ── Pre-warm login session ───────────────────────────────────────────
+      // Navigate to the base URL first so the browser establishes the session
+      // cookie / token before we crawl individual deep pages. Without this,
+      // every deep-page navigation hits the login redirect and burns the
+      // consecutive-failure counter.
+      if (credentials && !isBasicAuth) {
+        try {
+          log.info(`[CRAWLER] 🔐 Pre-warming login session on ${baseUrl}`)
+          await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 25_000 })
+          await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {})
+          const preCheck = await WebMetadataService._isLoginPage(page)
+          if (preCheck.isLogin) {
+            const loginResult = await WebMetadataService._attemptLogin(page, credentials)
+            if (loginResult.success) {
+              log.info(`[CRAWLER] ✅ Pre-warm login succeeded — session established`)
+              // Wait a beat for any SPA to finish bootstrapping
+              await page.waitForTimeout(1_500)
+            } else {
+              log.warn(`[CRAWLER] ⚠ Pre-warm login FAILED — crawl may produce fewer pages`)
+            }
+          } else {
+            log.info(`[CRAWLER] Pre-warm: base URL is not a login page — session already active`)
+          }
+        } catch (preErr) {
+          log.warn({ err: preErr }, '[CRAWLER] Pre-warm login error — continuing anyway')
+        }
+      }
+
       let pagesCrawled = 0
       let consecutiveLoginFailures = 0
-      const MAX_LOGIN_FAILURES = 3
+      // Increased from 3 → 10: some apps have isolated pages that require a
+      // fresh token challenge even within the same browser session. A higher
+      // limit prevents premature abort while still catching real auth failures.
+      const MAX_LOGIN_FAILURES = 10
 
       for (const url of toVisitThisRun) {
         if (visitedUrls.has(url)) {
@@ -350,14 +530,18 @@ export class WebMetadataService {
 
         try {
           const source: 'sitemap' | 'playwright' = 'playwright'
+          // Always pass credentials to _visitPage — for basic_auth apps that use
+          // Keycloak/form-based login, the browser context httpCredentials handles
+          // HTTP 401 challenges while the form-login fallback handles SSO redirect pages.
           const pageMeta = await WebMetadataService._visitPage(
             page, url, baseUrl, credentials,
           )
 
           if (pageMeta) {
             // ── Filter login-redirect pages ───────────────────────────────────────────────
-            // If the page was detected as a login redirect, do NOT store it.
-            // Track consecutive failures for early abort.
+            // If the page was detected as a login redirect AND re-login also failed,
+            // count it as a failure. If re-login succeeded, the page just needed a
+            // fresh challenge — don't penalise that as a failure.
             if (pageMeta.redirected_to_login) {
               consecutiveLoginFailures++
               visitedUrls.add(url)
@@ -368,7 +552,7 @@ export class WebMetadataService {
               continue
             }
 
-            // Reset consecutive failure counter on successful crawl
+            // Reset consecutive failure counter on any successfully crawled page
             consecutiveLoginFailures = 0
 
             // ── Filter 404 / error pages ─────────────────────────────────────────────────
@@ -404,6 +588,8 @@ export class WebMetadataService {
             }
 
             // ── Link collection: discover new internal links ────────────────
+            // Note: normalizeUrl now preserves hash fragments, so hash-routed
+            // SPAs (e.g. /#/leads) generate distinct entries in pendingUrls.
             if (enableDeepCrawl || true) { // always collect links for incremental discovery
               for (const link of pageMeta.links) {
                 if (link.locator && link.locator.startsWith('http')) {
@@ -420,7 +606,29 @@ export class WebMetadataService {
               }
             }
 
-            // ── Button-based route discovery ─────────────────────────────────
+            // ── Navigation item route discovery ──────────────────────────────
+            // Uses the extracted <nav>/sidebar items which are more reliable
+            // than body links for SPAs. Covers both href-based and text-derived
+            // routes, and handles hash-routing (#/leads) via the updated normalizeUrl.
+            const navRoutes = deriveRoutesFromNavItems(pageMeta.navigation_items, baseUrl)
+            let navRoutesAdded = 0
+            for (const candidate of navRoutes) {
+              if (
+                !visitedUrls.has(candidate) &&
+                !pendingUrls.includes(candidate) &&
+                !toVisitThisRun.includes(candidate)
+              ) {
+                pendingUrls.push(candidate)
+                navRoutesAdded++
+              }
+            }
+            if (navRoutesAdded > 0) {
+              log.info(
+                `[CRAWLER] Nav-item discovery: found ${navRoutesAdded} new routes from navigation items on ${url}`
+              )
+            }
+
+            // ── Button-based route discovery (strict multi-line format) ───────
             // SPA apps often use <button> elements for navigation (not <a> tags).
             // Derive candidate URLs from button labels and add to pending queue.
             const buttonRoutes = deriveRoutesFromButtons(pageMeta.buttons, baseUrl)
@@ -438,6 +646,28 @@ export class WebMetadataService {
             if (buttonRoutesAdded > 0) {
               log.info(
                 `[CRAWLER] Button-route discovery: found ${buttonRoutesAdded} new candidate routes from buttons on ${url}`
+              )
+            }
+
+            // ── Deep-route expansion: create/detail routes per entity ─────────────
+            // For each top-level list page (e.g. /leads) derive:
+            //   /leads/create, /leads/new     ← create form
+            //   /leads/{first-uuid-found}     ← one representative detail page
+            const deepRoutes = deriveDetailRoutes(pageMeta, baseUrl)
+            let deepRoutesAdded = 0
+            for (const candidate of deepRoutes) {
+              if (
+                !visitedUrls.has(candidate) &&
+                !pendingUrls.includes(candidate) &&
+                !toVisitThisRun.includes(candidate)
+              ) {
+                pendingUrls.push(candidate)
+                deepRoutesAdded++
+              }
+            }
+            if (deepRoutesAdded > 0) {
+              log.info(
+                `[CRAWLER] Deep-route expansion: added ${deepRoutesAdded} create/detail routes from ${url}`
               )
             }
           } else {
@@ -508,8 +738,8 @@ export class WebMetadataService {
   ): Promise<{ isLogin: boolean; reason: string }> {
     const currentUrl = page.url().toLowerCase()
 
-    // Check 1: URL path contains auth-related segments
-    const authPathPattern = /\/(login|signin|sign-in|sign_in|auth|authenticate|sso|oauth|cas|saml)\b/i
+    // Check 1: URL path contains auth-related segments (including Keycloak SSO patterns)
+    const authPathPattern = /\/(login|signin|sign-in|sign_in|auth|authenticate|sso|oauth|cas|saml|realms|openid-connect|kc|idp)\b/i
     const urlIsAuth = authPathPattern.test(currentUrl)
 
     // Check 2: Visible password field present
@@ -623,7 +853,13 @@ export class WebMetadataService {
   ): Promise<PageMetadata | null> {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25_000 })
-      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {})
+      // Give the network a chance to settle (increased from 5s → 10s).
+      // SPAs fire DOMContentLoaded before JavaScript frameworks render the nav,
+      // so a short networkidle timeout results in empty link/button arrays.
+      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {})
+      // Hard minimum wait: even after networkidle, React/Vue need a tick to
+      // finish rendering route-level components. 1.5 s covers 99% of SPAs.
+      await page.waitForTimeout(1_500)
     } catch (err) {
       log.warn({ err }, `[CRAWLER] Navigation failed for ${url}`)
       return null
@@ -708,17 +944,41 @@ export class WebMetadataService {
     } catch { /* ignore */ }
 
     try {
-      const buttonsRaw = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"]') as NodeListOf<HTMLElement>)
-          .filter((el) => el.offsetParent !== null)
-          .slice(0, 25)
-          .map((el) => ({
-            tag: el.tagName.toLowerCase(),
-            text: ((el as HTMLButtonElement).innerText || (el as HTMLInputElement).value || el.getAttribute('aria-label') || '').trim(),
-            ariaLabel: el.getAttribute('aria-label') || '',
-            testid: el.getAttribute('data-testid') || '',
-          }))
-      ) as Array<{ tag: string; text: string; ariaLabel: string; testid: string }>
+      const buttonsRaw = await page.evaluate(() => {
+        const all = Array.from(
+          document.querySelectorAll(
+            'button, [role="button"], input[type="submit"], input[type="button"], a[role="button"]'
+          ) as NodeListOf<HTMLElement>
+        ).filter(el => el.offsetParent !== null)
+
+        const toInfo = (el: HTMLElement) => ({
+          tag:       el.tagName.toLowerCase(),
+          // IMPORTANT: Collapse ALL lines into one label — the CRM uses multi-line buttons:
+          //   e.g. innerText = "+\nNew Lead"  → we store "+ New Lead" (not just "+")
+          text:      ((el as HTMLButtonElement).innerText || (el as HTMLInputElement).value || '')
+                       .replace(/\s*\n\s*/g, ' ')   // collapse newlines to single space
+                       .replace(/\s+/g, ' ')          // normalise multiple spaces
+                       .trim(),
+          ariaLabel: el.getAttribute('aria-label') || '',
+          testid:    el.getAttribute('data-testid') || '',
+        })
+
+        // Priority pass: capture "+New X" / "New X" / "Add X" action buttons FIRST
+        // These are the list-page CTA buttons that must not be crowded out by nav items.
+        const actionBtns = all.filter(el => {
+          const txt = ((el as HTMLButtonElement).innerText || el.getAttribute('aria-label') || '').trim().toLowerCase()
+          return txt.startsWith('+') || txt.startsWith('new ') || /^add\s/.test(txt)
+        }).map(toInfo)
+
+        // Then capture remaining buttons up to a wider cap
+        const restBtns = all.filter(el => {
+          const txt = ((el as HTMLButtonElement).innerText || el.getAttribute('aria-label') || '').trim().toLowerCase()
+          return !(txt.startsWith('+') || txt.startsWith('new ') || /^add\s/.test(txt))
+        }).slice(0, 50).map(toInfo)
+
+        // Return action buttons first, then rest (total cap: 60)
+        return [...actionBtns, ...restBtns].slice(0, 60)
+      }) as Array<{ tag: string; text: string; ariaLabel: string; testid: string }>
 
       for (const raw of buttonsRaw) {
         const name = (raw.ariaLabel || raw.text || '').slice(0, 80)

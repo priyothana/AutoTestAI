@@ -116,9 +116,12 @@ export async function createTestRun(data: TestRunCreate) {
     context,
   }
 
+  // Interactive (headed) runs: no retries — re-launching a visible browser
+  // after a crash would open duplicate windows and confuse the user.
+  // Headless runs: keep 3 attempts with exponential back-off.
   await executionQueue.add('execute', job, {
-    attempts: 3,
-    backoff: { type: 'exponential', delay: 2000 },
+    attempts: context.interactive ? 1 : 3,
+    backoff: context.interactive ? undefined : { type: 'exponential', delay: 2000 },
   })
 
   log.info(`[TEST-RUN] Enqueued execution for test run ${testRun.id}`)
@@ -141,21 +144,25 @@ export async function getTestRun(id: string) {
   if (!testRun) throw { statusCode: 404, message: 'Test run not found' }
 
   // ── Stale-run guard ────────────────────────────────────────────────
-  // If the run has been in pending or running for >5 minutes the BullMQ
-  // worker likely crashed before writing. Mark it as error so the
-  // frontend polling loop can exit cleanly.
-  // NOTE: 'paused' is intentionally excluded — HITL runs can wait up to
-  // 10 minutes for user intervention and must NOT be auto-marked as error.
-  if (['pending', 'running'].includes(testRun.status ?? '') && testRun.created_at) {
+  // 'pending'  → 5 min:  job was never picked up by the worker (crash at enqueue)
+  // 'running'  → 15 min: accounts for interactive HITL runs with many steps
+  //                       (frontend polls up to 15 min = 300 × 3s)
+  // NOTE: 'paused' is intentionally excluded — HITL runs can wait indefinitely
+  //       for user intervention and must NOT be auto-marked as error.
+  const STALE_TIMEOUT_MS: Record<string, number> = {
+    pending: 5  * 60 * 1000,  // 5 min — stuck before worker picked it up
+    running: 15 * 60 * 1000,  // 15 min — matches interactive HITL budget
+  }
+  if (testRun.status && STALE_TIMEOUT_MS[testRun.status] && testRun.created_at) {
     const ageMs = Date.now() - testRun.created_at.getTime()
-    if (ageMs > 5 * 60 * 1000) {
+    if (ageMs > STALE_TIMEOUT_MS[testRun.status]) {
       log.warn(`[TEST-RUN] Stale run ${id} in '${testRun.status}' for ${(ageMs / 1000).toFixed(0)}s — auto-marking as error`)
       await prisma.test_runs.update({
         where: { id },
         data: {
           status: 'error',
           result: 'error',
-          logs: [{ step_order: 999, action: 'SYSTEM', error: 'Test run timed out: worker did not complete within 5 minutes.', status: 'error' }],
+          logs: [{ step_order: 999, action: 'SYSTEM', error: 'Test run timed out: worker did not complete within the allowed time.', status: 'error' }],
         },
       })
       return {

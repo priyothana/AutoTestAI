@@ -57,6 +57,8 @@ import {
   extractTestData,
   storeUploadedTestData,
   getTestData,
+  clearTestData,
+  deleteTestDataEntity,
 } from '../webapp/webapp-test-data.service.js'
 import prisma from '../../shared/db/prisma.js'
 
@@ -281,16 +283,7 @@ export async function projectRoutes(app: FastifyInstance) {
         prisma.project_integrations.findFirst({ where: { project_id: id } }),
       ])
 
-      // Infer which stage is active based on which counts have non-zero values.
-      // Stage progresses: 1 (crawl) → 2 (normalize) → 3 (domain) → 4 (embed) → done
-      let active_stage: number | null = null
-      if (embeddingCount > 0) active_stage = null   // all done
-      else if (domainCount > 0) active_stage = 4     // generating embeddings
-      else if (normalizedCount > 0) active_stage = 3 // building domain models
-      else if (rawCount > 0) active_stage = 2        // normalizing
-      else active_stage = 1                          // crawling (nothing in DB yet)
-
-      // ── Crawl state (incremental progress) ──────────────────────────────────
+      // ── Crawl state (incremental progress) ──────────────────────────────────────────
       let has_more_pages = false
       let crawled_so_far = 0
       let total_discovered = 0
@@ -319,10 +312,13 @@ export async function projectRoutes(app: FastifyInstance) {
         }
       }
 
-      // Compute actual pages_crawled from the raw_json.pages array.
-      // raw_count is always 1 (one DB row per project), NOT the page count.
-      // pages_crawled is the true number of pages visited by the Playwright crawler.
-      let pages_crawled = 0
+      // ── Actual page counts (from JSON arrays, not DB row counts) ──────────────────
+      // For web-app projects, raw_store and metadata_normalized each hold ONE DB row
+      // that contains an array of pages inside raw_json / structured_json.
+      // The UI should show the page counts (array lengths), not the DB row count (always 1).
+      let pages_crawled      = 0
+      let normalized_pages   = 0
+
       if (rawCount > 0) {
         const rawRow = await prisma.metadata_raw_store.findFirst({
           where: { project_id: id, metadata_type: 'webpage' },
@@ -334,21 +330,53 @@ export async function projectRoutes(app: FastifyInstance) {
         }
       }
 
-      // Fall back: if crawl_state hasn't populated crawled_so_far yet, use pages_crawled
-      if (crawled_so_far === 0 && pages_crawled > 0) {
-        crawled_so_far = pages_crawled
+      if (normalizedCount > 0) {
+        // Prefer webapp_crawl normalized row; fall back to counting rows for non-webapp projects
+        const normRow = await prisma.metadata_normalized.findFirst({
+          where: { project_id: id, entity_type: 'webapp_crawl' },
+          select: { structured_json: true },
+        })
+        if (normRow?.structured_json) {
+          const nd = normRow.structured_json as { pages?: unknown[] }
+          normalized_pages = nd.pages?.length ?? 0
+        }
+        // Non-webapp (Salesforce etc.): fall back to row count
+        if (normalized_pages === 0) normalized_pages = normalizedCount
+      }
+
+      // crawled_so_far: prefer raw_json.pages count over crawl_state.visitedUrls
+      // (visitedUrls only tracks the CURRENT run, not cumulative across continuation runs)
+      if (pages_crawled > 0) crawled_so_far = pages_crawled
+      else if (crawled_so_far === 0 && rawCount > 0) crawled_so_far = rawCount
+
+      // ── Active stage inference ───────────────────────────────────────────────────────
+      // IMPORTANT: if has_more_pages is true the crawl is still running (stage 1).
+      // Stale embeddings from a previous sync must NOT make it appear complete.
+      let active_stage: number | null = null
+      if (has_more_pages) {
+        active_stage = 1             // crawl still in progress
+      } else if (embeddingCount > 0 && normalized_pages > 0) {
+        active_stage = null          // all stages done
+      } else if (domainCount > 0) {
+        active_stage = 4             // generating embeddings
+      } else if (normalized_pages > 0) {
+        active_stage = 3             // building domain models
+      } else if (rawCount > 0) {
+        active_stage = 2             // normalizing
+      } else {
+        active_stage = 1             // crawling (nothing in DB yet)
       }
 
       return reply.send({
         raw_count:          rawCount,
         pages_crawled,          // ← actual page count (from raw_json.pages.length)
-        normalized_count:   normalizedCount,
+        normalized_count:   normalized_pages,   // ← actual normalized page count
         domain_model_count: domainCount,
         embedding_count:    embeddingCount,
         active_stage,
         last_synced_at:     integration?.last_synced_at?.toISOString() ?? null,
         sync_error:         integration?.sync_error ?? null,
-        // ── Crawl progress ──────────────────────────────────────
+        // ── Crawl progress ────────────────────────────────
         has_more_pages,
         crawled_so_far,
         total_discovered,
@@ -404,8 +432,33 @@ export async function projectRoutes(app: FastifyInstance) {
     }
   })
 
+  // DELETE /api/v1/projects/:id/test-data
+  // Clears ALL test-data entities for a project.
+  // Useful to remove stale/wrong entities (e.g. Salesforce CRM entities on a web app project).
+  app.delete('/projects/:id/test-data', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const deleted = await clearTestData(id)
+      return reply.send({ success: true, deleted_count: deleted, message: `Cleared ${deleted} test data entities` })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
 
-
+  // DELETE /api/v1/projects/:id/test-data/:entityName
+  // Deletes a single test-data entity by name for a project.
+  app.delete('/projects/:id/test-data/:entityName', async (request, reply) => {
+    try {
+      const { id, entityName } = request.params as { id: string; entityName: string }
+      const deleted = await deleteTestDataEntity(id, decodeURIComponent(entityName))
+      if (!deleted) {
+        return reply.status(404).send({ detail: `Entity '${entityName}' not found for this project` })
+      }
+      return reply.send({ success: true, message: `Entity '${entityName}' deleted` })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
 
   // POST /api/v1/projects/:id/test-data/upload
   // Accepts { data: { Entity: [records…] } } and upserts with source='user_upload'.

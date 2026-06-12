@@ -109,7 +109,17 @@ export interface FieldManifest {
   entityName:    string
   requiredCount: number
   fields:        FieldEntry[]
-  submitButton?: string            // exact primary action button name (e.g. "+ New Lead")
+  /**
+   * The OPEN FORM button — clicked on the LIST page to navigate to the create form.
+   * e.g. "+New Lead", "+ New Account", "New Opportunity"
+   * This is DIFFERENT from submitButton (which is clicked INSIDE the form to save).
+   */
+  openButton?:   string
+  /**
+   * The SUBMIT/SAVE button — clicked inside the create/edit form to save the record.
+   * e.g. "Create Lead", "Save", "Save & New"
+   */
+  submitButton?: string
   allButtons?:   string[]         // all button names found on the page (verbatim)
   createUrl?:    string
   listUrl?:      string

@@ -43,6 +43,9 @@ export const REQUIRED_FIELD_OVERRIDE_MAP: Record<string, string[]> = {
   invoice:          ['contact', 'due date', 'number'],
   contract:         ['account', 'start date', 'status'],
   payment:          ['amount', 'date'],
+  // Banking / Finance
+  bank_detail:      ['account holder name', 'account number', 'bank name', 'ifsc code', 'routing number', 'account type', 'branch'],
+  bank:             ['account holder name', 'account number', 'bank name', 'ifsc code', 'routing number', 'account type'],
   // Logistics
   shipment:         ['origin', 'destination', 'status'],
   inventory:        ['name', 'quantity', 'unit'],
@@ -225,6 +228,31 @@ export const TYPICAL_FIELDS_BY_ENTITY: Record<string, FieldEntry[]> = {
     { label: 'Expiration Date', type: 'input', required: false, locatorType: 'label' },
     { label: 'Status', type: 'select', required: false, locatorType: 'label', options: ['Draft', 'In Review', 'Presented', 'Accepted', 'Rejected'] },
   ],
+  // Banking / Finance — Real fields from CRM-D /custom/bank_detail page
+  bank_detail: [
+    { label: 'Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'IBAN', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Account Number', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Bank Account Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'IFSC Code', type: 'input', required: true, locatorType: 'label' },
+    { label: 'SWIT Code', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Branch', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Country', type: 'input', required: false, locatorType: 'label' },
+    { label: 'HSN Code', type: 'input', required: false, locatorType: 'label' },
+    { label: 'License No', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Formation Number', type: 'input', required: false, locatorType: 'label' },
+  ],
+  bank: [
+    { label: 'Name', type: 'input', required: true, locatorType: 'label' },
+    { label: 'IBAN', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Account Number', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Bank Account Name', type: 'input', required: false, locatorType: 'label' },
+    { label: 'IFSC Code', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Branch', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Country', type: 'input', required: false, locatorType: 'label' },
+  ],
+
+
 }
 
 // ── Field manifest builder ────────────────────────────────────────────────────
@@ -429,10 +457,30 @@ export async function buildFieldManifest(
             continue
           }
 
+          // ── Resolve openButton (list-page button to open the create form) ────────
+          // This is different from the form-page submitButton.
+          // Try to detect from the filtered button list, then synthesise a default.
+          let openBtn: string | undefined
+          if (entityFilter) {
+            // Look for a "+New X" or "New X" style button
+            openBtn = allButtonNames.find(n => {
+              const nLower = n.toLowerCase()
+              return (nLower.startsWith('+') || nLower.startsWith('new ')) && nLower.includes(entityLower)
+            }) ?? allButtonNames.find(n => {
+              const nLower = n.toLowerCase()
+              return nLower.startsWith('+') && (nLower.includes('new') || nLower.includes('add'))
+            })
+          }
+          // Default: synthesise from entity name so the prompt always shows something
+          if (!openBtn && entityFilter) {
+            openBtn = `+New ${entityFilter.charAt(0).toUpperCase() + entityFilter.slice(1)}`
+          }
+
           return {
             entityName,
             requiredCount: patchedFields.filter(f => f.required).length,
             fields:        patchedFields,
+            openButton:    openBtn,
             submitButton:  submitBtn?.name,
             allButtons:    allButtonNames,
             createUrl:     page.path,
@@ -657,6 +705,7 @@ export async function buildFieldManifest(
           entityName,
           requiredCount: reqCount,
           fields:        typicalFields,
+          openButton:    openBtn,
           submitButton:  submitBtn,
           allButtons:    [submitBtn, openBtn, 'Save', 'Cancel'],
         }
@@ -781,18 +830,50 @@ export function formatManifestForPrompt(manifest: FieldManifest, operationMode: 
     }
   }
 
-  if (manifest.submitButton) {
-    const buttonLabel = operationMode === 'update'
-      ? `\n⚡ SAVE/UPDATE BUTTON: "${manifest.submitButton}" — use for saving changes (or look for a "Save" / "Update" button)`
-      : `\n⚡ PRIMARY ACTION BUTTON: "${manifest.submitButton}" — copy EXACTLY into CLICK target`
-    lines.push(buttonLabel)
+  // ── For Create operations: show OPEN FORM button and SUBMIT FORM button separately ──
+  // This is critical — the LLM must know WHICH button to use at WHICH step:
+  //   Step 2: CLICK the OPEN FORM button (on the LIST page) → opens the create form
+  //   Step N: CLICK the SUBMIT FORM button (inside the form) → saves the record
+  if (operationMode === 'create' || (operationMode === 'default' && manifest.openButton)) {
+    if (manifest.openButton) {
+      lines.push(`\n╔══════════════════════════════════════════════════════════════╗`)
+      lines.push(`║  🔓 OPEN FORM BUTTON (Step 2 — on the LIST page)             ║`)
+      lines.push(`╠══════════════════════════════════════════════════════════════╣`)
+      lines.push(`║  CLICK "${manifest.openButton}"`)
+      lines.push(`║  → This button is on the LIST page (e.g. /leads).            ║`)
+      lines.push(`║  → Clicking it opens the CREATE form.                        ║`)
+      lines.push(`║  → Use this EXACT name — character-for-character.            ║`)
+      lines.push(`╚══════════════════════════════════════════════════════════════╝`)
+    }
+    if (manifest.submitButton) {
+      lines.push(`\n╔══════════════════════════════════════════════════════════════╗`)
+      lines.push(`║  💾 SUBMIT FORM BUTTON (Last click — inside the form)         ║`)
+      lines.push(`╠══════════════════════════════════════════════════════════════╣`)
+      lines.push(`║  CLICK "${manifest.submitButton}"`)
+      lines.push(`║  → This button is INSIDE the create form.                    ║`)
+      lines.push(`║  → Clicking it saves the new record.                         ║`)
+      lines.push(`║  → Use this EXACT name — character-for-character.            ║`)
+      lines.push(`╚══════════════════════════════════════════════════════════════╝`)
+    }
+    if (!manifest.openButton && !manifest.submitButton) {
+      lines.push(`\n⚠️ No button names found in metadata — use "+New ${manifest.entityName}" to open form and "Save" to submit.`)
+    }
+  } else {
+    // Update or default mode — single button display
+    if (manifest.submitButton) {
+      const buttonLabel = operationMode === 'update'
+        ? `\n⚡ SAVE/UPDATE BUTTON: "${manifest.submitButton}" — use for saving changes (or look for a "Save" / "Update" button)`
+        : `\n⚡ PRIMARY ACTION BUTTON: "${manifest.submitButton}" — copy EXACTLY into CLICK target`
+      lines.push(buttonLabel)
+    }
   }
+
   if (manifest.allButtons && manifest.allButtons.length > 0) {
     lines.push(`\n📋 ALL PAGE BUTTONS (use EXACT names only):`)
     for (const btn of manifest.allButtons.slice(0, 15)) {
       lines.push(`  → "${btn}"`)
     }
-    lines.push('  ⚠️  NEVER invent button names — only use names from this list or the PRIMARY ACTION BUTTON above')
+    lines.push('  ⚠️  NEVER invent button names — only use names from this list or the buttons shown above')
   }
   if (manifest.createUrl) {
     if (operationMode === 'update') {
@@ -976,10 +1057,42 @@ async function tryCanonicalManifest(
     return null
   }
 
+  // ── Resolve the OPEN FORM button vs SUBMIT FORM button ──────────────────
+  // The canonical primary_action_button is the SUBMIT button (inside the form).
+  // The OPEN button (on the list page) is typically stored in learned_rules.open_button.
+  // We also try to detect it from all_buttons.
+  let resolvedOpenButton: string | undefined
+
+  // Priority 1: learned_rules.open_button (user-confirmed or runtime-discovered)
+  if (typeof learnedRules.open_button === 'string' && learnedRules.open_button.length > 0) {
+    resolvedOpenButton = learnedRules.open_button
+  }
+
+  // Priority 2: look in all_buttons for a "New X" / "+New X" button
+  if (!resolvedOpenButton && allButtons.length > 0) {
+    const entityLowerBtn = canonical.entity_name.toLowerCase()
+    // Match buttons like "+New Lead", "New Account", "+ New Opportunity"
+    resolvedOpenButton = allButtons.find(b => {
+      const n = b.toLowerCase().trim()
+      return (n.startsWith('+') || n.startsWith('new ') || n.includes(' new ')) &&
+             n.includes(entityLowerBtn)
+    }) ?? allButtons.find(b => {
+      const n = b.toLowerCase().trim()
+      return n.startsWith('+') && (n.includes('new') || n.includes('add'))
+    }) ?? undefined
+  }
+
+  // Priority 3: synthesise a sensible default from the entity name
+  // so the prompt always has something concrete rather than generic "Save"
+  if (!resolvedOpenButton) {
+    resolvedOpenButton = `+New ${canonical.entity_name}`
+  }
+
   return {
     entityName:    canonical.entity_name,
     requiredCount: patchedFields.filter(f => f.required).length,
     fields:        patchedFields,
+    openButton:    resolvedOpenButton,
     submitButton:  canonical.primary_action_button ?? undefined,
     allButtons:    allButtons.length > 0 ? allButtons : undefined,
     createUrl:     canonical.page_url ?? undefined,
@@ -1075,17 +1188,26 @@ export async function autoCorrectButtonNames(
               '[META-TOOL] autoCorrectButtonNames: using CANONICAL submit button',
             )
           }
-          const canButtons = (canonical.all_buttons ?? []) as string[]
+          // Check learned_rules.open_button FIRST — highest priority (user-confirmed)
+          const rules = (canonical.learned_rules ?? {}) as Record<string, unknown>
+          if (!realOpenBtn && typeof rules.open_button === 'string' && rules.open_button.length > 0) {
+            realOpenBtn = rules.open_button
+            log.info(
+              { projectId, entityHint, button: realOpenBtn },
+              '[META-TOOL] autoCorrectButtonNames: using CANONICAL learned_rules.open_button (highest priority)',
+            )
+          }
+          // Fall back: scan all_buttons for "+New X" patterns (entity-specific first)
           if (!realOpenBtn) {
+            const canButtons = (canonical.all_buttons ?? []) as string[]
+            const entityLowerAuto = entityHint.toLowerCase()
             realOpenBtn = canButtons.find(b => {
+              const n = b.toLowerCase()
+              return (n.startsWith('+') || n.startsWith('new ')) && n.includes(entityLowerAuto)
+            }) ?? canButtons.find(b => {
               const n = b.toLowerCase()
               return (n.includes('new') || n.includes('add') || n.startsWith('+')) && !n.includes('save')
             }) ?? null
-          }
-          // Check learned_rules for open button
-          const rules = (canonical.learned_rules ?? {}) as Record<string, unknown>
-          if (!realOpenBtn && typeof rules.open_button === 'string') {
-            realOpenBtn = rules.open_button
           }
         }
       } catch { /* canonical table may not exist yet — non-fatal */ }

@@ -617,16 +617,45 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
 
 
     // ── HITL: Resume or skip the paused step ────────────────────────────
-    const handlePauseAction = async (action: 'resume' | 'skip') => {
+    const handlePauseAction = async (
+        action: 'resume' | 'skip',
+        opts?: {
+            /** Structured step override — patches the paused test step before resuming */
+            step_override?: { action?: string; target?: string; value?: string; locator_type?: string }
+            /** New step to INSERT before the paused step (Add Step & Resume) */
+            insert_step?: { action: string; target: string; value: string }
+            /** If true, delete the paused step before resuming */
+            delete_step?: boolean
+            /** User's typed/selected instruction (for learning) */
+            user_instruction?: string
+            /** AI suggestion text (for learning) */
+            ai_suggestion?: string
+            /** 1-based step index — supplied by the chatbot panel */
+            paused_step?: number
+            /** test case ID — supplied by the chatbot panel */
+            test_case_id?: string
+        }
+    ) => {
         if (!activeRunId) return
         setIsResumingPause(true)
         try {
+            const payload: Record<string, unknown> = { action }
+            if (opts?.step_override)    payload.step_override    = opts.step_override
+            if (opts?.insert_step)      payload.insert_step      = opts.insert_step
+            if (opts?.delete_step)      payload.delete_step      = opts.delete_step
+            if (opts?.user_instruction) payload.user_instruction = opts.user_instruction
+            if (opts?.ai_suggestion)    payload.ai_suggestion    = opts.ai_suggestion
+            // Send paused_step + test_case_id whenever any step mutation is requested
+            if (opts?.step_override || opts?.insert_step || opts?.delete_step) {
+                payload.paused_step  = opts.paused_step  ?? pausedStepIndex ?? undefined
+                payload.test_case_id = opts.test_case_id ?? currentId
+            }
             const res = await fetch(
                 `${process.env.NEXT_PUBLIC_API_URL}/api/v1/test-runs/${activeRunId}/resume`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action }),
+                    body: JSON.stringify(payload),
                 }
             )
             if (!res.ok) {
@@ -636,7 +665,15 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                 setIsPaused(false)
                 setPausedStepIndex(null)
                 setPausedErrorMessage(null)
-                toast.success(action === 'resume' ? '▶ Continuing test...' : '⏭ Step skipped — continuing...')
+                // Refresh test steps after any step mutation
+                if (opts?.step_override || opts?.insert_step || opts?.delete_step) {
+                    fetchTestCase()
+                    if (opts.insert_step)      toast.success('✅ New step added & test resuming...')
+                    else if (opts.delete_step) toast.success('🗑️ Step deleted & test resuming...')
+                    else                       toast.success('✅ Step updated & test resuming...')
+                } else {
+                    toast.success(action === 'resume' ? '▶ Continuing test...' : '⏭ Step skipped — continuing...')
+                }
             }
         } catch (e) {
             toast.error('Network error — could not reach backend')
@@ -873,7 +910,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             </div>
 
             {/* ── Execution Status Highlight Panel ─────────────────────────── */}
-            {(isRunning || executionStatus === 'passed' || executionStatus === 'failed') && (
+            {(isRunning || executionStatus === 'paused' || executionStatus === 'passed' || executionStatus === 'failed') && (
                 <div className={`rounded-xl border-2 shadow-lg overflow-hidden transition-all duration-300 ${
                     executionStatus === 'running'
                         ? 'border-blue-400 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/30 dark:to-indigo-950/20 dark:border-blue-600'
@@ -1686,7 +1723,8 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     testCaseId={currentId}
                     pausedStep={pausedStepIndex}
                     errorMessage={pausedErrorMessage}
-                    onResume={async () => handlePauseAction('resume')}
+                    currentSteps={steps}
+                    onResume={async (opts) => handlePauseAction('resume', opts)}
                     onSkip={async () => handlePauseAction('skip')}
                     onStop={handleStopTest}
                     isActioning={isResumingPause}

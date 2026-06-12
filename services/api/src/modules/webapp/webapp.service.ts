@@ -208,14 +208,17 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
   // ── Decrypt credentials if available ──────────────────────────────────────
   let credentials: { username: string; password: string } | undefined
   if (integration.username && integration.password) {
-    try {
-      credentials = {
-        username: fernetDecrypt(integration.username),
-        password: fernetDecrypt(integration.password),
-      }
-    } catch (err) {
-      log.warn({ err }, '[WEB-SYNC] Failed to decrypt credentials — crawling without auth')
+    // Try Fernet decryption first. If it fails (e.g. credentials stored as plain text
+    // for older integrations), fall back to using the raw stored value.
+    const tryDecrypt = (val: string): string => {
+      try { return fernetDecrypt(val) }
+      catch { return val }  // plain-text fallback
     }
+    credentials = {
+      username: tryDecrypt(integration.username),
+      password: tryDecrypt(integration.password),
+    }
+    log.info(`[WEB-SYNC] Credentials loaded for: ${credentials.username.slice(0, 12)}…`)
   }
 
   // ── Parse Auth Config Options ───────────────────────────────────────────
@@ -224,6 +227,8 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
   let keyRoutes: string[] | undefined
   let enableDeepCrawl: boolean | undefined
   let initialState: CrawlState | undefined
+  // Read login_strategy directly from the integration row
+  const loginStrategy: string = integration.login_strategy ?? 'form'
 
   if (integration.auth_config && typeof integration.auth_config === 'object') {
     const conf = integration.auth_config as Record<string, any>
@@ -244,26 +249,14 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
     }
   }
 
-  // ── Inject default key routes + dynamic BRD / button-derived routes ────────
-  // Base set: generic CRM form routes (good default for most web apps).
-  // We augment these with routes derived from the project's BRD content and
-  // any navigation buttons discovered on previously crawled pages.
-  const DEFAULT_CRM_KEY_ROUTES = [
-    '/accounts/create', '/accounts/new',
-    '/contacts/create', '/contacts/new',
-    '/leads/create',    '/leads/new',
-    '/opportunities/create', '/opportunities/new',
-    '/campaigns/create',
-    '/contracts/create',
-    '/orders/create',
-    '/invoices/create',
-    '/quotes/create',
-    '/products/create',
-    '/accounts', '/contacts', '/leads', '/opportunities',
-  ]
+  // ── Inject default key routes only when user has not configured their own ──
+  // IMPORTANT: Do NOT inject Salesforce-specific entity routes (/accounts, /contacts,
+  // /leads etc.) for generic web apps — they cause 404 floods on non-Salesforce apps.
+  // If the user configured key_routes in auth_config, those are already in keyRoutes.
+  // BRD + button discovery below will augment further.
   if (!keyRoutes || keyRoutes.length === 0) {
-    keyRoutes = [...DEFAULT_CRM_KEY_ROUTES]
-    log.info('[WEB-SYNC] No key routes configured — injecting default CRM form routes')
+    keyRoutes = []
+    log.info('[WEB-SYNC] No key routes configured — will rely on BRD and link discovery')
   }
 
   // ── BRD-aware route extraction ─────────────────────────────────────────────
@@ -321,7 +314,8 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
     sitemapUrl,
     keyRoutes,
     enableDeepCrawl,
-    initialState, // undefined on first run
+    loginStrategy,   // pass basic_auth/form/keycloak to the crawler
+    initialState,    // undefined on first run
   })
 
   // ── Persist updated crawl state back to auth_config ────────────────────────
@@ -580,19 +574,14 @@ interface TestingRule { [key: string]: unknown }
 export async function buildWebappDomainModels(projectId: string): Promise<number> {
   log.info(`[WEB-SYNC] Stage 3: Domain model build started for project ${projectId}`)
 
-  // Clear existing webapp domain models (full rebuild)
-  const existingDomainIds = await prisma.metadata_normalized
-    .findMany({ where: { project_id: projectId, entity_type: 'webapp_crawl' }, select: { object_name: true } })
-    .then((rows) => rows.map((r) => r.object_name))
-
-  if (existingDomainIds.length > 0) {
-    await prisma.domain_models.deleteMany({
-      where: {
-        project_id:  projectId,
-        entity_name: { in: existingDomainIds },
-      },
-    })
-  }
+  // Clear ALL existing webapp domain models for this project (full rebuild).
+  // IMPORTANT: domain models use entity_name = baseUrl + path (e.g. "https://app.com/leads"),
+  // NOT just the base URL. The old pattern of deleting by entity_name IN [baseUrl] never
+  // matched anything and caused stale models to accumulate across syncs.
+  await prisma.domain_models.deleteMany({
+    where: { project_id: projectId },
+  })
+  log.info(`[WEB-SYNC] Cleared all existing domain models for project ${projectId} — rebuilding from scratch`)
 
   const normalizedRows = await prisma.metadata_normalized.findMany({
     where: { project_id: projectId, entity_type: 'webapp_crawl' },
@@ -893,10 +882,20 @@ export async function syncWebappMetadata(projectId: string): Promise<WebAppSyncR
   log.info(`[WEB-SYNC] Sync queued for project ${projectId}`)
 
   // ── Smart detection: stale stuck crawl state ──────────────────────────────
-  // If pages are already crawled but Normalize/Domain/Embed stages are at 0,
-  // this means the crawl never "completed" (hasMorePages was stuck). Instead
-  // of re-crawling from scratch, run forceNormalize to unblock the pipeline.
+  // Only redirect to force-normalize when BOTH conditions are true:
+  //   1. A previous crawl left crawl_state.pendingUrls > 0 (stuck mid-crawl)
+  //   2. Raw pages exist but downstream normalized = 0 (pipeline never ran)
+  // Without condition 1, this fires on every fresh sync (normalizedCount is
+  // always 0 at the start of a new sync) and skips the re-crawl entirely.
   try {
+    const integration = await prisma.project_integrations.findFirst({
+      where: { project_id: projectId, category: 'web_app' },
+      select: { id: true, auth_config: true },
+    })
+    const conf = (integration?.auth_config as Record<string, any>) ?? {}
+    const crawlState = conf.crawl_state as { pendingUrls?: string[] } | null
+    const hasStaleCrawlState = Array.isArray(crawlState?.pendingUrls) && crawlState!.pendingUrls.length > 0
+
     const rawRow = await prisma.metadata_raw_store.findFirst({
       where: { project_id: projectId, metadata_type: 'webpage' },
       select: { raw_json: true },
@@ -904,12 +903,22 @@ export async function syncWebappMetadata(projectId: string): Promise<WebAppSyncR
     const pagesInDb = (rawRow?.raw_json as { pages?: unknown[] })?.pages?.length ?? 0
     const normalizedCount = await prisma.metadata_normalized.count({ where: { project_id: projectId } })
 
-    if (pagesInDb >= 5 && normalizedCount === 0) {
+    if (hasStaleCrawlState && pagesInDb >= 5 && normalizedCount === 0) {
       log.warn(
         `[WEB-SYNC] Detected stuck pipeline for project ${projectId}: ` +
-        `${pagesInDb} pages crawled but normalized=0. Redirecting to force-normalize.`
+        `${pagesInDb} pages crawled, crawl_state has ${crawlState?.pendingUrls?.length} pending, normalized=0. Redirecting to force-normalize.`
       )
       return forceNormalizeWebapp(projectId)
+    }
+
+    // Not a stuck state — clear any leftover crawl_state so the fresh crawl
+    // starts with clean visitedUrls/pendingUrls counters (prevents ghost "1 page" reading).
+    if (integration && hasStaleCrawlState) {
+      await prisma.project_integrations.update({
+        where: { id: integration.id as string },
+        data:  { auth_config: { ...conf, crawl_state: null } as object },
+      })
+      log.info(`[WEB-SYNC] Cleared stale crawl_state for fresh sync on project ${projectId}`)
     }
   } catch (detectErr) {
     log.warn({ err: detectErr }, '[WEB-SYNC] Stuck-crawl detection failed — proceeding with normal sync')

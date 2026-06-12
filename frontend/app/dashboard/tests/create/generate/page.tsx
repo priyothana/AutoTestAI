@@ -6,7 +6,7 @@ import {
   Sparkles, ArrowLeft, Check, Loader2, ChevronRight, ChevronDown, ChevronUp,
   GitBranch, Cpu, Send, Play, RotateCcw, CheckSquare, Square, GripVertical,
   AlertCircle, CheckCircle2, XCircle, Clock, Zap, Filter, X, ArrowRight,
-  RefreshCw, FileText, BarChart3, TrendingUp, MonitorPlay
+  RefreshCw, FileText, BarChart3, TrendingUp, MonitorPlay, History, FolderOpen
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -14,6 +14,52 @@ import { toast } from "sonner"
 
 const API = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000") + "/api/v1"
 type Phase = "discover" | "generating" | "review" | "running" | "results"
+
+// ── localStorage persistence helpers ────────────────────────────────────────
+interface StoredFlowsEntry {
+  flows: FlowItem[]
+  discoveredAt: string   // ISO timestamp
+  projectName: string
+}
+const STORAGE_KEY = "autotest_discovered_flows"
+function getStoredFlows(projectId: string): StoredFlowsEntry | null {
+  if (typeof window === "undefined") return null
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return null
+    const all: Record<string, StoredFlowsEntry> = JSON.parse(raw)
+    return all[projectId] ?? null
+  } catch { return null }
+}
+function saveStoredFlows(projectId: string, entry: StoredFlowsEntry) {
+  if (typeof window === "undefined") return
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    const all: Record<string, StoredFlowsEntry> = raw ? JSON.parse(raw) : {}
+    all[projectId] = entry
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(all))
+  } catch { /* quota exceeded – silently ignore */ }
+}
+function clearStoredFlows(projectId: string) {
+  if (typeof window === "undefined") return
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return
+    const all: Record<string, StoredFlowsEntry> = JSON.parse(raw)
+    delete all[projectId]
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(all))
+  } catch { }
+}
+function fmtRelativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const mins  = Math.floor(diff / 60_000)
+  const hours = Math.floor(diff / 3_600_000)
+  const days  = Math.floor(diff / 86_400_000)
+  if (mins < 1)   return "just now"
+  if (mins < 60)  return `${mins}m ago`
+  if (hours < 24) return `${hours}h ago`
+  return `${days}d ago`
+}
 interface Msg { role: "user" | "assistant"; content: string }
 interface FlowItem { name: string; description: string }  // richer flow object from backend
 interface TC { id: string; name: string; description?: string | null; priority: string; steps?: unknown[]; tags?: string[] }
@@ -168,6 +214,11 @@ export default function GenerateWizardPage() {
   const [flows, setFlows] = useState<FlowItem[]>([])
   const [flowsLoading, setFlowsLoading] = useState(false)
   const [selectedFlows, setSelectedFlows] = useState<Set<string>>(new Set())
+
+  // Stored flows from localStorage (per project)
+  const [storedEntry, setStoredEntry] = useState<StoredFlowsEntry | null>(null)
+  // Whether user is "using existing" stored flows or has triggered a new discovery
+  const [usingStored, setUsingStored] = useState(false)
   const [customFlowInput, setCustomFlowInput] = useState("")
 
   // Phase 2 — generating
@@ -205,10 +256,27 @@ export default function GenerateWizardPage() {
       }).catch(() => { }).finally(() => setProjLoading(false))
   }, [])
 
-  // ── Load flows ───────────────────────────────────────────────────────────────
+  // ── When project changes, check localStorage for stored flows ────────────────
+  useEffect(() => {
+    if (!projectId) { setStoredEntry(null); setFlows([]); setSelectedFlows(new Set()); setUsingStored(false); return }
+    const entry = getStoredFlows(projectId)
+    setStoredEntry(entry)
+    // If there are stored flows, pre-load them and mark as using-stored
+    if (entry) {
+      setFlows(entry.flows)
+      setSelectedFlows(new Set(entry.flows.map(f => f.name)))
+      setUsingStored(true)
+    } else {
+      setFlows([])
+      setSelectedFlows(new Set())
+      setUsingStored(false)
+    }
+  }, [projectId])
+
+  // ── Load flows (fresh discovery — overwrites stored) ──────────────────────────
   const loadFlows = async () => {
     if (!projectId) { toast.error("Select a project first"); return }
-    setFlowsLoading(true); setFlows([]); setSelectedFlows(new Set())
+    setFlowsLoading(true); setFlows([]); setSelectedFlows(new Set()); setUsingStored(false)
     try {
       const res = await fetch(`${API}/projects/${projectId}/generate-workflows`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({})
@@ -221,6 +289,22 @@ export default function GenerateWizardPage() {
         typeof f === "string" ? { name: f, description: "" } : { name: f.name ?? f, description: f.description ?? "" }
       )
       setFlows(items)
+      // Only persist non-empty results — an empty list must never create a dead-state
+      // where storedEntry exists but there are no flows to show or interact with.
+      if (items.length > 0) {
+        const projName = projects.find(p => p.id === projectId)?.name ?? projectId
+        const entry: StoredFlowsEntry = { flows: items, discoveredAt: new Date().toISOString(), projectName: projName }
+        saveStoredFlows(projectId, entry)
+        setStoredEntry(entry)
+        setUsingStored(true)
+        toast.success(`Discovered ${items.length} business flows — saved for later reference`)
+      } else {
+        // Clear any stale stored entry so the discover button re-appears
+        clearStoredFlows(projectId)
+        setStoredEntry(null)
+        setUsingStored(false)
+        toast.warning("No business flows were discovered for this project. Try again or check your project metadata.")
+      }
     } catch { toast.error("Could not discover flows") }
     finally { setFlowsLoading(false) }
   }
@@ -516,18 +600,93 @@ export default function GenerateWizardPage() {
               <label className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Project</label>
               {projLoading
                 ? <div className="flex items-center gap-2 text-sm text-slate-400 py-3"><Loader2 className="h-4 w-4 animate-spin" />Loading projects…</div>
-                : <select value={projectId} onChange={e => { setProjectId(e.target.value); setFlows([]); setSelectedFlows(new Set()) }}
+                : <select value={projectId} onChange={e => { setProjectId(e.target.value) }}
                     className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-violet-400 focus:border-transparent transition-all">
                     <option value="">— Choose a project —</option>
                     {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                   </select>}
             </div>
 
-            {/* Discover button */}
-            {projectId && (
+            {/* ── Stored-flows banner: shown when localStorage has data ── */}
+            {projectId && storedEntry && usingStored && flows.length > 0 && (
+              <div className="rounded-2xl border-2 border-violet-200 dark:border-violet-800 bg-gradient-to-br from-violet-50/80 to-indigo-50/60 dark:from-violet-950/30 dark:to-indigo-950/20 overflow-hidden">
+                {/* Banner header */}
+                <div className="flex items-center gap-3 px-5 py-4 border-b border-violet-100 dark:border-violet-800/60">
+                  <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: "linear-gradient(135deg,#7c3aed,#4f46e5)" }}>
+                    <History className="h-4.5 w-4.5 text-white h-5 w-5" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold text-violet-800 dark:text-violet-200">Previously Discovered Workflows</p>
+                    <p className="text-[11px] text-violet-600/80 dark:text-violet-400/80 mt-0.5">
+                      {flows.length} flows saved · Discovered {fmtRelativeTime(storedEntry.discoveredAt)}
+                    </p>
+                  </div>
+                  <Badge className="bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-700 text-[11px]">
+                    {flows.length} flows
+                  </Badge>
+                </div>
+
+                {/* Collapsed flow chips */}
+                <div className="px-5 py-4 space-y-3">
+                  <div className="flex flex-wrap gap-2">
+                    {flows.slice(0, 12).map((f, i) => (
+                      <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-white dark:bg-slate-900 border border-violet-200 dark:border-violet-700 text-violet-700 dark:text-violet-300">
+                        <GitBranch className="h-3 w-3 opacity-70" />{f.name}
+                      </span>
+                    ))}
+                    {flows.length > 12 && (
+                      <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-medium bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-400">
+                        +{flows.length - 12} more
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Action row */}
+                  <div className="flex items-center gap-3 pt-1">
+                    <Button
+                      onClick={() => {
+                        // Use existing — scroll down to the full flow selector
+                        setUsingStored(true)
+                        setSelectedFlows(new Set(flows.map(f => f.name)))
+                      }}
+                      className="flex-1 h-10 gap-2 text-white text-sm font-semibold shadow-md shadow-violet-200 dark:shadow-violet-900/30"
+                      style={{ background: "linear-gradient(135deg,#7c3aed,#4f46e5)" }}
+                    >
+                      <FolderOpen className="h-4 w-4" />Use Existing Workflows
+                    </Button>
+                    <Button
+                      onClick={() => {
+                        clearStoredFlows(projectId)
+                        setStoredEntry(null)
+                        setFlows([])
+                        setSelectedFlows(new Set())
+                        setUsingStored(false)
+                        loadFlows()
+                      }}
+                      disabled={flowsLoading}
+                      variant="outline"
+                      className="flex-1 h-10 gap-2 border-2 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 text-sm font-semibold"
+                    >
+                      {flowsLoading
+                        ? <><Loader2 className="h-4 w-4 animate-spin" />Discovering…</>
+                        : <><RefreshCw className="h-4 w-4" />Discover New Workflows</>}
+                    </Button>
+                  </div>
+                  <p className="text-[10px] text-violet-500/70 dark:text-violet-500/50 text-center">
+                    Discovering new workflows will replace the saved set above.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Discover button — shown when no stored flows exist, OR if flows came back empty.
+                Always provide an escape hatch so the user is never left with a blank screen. */}
+            {projectId && (!storedEntry || flows.length === 0) && (
               <Button onClick={loadFlows} disabled={flowsLoading} variant="outline"
                 className="w-full h-12 border-2 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 gap-2 text-sm font-semibold">
-                {flowsLoading ? <><Loader2 className="h-4 w-4 animate-spin" />Analysing project metadata & BRD…</> : <><Zap className="h-4 w-4" />Discover Business Flows</>}
+                {flowsLoading
+                  ? <><Loader2 className="h-4 w-4 animate-spin" />Analysing project metadata & BRD…</>
+                  : <><Zap className="h-4 w-4" />{storedEntry ? "Discover Business Flows Again" : "Discover Business Flows"}</>}
               </Button>
             )}
 
