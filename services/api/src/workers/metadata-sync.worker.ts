@@ -221,9 +221,23 @@ async function processMetadataSync(job: Job<MetadataSyncJob>): Promise<void> {
         log.info('[SYNC] Stage 3.5/5 — Canonical + Knowledge Graph build')
         await job.updateProgress(60)
         try {
-          const { buildCanonicalMetadata } = await import('../modules/webapp/canonical-builder.service.js')
+          const { buildCanonicalMetadata, populateOpenButtonsFromCrawlData } = await import('../modules/webapp/canonical-builder.service.js')
           const canonicalCount = await buildCanonicalMetadata(projectId)
           log.info(`[SYNC] Stage 3.5 done — ${canonicalCount} canonical records (with Knowledge Graph)`)
+
+          // ── Stage 3.6: Universal Open-Button Population ─────────────────
+          // Scans ALL crawled pages (including list pages like /leads, /accounts)
+          // to extract the real "+New X" open-form button for EVERY entity.
+          // This is the universal fix for the wrong-button-name problem.
+          // Even if Stage 3.5 misses the list page, 3.6 catches it because
+          // it scans ALL pages across the entire crawl dataset.
+          log.info('[SYNC] Stage 3.6/5 — Universal open-button population (list-page buttons)')
+          try {
+            const openBtnCount = await populateOpenButtonsFromCrawlData(projectId)
+            log.info(`[SYNC] Stage 3.6 done — ${openBtnCount} entities updated with open_button`)
+          } catch (obErr) {
+            log.warn({ err: obErr }, '[SYNC] Stage 3.6 failed (non-critical) — open-button population skipped')
+          }
         } catch (canErr) {
           log.warn({ err: canErr }, '[SYNC] Stage 3.5 failed (non-critical) — canonical metadata skipped')
         }

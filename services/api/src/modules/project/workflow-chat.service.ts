@@ -33,12 +33,12 @@ function useAnthropic(): boolean {
 
 function buildLlm(): BaseChatModel {
   if (!useAnthropic() && process.env.OPENAI_API_KEY) {
-    return new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY, model: 'gpt-4o-mini', temperature: 0.4, maxTokens: 2048 })
+    return new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY, model: 'gpt-4o', temperature: 0.4, maxTokens: 8192 })
   }
   return new ChatAnthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
     model:  process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
-    maxTokens: 2048,
+    maxTokens: 8192,
     temperature: 0.4,
   })
 }
@@ -46,12 +46,12 @@ function buildLlm(): BaseChatModel {
 /** Dedicated LLM for workflow discovery — uses a high-capability model for richer analysis. */
 function buildDiscoveryLlm(): BaseChatModel {
   if (!useAnthropic() && process.env.OPENAI_API_KEY) {
-    return new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY, model: 'gpt-4o', temperature: 0.3, maxTokens: 3000 })
+    return new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY, model: 'gpt-4o', temperature: 0.3, maxTokens: 8192 })
   }
   return new ChatAnthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
     model:  process.env.CLAUDE_MODEL ?? (process.env.LLM_MODEL ?? 'claude-sonnet-4-5'),
-    maxTokens: 3000,
+    maxTokens: 8192,
     temperature: 0.3,
   })
 }
@@ -1379,6 +1379,44 @@ export interface GenerateTestSuiteResult {
   totalTestCases: number
 }
 
+/**
+ * Words that commonly appear in flow names but are NOT entity names.
+ * Used by extractPrimaryEntityFromFlow and generateFallbackTestCases.
+ */
+const FLOW_STOP_WORDS = new Set([
+  'create','update','edit','delete','view','add','manage','verify','test','check',
+  'and','or','link','to','with','for','from','new','a','an','the','record','records',
+  'successfully','on','off','without','all','using','based','existing','multiple',
+  'successful','ensure','confirm','validate','show','display','missing','required',
+  'fields','field','validation','error','errors','message','messages','alert','alerts',
+  'form','page','module','feature','settings','list','management','flow','workflow',
+  'process','handling','operations','operation','via','by','when','where','that',
+  // Search/filter/view/navigation verbs — NEVER entity names
+  'search','filter','find','sort','browse','navigate','access','open','close',
+  'reset','clear','apply','column','columns','results','result','criteria',
+])
+
+/**
+ * Extracts the PRIMARY entity name from a flow name by stripping verbs,
+ * adjectives, and common descriptive words.  Returns the first meaningful
+ * content word (Title-cased), or the first token of the flow name as fallback.
+ *
+ * Examples:
+ *   "Create Lead and Verify Validation on Missing Required Fields" → "Lead"
+ *   "Account Management" → "Account"
+ *   "Delete Contract"    → "Contract"
+ */
+function extractPrimaryEntityFromFlow(flowName: string): string {
+  for (const word of flowName.split(/\s+/)) {
+    const clean = word.replace(/[^a-zA-Z]/g, '')
+    if (clean.length > 2 && !FLOW_STOP_WORDS.has(clean.toLowerCase())) {
+      return clean.charAt(0).toUpperCase() + clean.slice(1)
+    }
+  }
+  // Fallback: strip known suffixes and return first token
+  return (flowName.replace(/\s*(Management|List|Module|Feature|Settings)$/i, '').trim().split(/\s+/)[0] ?? flowName)
+}
+
 export async function generateTestSuite(params: {
   projectId:  string
   flows:      string[]
@@ -1452,7 +1490,9 @@ Return ONLY valid JSON:
   }
 
   // ── Step 2: Generate test cases per flow in parallel ────────────────────────
-  const PER_FLOW_COUNT = Math.min(Math.max(4, Math.floor(20 / flows.length)), 8)
+  // Generate at least 8 and up to 15 test cases per flow regardless of flow count.
+  // A higher token budget (8192) means Tier 1/2 can reliably return the full set.
+  const PER_FLOW_COUNT = Math.min(Math.max(8, Math.floor(60 / Math.max(flows.length, 1))), 15)
 
   // ── Robust JSON extraction — handles common LLM formatting issues ──────────
   function extractJsonArray(raw: string): FlowTestCase[] {
@@ -1495,21 +1535,138 @@ Return ONLY valid JSON:
     throw new Error(`Could not extract JSON array from LLM response (length=${raw.length})`)
   }
 
+  // ── Flow type classifier ──────────────────────────────────────────────────
+  // Detects whether a flow is a search/filter/list-view flow (as opposed to a CRUD flow).
+  // Examples that should return true:
+  //   "Search and Filter Lead from List view"
+  //   "Filter Leads by Status"
+  //   "Browse Contacts"
+  //   "Search Records"
+  function isSearchFilterFlow(flowName: string): boolean {
+    const lower = flowName.toLowerCase()
+    return (
+      /\bsearch\b/.test(lower) ||
+      /\bfilter\b/.test(lower) ||
+      /\bsort\b/.test(lower) ||
+      /\bbrowse\b/.test(lower) ||
+      (/\blist\s+view\b/.test(lower) && !/\bcreate\b/.test(lower) && !/\bedit\b/.test(lower)) ||
+      (/\blist\b/.test(lower) && /\bfind\b/.test(lower))
+    )
+  }
+
   // ── Metadata-driven fallback generator ──────────────────────────────────────
-  // When BOTH LLM attempts fail, generate basic CRUD test cases from the field
-  // manifest and URL map. This ensures no flow gets an empty group.
+  // When BOTH LLM attempts fail, generate contextually appropriate test cases
+  // from the field manifest and URL map. This ensures no flow gets an empty group.
+  //
+  // CRITICAL: Test cases must reflect the ACTUAL BUSINESS FLOW, not generic CRUD.
+  // - Search/filter/list-view flows → list navigation + search/filter + assertion
+  // - CRUD flows → create/read/update/delete with real fields from manifest
   async function generateFallbackTestCases(
     flowName: string,
   ): Promise<FlowTestCase[]> {
-    // Extract entity name(s) from the flow name
-    const entityNames = flowName
-      .replace(/\b(create|update|edit|delete|view|add|manage|verify|test|check|and|link|to|with|for|from|new|a|an|the|record|records|successfully)\b/gi, '')
-      .trim()
-      .split(/\s+/)
-      .filter(w => w.length > 2)
+    // Extract entity name(s) from the flow name — use FLOW_STOP_WORDS (which includes
+    // 'search', 'filter', 'list', 'view', 'find', 'sort', 'browse', 'navigate', etc.)
+    // so these action/UI words are NEVER treated as entity names.
+    const entityNames: string[] = []
+    for (const word of flowName.split(/\s+/)) {
+      const clean = word.replace(/[^a-zA-Z]/g, '')
+      if (clean.length > 2 && !FLOW_STOP_WORDS.has(clean.toLowerCase())) {
+        entityNames.push(clean.charAt(0).toUpperCase() + clean.slice(1))
+        if (entityNames.length >= 2) break  // cap at 2 to avoid over-generation
+      }
+    }
 
+    const primaryEntity = entityNames[0] ?? flowName.split(/\s+/).find(w => w.length > 3) ?? 'Record'
+    const entityPath    = `/${primaryEntity.toLowerCase()}s`
+
+    // ── Branch A: Search / Filter / List-view flows ─────────────────────────
+    // These flows are about finding/filtering existing records in a list view,
+    // NOT about creating new records. Generate appropriate list-navigation tests.
+    if (isSearchFilterFlow(flowName)) {
+      const flowLower = flowName.toLowerCase()
+      const hasSearch = /\bsearch\b/.test(flowLower)
+      const hasFilter = /\bfilter\b/.test(flowLower)
+
+      const testCases: FlowTestCase[] = []
+
+      if (hasSearch) {
+        testCases.push({
+          name: `Search ${primaryEntity} in List View and Verify Results`,
+          description: `Navigate to the ${primaryEntity} list view, enter a search term, and verify matching records appear in results.`,
+          priority: 'high',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'TYPE', target: 'Search', value: primaryEntity, locator_type: 'label' },
+            { id: '3', action: 'ASSERT_TEXT', target: primaryEntity, locator_type: 'text' },
+          ],
+          tags: [primaryEntity, 'search', 'list-view', 'fallback'],
+        })
+
+        testCases.push({
+          name: `Search ${primaryEntity} with No Matching Results`,
+          description: `Navigate to the ${primaryEntity} list view, enter a search term that returns no results, and verify the empty state message is shown.`,
+          priority: 'medium',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'TYPE', target: 'Search', value: 'xyznonexistent99', locator_type: 'label' },
+            { id: '3', action: 'ASSERT_TEXT', target: 'No records', locator_type: 'text' },
+          ],
+          tags: [primaryEntity, 'search', 'negative', 'list-view', 'fallback'],
+        })
+      }
+
+      if (hasFilter) {
+        testCases.push({
+          name: `Filter ${primaryEntity} List by Criteria and Verify Filtered Results`,
+          description: `Navigate to the ${primaryEntity} list view, apply a filter, and verify only matching records appear.`,
+          priority: 'high',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'CLICK', target: 'Filter', locator_type: 'role' },
+            { id: '3', action: 'ASSERT_TEXT', target: primaryEntity, locator_type: 'text' },
+          ],
+          tags: [primaryEntity, 'filter', 'list-view', 'fallback'],
+        })
+
+        testCases.push({
+          name: `Reset ${primaryEntity} List Filter and Verify All Records Restored`,
+          description: `Apply a filter on the ${primaryEntity} list, then clear/reset the filter, and verify all records are shown again.`,
+          priority: 'medium',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'CLICK', target: 'Filter', locator_type: 'role' },
+            { id: '3', action: 'CLICK', target: 'Clear', locator_type: 'role' },
+            { id: '4', action: 'ASSERT_TEXT', target: primaryEntity, locator_type: 'text' },
+          ],
+          tags: [primaryEntity, 'filter', 'reset', 'list-view', 'fallback'],
+        })
+      }
+
+      // End-to-end flow test combining search AND filter if both are present
+      if (hasSearch && hasFilter) {
+        testCases.push({
+          name: flowName,
+          description: `End-to-end test for "${flowName}" — navigates to the ${primaryEntity} list view, applies a search term AND a filter, and verifies the combined results.`,
+          priority: 'high',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'TYPE', target: 'Search', value: primaryEntity, locator_type: 'label' },
+            { id: '3', action: 'CLICK', target: 'Filter', locator_type: 'role' },
+            { id: '4', action: 'ASSERT_TEXT', target: primaryEntity, locator_type: 'text' },
+          ],
+          tags: [primaryEntity, 'search', 'filter', 'end-to-end', 'fallback'],
+        })
+      }
+
+      log.info(
+        { flowName, entityNames, testCaseCount: testCases.length, flowType: 'search-filter' },
+        '[SUITE] Generated search/filter fallback test cases',
+      )
+      return testCases
+    }
+
+    // ── Branch B: Generic flow with no entity extracted ──────────────────────
     if (entityNames.length === 0) {
-      // Cannot extract any entity — generate a single generic test
       return [{
         name: `Test ${flowName}`,
         description: `Execute the "${flowName}" business flow end-to-end.`,
@@ -1522,6 +1679,7 @@ Return ONLY valid JSON:
       }]
     }
 
+    // ── Branch C: CRUD / management flows ────────────────────────────────────
     const testCases: FlowTestCase[] = []
 
     for (const entityName of entityNames) {
@@ -1530,6 +1688,9 @@ Return ONLY valid JSON:
       try {
         manifest = await buildFieldManifest(projectId, entityName)
       } catch { /* non-critical */ }
+
+      const entityPath = manifest?.createUrl?.replace(/\/new$/, '') ?? `/${entityName.toLowerCase()}s`
+      const createPath = manifest?.createUrl ?? `/${entityName.toLowerCase()}s/new`
 
       if (manifest && manifest.fields.length > 0) {
         // Generate a create test using real field data
@@ -1554,50 +1715,247 @@ Return ONLY valid JSON:
           locator_type: 'role',
         }
 
-        const verifyStep = {
+        const verifyCreatedStep = {
           id: String(fieldSteps.length + 3),
           action: 'ASSERT_TEXT',
           target: `${entityName} created successfully`,
           locator_type: 'text',
         }
 
+        // TC1: Create with required fields
         testCases.push({
-          name: `Create ${entityName} with Required Fields`,
-          description: `Create a new ${entityName} record filling all required fields. Generated from field manifest as AI fallback.`,
+          name: `Create ${entityName} with Required Fields and Verify Success`,
+          description: `Create a new ${entityName} record filling all required fields. Verifies the record is saved successfully.`,
           priority: 'high',
           steps: [
-            { id: '1', action: 'NAVIGATE', value: manifest.createUrl ?? `/${entityName.toLowerCase()}s/new`, locator_type: 'url' },
+            { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
             ...fieldSteps,
             submitStep,
-            verifyStep,
+            verifyCreatedStep,
           ],
-          tags: [entityName, 'fallback'],
+          tags: [entityName, 'create', 'fallback'],
         })
 
-        // Also generate a validation test
+        // TC2: Validate required fields (submit empty form)
         testCases.push({
           name: `Validate Required Fields on ${entityName} Form`,
           description: `Attempt to submit the ${entityName} form without filling required fields. Expected: validation errors appear.`,
-          priority: 'medium',
-          steps: [
-            { id: '1', action: 'NAVIGATE', value: manifest.createUrl ?? `/${entityName.toLowerCase()}s/new`, locator_type: 'url' },
-            submitStep,
-            { id: '3', action: 'ASSERT_TEXT', target: 'required', locator_type: 'text' },
-          ],
-          tags: [entityName, 'validation', 'fallback'],
-        })
-      } else {
-        // No manifest — generate minimal placeholder tests
-        testCases.push({
-          name: `Create ${entityName} Record`,
-          description: `Create a new ${entityName} record as part of the "${flowName}" flow.`,
           priority: 'high',
           steps: [
-            { id: '1', action: 'NAVIGATE', value: `/${entityName.toLowerCase()}s/new`, locator_type: 'url' },
+            { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
+            { ...submitStep, id: '2' },
+            { id: '3', action: 'ASSERT_TEXT', target: 'required', locator_type: 'text' },
+          ],
+          tags: [entityName, 'validation', 'negative', 'fallback'],
+        })
+
+        // TC3: Verify list view loads
+        testCases.push({
+          name: `Navigate to ${entityName} List and Verify Records Display`,
+          description: `Navigate to the ${entityName} list page and verify records are displayed correctly.`,
+          priority: 'medium',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
             { id: '2', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
           ],
-          tags: [entityName, 'fallback'],
+          tags: [entityName, 'read', 'list', 'fallback'],
         })
+
+        // TC4: Edit existing record (if required fields known)
+        if (requiredFields.length > 0) {
+          const editFieldSteps = requiredFields.slice(0, 2).map((f, i) => ({
+            id: String(i + 3),
+            action: f.type === 'select' ? 'SELECT' : 'TYPE',
+            target: f.label,
+            value: f.sampleValue ?? `Updated ${f.label}`,
+            locator_type: 'label',
+          }))
+          testCases.push({
+            name: `Edit ${entityName} Record and Verify Updated Values`,
+            description: `Open an existing ${entityName} record, modify key fields, save, and verify the updated values are reflected.`,
+            priority: 'high',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+              { id: '2', action: 'CLICK', target: entityName, locator_type: 'role' },
+              { id: '3', action: 'CLICK', target: 'Edit', locator_type: 'role' },
+              ...editFieldSteps.map((s, i) => ({ ...s, id: String(4 + i) })),
+              { ...submitStep, id: String(4 + editFieldSteps.length) },
+              { id: String(5 + editFieldSteps.length), action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+            ],
+            tags: [entityName, 'update', 'fallback'],
+          })
+        }
+
+        // TC5: Delete record
+        testCases.push({
+          name: `Delete ${entityName} Record and Verify Removal`,
+          description: `Navigate to an existing ${entityName} record, trigger deletion, confirm the dialog, and verify the record no longer appears in the list.`,
+          priority: 'medium',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'CLICK', target: entityName, locator_type: 'role' },
+            { id: '3', action: 'CLICK', target: 'Delete', locator_type: 'role' },
+            { id: '4', action: 'CLICK', target: 'Confirm', locator_type: 'role' },
+            { id: '5', action: 'ASSERT_TEXT', target: `${entityName} deleted`, locator_type: 'text' },
+          ],
+          tags: [entityName, 'delete', 'fallback'],
+        })
+
+        // TC6: Search in list view
+        testCases.push({
+          name: `Search ${entityName} by Name and Verify Result`,
+          description: `Navigate to the ${entityName} list, use the search field to locate a specific record by name, and verify it appears in results.`,
+          priority: 'medium',
+          steps: [
+            { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+            { id: '2', action: 'TYPE', target: 'Search', value: entityName, locator_type: 'label' },
+            { id: '3', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+          ],
+          tags: [entityName, 'search', 'fallback'],
+        })
+
+        // TC7: Create with invalid data (negative test)
+        if (requiredFields.length > 0) {
+          const invalidField = requiredFields[0]
+          testCases.push({
+            name: `Create ${entityName} with Invalid Data in ${invalidField.label} Field`,
+            description: `Attempt to create a ${entityName} record with invalid data in the "${invalidField.label}" field. Verifies the appropriate validation error appears.`,
+            priority: 'medium',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
+              { id: '2', action: 'TYPE', target: invalidField.label, value: '!!!INVALID_DATA@@@', locator_type: 'label' },
+              { ...submitStep, id: '3' },
+              { id: '4', action: 'ASSERT_TEXT', target: 'invalid', locator_type: 'text' },
+            ],
+            tags: [entityName, 'negative', 'validation', 'fallback'],
+          })
+        }
+
+        // TC8: Create with all optional fields populated
+        const optionalFields = manifest.fields.filter(f => !f.required).slice(0, 4)
+        if (optionalFields.length > 0) {
+          const optionalSteps = [
+            ...requiredFields.slice(0, 3),
+            ...optionalFields,
+          ].map((f, i) => ({
+            id: String(i + 2),
+            action: f.type === 'select' ? 'SELECT' : f.type === 'lookup' ? 'LOOKUP' : 'TYPE',
+            target: f.label,
+            value: f.sampleValue ?? (f.options?.[0] ?? `Test ${f.label}`),
+            locator_type: 'label',
+          }))
+          testCases.push({
+            name: `Create ${entityName} with All Optional Fields and Verify Complete Record`,
+            description: `Create a ${entityName} record populating both required and optional fields. Verifies all entered data is saved and displayed correctly.`,
+            priority: 'low',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
+              ...optionalSteps,
+              { ...submitStep, id: String(optionalSteps.length + 2) },
+              { id: String(optionalSteps.length + 3), action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+            ],
+            tags: [entityName, 'create', 'optional-fields', 'fallback'],
+          })
+        }
+
+      } else {
+        // No manifest — generate a full set of minimal navigation + assertion tests
+        testCases.push(
+          {
+            name: `Navigate to ${entityName} List and Verify Page Loads`,
+            description: `Navigate to the ${entityName} list page and verify it loads correctly as part of the "${flowName}" flow.`,
+            priority: 'high',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+              { id: '2', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+            ],
+            tags: [entityName, 'read', 'fallback'],
+          },
+          {
+            name: `Create New ${entityName} Record with Required Fields`,
+            description: `Navigate to the ${entityName} create form, fill required fields with valid data, and verify the record is created successfully.`,
+            priority: 'high',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
+              { id: '2', action: 'TYPE', target: 'Name', value: `Test ${entityName}`, locator_type: 'label' },
+              { id: '3', action: 'CLICK', target: 'Save', locator_type: 'role' },
+              { id: '4', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+            ],
+            tags: [entityName, 'create', 'fallback'],
+          },
+          {
+            name: `Validate Required Fields on ${entityName} Form`,
+            description: `Submit the ${entityName} form without required fields and verify validation errors appear.`,
+            priority: 'high',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
+              { id: '2', action: 'CLICK', target: 'Save', locator_type: 'role' },
+              { id: '3', action: 'ASSERT_TEXT', target: 'required', locator_type: 'text' },
+            ],
+            tags: [entityName, 'validation', 'negative', 'fallback'],
+          },
+          {
+            name: `Edit Existing ${entityName} Record and Verify Changes Saved`,
+            description: `Open an existing ${entityName} record, modify key fields, save, and verify the changes persist.`,
+            priority: 'medium',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+              { id: '2', action: 'CLICK', target: entityName, locator_type: 'role' },
+              { id: '3', action: 'CLICK', target: 'Edit', locator_type: 'role' },
+              { id: '4', action: 'TYPE', target: 'Name', value: `Updated ${entityName}`, locator_type: 'label' },
+              { id: '5', action: 'CLICK', target: 'Save', locator_type: 'role' },
+              { id: '6', action: 'ASSERT_TEXT', target: `Updated ${entityName}`, locator_type: 'text' },
+            ],
+            tags: [entityName, 'update', 'fallback'],
+          },
+          {
+            name: `Delete ${entityName} Record and Verify It Is Removed`,
+            description: `Select an existing ${entityName} record, delete it, confirm the action, and verify it no longer appears in the list.`,
+            priority: 'medium',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+              { id: '2', action: 'CLICK', target: entityName, locator_type: 'role' },
+              { id: '3', action: 'CLICK', target: 'Delete', locator_type: 'role' },
+              { id: '4', action: 'CLICK', target: 'Confirm', locator_type: 'role' },
+              { id: '5', action: 'ASSERT_TEXT', target: 'deleted', locator_type: 'text' },
+            ],
+            tags: [entityName, 'delete', 'fallback'],
+          },
+          {
+            name: `Search for ${entityName} in List View and Verify Results`,
+            description: `Use the search functionality on the ${entityName} list page to find a specific record by name.`,
+            priority: 'medium',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+              { id: '2', action: 'TYPE', target: 'Search', value: entityName, locator_type: 'label' },
+              { id: '3', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+            ],
+            tags: [entityName, 'search', 'fallback'],
+          },
+          {
+            name: `Create ${entityName} with Duplicate Name and Verify Error`,
+            description: `Attempt to create a ${entityName} with a name that already exists. Verify a duplicate/uniqueness error is shown.`,
+            priority: 'low',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: createPath, locator_type: 'url' },
+              { id: '2', action: 'TYPE', target: 'Name', value: `Existing ${entityName}`, locator_type: 'label' },
+              { id: '3', action: 'CLICK', target: 'Save', locator_type: 'role' },
+              { id: '4', action: 'ASSERT_TEXT', target: 'already exists', locator_type: 'text' },
+            ],
+            tags: [entityName, 'negative', 'duplicate', 'fallback'],
+          },
+          {
+            name: `View ${entityName} Record Detail Page and Verify All Fields`,
+            description: `Navigate to a specific ${entityName} record's detail page and verify all fields are displayed correctly.`,
+            priority: 'low',
+            steps: [
+              { id: '1', action: 'NAVIGATE', value: entityPath, locator_type: 'url' },
+              { id: '2', action: 'CLICK', target: entityName, locator_type: 'role' },
+              { id: '3', action: 'ASSERT_TEXT', target: entityName, locator_type: 'text' },
+            ],
+            tags: [entityName, 'read', 'detail', 'fallback'],
+          },
+        )
       }
     }
 
@@ -1617,8 +1975,8 @@ Return ONLY valid JSON:
     }
 
     log.info(
-      { flowName, entityNames, testCaseCount: testCases.length },
-      '[SUITE] Generated fallback test cases from field manifest',
+      { flowName, entityNames, testCaseCount: testCases.length, flowType: 'crud' },
+      '[SUITE] Generated comprehensive CRUD fallback test cases from field manifest',
     )
 
     return testCases
@@ -1627,23 +1985,43 @@ Return ONLY valid JSON:
   // ── Per-flow generation with 3-tier resilience ─────────────────────────────
   const groupResults = await Promise.allSettled(
     orderedFlows.map(async (entry) => {
-      const isListOnlyModule = /\s+List$/i.test(entry.flow)
+      const isListOnlyModule  = /\s+List$/i.test(entry.flow)
+      const isSearchFilter    = isSearchFilterFlow(entry.flow)
       const moduleDisplayName = entry.flow.replace(/\s*(Management|List|Module|Feature|Settings)$/i, '').trim()
+      // Primary entity extracted from the flow name (e.g. "Lead" from
+      // "Search and Filter Lead from List view" or "Create Lead and Verify Validation").
+      // FLOW_STOP_WORDS now includes search/filter/sort/browse/navigate so these
+      // action words are never incorrectly extracted as entity names.
+      const modulePrimaryEntity = extractPrimaryEntityFromFlow(entry.flow)
+
+      // Build a flow-type-specific constraint block for the LLM scope lock
+      const searchFilterConstraint = isSearchFilter ? `
+⚠️  "${entry.flow}" is a SEARCH / FILTER / LIST-VIEW flow — there is NO create/edit/delete action.
+✅ ONLY generate tests that:
+   • Navigate to the ${modulePrimaryEntity} list / list view page
+   • Enter search terms in the search box (TYPE action)
+   • Apply filters (CLICK filter button + SELECT/TYPE criteria)
+   • Verify search/filter results appear correctly (ASSERT_TEXT on matching record or count)
+   • Test edge cases: empty search, no results, reset/clear filter
+⛔ DO NOT generate "Create ${modulePrimaryEntity} Record", "Edit ${modulePrimaryEntity}", or any CRUD test.
+⛔ DO NOT generate tests named "Create Search Record" or "Create Filter Record" — those are INVALID.
+   The word "Search" and "Filter" describe ACTIONS in the UI, not entities to create.
+` : ''
 
       const moduleScopeBlock = `
 ## 🔴🔴🔴 MODULE SCOPE LOCK — NON-NEGOTIABLE 🔴🔴🔴
 You MUST generate test cases EXCLUSIVELY for the "${entry.flow}" business flow.
 Every single test case in your output MUST be 100% about "${entry.flow}" — nothing else.
 
-${isListOnlyModule ? `⚠️  "${moduleDisplayName}" is a READ-ONLY LIST — there is NO create/edit/delete form.
+${isListOnlyModule && !isSearchFilter ? `⚠️  "${moduleDisplayName}" is a READ-ONLY LIST — there is NO create/edit/delete form.
 ✅ ONLY generate tests that navigate to the ${moduleDisplayName} list, verify records, search/filter.
 ⛔ DO NOT generate Create, Edit, Delete tests for "${moduleDisplayName}".` : ''}
-
+${searchFilterConstraint}
 ⛔ FORBIDDEN — DO NOT generate test cases for ANY entity, page, or workflow that is NOT part of "${entry.flow}":
 • Do NOT generate tests for other workflows/modules even if the metadata mentions them.
 • Only the selected flow matters — ignore all other entities visible in the metadata or BRD.
 
-✅ Every test case NAME must contain the word "${moduleDisplayName}" (e.g. "Create ${moduleDisplayName}", "Delete ${moduleDisplayName}").
+✅ Every test case NAME must contain the word "${modulePrimaryEntity}" (e.g. "${isSearchFilter ? `Search ${modulePrimaryEntity}` : `Create ${modulePrimaryEntity}`}", "Verify ${modulePrimaryEntity}").
 ## 🔴🔴🔴 END MODULE SCOPE LOCK 🔴🔴🔴
 `
 
@@ -1746,9 +2124,9 @@ Return ONLY a valid JSON array — no markdown, no explanation:
 
           // ── Tier 3: Metadata-driven fallback ─────────────────────────────
           testCases = await generateFallbackTestCases(entry.flow)
-          log.info(
-            { flow: entry.flow, count: testCases.length },
-            '[SUITE] Tier 3 metadata fallback generated test cases',
+          log.warn(
+            { flow: entry.flow, count: testCases.length, target: PER_FLOW_COUNT },
+            '[SUITE] ⚠️ Tier 3 metadata fallback activated — both LLM attempts failed',
           )
         }
       }
@@ -1757,6 +2135,24 @@ Return ONLY a valid JSON array — no markdown, no explanation:
       testCases = testCases.filter(
         (tc: any) => tc && typeof tc.name === 'string' && tc.name.trim(),
       )
+
+      // ── Top-up: if LLM returned fewer cases than PER_FLOW_COUNT, pad with fallback
+      if (testCases.length < PER_FLOW_COUNT) {
+        try {
+          const fallbackCases = await generateFallbackTestCases(entry.flow)
+          // Merge, avoiding name duplicates
+          const existingNames = new Set(testCases.map((tc: any) => String(tc.name ?? '').toLowerCase().trim()))
+          const newCases = fallbackCases.filter(
+            fc => !existingNames.has(fc.name.toLowerCase().trim())
+          )
+          const needed = PER_FLOW_COUNT - testCases.length
+          testCases = [...testCases, ...newCases.slice(0, needed)]
+          log.info(
+            { flow: entry.flow, added: Math.min(newCases.length, needed), total: testCases.length },
+            '[SUITE] Padded test cases with fallback to reach PER_FLOW_COUNT target',
+          )
+        } catch { /* non-critical */ }
+      }
 
       return { ...entry, testCases }
     })
@@ -1805,11 +2201,14 @@ Return ONLY a valid JSON array — no markdown, no explanation:
 
     const { flow, order, rationale, testCases } = result.value
 
-    // Apply the exact same robust post-generation filter to each business flow group
+    // Apply the exact same robust post-generation filter to each business flow group.
+    // Pass `modulePrimaryEntity` (e.g. "Lead") rather than the full flow name so that
+    // getEntityStems produces short, matchable stems instead of the entire phrase.
+    const modulePrimaryEntity = extractPrimaryEntityFromFlow(flow)
     let filteredCases = testCases
     try {
       const { filterTestCasesToModule } = await import('../test-case-generator/test-case-generator.service.js')
-      filteredCases = filterTestCasesToModule(testCases as any[], flow) as unknown as FlowTestCase[]
+      filteredCases = filterTestCasesToModule(testCases as any[], modulePrimaryEntity) as unknown as FlowTestCase[]
       log.info({ flow, beforeCount: testCases.length, afterCount: filteredCases.length }, '[SUITE] Filtered test cases to flow module')
     } catch (filterErr) {
       log.warn({ filterErr, flow }, '[SUITE] Failed to filter test cases to flow module')
@@ -1818,12 +2217,9 @@ Return ONLY a valid JSON array — no markdown, no explanation:
     const persisted: (FlowTestCase & { id?: string })[] = []
 
     // ── Pre-compute field manifest for this flow to filter hallucinated fields ──
-    // Extract entity from the flow name (e.g., "Account Management" → "Account")
-    const flowEntityRaw = flow
-      .replace(/\b(management|creation|list|module|feature|workflow|process|handling|operations?)\b/gi, '')
-      .replace(/\b(create|update|edit|delete|view|add|manage|new)\b/gi, '')
-      .trim().split(/\s+/)[0] ?? ''
-    const flowEntity = flowEntityRaw.length > 2 ? flowEntityRaw : undefined
+    // Extract primary entity from the flow name for manifest look-up.
+    // Reuse modulePrimaryEntity computed above (already the first non-stop-word).
+    const flowEntity = modulePrimaryEntity.length > 2 ? modulePrimaryEntity : undefined
 
     let flowManifest: Awaited<ReturnType<typeof buildFieldManifest>> = null
     try {

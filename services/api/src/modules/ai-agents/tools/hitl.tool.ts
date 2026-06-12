@@ -50,12 +50,24 @@ export async function hitlTool(input: HITLInput): Promise<HITLOutput> {
 
   // 2. Update execution status to PAUSED in DB (non-fatal if it fails)
   try {
-    await prisma.executions.update({
+    const isExecution = await prisma.executions.findUnique({
       where: { id: executionId },
-      data:  { status: 'PAUSED' },
-    })
+      select: { id: true },
+    }).catch(() => null)
+
+    if (isExecution) {
+      await prisma.executions.update({
+        where: { id: executionId },
+        data:  { status: 'PAUSED' },
+      })
+    } else {
+      await prisma.test_runs.update({
+        where: { id: executionId },
+        data:  { status: 'paused' },
+      })
+    }
   } catch (err) {
-    log.warn({ err }, '[HITL] Could not update execution status to PAUSED (non-fatal)')
+    log.warn({ err }, '[HITL] Could not update execution status to PAUSED in executions or test_runs (non-fatal)')
   }
 
   // 3. Log HITL invocation to agent_executions audit table
@@ -91,10 +103,22 @@ export async function hitlTool(input: HITLInput): Promise<HITLOutput> {
   // 5. Update execution status back to RUNNING
   try {
     if (action !== 'stop') {
-      await prisma.executions.update({
+      const isExecution = await prisma.executions.findUnique({
         where: { id: executionId },
-        data:  { status: 'RUNNING' },
-      })
+        select: { id: true },
+      }).catch(() => null)
+
+      if (isExecution) {
+        await prisma.executions.update({
+          where: { id: executionId },
+          data:  { status: 'RUNNING' },
+        })
+      } else {
+        await prisma.test_runs.update({
+          where: { id: executionId },
+          data:  { status: 'running' },
+        })
+      }
     }
   } catch { /* non-fatal */ }
 

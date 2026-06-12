@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { toast } from "sonner"
-import { useEffect, useState, useMemo, useCallback } from "react"
+import { useEffect, useState, useMemo, useCallback, useRef } from "react"
 import { format } from "date-fns"
 import {
     DropdownMenu,
@@ -70,6 +70,9 @@ export default function TestsPage() {
     const [newTestIds, setNewTestIds] = useState<Set<string>>(new Set())
     const [skeletonCount, setSkeletonCount] = useState(0)
 
+    // Prevents Radix UI ID hydration mismatch between SSR and client
+    const [mounted, setMounted] = useState(false)
+
     // Filters
     const [filterEnvironment, setFilterEnvironment] = useState("all")
     const [filterPriority, setFilterPriority] = useState("all")
@@ -98,7 +101,10 @@ export default function TestsPage() {
         }
     }
 
-    useEffect(() => { fetchTests() }, [])
+    useEffect(() => {
+        setMounted(true)
+        fetchTests()
+    }, [])
 
     // Called after wizard completes (passed via query params on return)
     useEffect(() => {
@@ -258,6 +264,7 @@ export default function TestsPage() {
                 </div>
 
                 {/* Environment Filter */}
+                {mounted && (
                 <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                         <Button
@@ -284,8 +291,10 @@ export default function TestsPage() {
                         </DropdownMenuRadioGroup>
                     </DropdownMenuContent>
                 </DropdownMenu>
+                )}
 
                 {/* Priority Filter */}
+                {mounted && (
                 <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                         <Button
@@ -312,6 +321,7 @@ export default function TestsPage() {
                         </DropdownMenuRadioGroup>
                     </DropdownMenuContent>
                 </DropdownMenu>
+                )}
 
                 {/* Clear Filters */}
                 {hasActiveFilters && (
@@ -370,6 +380,7 @@ export default function TestsPage() {
                                 <TableHead>Test Name</TableHead>
                                 {/* Environment — filterable */}
                                 <TableHead style={{ width: 140 }}>
+                                    {mounted ? (
                                     <DropdownMenu>
                                         <DropdownMenuTrigger asChild>
                                             <button className={`flex items-center gap-1 hover:text-foreground transition-colors ${filterEnvironment !== "all" ? "text-primary font-semibold" : ""}`}>
@@ -389,10 +400,12 @@ export default function TestsPage() {
                                             </DropdownMenuRadioGroup>
                                         </DropdownMenuContent>
                                     </DropdownMenu>
+                                    ) : <span>Environment</span>}
                                 </TableHead>
                                 <TableHead style={{ width: 60 }}>Steps</TableHead>
                                 {/* Priority — filterable */}
                                 <TableHead style={{ width: 110 }}>
+                                    {mounted ? (
                                     <DropdownMenu>
                                         <DropdownMenuTrigger asChild>
                                             <button className={`flex items-center gap-1 hover:text-foreground transition-colors ${filterPriority !== "all" ? "text-primary font-semibold" : ""}`}>
@@ -412,6 +425,7 @@ export default function TestsPage() {
                                             </DropdownMenuRadioGroup>
                                         </DropdownMenuContent>
                                     </DropdownMenu>
+                                    ) : <span>Priority</span>}
                                 </TableHead>
                                 {/* Created — sortable */}
                                 <TableHead style={{ width: 140 }}>

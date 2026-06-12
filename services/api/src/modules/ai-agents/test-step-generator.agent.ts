@@ -32,6 +32,7 @@ import {
   saveGenerationOutcome,
   getButtonMapping,
 } from '../self-healing/learning-registry.service.js'
+import { loadLearnings, formatLearningsBlock, extractFieldTypeCorrections, formatFieldTypeCorrectionsBlock } from '../test-run/hitl-learning.service.js'
 import prisma                    from '../../shared/db/prisma.js'
 import type {
   AgentStep_Playwright,
@@ -124,6 +125,41 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
       ASSERT_TEXT target: "<product name typed above>"  ← record title on detail page
 
 ╔══════════════════════════════════════════════════════════════════╗
+║  🆕 UNIQUE TEST DATA RULE — CREATE OPERATIONS (HARD RULE)        ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Every CREATE test MUST use UNIQUE, NON-DUPLICATE data values    ║
+║  for primary name/title/identifier fields to prevent the         ║
+║  "duplicate record" error that causes test failures.             ║
+║                                                                  ║
+║  ✅ REQUIRED for name / title / identifier fields:               ║
+║  - Append a short numeric suffix derived from the current time   ║
+║    to make the value unique on every run.                        ║
+║  - A UNIQUE NAME HINT will be provided in the === TEST CASE ===  ║
+║    section below — USE IT EXACTLY for the primary name field.    ║
+║                                                                  ║
+║  EXAMPLES of unique values (entity-appropriate):                 ║
+║  - Lead:        "Test Lead 4821"  (not "John Smith" — too common)║
+║  - Account:     "Acme Corp 4821"                                 ║
+║  - Contact:     "Jane Test 4821"                                 ║
+║  - Product:     "Test Product 4821"                              ║
+║  - Campaign:    "Auto Campaign 4821"                             ║
+║  - Invoice:     "INV-TEST-4821"                                  ║
+║  - Order:       "ORD-TEST-4821"                                  ║
+║  - Opportunity: "Q4 Deal 4821"                                   ║
+║                                                                  ║
+║  ⚠️  The SAMPLE TEST DATA section may show EXISTING records.    ║
+║     NEVER reuse a name from SAMPLE TEST DATA for a Create test   ║
+║     — it will cause a duplicate-record error at runtime.         ║
+║                                                                  ║
+║  ❌ FORBIDDEN for name/title fields in Create tests:             ║
+║  - Reusing any value from SAMPLE TEST DATA (those already exist) ║
+║  - Generic placeholders: "Test", "Sample", "Foo", "Bar"          ║
+║  - Status/stage words: "Active", "Prospect", "Open"              ║
+║  - Names without a unique suffix that could clash with existing  ║
+║    records in the application                                    ║
+╚══════════════════════════════════════════════════════════════════╝
+
+╔══════════════════════════════════════════════════════════════════╗
 ║  🔴 CREATE SUCCESS VALIDATION — HARD RULE (NEVER VIOLATE)        ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  After a Create form is submitted, the app REDIRECTS to the      ║
@@ -194,6 +230,34 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
       3. CLICK on the record name to open the detail page
       4. ASSERT_TEXT or ASSERT_URL confirming the detail page is displayed
   - Do NOT click Edit or Delete in a View-only test
+
+🔴 SEARCH / FILTER OPERATION RULE (applies when test name contains "Search", "Filter", "Find", "Look up", "Browse", or "List View"):
+  - This operation searches for a record via the list-page search input and selects it.
+  - HOW SEARCH/FILTER WORKS IN THIS APP:
+      • Typing in the search field LIVE-FILTERS the list — no separate search button needed.
+      • The list view may have TAB-STYLE view filters (e.g., "All Leads", "Recently Viewed",
+        "Today's Leads"). Clicking a tab is a CLICK step with locator_type "role" or "text".
+      • There is NO standalone "Filter" button that opens a filter panel.
+      • There is NO "Create Filter" button, NO "Apply Filter" button, NO status-dropdown filter.
+  - MANDATORY SEQUENCE:
+      1. NAVIGATE to the entity LIST page (from URL MAP)
+      2. [OPTIONAL] CLICK a tab-style view filter if the test explicitly names one
+         ▶ e.g., CLICK "All Leads", CLICK "Today's Leads" — locator_type: "text" or "role"
+         ▶ Only include this step if the test name specifically mentions a view filter name
+      3. TYPE the search term into the search field
+         ▶ action: TYPE, locator_type: "placeholder" or "label"
+         ▶ value: use the REAL RECORD NAME from EXISTING RECORD / SAMPLE TEST DATA
+      4. CLICK on the matching record name from the filtered list to open its detail page
+         ▶ action: CLICK, target: "<search term>", locator_type: "text"
+         ▶ ⚠️ This is a RECORD CLICK — clicks the ROW/LINK for the matching record
+         ▶ ⛔ NOT a "Filter button" click — do NOT use "Filter" as the click target
+      5. ASSERT_TEXT or ASSERT_URL confirming the record detail page is loaded
+  - ⛔ ABSOLUTELY FORBIDDEN in Search/Filter tests:
+      - CLICK any button whose name is only "Filter" (no such standalone button exists)
+      - SELECT from a "Status" dropdown as part of a "filter panel" (does not exist)
+      - CLICK "Create Filter", "Apply Filter", "Save Filter" — these do NOT exist
+      - TYPE or SELECT inside any hallucinated "filter panel" form
+      - WAIT steps (search is live-filtered — no wait needed after typing)
 
 ╔══════════════════════════════════════════════════════════════╗
 ║  VALID ACTIONS — USE ONLY THESE EXACT STRINGS                ║
@@ -1020,7 +1084,7 @@ export async function runTestStepGeneratorAgent(
     '[STEP-GEN] Resolved entity filter for manifest lookup',
   )
 
-  const [manifest, urlMap, ragResult, projectArtifacts, learningsText, learnedButtons, sampleTestData] = await Promise.all([
+  const [manifest, urlMap, ragResult, projectArtifacts, learningsText, learnedButtons, sampleTestData, hitlLearnings, fieldTypeCorrections] = await Promise.all([
     buildFieldManifest(input.projectId, resolvedEntityFilter),
     buildUrlMap(input.projectId),
     ragSearchTool({ projectId: input.projectId, query: `${input.testName} form fields steps`, topK: 8 }),
@@ -1060,6 +1124,10 @@ export async function runTestStepGeneratorAgent(
         return null
       } catch { return null }
     })(),
+    // Pull HITL learnings — real user-confirmed fixes from past HITL decisions
+    loadLearnings(input.projectId, input.testCaseId ?? '').catch(() => []),
+    // Pull field-type corrections — where humans changed action types (e.g. LOOKUP → TYPE)
+    extractFieldTypeCorrections(input.projectId, input.testCaseId ?? '').catch(() => []),
   ])
 
   // Automatically discover list URLs from create URLs in the URL map
@@ -1141,7 +1209,38 @@ export async function runTestStepGeneratorAgent(
 
   // ── THINK: build context prompt ───────────────────────────────────────────
 
-  thoughts.push(`THINK: manifest has ${manifest?.requiredCount ?? 0} required fields [${manifest?.fields.filter(f => f.required).map(f => f.label).join(', ') ?? 'none'}], URL map has ${urlMap.paths.length} paths, learnings: ${learningsText.length > 0 ? 'YES' : 'none'}`)
+  thoughts.push(`THINK: manifest has ${manifest?.requiredCount ?? 0} required fields [${manifest?.fields.filter(f => f.required).map(f => f.label).join(', ') ?? 'none'}], URL map has ${urlMap.paths.length} paths, learnings: ${learningsText.length > 0 ? 'YES' : 'none'}, fieldTypeCorrections: ${fieldTypeCorrections.length}`)
+
+  // ── Apply field-type corrections to in-memory manifest ─────────────────────
+  // When a human previously confirmed that e.g. "Account Name" is TYPE not LOOKUP,
+  // patch the manifest field in-memory so Check 7 and the manifest text both
+  // reflect the corrected type — preventing the same failure on re-generation.
+  if (manifest && manifest.fields.length > 0 && fieldTypeCorrections.length > 0) {
+    for (const correction of fieldTypeCorrections) {
+      const correctedLabel = correction.fieldTarget.toLowerCase().trim()
+      const fieldIdx = manifest.fields.findIndex(
+        f => f.label.toLowerCase().trim() === correctedLabel ||
+             correctedLabel.startsWith(f.label.toLowerCase().trim()) ||
+             f.label.toLowerCase().trim().startsWith(correctedLabel)
+      )
+      if (fieldIdx >= 0) {
+        const oldType = manifest.fields[fieldIdx].type
+        // Map action name to manifest field type
+        const newType: 'input' | 'select' | 'lookup' | 'checkbox' | 'textarea' =
+          correction.correctAction === 'TYPE'     ? 'input'
+          : correction.correctAction === 'SELECT'   ? 'select'
+          : correction.correctAction === 'LOOKUP'   ? 'lookup'
+          : correction.correctAction === 'CHECKBOX' ? 'checkbox'
+          : 'input'
+        manifest.fields[fieldIdx] = { ...manifest.fields[fieldIdx], type: newType }
+        thoughts.push(`THINK: manifest patch — field "${manifest.fields[fieldIdx].label}" type changed from ${oldType} → ${newType} based on HITL correction`)
+        log.info(
+          { field: manifest.fields[fieldIdx].label, oldType, newType, correction: correction.correctAction },
+          '[STEP-GEN] Patched manifest field type from HITL correction',
+        )
+      }
+    }
+  }
 
 
   // ── Detect operation type from test name ─────────────────────────────────────
@@ -1161,6 +1260,14 @@ export async function runTestStepGeneratorAgent(
     /\b(create|creation|add|new|register|registration|signup|sign-up|generation|generate)\b/i.test(input.testName)
     || /\b(creating|registering|signing\s*up|generating)\b/i.test(input.testName)
     || /\bnew\s+(product|lead|contact|account|opportunity|quote|order|invoice|campaign|contract|record|entity)\b/i.test(input.testName)
+  )
+  // Search/Filter/Browse: navigate → [optional tab filter] → type in search → click record → assert
+  // Fires when the test explicitly describes searching/filtering in a list view.
+  // IMPORTANT: Must be checked AFTER all other operations to avoid false positives
+  // (e.g. "Search and Filter" is not Create/Update/Delete/View)
+  const isSearchOperation = !isUpdateOperation && !isDeleteOperation && !isViewOperation && !isCreateOperation && (
+    /\b(search|filter|find|look\s*up|lookup|browse|query)\b/i.test(input.testName)
+    || /\blist\s*view\b/i.test(input.testName)
   )
 
   // ── Entity-specific record name fallbacks ─────────────────────────────────
@@ -1326,8 +1433,9 @@ export async function runTestStepGeneratorAgent(
   // ── Build existing record name text block for Update/Search operations ───────
   // For update/search tests, the LLM MUST use a real record name that exists in the app.
   // This block provides the ground truth so the LLM never invents a name.
+  // Also used for Search/Filter operations so the TYPE step uses a real existing record name.
   const existingRecordNameForPrompt = (() => {
-    if (!isUpdateOperation) return null
+    if (!isUpdateOperation && !isSearchOperation) return null
     if (sampleTestData) {
       const nameKey = Object.keys(sampleTestData).find(k =>
         /^(name|full.?name|display.?name|title|label|account.?name|contact.?name|lead.?name|company.?name|subject|first.?name)$/i.test(k)
@@ -1344,7 +1452,7 @@ export async function runTestStepGeneratorAgent(
 
   const existingRecordsText = existingRecordNameForPrompt
     ? [
-        `=== EXISTING RECORD TO SEARCH (MANDATORY for Update/Search operations) ===`,
+        `=== EXISTING RECORD TO SEARCH (MANDATORY for Update/Search/Filter operations) ===`,
         `⚠️  The following REAL record exists in the application. Use THIS EXACT name`,
         `   for the TYPE step (search input) AND the CLICK step (record selection).`,
         ``,
@@ -1360,7 +1468,20 @@ export async function runTestStepGeneratorAgent(
   // This is used by the CREATE OPERATION CONSTRAINT block below.
   const hasMissingRequiredFieldsForPrompt = manifest != null && manifest.fields.some(f => f.required)
 
+  // Format HITL learnings for prompt injection
+  const hitlLearningsText = Array.isArray(hitlLearnings) && hitlLearnings.length > 0
+    ? formatLearningsBlock(hitlLearnings as import('../test-run/hitl-learning.service.js').FormattedLearning[])
+    : ''
+
+  // Format field-type corrections as CRITICAL OVERRIDES block (placed at TOP of prompt)
+  const fieldTypeCorrectionsText = formatFieldTypeCorrectionsBlock(
+    fieldTypeCorrections as import('../test-run/hitl-learning.service.js').FieldTypeCorrection[]
+  )
+
   const userPrompt = [
+    // ── 🚨 CRITICAL OVERRIDES — always first so they win over everything below ──
+    fieldTypeCorrectionsText, // ← HITL field-type corrections: LOOKUP→TYPE etc. OVERRIDE manifest
+    hitlLearningsText,        // ← HITL learnings: real user-confirmed fixes from past runs
     urlMapText,
     manifestText,
     learningsText,   // ← Past learnings: failures, button mappings, corrections
@@ -1371,6 +1492,75 @@ export async function runTestStepGeneratorAgent(
     brdText ? `=== BRD / SPECIFICATION (business rules to follow) ===\n${brdText}` : '',
     existingTestsText ? `=== EXISTING TEST CASES (for naming conventions and coverage reference) ===\n${existingTestsText}` : '',
     `=== TEST CASE ===\nName: ${input.testName}\nDescription: ${input.description ?? ''}`,
+    // ── SEARCH/FILTER OPERATION CONSTRAINT ────────────────────────────────────────
+    // Placed before CREATE/UPDATE so it also lands in the recency window.
+    // Gives the LLM an explicit step-by-step search flow grounded in this app's behavior.
+    isSearchOperation
+      ? (() => {
+          // Detect if the test name mentions a specific tab-style view filter
+          const mentionsAllLeads        = /\ball\s*(leads|records|contacts|accounts)\b/i.test(input.testName)
+          const mentionsRecentlyViewed  = /\brecently\s*viewed\b/i.test(input.testName)
+          const mentionsTodaysLeads     = /\btoday\s*[''s]*\s*(leads|records)\b/i.test(input.testName)
+          const hasTabFilter = mentionsAllLeads || mentionsRecentlyViewed || mentionsTodaysLeads
+          const tabFilterStep = mentionsAllLeads       ? `CLICK "All Leads" tab (locator_type: "text" or "role")`
+            : mentionsRecentlyViewed ? `CLICK "Recently Viewed" tab (locator_type: "text" or "role")`
+            : mentionsTodaysLeads    ? `CLICK "Today's Leads" tab (locator_type: "text" or "role")`
+            : ''
+
+          const listUrl = manifest?.createUrl
+            ? manifest.createUrl.replace(/\/(new|create|add)\b.*$/i, '')
+            : urlMap.paths.find(p =>
+                p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) &&
+                !/new|create|add/i.test(p)
+              ) ?? `/${(resolvedEntityFilter ?? 'records').toLowerCase()}s`
+
+          const recordName = existingRecordNameForPrompt ?? entityRecordFallback
+
+          const lines = [
+            `🔴 SEARCH / FILTER OPERATION — ENTITY: ${resolvedEntityFilter ?? 'record'}`,
+            ``,
+            `This test searches for a record in the list view. The list filters live as you type.`,
+            `This app has TAB-STYLE view filters (e.g., "All Leads", "Recently Viewed", "Today's Leads")`,
+            `but NO standalone "Filter" button and NO filter panel with dropdowns or "Create Filter".`,
+            ``,
+            `MANDATORY SEQUENCE — generate EXACTLY these steps:`,
+            `  1. NAVIGATE to: ${listUrl}`,
+          ]
+
+          if (hasTabFilter) {
+            lines.push(`  2. ${tabFilterStep} — this is a tab, not a form dropdown`)
+            lines.push(`  3. TYPE search term into the search input:`)
+          } else {
+            lines.push(`  2. TYPE search term into the search input:`)
+          }
+
+          const typeStepNum = hasTabFilter ? 3 : 2
+          const clickStepNum = typeStepNum + 1
+          const assertStepNum = clickStepNum + 1
+
+          lines.push(
+            `     action: TYPE, target: "${resolvedSearchHint}", locator_type: "placeholder"`,
+            `     value: "${recordName}"`,
+            `     ▶ MANDATORY: use EXACTLY this record name — do NOT change it`,
+            `  ${clickStepNum}. CLICK the matching record name from the filtered list:`,
+            `     action: CLICK, target: "${recordName}", locator_type: "text"`,
+            `     ▶ This clicks the RECORD ROW/LINK that appeared in the filtered list`,
+            `     ▶ ⛔ NOT a "Filter" button — do NOT use "Filter" as target`,
+            `  ${assertStepNum}. ASSERT the detail page loaded:`,
+            `     ASSERT_URL with entity detail path OR ASSERT_TEXT with the record title`,
+            ``,
+            `⛔ FORBIDDEN — do NOT generate any of these:`,
+            `   - CLICK "Filter" (no standalone filter button in this app)`,
+            `   - SELECT from any Status/Type dropdown as a filter panel (does not exist)`,
+            `   - CLICK "Create Filter", "Apply Filter", "Save Filter"`,
+            `   - Any step that references a filter panel, filter dialog, or filter form`,
+            `   - WAIT steps`,
+          )
+
+          return lines.join('\n')
+        })()
+      : '',
+
     // ── CREATE/UPDATE OPERATION CONSTRAINT: explicit required fields listed by name ──
     // This is the highest-priority instruction — placed LAST in the prompt so
     // it is in the LLM's recency window. Lists every required field by name so
@@ -1422,16 +1612,45 @@ export async function runTestStepGeneratorAgent(
           const entityLower = (resolvedEntityFilter ?? 'record').toLowerCase()
           const detailUrlHint = `/${entityLower}s/`  // e.g. /leads/, /contacts/, /accounts/
           const detailUrlAlt  = `/${entityLower}/`   // e.g. /lead/, /contact/
+          // Generate a short, time-derived numeric suffix (4 digits) for unique record names
+          const uniqueSuffix = String(Date.now()).slice(-4)
+          const entityNameForDisplay = resolvedEntityFilter ?? 'Record'
+          // Build entity-appropriate unique name hint
+          const uniqueNameHint = (() => {
+            const el = entityNameForDisplay.toLowerCase()
+            if (/lead|contact/.test(el))        return `Test ${entityNameForDisplay} ${uniqueSuffix}`
+            if (/account|company|vendor|customer/.test(el)) return `Acme ${entityNameForDisplay} ${uniqueSuffix}`
+            if (/invoice/.test(el))             return `INV-TEST-${uniqueSuffix}`
+            if (/order/.test(el))               return `ORD-TEST-${uniqueSuffix}`
+            if (/opportunity|deal/.test(el))    return `Q4 Deal ${uniqueSuffix}`
+            if (/campaign/.test(el))            return `Auto Campaign ${uniqueSuffix}`
+            return `Test ${entityNameForDisplay} ${uniqueSuffix}`
+          })()
+
           return [
             `🔴 MANDATORY FIELDS — YOU MUST GENERATE A STEP FOR EVERY ★ FIELD BELOW:`,
             reqList,
             ``,
-            `This test creates a new ${resolvedEntityFilter ?? 'record'}.`,
+            `This test creates a new ${entityNameForDisplay}.`,
             `Rules:`,
             `  1. Generate one TYPE/SELECT/LOOKUP step per ★ field above — NO SKIPPING`,
             `  2. Use the EXACT label string shown (e.g. "${reqFields[0]?.label ?? 'Field'}")`,
             `  3. Sequence: NAVIGATE → CLICK open-form btn → fill all ★ fields → CLICK submit → ASSERT success`,
             `  4. Missing even ONE ★ field will FAIL validation and trigger re-generation`,
+            ``,
+            `╔══════════════════════════════════════════════════════════════════╗`,
+            `║  🆕 UNIQUE TEST DATA — MANDATORY FOR THIS CREATE TEST            ║`,
+            `╠══════════════════════════════════════════════════════════════════╣`,
+            `║  To avoid duplicate-record errors, use this pre-generated UNIQUE  ║`,
+            `║  name for the primary name / title field of this record:          ║`,
+            `║                                                                   ║`,
+            `║  ✅ USE THIS EXACT VALUE: "${uniqueNameHint.padEnd(37)}"  ║`,
+            `║                                                                   ║`,
+            `║  ⚠️  SAMPLE TEST DATA shows EXISTING records — do NOT reuse      ║`,
+            `║     any name from it. Existing names cause duplicate errors.       ║`,
+            `║  ❌ FORBIDDEN: plain names with no suffix (e.g. "John Smith",     ║`,
+            `║     "Acme Corp", "Test Record") — these likely already exist.     ║`,
+            `╚══════════════════════════════════════════════════════════════════╝`,
             ``,
             `🔴 CREATE SUCCESS VALIDATION — MANDATORY (final 1-2 steps after submit):`,
             `  The app redirects to the DETAIL PAGE after creation (NOT the list page, NO toast).`,
@@ -1442,21 +1661,33 @@ export async function runTestStepGeneratorAgent(
             `    ⚠️ The URL after save will be "${detailUrlHint}42" or similar — NOT "${detailUrlHint.replace(/\/$/, '')}" (bare list).`,
             `    ✅ Using "${detailUrlHint}" (with trailing slash) correctly matches "/leads/42" as a contains check.`,
             `  Step B — ASSERT_TEXT (record title or unique detail field):`,
-            `    { "action": "ASSERT_TEXT", "target": "<the name/title you typed in step 3>", "locator_type": "text" }`,
-            `    OR: { "action": "ASSERT_TEXT", "target": "${resolvedEntityFilter ?? 'Record'} Details", "locator_type": "text" }`,
+            `    { "action": "ASSERT_TEXT", "target": "${uniqueNameHint}", "locator_type": "text" }`,
+            `    OR: { "action": "ASSERT_TEXT", "target": "${entityNameForDisplay} Details", "locator_type": "text" }`,
             `  ❌ FORBIDDEN: ASSERT_URL value "${detailUrlHint.replace(/\/$/, '')}" (bare list page — will never match after redirect)`,
             `  ❌ FORBIDDEN: ASSERT_TOAST — no toast is shown on successful creation`,
           ].join('\n')
         })()
       : '',
 
-    // Inject confirmed button names from learning registry as a high-priority override
-    learnedButtons.openButton || learnedButtons.submitButton
-      ? `⚠️  CONFIRMED BUTTON NAMES FROM PAST EXECUTIONS:\n` +
-        (learnedButtons.openButton ? `  OPEN button: "${learnedButtons.openButton}" — use this EXACTLY for opening the form\n` : '') +
-        (learnedButtons.submitButton ? `  SUBMIT button: "${learnedButtons.submitButton}" — use this EXACTLY for saving/creating\n` : '') +
-        `  These were confirmed by successful past test runs. Do NOT substitute other names.`
-      : '',
+    // Inject confirmed button names — learning registry (runtime-confirmed) > manifest (metadata-derived)
+    (() => {
+      const openBtn   = learnedButtons.openButton   ?? manifest?.openButton
+      const submitBtn = learnedButtons.submitButton ?? manifest?.submitButton
+      if (!openBtn && !submitBtn) return ''
+      const lines = [`⚠️  CONFIRMED BUTTON NAMES (from metadata/past executions):`]
+      if (openBtn) {
+        lines.push(`  🔓 OPEN FORM button (Step 2 — CLICK on the LIST page to open the form):`)
+        lines.push(`     "${openBtn}"`)
+        lines.push(`     → This opens the create form. DO NOT use this as the save button.`)
+      }
+      if (submitBtn) {
+        lines.push(`  💾 SUBMIT FORM button (last CLICK — inside the form to save the record):`)
+        lines.push(`     "${submitBtn}"`)
+        lines.push(`     → This saves/creates the record. DO NOT use this to open the form.`)
+      }
+      lines.push(`  ⛔ NEVER substitute, abbreviate, or invent button names. Copy EXACTLY character-for-character.`)
+      return lines.join('\n')
+    })(),
     `Generate executable Playwright steps for this test case. Output ONLY a JSON array.`,
   ].filter(Boolean).join('\n\n')
 
@@ -1660,15 +1891,19 @@ export async function runTestStepGeneratorAgent(
           default:
             action = 'TYPE'
             // Generate realistic values based on field label
+            // IMPORTANT: for name/title fields, always generate a unique suffix to prevent
+            // duplicate-record errors at runtime. We deliberately do NOT reuse sampleValue
+            // for name/title fields in Create flows — those values already exist in the app.
             const label = field.label.toLowerCase()
+            const uniqueTs = String(Date.now()).slice(-4)  // 4-digit suffix for uniqueness
             if (/phone|mobile|tel/.test(label))          value = field.sampleValue ?? '+1 555-123-4567'
-            else if (/email/.test(label))                value = field.sampleValue ?? 'test@autotest.com'
+            else if (/email/.test(label))                value = field.sampleValue ?? `auto${uniqueTs}@autotest.com`
             else if (/date/.test(label))                 value = field.sampleValue ?? '12/31/2026'
             else if (/website|url|link/.test(label))     value = field.sampleValue ?? 'https://www.example.com'
             else if (/amount|price|cost|revenue/.test(label)) value = field.sampleValue ?? '25000.00'
-            else if (/name|title/.test(label))           value = field.sampleValue ?? `Test ${manifest.entityName} ${Date.now() % 10000}`
-            else if (/description|note|comment/.test(label)) value = field.sampleValue ?? 'Automated test data'
-            else                                         value = field.sampleValue ?? `Test ${field.label}`
+            else if (/name|title/.test(label))           value = `Test ${manifest.entityName} ${uniqueTs}`  // always unique — never reuse sampleValue
+            else if (/description|note|comment/.test(label)) value = field.sampleValue ?? `Automated test description ${uniqueTs}`
+            else                                         value = field.sampleValue ?? `Test ${field.label} ${uniqueTs}`
             break
         }
 
@@ -2252,6 +2487,67 @@ export async function runTestStepGeneratorAgent(
     await autoCorrectButtonNames(stepsAsRecords, input.projectId, effectiveEntityHint)
     steps = stepsAsRecords as unknown as AgentStep_Playwright[]
     thoughts.push('SAFETY NET 3: ran centralized button name auto-correction (metadata + learning registry)')
+  }
+
+  // ── SAFETY NET F: Strip hallucinated filter-panel steps ──────────────────
+  // For Search/Filter operations, the LLM sometimes hallucinates:
+  //   - CLICK "Filter" (a button that doesn't exist as a standalone control)
+  //   - SELECT from a Status/Type dropdown inside an imaginary filter panel
+  //   - CLICK "Create Filter" / "Apply Filter" / "Save Filter"
+  // This safety net strips those steps deterministically.
+  // It also covers cases where isSearchOperation is false but a non-search test
+  // somehow ends up with filter-panel hallucinations (defense in depth).
+  if (isSearchOperation && steps.length > 0) {
+    thoughts.push('SAFETY NET F: checking Search/Filter operation for hallucinated filter-panel steps')
+
+    // Patterns that indicate hallucinated filter-panel interaction
+    const FILTER_PANEL_BTN_RE = /^(filter|apply\s*filter|create\s*filter|save\s*filter|reset\s*filter|clear\s*filter|filter\s*results|add\s*filter)$/i
+    // Patterns for hallucinated filter-panel SELECT steps (Status/Type dropdown inside a non-existent panel)
+    // NOTE: We only strip bare "Status" / "Type" SELECT steps — not ones targeting real field labels in the manifest
+    const manifestFieldLabels = new Set((manifest?.fields ?? []).map(f => f.label.toLowerCase().trim()))
+    const FILTER_PANEL_SELECT_RE = /^(status|type|category|stage|priority|filter\s*by)$/i
+
+    const beforeF = steps.length
+    steps = steps.filter(s => {
+      const action = (s.action ?? '').toUpperCase()
+      const target = (s.target ?? '').trim()
+      const targetLower = target.toLowerCase()
+
+      // Strip hallucinated CLICK on a bare "Filter" button or "Create/Apply/Save Filter"
+      if (action === 'CLICK' && FILTER_PANEL_BTN_RE.test(target)) {
+        log.warn(
+          { projectId: input.projectId, target },
+          '[STEP-GEN] ⚡ SAFETY NET F: stripped hallucinated filter-panel CLICK',
+        )
+        thoughts.push(`SAFETY NET F: stripped hallucinated filter-panel CLICK — target: "${target}"`)
+        return false
+      }
+
+      // Strip hallucinated SELECT steps on filter-panel dropdowns (e.g. SELECT "Status" with value "New")
+      // Only strip if the target is not a real manifest field (to avoid stripping valid create/update selects)
+      if (action === 'SELECT' && FILTER_PANEL_SELECT_RE.test(target) && !manifestFieldLabels.has(targetLower)) {
+        log.warn(
+          { projectId: input.projectId, target },
+          '[STEP-GEN] ⚡ SAFETY NET F: stripped hallucinated filter-panel SELECT',
+        )
+        thoughts.push(`SAFETY NET F: stripped hallucinated filter SELECT — target: "${target}"`)
+        return false
+      }
+
+      return true
+    })
+
+    if (steps.length < beforeF) {
+      const stripped = beforeF - steps.length
+      steps = steps.map((s, i) => ({ ...s, id: String(i + 1) }))
+      log.info(
+        { projectId: input.projectId, testName: input.testName, stripped },
+        `[STEP-GEN] ✅ SAFETY NET F: stripped ${stripped} hallucinated filter-panel step(s)`,
+      )
+      thoughts.push(`SAFETY NET F: ✅ stripped ${stripped} hallucinated filter-panel step(s) — Search/Filter test is now clean`)
+    } else {
+      thoughts.push('SAFETY NET F: no hallucinated filter-panel steps detected')
+    }
   }
 
   // ── DELIVER ───────────────────────────────────────────────────────────────

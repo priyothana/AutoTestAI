@@ -592,7 +592,8 @@
 }
 
 .nexus-slide-out {
-  animation: nexus-slide-out 0.25s ease-in forwards;
+  animation: nexus-slide-out 0.25s ease-in;
+  /* Note: no 'forwards' fill — prevents panel from staying at opacity:0 before React unmounts it */
 }
 
 .nexus-dot-1 {

@@ -20,6 +20,7 @@ import { buildFieldManifest }    from './tools/metadata-reader.tool.js'
 import { logAgentExecution, getRecentFailedExecutions, saveAiSuggestions } from './tools/db-query.tool.js'
 import { hitlTool }              from './tools/hitl.tool.js'
 import prisma                    from '../../shared/db/prisma.js'
+import { loadLearnings, formatLearningsBlock } from '../test-run/hitl-learning.service.js'
 import type { StepData }         from '../../shared/queue/job-types.js'
 import type { HITLInput }        from './agent.types.js'
 
@@ -156,14 +157,15 @@ export async function runHealingAnalyzerAgent(
 
   // ── OBSERVE: retrieve field manifest + similar past failures ─────────────
 
-  thoughts.push('OBSERVE: loading field manifest and past failure patterns')
-  const [manifest, ragResult] = await Promise.all([
+  thoughts.push('OBSERVE: loading field manifest, past failures, and HITL learnings')
+  const [manifest, ragResult, hitlLearnings] = await Promise.all([
     buildFieldManifest(input.projectId),
     ragSearchTool({
       projectId: input.projectId,
       query:     `${input.failedStepError} ${input.failedStep.target ?? ''}`,
       topK:      5,
     }),
+    loadLearnings(input.projectId, input.testCaseId).catch(() => []),
   ])
 
   // ── THINK: decide if LLM needed ──────────────────────────────────────────
@@ -227,6 +229,8 @@ export async function runHealingAnalyzerAgent(
 
   thoughts.push('ACT: calling LLM for root cause analysis and step correction')
 
+  const hitlLearningsBlock = formatLearningsBlock(hitlLearnings as import('../test-run/hitl-learning.service.js').FormattedLearning[])
+
   const context = [
     `Failed step: ${JSON.stringify(input.failedStep)}`,
     `Error: ${input.failedStepError}`,
@@ -236,6 +240,10 @@ export async function runHealingAnalyzerAgent(
     manifest
       ? `=== CURRENT FIELD MANIFEST ===\n${JSON.stringify(manifest.fields.slice(0, 15), null, 2)}`
       : '(no field manifest available)',
+    '',
+    hitlLearningsBlock
+      ? `=== PAST HITL LEARNINGS (user-confirmed fixes for this project) ===\n${hitlLearningsBlock}`
+      : '',
     '',
     ragResult.chunks.length > 0
       ? `=== SIMILAR PAST FAILURES ===\n${ragResult.chunks.slice(0, 3).join('\n---\n')}`

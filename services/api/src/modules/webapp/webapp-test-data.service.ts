@@ -1152,6 +1152,33 @@ export async function getTestData(projectId: string): Promise<TestDataEntity[]> 
   }))
 }
 
+/**
+ * Delete ALL test-data entities for a project.
+ * Used to clear stale/wrong entities (e.g. CRM entities from a different app context).
+ */
+export async function clearTestData(projectId: string): Promise<number> {
+  await ensureTable()
+  const result = await prisma.$executeRaw`
+    DELETE FROM web_test_data WHERE project_id = ${projectId}::uuid
+  `
+  log.info(`[WTD] Cleared all test data for project ${projectId} (${result} rows deleted)`)
+  return result
+}
+
+/**
+ * Delete a single test-data entity by name for a project.
+ * Used to remove individual stale entities from the UI.
+ */
+export async function deleteTestDataEntity(projectId: string, entityName: string): Promise<boolean> {
+  await ensureTable()
+  const result = await prisma.$executeRaw`
+    DELETE FROM web_test_data
+    WHERE project_id = ${projectId}::uuid
+      AND entity_name = ${entityName}
+  `
+  return (result as number) > 0
+}
+
 export interface EntityUrlInfo {
   path:            string
   buttonName?:     string   // e.g. "Create Role" — the SUBMIT button inside the form/modal

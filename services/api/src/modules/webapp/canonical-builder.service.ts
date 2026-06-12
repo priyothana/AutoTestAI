@@ -627,14 +627,52 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
 
       const relationships: Record<string, string> = {}
 
-      // Detect lookup relationships from field labels
+      // Detect lookup relationships from ALL fields — not just type='lookup'
+      // because classifyInputType() is applied at write-time but relationship
+      // detection must work on the already-stored canonical fields too.
       for (const field of allFields) {
-        const labelLower = field.label.toLowerCase()
-        if (field.type === 'lookup') {
-          // Extract the entity name from lookup label: "Account Name" → "Account"
-          const relName = field.label.replace(/\s*(name|id|lookup)\s*$/i, '').trim()
+        // Re-classify to ensure we catch lookup patterns
+        const effectiveType = field.type === 'lookup' ? 'lookup' : classifyInputType(field.label)
+        if (effectiveType === 'lookup') {
+          // Extract entity name from label: "ACCOUNT NAME *" → "Account"
+          const relName = field.label
+            .replace(/\s*\*\s*$/, '')         // strip trailing asterisk
+            .replace(/\s*(name|id|lookup|#)\s*$/i, '') // strip suffix
+            .trim()
+            .toLowerCase()
+            .split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
           if (relName.length > 1 && relName.toLowerCase() !== entityLower) {
             relationships[relName] = field.required ? 'required_lookup' : 'optional_lookup'
+          }
+        }
+      }
+
+      // ── CRM-specific relationship inference from field labels ─────────────
+      // Catches relationships the type-based detection misses (e.g. plain 'input'
+      // fields whose label implies a foreign-key relationship).
+      const CRM_RELATION_PATTERNS: Array<{ pattern: RegExp; entity: string; strength: 'required_lookup' | 'optional_lookup' }> = [
+        { pattern: /\baccount\b/i,     entity: 'Account',     strength: 'optional_lookup' },
+        { pattern: /\bcontact\b/i,     entity: 'Contact',     strength: 'optional_lookup' },
+        { pattern: /\bopportunity\b/i, entity: 'Opportunity', strength: 'optional_lookup' },
+        { pattern: /\bproduct\b/i,     entity: 'Product',     strength: 'optional_lookup' },
+        { pattern: /\bcampaign\b/i,    entity: 'Campaign',    strength: 'optional_lookup' },
+        { pattern: /\bquote\b/i,       entity: 'Quote',       strength: 'optional_lookup' },
+        { pattern: /\border\b/i,       entity: 'Order',       strength: 'optional_lookup' },
+        { pattern: /\binvoice\b/i,     entity: 'Invoice',     strength: 'optional_lookup' },
+        { pattern: /\bcontract\b/i,    entity: 'Contract',    strength: 'optional_lookup' },
+        { pattern: /\blead\b/i,        entity: 'Lead',        strength: 'optional_lookup' },
+        { pattern: /\bowner\b/i,       entity: 'User',        strength: 'optional_lookup' },
+        { pattern: /\bassigned\s*to\b/i, entity: 'User',      strength: 'optional_lookup' },
+        { pattern: /\breported\s*by\b/i, entity: 'User',      strength: 'optional_lookup' },
+        { pattern: /\bparent\s*account\b/i, entity: 'Account', strength: 'optional_lookup' },
+      ]
+
+      for (const field of allFields) {
+        const labelLower = field.label.toLowerCase()
+        for (const { pattern, entity, strength } of CRM_RELATION_PATTERNS) {
+          if (entity.toLowerCase() === entityLower) continue // skip self-reference
+          if (pattern.test(labelLower) && !relationships[entity]) {
+            relationships[entity] = strength
           }
         }
       }
@@ -648,6 +686,10 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
         const ruleKey = field.label.toLowerCase().replace(/[^a-z0-9]+/g, '_') + '_required'
         businessRules[ruleKey] = true
       }
+
+      // Add navigation business rule
+      businessRules['form_url'] = path
+      businessRules['list_url'] = '/' + (entityName.toLowerCase() + 's')
 
       // ── Upsert into metadata_canonical ────────────────────────────────
 
@@ -1016,3 +1058,194 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
 
   return upsertCount
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Stage 3.6 — Universal Open-Button Population
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Scans ALL crawled pages (including list pages like /leads, /accounts) to
+ * extract the "+New X" open-form button for every entity and writes it to
+ * metadata_canonical.learned_rules.open_button.
+ *
+ * This is the universal fix for the "wrong button name" problem:
+ *
+ *   Problem: The crawler visits /leads/create and captures its buttons.
+ *   But "+New Lead" lives on the /leads LIST page, not on the create form.
+ *   So metadata_canonical ends up with no open_button, and the LLM
+ *   hallucinates "Create Lead" for both the open-form step and the submit step.
+ *
+ *   Fix: This function:
+ *     1. Scans ALL pages in the crawl data (list, form, any)
+ *     2. For each page, checks every button for "+New X" / "New X" patterns
+ *     3. Maps the button to the correct entity via the entity name
+ *     4. Writes open_button into learned_rules for every entity
+ *     5. Synthesises a sensible "+New EntityName" default for any entity
+ *        that still has no open button after crawl scanning
+ *
+ * Called after buildCanonicalMetadata in metadata-sync.worker.ts Stage 3.5.
+ *
+ * @returns Number of canonical records updated.
+ */
+export async function populateOpenButtonsFromCrawlData(projectId: string): Promise<number> {
+  await ensureCanonicalTable()
+
+  log.info(`[CANONICAL-OB] Starting open-button population for project ${projectId}`)
+  const startMs = Date.now()
+
+  // ── 1. Load all crawled pages ─────────────────────────────────────────────
+  const webRows = await prisma.metadata_normalized.findMany({
+    where:  { project_id: projectId, entity_type: 'webapp_crawl' },
+    select: { structured_json: true },
+  })
+
+  if (webRows.length === 0) {
+    log.info('[CANONICAL-OB] No webapp_crawl data — skipping open-button population')
+    return 0
+  }
+
+  // ── 2. Load existing canonical entities ──────────────────────────────────
+  const canonicalRows = await prisma.metadata_canonical.findMany({
+    where:  { project_id: projectId },
+    select: { entity_name: true, learned_rules: true, all_buttons: true },
+  })
+
+  // Build entity name → current open_button map
+  const entityOpenBtnMap = new Map<string, string | null>()
+  for (const row of canonicalRows) {
+    const rules = (row.learned_rules ?? {}) as Record<string, unknown>
+    const existing = typeof rules.open_button === 'string' ? rules.open_button : null
+    entityOpenBtnMap.set(row.entity_name.toLowerCase(), existing)
+  }
+
+  // ── 3. Scan every button on every page to find "+New X" patterns ──────────
+  // openButtonDiscovery: entityNameLower → discovered open button name
+  const openButtonDiscovery = new Map<string, string>()
+
+  for (const row of webRows) {
+    const data  = (row.structured_json ?? {}) as NormalizedWebPage
+    const pages = data.pages ?? []
+
+    for (const page of pages) {
+      const pageButtons = (page.buttons ?? [])
+        .map(b => String(b.name ?? '').trim())
+        .filter(n => n.length > 0 && n.length < 60)
+
+      for (const btnName of pageButtons) {
+        const n = btnName.toLowerCase()
+
+        // Pattern 1: "+New Lead", "+New Account", etc.
+        // Pattern 2: "New Lead", "New Account" (without +)
+        // Pattern 3: "+ New Lead" (with space after +)
+        const newMatch = n.match(/^\+?\s*new\s+(.+)$/)
+        if (newMatch) {
+          const entityWord = newMatch[1].trim()
+          // Match against known entities (case-insensitive)
+          for (const [entityLower] of entityOpenBtnMap) {
+            if (
+              entityLower.includes(entityWord) ||
+              entityWord.includes(entityLower) ||
+              // Handle plural: "leads" vs "lead"
+              entityLower.includes(entityWord.replace(/s$/, '')) ||
+              entityWord.replace(/s$/, '').includes(entityLower)
+            ) {
+              if (!openButtonDiscovery.has(entityLower)) {
+                openButtonDiscovery.set(entityLower, btnName)
+                log.info(
+                  `[CANONICAL-OB] Discovered: entity="${entityLower}" → open_button="${btnName}" (from page ${page.path ?? '?'})`,
+                )
+              }
+              break
+            }
+          }
+        }
+
+        // Pattern 4: "Add Lead", "Add New Account" etc.
+        const addMatch = n.match(/^\+?\s*add(?:\s+new)?\s+(.+)$/)
+        if (addMatch) {
+          const entityWord = addMatch[1].trim()
+          for (const [entityLower] of entityOpenBtnMap) {
+            if (entityLower.includes(entityWord) || entityWord.includes(entityLower)) {
+              if (!openButtonDiscovery.has(entityLower)) {
+                openButtonDiscovery.set(entityLower, btnName)
+              }
+              break
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── 4. For entities with no discovered button, synthesise a default ────────
+  // Pattern: "+New <EntityName>" — matches what the CRM actually uses
+  for (const [entityLower] of entityOpenBtnMap) {
+    if (!openButtonDiscovery.has(entityLower)) {
+      // Find the canonical entity name (correctly-cased)
+      const canonicalRow = canonicalRows.find(r => r.entity_name.toLowerCase() === entityLower)
+      const entityName = canonicalRow?.entity_name ?? (entityLower.charAt(0).toUpperCase() + entityLower.slice(1))
+
+      // Synthesise "+New EntityName" as the universal fallback
+      const synthesised = `+New ${entityName}`
+      openButtonDiscovery.set(entityLower, synthesised)
+      log.info(
+        `[CANONICAL-OB] Synthesised default: entity="${entityLower}" → open_button="${synthesised}"`,
+      )
+    }
+  }
+
+  // ── 5. Update metadata_canonical for each entity ──────────────────────────
+  let updateCount = 0
+
+  for (const row of canonicalRows) {
+    const entityLower = row.entity_name.toLowerCase()
+    const discoveredBtn = openButtonDiscovery.get(entityLower)
+
+    const existingRules = (row.learned_rules ?? {}) as Record<string, unknown>
+
+    // Only update if:
+    //   a) No open_button exists yet, OR
+    //   b) The discovered button is "real" (from crawl, not synthesised) and different
+    const currentOpenBtn = typeof existingRules.open_button === 'string' ? existingRules.open_button : null
+    const newBtn = discoveredBtn ?? `+New ${row.entity_name}`
+    const isSynthesised = newBtn === `+New ${row.entity_name}` || newBtn.startsWith('+New ')
+
+    // Always update to ensure every entity has an open_button
+    const updatedRules = {
+      ...existingRules,
+      open_button: currentOpenBtn ?? newBtn, // preserve confirmed real button if already set
+    }
+
+    // If we found a real crawled button and current is synthesised, prefer the crawled one
+    if (discoveredBtn && (!currentOpenBtn || currentOpenBtn.includes('+New '))) {
+      updatedRules.open_button = discoveredBtn
+    }
+
+    try {
+      await prisma.$executeRaw`
+        UPDATE metadata_canonical
+        SET
+          learned_rules  = learned_rules || ${JSON.stringify(updatedRules)}::jsonb,
+          last_synced_at = now()
+        WHERE
+          project_id  = ${projectId}::uuid
+          AND entity_name ILIKE ${row.entity_name}
+      `
+      updateCount++
+      log.info(
+        `[CANONICAL-OB] Updated "${row.entity_name}": open_button="${updatedRules.open_button}"`,
+      )
+    } catch (err) {
+      log.warn({ err }, `[CANONICAL-OB] Failed to update "${row.entity_name}"`)
+    }
+  }
+
+  const durationMs = Date.now() - startMs
+  log.info(
+    { projectId, updateCount, durationMs },
+    `[CANONICAL-OB] ✅ Open-button population complete — ${updateCount} entities updated in ${durationMs}ms`,
+  )
+
+  return updateCount
+}
+

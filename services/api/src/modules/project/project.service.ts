@@ -257,6 +257,17 @@ export async function createWebIntegration(
   })
 
   if (existing) {
+    // ── Merge auth_config to preserve login_url and other saved fields ──────
+    // If the caller passes a fresh authConfig (e.g. from the Connect form which
+    // only contains crawl settings), it must NOT wipe out fields that were
+    // previously saved via save-web-credentials (login_url) or
+    // save-keycloak-tokens (auth_token, id_token, etc.).
+    // We always merge new fields ON TOP of the existing auth_config.
+    let mergedAuthConfig: Record<string, any> | undefined
+    if (authConfig) {
+      const existingCfg = (existing.auth_config as Record<string, any>) ?? {}
+      mergedAuthConfig = { ...existingCfg, ...authConfig }
+    }
     return prisma.project_integrations.update({
       where: { id: existing.id },
       data: {
@@ -266,10 +277,11 @@ export async function createWebIntegration(
         username: encUsername,
         password: encPassword,
         login_strategy: loginStrategy,
-        ...(authConfig && { auth_config: authConfig }),
+        ...(mergedAuthConfig && { auth_config: mergedAuthConfig }),
       },
     })
   }
+
 
   return prisma.project_integrations.create({
     data: {
@@ -529,6 +541,7 @@ async function getSyncCounts(projectId: string) {
 
   return {
     raw_count:          rawPageCount,
+    pages_crawled:      rawPageCount,   // explicit alias — for web apps, this IS the page count
     normalized_count:   normalizedPageCount,
     domain_model_count: domain,
     embedding_count:    embeddings,

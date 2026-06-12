@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, Suspense } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useForm } from "react-hook-form"
@@ -56,7 +56,7 @@ const formSchema = z.object({
     }
 })
 
-export default function CreateProjectPage() {
+function CreateProjectPageInner() {
     const router = useRouter()
     const searchParams = useSearchParams()
     const [currentStep, setCurrentStep] = useState(1)
@@ -1114,5 +1114,17 @@ export default function CreateProjectPage() {
                 </CardFooter>
             </Card>
         </div>
+    )
+}
+
+export default function CreateProjectPage() {
+    return (
+        <Suspense fallback={
+            <div className="flex min-h-screen items-center justify-center">
+                <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
+            </div>
+        }>
+            <CreateProjectPageInner />
+        </Suspense>
     )
 }
