@@ -115,6 +115,7 @@ export interface TestCaseGenInput {
   focusAreas?:         string[]
   selectedModule?:     string
   brdContent?:         string
+  existingTestsContent?: string
   executionId?:        string  // for HITL
   excludeDuplicates?:  boolean // default true
 }
@@ -246,7 +247,7 @@ export async function runTestCaseGeneratorAgent(
 
   // Resolve BRD content early — caller-provided wins over DB-stored
   const resolvedBrd = decodeArtifact(input.brdContent ?? (projectArtifacts as any).brd_content)
-  const resolvedExistingTests = decodeArtifact((projectArtifacts as any).existing_tests_content)
+  const resolvedExistingTests = decodeArtifact(input.existingTestsContent ?? (projectArtifacts as any).existing_tests_content)
 
   // Step 2: Build enriched RAG query:
   //   - Module/focus area terms (as before)
@@ -264,16 +265,47 @@ export async function runTestCaseGeneratorAgent(
 
   thoughts.push(`OBSERVE: enriched RAG query with BRD terms: "${enrichedQuery.slice(0, 80)}…"`)
 
-  const [ragResult, existingCases] = await Promise.all([
+  const [ragResult, repoCanonicals, existingCases] = await Promise.all([
     ragSearchTool({
       projectId: input.projectId,
       query:     enrichedQuery,
       topK:      15,  // increased from 12 to capture more coverage
     }),
+    (async () => {
+      const { default: p } = await import('../../shared/db/prisma.js')
+      try {
+        return await p.metadata_canonical.findMany({
+          where: { project_id: input.projectId, source: 'repository' },
+          select: { entity_name: true, form_fields: true, primary_action_button: true, all_buttons: true, page_url: true },
+          take: 30,
+        })
+      } catch (err) {
+        log.warn({ err }, '[TCG] Failed to query repo metadata canonicals')
+        return []
+      }
+    })(),
     input.excludeDuplicates !== false
       ? getTestCasesByProject(input.projectId, 100)
       : Promise.resolve([]),
   ])
+
+  let repoMetadataText = ''
+  if (repoCanonicals && repoCanonicals.length > 0) {
+    const lines = ['=== REPOSITORY METADATA (Parsed from source code — HIGHEST PRIORITY) ===']
+    for (const canon of repoCanonicals) {
+      const fields = Array.isArray(canon.form_fields) ? canon.form_fields : []
+      const required = fields.filter((f: any) => f.required).map((f: any) => `${f.label} (${f.type})`)
+      const optional = fields.filter((f: any) => !f.required).map((f: any) => `${f.label}`)
+      const buttons = Array.isArray(canon.all_buttons) ? canon.all_buttons : []
+      let line = `Entity: ${canon.entity_name}`
+      if (canon.page_url) line += ` [URL: ${canon.page_url}]`
+      if (required.length > 0) line += `\n  Required fields: ${required.slice(0, 10).join(', ')}`
+      if (optional.length > 0) line += `\n  Optional fields: ${optional.slice(0, 8).join(', ')}`
+      if (buttons.length > 0) line += `\n  Buttons: ${buttons.slice(0, 6).join(', ')}`
+      lines.push(line)
+    }
+    repoMetadataText = lines.join('\n')
+  }
 
   // Apply RAG filter for the agent
   if (input.selectedModule && ragResult.chunks.length > 0) {
@@ -376,6 +408,7 @@ If in doubt, generate only CREATE and UPDATE test cases — those are always saf
   const moduleText = input.selectedModule ? `Module/Entity: ${input.selectedModule}` : ''
 
   const userPromptParts = [
+    repoMetadataText ? `${repoMetadataText}\n\n` : '',
     ragResult.chunks.length > 0
       ? `=== PROJECT METADATA ===\n${ragResult.chunks.join('\n\n---\n')}`
       : '(no metadata — generate from specification only)',

@@ -568,6 +568,9 @@ async function runUiScraping(
         // Wider viewport catches more nav items
         viewport: { width: 1440, height: 900 },
       })
+      await context.addInitScript(() => {
+        (window as any).__name = (fn: any) => fn;
+      });
       const page = await context.newPage()
       page.setDefaultTimeout(15_000)
 

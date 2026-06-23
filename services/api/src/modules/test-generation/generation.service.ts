@@ -1087,6 +1087,8 @@ function validateAndFixSampleValue(fieldLabel: string, value: string): string {
 //   status        → status       (already singular)
 function depluralize(word: string): string {
   const w = word.toLowerCase()
+  if (w === 'skus') return 'sku'
+  if (w === 'menus') return 'menu'
   if (w.endsWith('ies') && w.length > 4)  return w.slice(0, -3) + 'y'   // opportunities → opportunity
   if (w.endsWith('sses'))                  return w.slice(0, -2)         // addresses → address (via 'esses' actually 'sses')
   if (w.endsWith('ches') || w.endsWith('shes') || w.endsWith('xes') || w.endsWith('zes'))
@@ -4189,6 +4191,8 @@ function ensureWebAppCreateSteps(
   // ── -1b. Strip cross-entity CLICK buttons (HARD GUARD) ──────────────────
   // The LLM picks sidebar buttons for the WRONG entity (e.g. "+ New Lead"
   // in an Account test). This catches them at the final output level.
+  // IMPORTANT: Only strip CLICK steps whose entity word is CLEARLY for a
+  // DIFFERENT entity — never strip the open-form button for the SAME entity.
   {
     const entityMatch = prompt
       .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
@@ -4199,6 +4203,9 @@ function ensureWebAppCreateSteps(
 
     if (entityHint && entityHint.length > 2) {
       const entityLower = entityHint.toLowerCase()
+      // Derive singular form of entity for stem matching
+      const entityStem = entityLower.endsWith('s') && !entityLower.endsWith('ss')
+        ? entityLower.slice(0, -1) : entityLower
       const beforeCount = result.steps.length
 
       result.steps = result.steps.filter(step => {
@@ -4207,14 +4214,20 @@ function ensureWebAppCreateSteps(
         const target = (step.target ?? '').toLowerCase().trim()
         if (!target) return true
 
-        // Detect "new/create/add <entity>" pattern
-        const match = target.match(/\b(?:new|create|add)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+        // Detect "new/create/add <entity>" pattern — capture ONLY the FIRST word after the verb
+        // (not multi-word) to avoid capturing "account record" when entity is "account"
+        const match = target.match(/\b(?:new|create|add)\s+([a-z]+)\b/)
         if (!match) return true
         const entityWord = match[1].trim()
-        if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
+        // Skip generic words and known suffix words like "record"
+        const SKIP_WORDS = new Set(['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry', 'form', 'page'])
+        if (entityWord.length < 3 || SKIP_WORDS.has(entityWord)) return true
 
-        // Keep if entity matches
-        if (entityLower.includes(entityWord) || entityWord.includes(entityLower)) return true
+        // Keep if entity stem matches (account=account, accounts=account, etc.)
+        const wordStem = entityWord.endsWith('s') && !entityWord.endsWith('ss')
+          ? entityWord.slice(0, -1) : entityWord
+        if (entityLower.includes(entityWord) || entityWord.includes(entityStem)) return true
+        if (entityStem === wordStem || entityStem.includes(wordStem) || wordStem.includes(entityStem)) return true
 
         // Cross-entity contamination → strip
         log.warn(`[GEN] Post-process: stripped cross-entity CLICK "${step.target}" — button is for "${entityWord}", test is for "${entityHint}"`)
@@ -4705,7 +4718,8 @@ function ensureWebAppCreateSteps(
   // ── Derive the real list-page URL for ASSERT_URL ──────────────────────────
   // Priority: (1) entity URL map, (2) known page path from RAG context that matches
   // entity name, (3) naive pluralization (last resort — avoids '/opportunitys' typo)
-  let entityListPath = `/${capitalizedEntity.toLowerCase()}s`  // naive default
+  const entityLower = capitalizedEntity.toLowerCase()
+  let entityListPath = `/${entityLower.endsWith('s') ? entityLower : entityLower.endsWith('y') ? entityLower.slice(0, -1) + 'ies' : entityLower + 's'}`  // naive default
 
   // Check entityUrlMap first (highest confidence)
   const urlInfoForEntity = Object.entries(entityUrlMap).find(
@@ -5041,6 +5055,78 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
     } catch { /* non-critical */ }
   }
 
+  // ── Web App: ALWAYS delegate to STEP_GEN_MODEL agent ─────────────────────
+  // This runs BEFORE the RAG block so it is reached even when useMcpRag=false
+  // (i.e. no vector embeddings). The agent handles its own metadata_canonical
+  // lookup internally and produces validated steps with Safety Net enforcement.
+  if (isWebAppProject && project_id) {
+    try {
+      const { runTestStepGeneratorAgent } = await import('../ai-agents/test-step-generator.agent.js')
+
+      // ── Entity filter extraction ─────────────────────────────────────────────
+      // For "Convert Quotation to Booking - Happy Path", extractTargetObjects()
+      // doesn't pick up "Booking" because "convert" isn't in its verb list.
+      // Instead, directly parse the "convert/transform X to Y" pattern first.
+      let agentEntityFilter: string | undefined
+      const convertMatch = prompt.match(/\b(?:convert|transform|turn)\s+\w+\s+to\s+([A-Za-z][A-Za-z\s_]+?)(?:\s*[-–]|\s*$)/i)
+      if (convertMatch) {
+        // Extract target entity from "Convert Quotation to Booking" → "Booking"
+        agentEntityFilter = convertMatch[1].trim().split(/\s+/)[0]
+        log.info(`[GEN] Web App early-path: detected convert target="${agentEntityFilter}" from prompt`)
+      } else {
+        const agentTargetObjs = extractTargetObjects(prompt)
+        agentEntityFilter = agentTargetObjs[0]
+      }
+
+      log.info(`[GEN] Web App early-path: delegating to STEP_GEN_MODEL agent (entity="${agentEntityFilter}")`)
+
+      const agentOutput = await runTestStepGeneratorAgent({
+        projectId:    project_id,
+        testName:     prompt.trim().slice(0, 200),
+        description:  prompt,
+        entityFilter: agentEntityFilter || undefined,
+      })
+
+      log.info(
+        `[GEN] STEP_GEN_MODEL agent done: ${agentOutput.steps.length} steps, ` +
+        `loops=${agentOutput.loopCount}, confidence=${agentOutput.confidence}, ` +
+        `passed=${agentOutput.validation.passed}`,
+      )
+
+      if (agentOutput.validation.issues.length > 0) {
+        log.warn(`[GEN] Agent validation issues: ${agentOutput.validation.issues.join('; ')}`)
+      }
+
+      const agentSteps: Step[] = agentOutput.steps.map((s, i) => ({
+        id:           String(i + 1),
+        action:       normaliseAction(s.action),
+        target:       s.target,
+        value:        s.value,
+        locator_type: s.locator_type,
+      }))
+
+      const agentNormalised: GenerateResponse = {
+        name:             prompt.trim().slice(0, 80),
+        description:      prompt,
+        steps:            agentSteps,
+        priority:         'medium',
+        preconditions:    ['User is already authenticated'],
+        expected_outcome: `${agentEntityFilter ?? 'Entity'} created/updated successfully`,
+      }
+
+      agentNormalised.steps = validateFieldValueAlignment(agentNormalised.steps)
+      agentNormalised.steps = await filterNonExistentFieldSteps(agentNormalised.steps, project_id, agentEntityFilter)
+      const agentResult = ensureWebAppCreateSteps(agentNormalised, prompt, true, '', globalEntityUrlMap)
+
+      log.info(`[GEN] Web App early-path via STEP_GEN_MODEL: ${agentResult.steps.length} final steps`)
+      return { ...agentResult, rag_context_used: false, retrieved_chunks: 0 }
+
+    } catch (agentErr) {
+      log.warn({ err: agentErr }, '[GEN] Web App early-path: STEP_GEN_MODEL agent failed — falling back to RAG/standard path')
+      // Fall through to RAG path below
+    }
+  }
+
   // ── MCP RAG path ───────────────────────────────────────────────────
 
   if (useMcpRag && project_id) {
@@ -5088,134 +5174,25 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
           }
         }
 
-        if (chunks.length > 0) {
-
-        // ── Web App: build a dedicated structured context from normalized DB ─
-        // The RAG chunks contain plain-text summaries (field names only). We
-        // supplement with the full structured page data so the LLM sees locator
-        // types, field tags, required status, and submit buttons — not just names.
-        let ragContext: string
-        if (isWebAppProject) {
-          ragContext = await buildWebAppStructuredContext(project_id, targetObjs, chunks, testIntent, globalEntityUrlMap)
-          log.info(`[GEN] Web App: built structured context for intent=${testIntent} (${ragContext.length} chars)`)
-        } else {
-          ragContext = buildRagContext(chunks)
-        }
-
-        // Supplemental: structured field manifest + record type manifest from salesforce.service.ts
-        // Skip this for web app projects — they use crawled page metadata, not SF describe API
-        if (!isWebAppProject) {
-          try {
-            if (project_id && targetObjs.length > 0) {
-              for (const targetObj of targetObjs) {
-              // Resolve API name: 'Inventory' → 'Inventory__c' etc.
-              const sfMeta = await resolveObjectMetadata(project_id, targetObj)
-              if (sfMeta?.metadata) {
-                // ── Record type manifest (inject BEFORE field manifest) ──────
-                // When an object has multiple record types, SF shows a selection
-                // dialog before the create form. Inject the manifest so the LLM
-                // generates a SELECT_RECORD_TYPE step.
-                let selectedRTName = ''
-                try {
-                  const recordTypes = await getRecordTypes(project_id, sfMeta.object_name)
-                  const rtManifest = buildRecordTypeManifest(sfMeta.object_name, recordTypes)
-                  if (rtManifest) {
-                    ragContext = rtManifest + '\n\n' + ragContext
-                    selectedRTName = extractRequestedRecordType(prompt, recordTypes)
-                    log.info(`[GEN] RT manifest injected for ${sfMeta.object_name}, selected RT: "${selectedRTName}"`)
-                  }
-                } catch {
-                  log.info(`[GEN] Could not fetch record types for ${sfMeta.object_name} — skipping RT manifest`)
-                }
-
-                // ── Page layout fields filter ───────────────────────────────
-                // Use the RT-specific layout so only the 3 (or N) fields for the
-                // selected record type are shown — not all 30+ from every RT layout.
-                const layoutFields = await getPageLayoutFields(
-                    project_id,
-                    sfMeta.object_name,
-                    selectedRTName || undefined,
-                  ).catch(() => null)
-                // Build the field manifest filtered to layout fields + user prompt,
-                // injecting REAL lookup values queried from the org.
-                if (layoutFields) {
-                  log.info(`[GEN] Page layout fetched: ${layoutFields.available.size} fields (${layoutFields.layoutRequired.size} layout-required) for ${sfMeta.object_name}`)
-                } else {
-                  log.info(`[GEN] No page layout data — using all createable schema fields`)
-                }
-
-                // Build the field manifest filtered to layout fields + user prompt,
-                // injecting REAL lookup values queried from the org.
-                const lookupSamples = await fetchLookupSamplesForManifest(
-                  project_id, sfMeta.metadata, layoutFields
-                ).catch(() => new Map<string, string[]>())
-                const manifest = buildFieldManifest(sfMeta.metadata, layoutFields, prompt, lookupSamples)
-                if (manifest) {
-                  ragContext += `\n\n=== Field Manifest for ${sfMeta.object_name} ===\n` + manifest
-                  log.info(`[GEN] Injected field manifest for ${targetObj}`)
-                }
-
-                // Also add the object name and label
-                ragContext += `\n\nObject API Name: ${sfMeta.object_name} | Label: ${sfMeta.label ?? sfMeta.object_name}`
-              }
-            }
-          }
-        } catch {
-          // non-critical salesforce metadata enrichment
-        }
-        } // end if (!isWebAppProject)
-
-        // ── Web App: inject verified entity URL map into ragContext ────────
-        // The metadata crawler may only have /home pages. The test data scraper
-        // discovered REAL URLs (e.g. /roles, /campaigns). Inject them so the LLM
-        // uses verified paths and the post-processor can correct hallucinated ones.
-        const entityUrlMap = globalEntityUrlMap
-        if (isWebAppProject && Object.keys(entityUrlMap).length > 0) {
-          const urlMapSection = [
-            '',
-            '=== VERIFIED URL MAP (use these EXACT paths and button names) ===',
-            ...Object.entries(entityUrlMap).map(([entity, info]) => {
-              const path   = typeof info === 'string' ? info : info.path
-              const btn    = typeof info === 'string' ? undefined : info.buttonName
-              const opener = typeof info === 'string' ? undefined : info.openButtonName
-              if (opener && btn) {
-                // Two-step modal flow: click opener → fill form → click submit
-                return (
-                  `  Entity: ${entity}  →  List Page: ${path}\n` +
-                  `    CREATE FLOW (TWO STEPS REQUIRED):\n` +
-                  `      Step A: CLICK "${opener}" button  (this OPENS the create form/modal)\n` +
-                  `      Step B: Fill all required fields\n` +
-                  `      Step C: CLICK "${btn}" button  (this SUBMITS the form — use as CLICK target)`
-                )
-              }
-              const btnNote = btn
-                ? `  |  Submit Button: "${btn}" (use this EXACT text for the CLICK step)`
-                : `  |  Create Page: ${path}/new`
-              return `  Entity: ${entity}  →  List Page: ${path}${btnNote}`
-            }),
-            '=== END VERIFIED URL MAP ===',
-            '',
-          ].join('\n')
-          ragContext = urlMapSection + ragContext
-          log.info(`[GEN] Injected verified URL map: ${Object.keys(entityUrlMap).length} entities`)
-        }
-
-        // ── Web App: route through STEP_GEN_MODEL agent for validated generation ──
-        // The runTestStepGeneratorAgent uses STEP_GEN_MODEL (env var, defaults to gpt-4o)
-        // and runs up to 3 self-correction loops with a 5-check validation gate:
-        //   ✅ Check 1: required field coverage (no missing REQUIRED fields)
-        //   ✅ Check 2: URL verification (only crawled paths used)
-        //   ✅ Check 3: button name exactness (actual button from page, e.g. "Create Account")
-        //   ✅ Check 4: locator type validity (LOOKUP uses label, SELECT uses options)
-        //   ✅ Check 5: data type alignment (phone/email/date formats)
-        // Non-webapp projects (Salesforce) continue using the direct LLM call below.
+        // ── Web App: ALWAYS route through STEP_GEN_MODEL agent ────────────────
+        // The agent handles its own metadata_canonical lookup internally,
+        // so it does NOT need RAG chunks to have form fields — it can be called
+        // even when chunks were cleared (e.g. no Booking form fields in RAG embeddings).
+        // This block runs for ALL web app requests, regardless of chunk content.
+        // Non-webapp projects (Salesforce) fall through to the direct LLM call below.
         if (isWebAppProject) {
           try {
             const { runTestStepGeneratorAgent } = await import('../ai-agents/test-step-generator.agent.js')
-            const targetObjs = extractTargetObjects(prompt)
-            const entityFilter = targetObjs[0] // narrow metadata to primary entity
+            const agentTargetObjs = extractTargetObjects(prompt)
+            // For CONVERT operations ("Convert Quotation to Booking"), the TARGET entity
+            // (Booking) is what gets created — we need its manifest, NOT the source entity's.
+            // Use the LAST extracted object for convert ops, FIRST for all other ops.
+            const isConvertPrompt = /\b(convert|transform|turn\s+into|move\s+to)\b/i.test(prompt)
+            const entityFilter = isConvertPrompt && agentTargetObjs.length > 1
+              ? agentTargetObjs[agentTargetObjs.length - 1]  // Booking (target entity)
+              : agentTargetObjs[0]                            // primary entity for create/update/etc
 
-            log.info(`[GEN] Web App: delegating to STEP_GEN_MODEL agent (entity="${entityFilter}", chunks=${chunks.length})`)
+            log.info(`[GEN] Web App: delegating to STEP_GEN_MODEL agent (entity="${entityFilter}", isConvert=${isConvertPrompt}, ragChunks=${chunks.length})`)
 
             const agentOutput = await runTestStepGeneratorAgent({
               projectId:    project_id,
@@ -5234,7 +5211,7 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
               log.warn(`[GEN] Agent validation issues: ${agentOutput.validation.issues.join('; ')}`)
             }
 
-            // Map AgentStep_Playwright → Step (same shape, just ensure required fields)
+            // Map AgentStep_Playwright → Step
             const agentSteps: Step[] = agentOutput.steps.map((s, i) => ({
               id:           String(i + 1),
               action:       normaliseAction(s.action),
@@ -5253,19 +5230,111 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
             }
 
             agentNormalised.steps = validateFieldValueAlignment(agentNormalised.steps)
-            // Filter hallucinated fields (e.g., "Email" on Account form)
             if (project_id) {
               agentNormalised.steps = await filterNonExistentFieldSteps(agentNormalised.steps, project_id, entityFilter)
             }
-            const agentResult = ensureWebAppCreateSteps(agentNormalised, prompt, true, ragContext, entityUrlMap)
+            const agentResult = ensureWebAppCreateSteps(agentNormalised, prompt, true, chunks.join('\n\n') || '', globalEntityUrlMap)
 
             log.info(`[GEN] Web App via STEP_GEN_MODEL: ${agentResult.steps.length} final steps`)
-            return { ...agentResult, rag_context_used: true, retrieved_chunks: chunks.length }
+            return { ...agentResult, rag_context_used: chunks.length > 0, retrieved_chunks: chunks.length }
 
           } catch (agentErr) {
             log.warn({ err: agentErr }, '[GEN] STEP_GEN_MODEL agent failed — falling back to direct LLM')
-            // Fall through to direct LLM call below
           }
+        }
+
+        if (chunks.length > 0) {
+
+        // ── Web App: build a dedicated structured context from normalized DB ─
+        let ragContext: string
+        if (isWebAppProject) {
+          ragContext = await buildWebAppStructuredContext(project_id, targetObjs, chunks, testIntent, globalEntityUrlMap)
+          log.info(`[GEN] Web App: built structured context for intent=${testIntent} (${ragContext.length} chars)`)
+        } else {
+          ragContext = buildRagContext(chunks)
+        }
+
+        // Supplemental: structured field manifest + record type manifest from salesforce.service.ts
+        // Skip this for web app projects — they use crawled page metadata, not SF describe API
+        if (!isWebAppProject) {
+          try {
+            if (project_id && targetObjs.length > 0) {
+              for (const targetObj of targetObjs) {
+              // Resolve API name: 'Inventory' → 'Inventory__c' etc.
+              const sfMeta = await resolveObjectMetadata(project_id, targetObj)
+              if (sfMeta?.metadata) {
+                // ── Record type manifest (inject BEFORE field manifest) ──────
+                let selectedRTName = ''
+                try {
+                  const recordTypes = await getRecordTypes(project_id, sfMeta.object_name)
+                  const rtManifest = buildRecordTypeManifest(sfMeta.object_name, recordTypes)
+                  if (rtManifest) {
+                    ragContext = rtManifest + '\n\n' + ragContext
+                    selectedRTName = extractRequestedRecordType(prompt, recordTypes)
+                    log.info(`[GEN] RT manifest injected for ${sfMeta.object_name}, selected RT: "${selectedRTName}"`)
+                  }
+                } catch {
+                  log.info(`[GEN] Could not fetch record types for ${sfMeta.object_name} — skipping RT manifest`)
+                }
+
+                const layoutFields = await getPageLayoutFields(
+                    project_id,
+                    sfMeta.object_name,
+                    selectedRTName || undefined,
+                  ).catch(() => null)
+                if (layoutFields) {
+                  log.info(`[GEN] Page layout fetched: ${layoutFields.available.size} fields (${layoutFields.layoutRequired.size} layout-required) for ${sfMeta.object_name}`)
+                } else {
+                  log.info(`[GEN] No page layout data — using all createable schema fields`)
+                }
+
+                const lookupSamples = await fetchLookupSamplesForManifest(
+                  project_id, sfMeta.metadata, layoutFields
+                ).catch(() => new Map<string, string[]>())
+                const manifest = buildFieldManifest(sfMeta.metadata, layoutFields, prompt, lookupSamples)
+                if (manifest) {
+                  ragContext += `\n\n=== Field Manifest for ${sfMeta.object_name} ===\n` + manifest
+                  log.info(`[GEN] Injected field manifest for ${targetObj}`)
+                }
+
+                ragContext += `\n\nObject API Name: ${sfMeta.object_name} | Label: ${sfMeta.label ?? sfMeta.object_name}`
+              }
+            }
+          }
+        } catch {
+          // non-critical salesforce metadata enrichment
+        }
+        } // end if (!isWebAppProject)
+
+        // ── Web App: inject verified entity URL map into ragContext ────────
+        const entityUrlMap = globalEntityUrlMap
+        if (isWebAppProject && Object.keys(entityUrlMap).length > 0) {
+          const urlMapSection = [
+            '',
+            '=== VERIFIED URL MAP (use these EXACT paths and button names) ===',
+            ...Object.entries(entityUrlMap).map(([entity, info]) => {
+              const path   = typeof info === 'string' ? info : info.path
+              const btn    = typeof info === 'string' ? undefined : info.buttonName
+              const opener = typeof info === 'string' ? undefined : info.openButtonName
+              if (opener && btn) {
+                return (
+                  `  Entity: ${entity}  →  List Page: ${path}\n` +
+                  `    CREATE FLOW (TWO STEPS REQUIRED):\n` +
+                  `      Step A: CLICK "${opener}" button  (this OPENS the create form/modal)\n` +
+                  `      Step B: Fill all required fields\n` +
+                  `      Step C: CLICK "${btn}" button  (this SUBMITS the form — use as CLICK target)`
+                )
+              }
+              const btnNote = btn
+                ? `  |  Submit Button: "${btn}" (use this EXACT text for the CLICK step)`
+                : `  |  Create Page: ${path}/new`
+              return `  Entity: ${entity}  →  List Page: ${path}${btnNote}`
+            }),
+            '=== END VERIFIED URL MAP ===',
+            '',
+          ].join('\n')
+          ragContext = urlMapSection + ragContext
+          log.info(`[GEN] Injected verified URL map: ${Object.keys(entityUrlMap).length} entities`)
         }
 
         // ── Non-webapp (Salesforce MCP) — direct LLM call ──────────────────────

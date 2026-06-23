@@ -46,12 +46,32 @@ export interface HitlChatRequest {
   chatHistory:  ChatMsg[]
 }
 
-/** A concrete step the AI has agreed to insert before the paused step */
+/** A concrete step the AI has agreed to insert/update/delete */
 export interface ProposedStep {
   action: string   // NAVIGATE | CLICK | TYPE | LOOKUP | SELECT | WAIT | …
   target: string   // URL, field name, selector
   value:  string   // optional value (typed text, selected option)
   label:  string   // human-readable one-liner shown in the Apply button card
+  /** insert = add before paused step | update = patch paused step | delete = remove paused step */
+  opType?: 'insert' | 'update' | 'delete'
+}
+
+/**
+ * A structured suggestion card shown in the HITL panel.
+ * Each suggestion has enough information to apply the change without further
+ * parsing — eliminating fragile regex-based option parsing on the frontend.
+ */
+export interface SuggestionOption {
+  /** Short human-readable label shown on the card */
+  label:  string
+  /** Playwright action keyword */
+  action: string
+  /** Field label, URL path, or selector */
+  target: string
+  /** Value to type / select (empty string if N/A) */
+  value:  string
+  /** Whether to insert a new step, update the paused step, or delete it */
+  opType: 'insert' | 'update' | 'delete'
 }
 
 export interface HitlAiResponse {
@@ -62,14 +82,20 @@ export interface HitlAiResponse {
   /** Quick-reply chips to surface as buttons */
   quick_replies?:    string[]
   /**
-   * 2-4 distinct, actionable resolution options (shown as "Apply & Resume" cards).
-   * Each entry is a concise plain-English description of a specific fix.
-   * Omit when clarifying (clarify type).
+   * Structured suggestion cards — each item contains enough info for
+   * the UI to apply the change immediately (no parsing required).
+   * Prefer this over the legacy `options` string array.
+   */
+  suggestions?:      SuggestionOption[]
+  /**
+   * Legacy string options array kept for backward-compatibility with
+   * the in-browser Playwright overlay script.
+   * When `suggestions` is present, this is derived from it automatically.
    */
   options?:          string[]
   /**
    * When suggestion_type === "valid" AND the AI has agreed on a concrete step
-   * to INSERT before the paused step, this field contains the structured step.
+   * to INSERT/UPDATE before the paused step, this field contains the structured step.
    * The UI renders it as a prominent "✓ Accept & Resume Testing" card.
    */
   proposed_step?:    ProposedStep
@@ -102,7 +128,7 @@ function buildLlm(): BaseChatModel {
 const HITL_SYSTEM_PROMPT = `
 You are NEXUS, an expert QA Automation Engineer AI assistant embedded in the AutoTest AI platform.
 A test has PAUSED because a step failed. Your job is to help the human CHOOSE the best corrective
-action from a set of options you provide, so they can click "Apply & Resume" in the chatbot panel.
+action from a set of structured suggestions you provide so they can click "Apply & Resume".
 
 ═══════════════════════════════════════════════════════════════════
 CONTEXT
@@ -126,52 +152,94 @@ RECENT CHAT HISTORY:
 YOUR ROLE
 ═══════════════════════════════════════════════════════════════════
 
-1. Analyse the error and the paused step.
-2. Provide 2–4 CONCRETE, DISTINCT resolution options the user can choose from.
-   Each option must be a specific, actionable description (not generic).
-3. When the human selects/confirms a specific fix ("yes", "ok", "add this", "insert", etc.):
+1. Analyse the error and the paused step context.
+2. Provide 2–4 CONCRETE, DISTINCT structured suggestions the user can select from.
+   Each suggestion must be specific and directly actionable — not generic advice.
+3. When the human selects/confirms a specific fix ("yes", "ok", "use this", "apply", etc.):
    - Set suggestion_type="valid"
-   - Set proposed_step with the EXACT step to insert before the paused step
-   - proposed_step fields: action (NAVIGATE/CLICK/TYPE/LOOKUP/SELECT/WAIT/ASSERT_TEXT/CHECKBOX),
-     target (URL path or field label), value (typed value if any), label (short description)
-   - Do NOT include options[] when suggestion_type="valid" — only proposed_step
-4. If unclear, set suggestion_type="clarify" and ask ONE follow-up question.
-5. If invalid, set suggestion_type="invalid" and explain why, with corrected options.
+   - Set proposed_step with the EXACT structured step to apply
+   - proposed_step.opType: "insert" (add before paused step), "update" (patch paused step), or "delete" (remove paused step)
+   - proposed_step fields: action, target, value, opType, label
+   - Do NOT include suggestions[] when suggestion_type="valid" — only proposed_step
+4. If the user's natural language instruction is valid (e.g. "use SKU-100", "change value to USD"),
+   classify as suggestion_type="valid" and include proposed_step immediately. Do NOT ask for more info.
+5. If unclear, set suggestion_type="clarify" and ask ONE specific follow-up question.
+6. If invalid, set suggestion_type="invalid" and explain why, with corrected suggestions.
 
-Keep responses short and practical (2–4 sentences max). No waffle.
+Keep responses short and practical (2–4 sentences max).
 
 IMPORTANT RULES:
-- You do NOT modify test steps directly — proposed_step describes what to INSERT.
-- Do NOT suggest actions outside the supported set: NAVIGATE CLICK TYPE SELECT ASSERT_TEXT WAIT CHECKBOX LOOKUP ASSERT_VISIBLE ASSERT_URL ASSERT_TOAST.
-- If the error suggests a data-uniqueness issue, suggest using different test data.
-- If the error is a locator/element-not-found issue, suggest checking page load or element label.
+- Supported action keywords: NAVIGATE CLICK TYPE SELECT ASSERT_TEXT WAIT CHECKBOX LOOKUP ASSERT_VISIBLE ASSERT_URL ASSERT_TOAST SCROLL HOVER.
+- If error is data-uniqueness issue → suggest using different/unique test data values.
+- If error is element-not-found → suggest checking page navigation or element label.
+- If the step value is clearly wrong/placeholder → suggest opType="update" to fix the value.
+- If the step is fundamentally invalid → suggest opType="delete" to remove it.
+- If a prerequisite step is missing → suggest opType="insert" for the missing step.
 - 🔴 IF PAST HUMAN CORRECTIONS APPEAR ABOVE: they OVERRIDE your general knowledge.
-- When user says "yes", "ok", "insert", "add this", "go ahead", "do it" — treat as CONFIRMATION
-  of the most recently discussed option. Set suggestion_type="valid" and include proposed_step.
+- When user confirms ("yes", "ok", "go ahead", "do it") → treat as confirmation of the last discussed option.
 
 ═══════════════════════════════════════════════════════════════════
 OUTPUT FORMAT — respond with ONLY valid JSON (no markdown, no code fences)
 ═══════════════════════════════════════════════════════════════════
 
+// When suggestion_type is "advice" (initial analysis or info needed):
 {
-  "reply": "Short, helpful message (2-4 sentences, plain text)",
-  "suggestion_type": "advice" | "valid" | "clarify" | "invalid",
-  "suggested_action": "One sentence (omit if clarify or valid+proposed_step)",
-  "options": ["Option A", "Option B", "Option C"],
+  "reply": "Short analysis (2-4 sentences, plain text)",
+  "suggestion_type": "advice",
+  "suggested_action": "One-sentence action hint",
+  "suggestions": [
+    {
+      "label": "Navigate to the Accounts page first",
+      "action": "NAVIGATE",
+      "target": "/accounts",
+      "value": "",
+      "opType": "insert"
+    },
+    {
+      "label": "Update step value to use real SKU-100 instead",
+      "action": "TYPE",
+      "target": "Product Code",
+      "value": "SKU-100",
+      "opType": "update"
+    }
+  ],
+  "options": ["NAVIGATE → /accounts", "TYPE 'SKU-100' into Product Code"],
+  "quick_replies": ["Try option 1", "Try option 2"]
+}
+
+// When suggestion_type is "valid" (user confirmed or instruction is clear):
+{
+  "reply": "Got it! Applying the fix now.",
+  "suggestion_type": "valid",
   "proposed_step": {
     "action": "NAVIGATE",
     "target": "/bank-details",
     "value": "",
-    "label": "Navigate to Bank Details page"
-  },
-  "quick_replies": ["chip 1", "chip 2"]
+    "opType": "insert",
+    "label": "Navigate to Bank Details page before the failing step"
+  }
 }
 
-IMPORTANT:
-- ALWAYS include "options" with 2-4 choices EXCEPT when suggestion_type="valid".
-- When suggestion_type="valid", ALWAYS include "proposed_step" with the exact step to insert.
-- "options" entries must be short (max 10 words) and directly actionable.
+// When suggestion_type is "clarify":
+{
+  "reply": "Which Currency value should I use instead?",
+  "suggestion_type": "clarify",
+  "quick_replies": ["USD", "EUR", "GBP"]
+}
+
+// When suggestion_type is "invalid":
+{
+  "reply": "That action is not supported. Here are valid alternatives:",
+  "suggestion_type": "invalid",
+  "suggestions": [ ... ]
+}
+
+CRITICAL RULES:
+- ALWAYS include "suggestions" array (2-4 items) when suggestion_type is "advice" or "invalid".
+- ALWAYS include "options" string array alongside "suggestions" for backward-compat with the browser overlay (derive it from suggestions: "ACTION → target").
+- When suggestion_type="valid", include ONLY "reply" and "proposed_step" (no suggestions array).
 - Output ONLY valid JSON. No markdown, no explanation outside JSON.
+- proposed_step.opType MUST be one of: "insert", "update", "delete".
 `
 
 
@@ -328,13 +396,37 @@ async function callLlm(systemPrompt: string, userMessage: string): Promise<HitlA
   if (parsed.proposed_step && typeof parsed.proposed_step === 'object') {
     const ps = parsed.proposed_step
     const action = (ps.action || 'NAVIGATE').toUpperCase()
+    const opType = ['insert', 'update', 'delete'].includes(ps.opType) ? ps.opType : 'insert'
     if (VALID_ACTIONS.includes(action)) {
       proposedStep = {
         action,
         target: String(ps.target || ''),
         value:  String(ps.value  || ''),
         label:  String(ps.label  || `${action} → ${ps.target}`),
+        opType,
       }
+    }
+  }
+
+  // Parse structured suggestions array from LLM
+  let suggestions: SuggestionOption[] | undefined
+  if (Array.isArray(parsed.suggestions) && parsed.suggestions.length > 0) {
+    suggestions = parsed.suggestions
+      .filter((s: any) => s && typeof s === 'object' && s.action)
+      .slice(0, 4)
+      .map((s: any) => ({
+        label:  String(s.label  || `${s.action} → ${s.target}`),
+        action: (s.action || 'NAVIGATE').toUpperCase(),
+        target: String(s.target || ''),
+        value:  String(s.value  || ''),
+        opType: ['insert', 'update', 'delete'].includes(s.opType) ? s.opType : 'insert',
+      } as SuggestionOption))
+
+    // Derive legacy options strings from suggestions for backward-compat with browser overlay
+    if (!Array.isArray(parsed.options) || parsed.options.length === 0) {
+      parsed.options = suggestions!.map(s =>
+        s.value ? `${s.action} '${s.value}' into ${s.target}` : `${s.action} → ${s.target}`
+      )
     }
   }
 
@@ -343,6 +435,7 @@ async function callLlm(systemPrompt: string, userMessage: string): Promise<HitlA
     suggestion_type:  parsed.suggestion_type  || 'advice',
     suggested_action: parsed.suggested_action,
     quick_replies:    Array.isArray(parsed.quick_replies) ? parsed.quick_replies.slice(0, 4) : undefined,
+    suggestions,
     options:          Array.isArray(parsed.options) ? parsed.options.slice(0, 4) : undefined,
     proposed_step:    proposedStep,
   }

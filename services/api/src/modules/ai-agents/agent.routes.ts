@@ -40,6 +40,7 @@ const GenerateTestCasesSchema = z.object({
   focusAreas:     z.array(z.string()).optional(),
   selectedModule: z.string().optional(),
   brdContent:     z.string().optional(),
+  existingTestsContent: z.string().optional(),
   executionId:    z.string().uuid().optional(),
 })
 
@@ -50,6 +51,8 @@ const GenerateStepsSchema = z.object({
   description:  z.string().optional(),
   entityFilter: z.string().optional(),
   executionId:  z.string().uuid().optional(),
+  brdContent:   z.string().optional(),
+  existingTestsContent: z.string().optional(),
 })
 
 const AnalyzeFailureSchema = z.object({

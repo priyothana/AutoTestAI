@@ -174,6 +174,21 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
     const [jiraReconfiguring, setJiraReconfiguring] = useState(false)
     const [jiraConnectError, setJiraConnectError] = useState<string | null>(null)
 
+    // Repository Connection
+    const [repoStatus, setRepoStatus] = useState<{
+        connected: boolean; repo_url: string | null; branch: string | null;
+        provider: string | null; status: string; last_synced_at: string | null; sync_error: string | null
+    } | null>(null)
+    const [repoLoading, setRepoLoading] = useState(false)
+    const [repoUrl, setRepoUrl] = useState("")
+    const [repoBranch, setRepoBranch] = useState("main")
+    const [repoToken, setRepoToken] = useState("")
+    const [repoProvider, setRepoProvider] = useState<"github" | "gitlab" | "bitbucket">("github")
+    const [repoConnecting, setRepoConnecting] = useState(false)
+    const [repoSyncing, setRepoSyncing] = useState(false)
+    const [repoDisconnecting, setRepoDisconnecting] = useState(false)
+    const [repoShowToken, setRepoShowToken] = useState(false)
+
     // Web App Session & Login Credentials
     const [webLoginUrl, setWebLoginUrl] = useState("")
     const [webUsername, setWebUsername] = useState("")
@@ -221,6 +236,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             fetchProject()
             fetchIntegration()
             fetchJiraConfig()
+            fetchRepoStatus()
             loadTestData()
             loadPersistedDocs()
             fetchKeycloakSessionStatus()
@@ -278,6 +294,83 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             }
         } catch (e) { console.error("Failed to fetch Jira config:", e) }
         finally { setJiraConfigLoading(false) }
+    }
+
+    const fetchRepoStatus = async () => {
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/repo-status`)
+            if (res.ok) {
+                const data = await res.json()
+                setRepoStatus(data)
+                if (data.repo_url) setRepoUrl(data.repo_url)
+                if (data.branch) setRepoBranch(data.branch)
+                if (data.provider) setRepoProvider(data.provider)
+            }
+        } catch (e) { console.error("Failed to fetch repo status:", e) }
+    }
+
+    const handleRepoConnect = async () => {
+        if (!repoUrl.trim()) { toast.error("Repository URL is required"); return }
+        setRepoConnecting(true)
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/repo-connect`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    repo_url: repoUrl.trim(),
+                    branch: repoBranch.trim() || "main",
+                    access_token: repoToken.trim() || null,
+                    provider: repoProvider,
+                }),
+            })
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}))
+                throw new Error(err.detail || `HTTP ${res.status}`)
+            }
+            toast.success("Repository connected! Run Sync Metadata to index source files.")
+            setRepoToken("")
+            await fetchRepoStatus()
+        } catch (e: any) {
+            toast.error(`Failed to connect repository: ${e.message}`)
+        } finally {
+            setRepoConnecting(false)
+        }
+    }
+
+    const handleRepoDisconnect = async () => {
+        setRepoDisconnecting(true)
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/repo-disconnect`, { method: "DELETE" })
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            toast.success("Repository disconnected and repo metadata removed.")
+            setRepoStatus(null)
+            setRepoUrl("")
+            setRepoBranch("main")
+            setRepoToken("")
+        } catch (e: any) {
+            toast.error(`Failed to disconnect: ${e.message}`)
+        } finally {
+            setRepoDisconnecting(false)
+        }
+    }
+
+    const handleRepoSync = async () => {
+        setRepoSyncing(true)
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/projects/${id}/sync-repo-metadata`, { method: "POST" })
+            const data = await res.json()
+            if (data.success) {
+                toast.success(`Sync complete: ${data.files_indexed} files indexed, ${data.entities_extracted} entities extracted`)
+                if (data.warning) toast.warning(data.warning)
+            } else {
+                toast.error(`Sync failed: ${data.message}`)
+            }
+            await fetchRepoStatus()
+        } catch (e: any) {
+            toast.error(`Sync failed: ${e.message}`)
+        } finally {
+            setRepoSyncing(false)
+        }
     }
 
     const handleJiraConnect = async () => {
@@ -498,6 +591,8 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         setSyncing(true)
         setSyncCompleted(null)
         setSyncProgress({ active_stage: 1, raw_count: 0, normalized_count: 0, domain_model_count: 0, embedding_count: 0 })
+        // Capture a baseline timestamp BEFORE triggering so polling can detect a *new* completion
+        const syncTriggeredAt = new Date().toISOString()
         try {
             // Route to the correct sync endpoint based on integration type
             const isMcpConn = integration?.mcp_connected
@@ -513,7 +608,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             const data = await response.json()
 
             if (data.status === "completed") {
-                // Inline sync completed immediately
+                // Inline sync completed immediately (Redis unavailable fallback)
                 setSyncing(false)
                 setSyncProgress(null)
                 const pagesCrawled = data.pages_crawled ?? data.raw_count ?? 0
@@ -530,7 +625,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
             } else if (data.status === "queued") {
                 // Job queued in BullMQ — start polling for live progress
                 if (isWebAppIntegration) {
-                    startSyncPolling()
+                    startSyncPolling(syncTriggeredAt)
                 } else {
                     setSyncing(false)
                     setSyncProgress(null)
@@ -549,7 +644,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
         }
     }
 
-    const startSyncPolling = () => {
+    const startSyncPolling = (syncTriggeredAt: string) => {
         // Clear any existing poll
         if (syncPollRef.current) clearInterval(syncPollRef.current)
         let consecutiveDoneChecks = 0
@@ -578,10 +673,15 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                     })
                 }
 
-                // Done: last_synced_at set AND embeddings exist AND crawl is no longer running
-                // NOTE: has_more_pages=true means the crawler is still processing continuation jobs;
-                // stale embeddings from a previous sync must NOT trigger a false "done" here.
-                const isDone = status.last_synced_at != null && status.embedding_count > 0 && !status.has_more_pages
+                // Done: last_synced_at must be NEWER than when we triggered this sync
+                // (prevents false-done from a previous sync's timestamp), AND
+                // active_stage must be null (all pipeline stages finished), AND
+                // crawl must not still be paginating.
+                const lastSyncedAt = status.last_synced_at
+                const isNewerSync = lastSyncedAt != null && new Date(lastSyncedAt) > new Date(syncTriggeredAt)
+                const allStagesDone = status.active_stage === null
+                const crawlDone = !status.has_more_pages
+                const isDone = isNewerSync && allStagesDone && crawlDone && status.embedding_count > 0
 
                 if (isDone) {
                     consecutiveDoneChecks++
@@ -1469,7 +1569,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                     {[
                                         { 
                                             label: "Pages Crawled", 
-                                            count: integration.sync_counts.pages_crawled ?? integration.sync_counts.raw_count, 
+                                            count: integration.sync_counts.raw_count, 
                                             color: "text-blue-600" 
                                         },
                                         { label: "Normalized", count: integration.sync_counts.normalized_count, color: "text-indigo-600" },
@@ -1484,6 +1584,188 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                                         </Card>
                                     ))}
                                 </div>
+                            )}
+
+                            {/* Repository Connection Card */}
+                            {isWebApp && (
+                                <Card className="border-blue-200 dark:border-blue-900">
+                                    <CardHeader>
+                                        <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-2">
+                                                <svg className="h-5 w-5 text-blue-600" viewBox="0 0 24 24" fill="currentColor">
+                                                    <path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.17 6.839 9.49.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.578 9.578 0 0 1 12 6.836c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.202 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.167 22 16.418 22 12c0-5.523-4.477-10-10-10z" />
+                                                </svg>
+                                                <CardTitle>Repository Connection</CardTitle>
+                                                {repoStatus?.connected && (
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
+                                                        ● Connected
+                                                    </span>
+                                                )}
+                                                {repoStatus?.status === 'error' && (
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">
+                                                        ✗ Error
+                                                    </span>
+                                                )}
+                                            </div>
+                                            {repoStatus?.connected && (
+                                                <div className="flex gap-2">
+                                                    <Button
+                                                        variant="outline" size="sm"
+                                                        onClick={handleRepoSync}
+                                                        disabled={repoSyncing}
+                                                        className="border-blue-300 text-blue-700 hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300"
+                                                    >
+                                                        {repoSyncing
+                                                            ? <><Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />Syncing...</>
+                                                            : <><RefreshCw className="mr-2 h-3.5 w-3.5" />Sync Now</>}
+                                                    </Button>
+                                                    <Button
+                                                        variant="outline" size="sm"
+                                                        onClick={handleRepoDisconnect}
+                                                        disabled={repoDisconnecting}
+                                                        className="border-red-300 text-red-600 hover:bg-red-50 dark:border-red-800 dark:text-red-400"
+                                                    >
+                                                        {repoDisconnecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Unplug className="h-3.5 w-3.5" />}
+                                                    </Button>
+                                                </div>
+                                            )}
+                                        </div>
+                                        <CardDescription>
+                                            Connect your source repository to use code as the <strong>primary metadata source</strong> — highest accuracy for test generation.
+                                            Repository data takes priority over the Playwright crawler.
+                                        </CardDescription>
+                                    </CardHeader>
+                                    <CardContent>
+                                        {/* Connected state */}
+                                        {repoStatus?.connected && (
+                                            <div className="space-y-3">
+                                                <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-950/20 border border-green-200 dark:border-green-800 rounded-md">
+                                                    <Check className="h-4 w-4 text-green-600" />
+                                                    <span className="text-sm text-green-700 dark:text-green-400 font-medium">
+                                                        Repository connected as primary metadata source
+                                                    </span>
+                                                </div>
+                                                <div className="grid grid-cols-3 gap-4 text-sm">
+                                                    <div>
+                                                        <p className="font-medium text-muted-foreground">Provider</p>
+                                                        <p className="capitalize">{repoStatus.provider}</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-medium text-muted-foreground">Branch</p>
+                                                        <p className="font-mono">{repoStatus.branch}</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="font-medium text-muted-foreground">Last Synced</p>
+                                                        <p>{repoStatus.last_synced_at ? new Date(repoStatus.last_synced_at).toLocaleString() : 'Never'}</p>
+                                                    </div>
+                                                </div>
+                                                <div className="flex items-center gap-2 p-2 bg-muted/50 rounded-md">
+                                                    <Globe className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                                                    <p className="text-xs text-muted-foreground font-mono truncate">{repoStatus.repo_url}</p>
+                                                </div>
+                                                {repoStatus.sync_error && (
+                                                    <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-800 rounded-md">
+                                                        <AlertCircle className="h-4 w-4 text-red-600 mt-0.5 flex-shrink-0" />
+                                                        <div>
+                                                            <p className="text-sm font-medium text-red-700 dark:text-red-400">Last sync failed</p>
+                                                            <p className="text-xs text-red-600 dark:text-red-500 mt-0.5">{repoStatus.sync_error}</p>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                {/* Private repo warning */}
+                                                {!repoToken && (
+                                                    <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-md">
+                                                        <AlertCircle className="h-4 w-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                                                        <p className="text-xs text-amber-700 dark:text-amber-400">
+                                                            No access token configured. Syncing will only work for <strong>public repositories</strong>.
+                                                            Reconnect with a token for private repositories.
+                                                        </p>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {/* Connect form */}
+                                        {!repoStatus?.connected && (
+                                            <div className="grid gap-4 max-w-lg">
+                                                <div className="grid grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label className="block text-sm font-medium mb-1.5">Provider</label>
+                                                        <select
+                                                            value={repoProvider}
+                                                            onChange={(e) => setRepoProvider(e.target.value as any)}
+                                                            className="w-full px-3 py-2 text-sm rounded-md border border-input bg-background focus:outline-none focus:ring-2 focus:ring-ring"
+                                                        >
+                                                            <option value="github">GitHub</option>
+                                                            <option value="gitlab">GitLab</option>
+                                                            <option value="bitbucket">Bitbucket</option>
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm font-medium mb-1.5">Branch</label>
+                                                        <input
+                                                            type="text"
+                                                            placeholder="main"
+                                                            value={repoBranch}
+                                                            onChange={(e) => setRepoBranch(e.target.value)}
+                                                            className="w-full px-3 py-2 text-sm rounded-md border border-input bg-background focus:outline-none focus:ring-2 focus:ring-ring"
+                                                        />
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium mb-1.5">Repository URL</label>
+                                                    <input
+                                                        type="url"
+                                                        placeholder="https://github.com/your-org/your-repo"
+                                                        value={repoUrl}
+                                                        onChange={(e) => setRepoUrl(e.target.value)}
+                                                        className="w-full px-3 py-2 text-sm rounded-md border border-input bg-background focus:outline-none focus:ring-2 focus:ring-ring font-mono"
+                                                    />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium mb-1.5">
+                                                        Access Token
+                                                        <span className="ml-1.5 text-xs text-muted-foreground font-normal">(optional for public repos)</span>
+                                                    </label>
+                                                    <div className="relative">
+                                                        <input
+                                                            type={repoShowToken ? "text" : "password"}
+                                                            placeholder="ghp_xxxx... (Personal Access Token)"
+                                                            value={repoToken}
+                                                            onChange={(e) => setRepoToken(e.target.value)}
+                                                            className="w-full px-3 py-2 pr-10 text-sm rounded-md border border-input bg-background focus:outline-none focus:ring-2 focus:ring-ring font-mono"
+                                                        />
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setRepoShowToken(v => !v)}
+                                                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                                        >
+                                                            {repoShowToken ? <X className="h-3.5 w-3.5" /> : <Key className="h-3.5 w-3.5" />}
+                                                        </button>
+                                                    </div>
+                                                    {!repoToken && (
+                                                        <p className="text-xs text-amber-600 dark:text-amber-400 mt-1 flex items-center gap-1">
+                                                            <AlertCircle className="h-3 w-3" />
+                                                            Without a token, only public repositories can be indexed.
+                                                        </p>
+                                                    )}
+                                                    <p className="text-xs text-muted-foreground mt-1">
+                                                        Token is Fernet-encrypted before storage. Required scopes: <code className="font-mono">repo</code> (GitHub), <code className="font-mono">read_repository</code> (GitLab).
+                                                    </p>
+                                                </div>
+                                                <Button
+                                                    onClick={handleRepoConnect}
+                                                    disabled={repoConnecting || !repoUrl.trim()}
+                                                    className="bg-blue-600 hover:bg-blue-700 w-fit"
+                                                >
+                                                    {repoConnecting
+                                                        ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Connecting...</>
+                                                        : <><Plug className="mr-2 h-4 w-4" />Connect Repository</>}
+                                                </Button>
+                                            </div>
+                                        )}
+                                    </CardContent>
+                                </Card>
                             )}
 
                             {/* Web App Crawler Status Card */}
@@ -2858,6 +3140,7 @@ export default function ProjectDetailsPage({ params }: { params: Promise<{ id: s
                         <CardHeader><CardTitle>Jira Integration</CardTitle><CardDescription>Configure Jira connection for this project</CardDescription></CardHeader>
                         <CardContent><p className="text-sm text-muted-foreground">General settings coming soon...</p></CardContent>
                     </Card>
+
 
                     {/* Jira Integration Card */}
                     <Card className="border-purple-200 dark:border-purple-900">

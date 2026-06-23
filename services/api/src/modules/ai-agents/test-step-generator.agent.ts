@@ -24,7 +24,7 @@ import { v4 as uuidv4 }          from 'uuid'
 
 import { createModuleLogger }    from '../../shared/logger/index.js'
 import { ragSearchTool }         from './tools/rag-search.tool.js'
-import { buildFieldManifest, buildUrlMap, formatManifestForPrompt, autoCorrectButtonNames } from './tools/metadata-reader.tool.js'
+import { buildFieldManifest, buildUrlMap, formatManifestForPrompt, autoCorrectButtonNames, getEntityPlural } from './tools/metadata-reader.tool.js'
 import { getTestCaseById, logAgentExecution } from './tools/db-query.tool.js'
 import { hitlTool }              from './tools/hitl.tool.js'
 import {
@@ -41,6 +41,51 @@ import type {
 } from './agent.types.js'
 
 const log = createModuleLogger('step-generator-agent')
+
+// ── Operation Type Detection ───────────────────────────────────────────────────
+// Single source of truth for detecting the primary operation from a test name.
+// Evaluated in PRIORITY ORDER: Update > Delete > View > Convert > Search > Create
+// This function is exported so test-case-generator.service.ts can use the same logic.
+
+export type OperationType = 'create' | 'update' | 'delete' | 'view' | 'search' | 'convert' | 'unknown'
+
+export function detectOperationType(testName: string): OperationType {
+  const name = testName.trim()
+
+  // ── Priority 1: UPDATE (highest — must beat Create when both keywords appear) ──
+  // Covers: "Update SKU weight and dimensions", "Edit Account", "Modify existing Lead"
+  // Also covers compound phrases like "Update <field> and <field>" where the
+  // entity word comes AFTER Update and before "and".
+  const UPDATE_RE = /\b(update|edit|modify|change|updating|modifying|editing|modifies|changes|edits|updates)\b/i
+  const EXISTING_RE = /\bexisting\s+\w+/i
+  // Extra signal: test mentions a field descriptor + update verb anywhere
+  const FIELD_DESCRIPTOR_RE = /\b(weight|dimension|sku|price|quantity|status|value|field|attribute|specification|detail|description|name|title|amount|rate|code|number|date|type|category|address|email|phone|note|comment|tag|label|level)\b/i
+  if (UPDATE_RE.test(name) || EXISTING_RE.test(name)) {
+    // Confirm: if both Update keyword AND a Create keyword appear (e.g. "Create and Update"),
+    // still treat as Update — update intent takes precedence.
+    return 'update'
+  }
+
+  // ── Priority 2: DELETE ──
+  if (/\b(delete|remove|archive|deactivate|trash|destroy)\b/i.test(name)) return 'delete'
+
+  // ── Priority 3: VIEW ──
+  if (/\b(view|open|display|read|preview|check\s+details?|see\s+details?|details\s+of|show)\b/i.test(name)) return 'view'
+
+  // ── Priority 4: CONVERT ──
+  if (/\b(convert|transform|turn\s+into|move\s+to)\b/i.test(name)) return 'convert'
+
+  // ── Priority 5: SEARCH ──
+  if (/\b(search|filter|find|look\s*up|lookup|browse|query|list\s*view)\b/i.test(name)) return 'search'
+
+  // ── Priority 6: CREATE ──
+  if (
+    /\b(create|creation|add|new|register|registration|signup|sign-up|generation|generate|creating|registering|generating)\b/i.test(name) ||
+    /\bnew\s+(record|entity|entry|item)\b/i.test(name)
+  ) return 'create'
+
+  return 'unknown'
+}
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -69,6 +114,39 @@ function buildLlm() {
 const SYSTEM_PROMPT = `You are the Test Step Generator Agent for AutoTestAI.
 Your job: generate EXECUTABLE Playwright test steps grounded in real metadata.
 
+╔══════════════════════════════════════════════════════════════════════╗
+║  🚨 STEP 0 — DETECT OPERATION TYPE FROM TEST NAME (MANDATORY FIRST)  ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  Read the test name BEFORE writing any step. Identify the type:      ║
+║                                                                      ║
+║  "Update", "Edit", "Modify", "Change"  → UPDATE flow                 ║
+║  "Create", "New", "Add"                → CREATE flow                 ║
+║  "Delete", "Remove", "Archive"         → DELETE flow                 ║
+║  "View", "Open", "Display", "Preview"  → VIEW flow                   ║
+║  "Search", "Filter", "Find", "Browse"  → SEARCH flow                 ║
+║  "Convert", "Transform"                → CONVERT flow                ║
+║                                                                      ║
+║  🔴 CROSS-CONTAMINATION IS ABSOLUTELY FORBIDDEN:                      ║
+║  ❌ UPDATE test → NAVIGATE /new, /create, /add       ALWAYS WRONG    ║
+║  ❌ UPDATE test → CLICK "+ New <Entity>"              ALWAYS WRONG    ║
+║  ❌ UPDATE test → CLICK "Create <Entity>"             ALWAYS WRONG    ║
+║  ❌ CREATE test → CLICK "Edit" to open a form         ALWAYS WRONG    ║
+║                                                                      ║
+║  ✅ UPDATE test MUST follow this EXACT sequence:                      ║
+║     NAVIGATE list → TYPE search → CLICK record →                     ║
+║     CLICK Edit → modify fields → CLICK Save → ASSERT                 ║
+║                                                                      ║
+║  ✅ CREATE test MUST follow this EXACT sequence:                      ║
+║     NAVIGATE list → CLICK "+New" → fill fields →                     ║
+║     CLICK Create/Save → ASSERT detail page                           ║
+║                                                                      ║
+║  If the test name says "Update SKU weight and dimensions":           ║
+║    → This is an UPDATE test. Do NOT navigate to /sku/new.            ║
+║    → Navigate to the SKU LIST page, search for an existing SKU,      ║
+║      click it, click Edit, update the Weight and Dimensions fields,   ║
+║      click Save, and assert the update succeeded.                     ║
+╚══════════════════════════════════════════════════════════════════════╝
+
 MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
   A. Identify PRIMARY ENTITY from the test case name.
   B. Find the EXACT page URL from the URL MAP — never invent.
@@ -82,7 +160,40 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
           - ❌ WRONG: CLICK "Create Z" in a test for "X" — Z ≠ X
           - ✅ CORRECT: Use the button that matches the entity being tested
           - Navigation sidebars often show buttons for ALL entities — IGNORE buttons for other entities.
+     ▶ 🔴 CRITICAL OPPORTUNITY EXAMPLE (applies universally to ALL entities):
+          Opportunity form has NO "Save" button. The REAL button is "Create Opportunity".
+          ❌ WRONG: CLICK "Save"         → This button does NOT exist on the Opportunity form.
+          ✅ CORRECT: CLICK "Create Opportunity" → This is the EXACT button name on the form.
+          Lesson: EVERY entity has its own specific button name — ALWAYS use the name from
+          "PRIMARY ACTION BUTTON" or "ALL PAGE BUTTONS" in the FIELD MANIFEST below.
   E. Self-check: will my steps cover COUNT_REQUIRED fields? If not, add them.
+  F. Audit ALL required LOOKUP fields — every ★ lookup field in the manifest MUST have a LOOKUP step:
+     ▶ Scan the 🔥 REQUIRED section: count every field with type (lookup).
+     ▶ For EACH required lookup field, generate a LOOKUP step with a real value from REAL LOOKUP DATA.
+     ▶ If REAL LOOKUP DATA is missing, use the sampleValue from the manifest or a plausible entity name.
+     ▶ NEVER skip a required lookup field — missing it causes the form to reject on submission.
+     ▶ 🔴 OPPORTUNITY EXAMPLE: "Account Name" (lookup, required) MUST have: 
+          { "action": "LOOKUP", "target": "Account Name", "value": "<existing account name>", "locator_type": "label" }
+          The Opportunity form WILL NOT save without this field.
+
+╔══════════════════════════════════════════════════════════════════╗
+║  🔴 REQUIRED LOOKUP FIELDS — NEVER SKIP                          ║
+╠══════════════════════════════════════════════════════════════════╣
+║  If the FIELD MANIFEST shows any field with:                     ║
+║    ★ "FieldName" (lookup) — REQUIRED                            ║
+║  You MUST generate: { "action": "LOOKUP", "target": "FieldName", ║
+║    "value": "<real existing record name>", "locator_type": "label" }  ║
+║                                                                  ║
+║  Common required lookup fields by entity:                        ║
+║  • Opportunity → "Account Name" (lookup) — MANDATORY            ║
+║  • Contact     → "Account Name" (lookup) — if listed required   ║
+║  • Quote       → "Opportunity" (lookup)  — MANDATORY            ║
+║  • Order       → "Account" (lookup)      — MANDATORY            ║
+║  • Invoice     → "Contact" (lookup)      — MANDATORY            ║
+║                                                                  ║
+║  ❌ SKIP = Test will FAIL at runtime with a validation error     ║
+║  ✅ INCLUDE = Form submits successfully                          ║
+╚══════════════════════════════════════════════════════════════════╝
 
 🔴 CREATE OPERATION RULE (applies when test name contains "Create", "New", or "Add"):
   - You MUST generate steps that FILL IN the entity's form fields (TYPE, SELECT, LOOKUP, CHECKBOX).
@@ -115,6 +226,18 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
   - If no FIELD MANIFEST is available, use the BRD/SPECIFICATION and PROJECT METADATA sections
     to discover which fields exist on the form, then generate TYPE/SELECT steps for them.
   - A test case that only navigates and clicks WITHOUT filling fields WILL BE REJECTED.
+
+🔴 MODAL FORM RULE (applies when the create form opens as an overlay/dialog on the list page):
+   - After CLICK the trigger button (e.g., "+ Add Account"), the modal overlays the SAME page.
+   - Do NOT add a NAVIGATE step AFTER clicking the trigger button — the URL does NOT change.
+   - Fill fields while the modal is open, then CLICK the submit button (e.g., "Save Account").
+   - After submission, the app redirects to the DETAIL PAGE (e.g., /accounts/636a2bf5-...)
+   - The CONFIRMED BUTTON NAMES section will tell you EXACTLY which button opens the modal.
+   - Final ASSERT_URL must match the entity detail path (e.g., "/accounts/") NOT the modal URL.
+   - ✅ CORRECT: ASSERT_URL value "/accounts/" — matches "/accounts/636a2bf5-9051-403b..."
+   - ❌ FORBIDDEN: ASSERT_URL value "/accounts" (bare list)
+   - ❌ FORBIDDEN: ASSERT_URL value containing "__modal__"
+
   - ⚠️ PRODUCT FORM EXAMPLE — if the test is for a Product entity and no manifest is present:
       TYPE "Name" / TYPE "Product Name"
       SELECT "Currency" (or TYPE if free-text)
@@ -231,6 +354,32 @@ MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
       4. ASSERT_TEXT or ASSERT_URL confirming the detail page is displayed
   - Do NOT click Edit or Delete in a View-only test
 
+🔴 CONVERT OPERATION RULE (applies when test name contains "Convert", "Transform", "Move to", or "Turn into"):
+  - This is a MULTI-STEP WORKFLOW that converts a SOURCE record (e.g. Quotation) into a TARGET entity (e.g. Booking).
+  - The flow has TWO PHASES:
+      PHASE 1 — Locate and trigger conversion:
+        1. NAVIGATE to the SOURCE entity list page (e.g., /quotations)
+        2. TYPE the source record identifier (e.g., "Q-2024-001") in the Search field
+        3. CLICK on the matching source record row (e.g., CLICK "Q-2024-001", locator_type: "text")
+        4. CLICK the conversion action button on the source record's detail page
+           ▶ Use the EXACT button name from "ALL PAGE BUTTONS" or "PRIMARY ACTION BUTTON".
+           ▶ NEVER substitute "Save", "Submit", "Convert", or a generic name.
+           ▶ Example: the EXACT button may be "Create Booking", "Convert to Booking", "+ Create Booking"
+      PHASE 2 — Fill the TARGET entity form (all required fields — DO NOT SKIP ANY):
+        5. TYPE/SELECT/LOOKUP ALL required fields of the TARGET entity form
+           ▶ The FIELD MANIFEST lists ALL required fields — EVERY ★ field MUST have a step.
+           ▶ This is the most commonly missed section — DO NOT generate fewer than COUNT_REQUIRED steps.
+        6. CLICK the FINAL submit button to save the new TARGET record
+           ▶ Use the EXACT final submit button name from the manifest or button list.
+        7. ASSERT_URL — the URL should contain the TARGET entity path (e.g., /bookings/)
+        8. ASSERT_TEXT — the TARGET record identifier (e.g., the booking reference) is visible on the page
+  - ⚠️ CRITICAL RULES:
+      - NEVER skip fields: ALL required form fields MUST have a step. The app will reject the form otherwise.
+      - NEVER omit the final CLICK submit button step — the form must be submitted.
+      - NEVER omit the final ASSERT steps — they verify the booking was actually created.
+      - The search/filter step (step 2) MUST use the source record ID (e.g., quotation number), NOT a status word.
+      - If no FIELD MANIFEST is provided, use BRD/SPECIFICATION context to infer the target entity's required fields.
+
 🔴 SEARCH / FILTER OPERATION RULE (applies when test name contains "Search", "Filter", "Find", "Look up", "Browse", or "List View"):
   - This operation searches for a record via the list-page search input and selects it.
   - HOW SEARCH/FILTER WORKS IN THIS APP:
@@ -294,6 +443,41 @@ Anti-hallucination rules (ABSOLUTE):
 - Industry/sector fields → MUST be a real industry category from VALID OPTIONS; NEVER use names like "Tara"
 - ⛔ CRITICAL: "-" is NEVER valid as any field value — it is a placeholder and will always FAIL at runtime
 - ⛔ CRITICAL: A bare number (e.g. "823462434234") is NEVER a valid URL or phone — use proper format
+
+╔══════════════════════════════════════════════════════════════╗
+║  🔴 REAL DATA ENFORCEMENT — UNIVERSAL HARD RULE              ║
+╠══════════════════════════════════════════════════════════════╣
+║  The test data sections below contain REAL RECORDS from the  ║
+║  live application. You MUST use those exact values.          ║
+║                                                              ║
+║  🔴 ABSOLUTE RULE: You MUST use one of the REAL EXISTING     ║
+║  RECORDS provided in the TEST DATA section. NEVER use        ║
+║  placeholder values like:                                    ║
+║    ❌ "Test Record"         ❌ "Test Account"               ║
+║    ❌ "Sample Account"      ❌ "John Doe"                   ║
+║    ❌ "Jane Smith"          ❌ "Test User"                  ║
+║    ❌ "Sample Product"      ❌ "Acme Corporation" (generic)  ║
+║    ❌ "Test Lead 4821"      ❌ any invented name             ║
+║                                                              ║
+║  ✅ For UPDATE / SEARCH / VIEW / DELETE operations:          ║
+║     The "=== REAL EXISTING RECORDS ==" section below        ║
+║     lists actual record names from the app. Use EXACTLY      ║
+║     one of those names for both the TYPE search step and     ║
+║     the CLICK record step.                                   ║
+║                                                              ║
+║  ✅ For LOOKUP fields (any operation type):                  ║
+║     The "=== REAL LOOKUP DATA ==" section lists valid        ║
+║     names for each lookup field. Pick ONE and use it         ║
+║     character-for-character.                                 ║
+║                                                              ║
+║  ✅ If no real data section is provided: use the             ║
+║     sampleValue shown in the FIELD MANIFEST (★ fields).     ║
+║     Do NOT fall back to generic placeholder names.           ║
+║                                                              ║
+║  WHY: Placeholder values do not exist in the application.   ║
+║  Using them causes the search/lookup to return zero results  ║
+║  and the test fails immediately at runtime.                  ║
+╚══════════════════════════════════════════════════════════════╝
 
 ╔══════════════════════════════════════════════════════════════╗
 ║  🔍 LOOKUP VALUE RULES — CRITICAL                            ║
@@ -383,9 +567,22 @@ Step schema (output a JSON array — no markdown, no fences):
 
 
 
+
+// ── Helper: derive a sensible "open form" button hint from a field label ───────
+// Used only in validation error messages so the correction instruction is concrete.
+// e.g. "Account Name" → "+New Opportunity" (the form-open button, not the lookup target)
+function resolveEntityOpenButton(fieldLabel: string): string {
+  const lower = fieldLabel.toLowerCase()
+  if (lower.includes('account'))    return '+New Opportunity'
+  if (lower.includes('contact'))    return '+New Quote'
+  if (lower.includes('opportunity')) return '+New Quote'
+  return '+New <Entity>'
+}
+
 // ── 5-Check Validation Gate ───────────────────────────────────────────────────
 
-function validateSteps(
+
+export function validateSteps(
   steps:              AgentStep_Playwright[],
   requiredCount:      number,
   verifiedPaths:      string[],
@@ -400,43 +597,97 @@ function validateSteps(
   // Check 1: Required field coverage
   // For Create operations with no manifest, enforce a minimum of at least 2 field steps
   // so the LLM cannot pass validation with only NAVIGATE+CLICK+ASSERT.
+  let check1 = true
+  const isCreateOrUpdateOrConvert = /\b(create|add|new|update|edit|modify|change|convert|transform|turn\s+into|move\s+to)\b/i.test(testEntityHint ?? '')
   const effectiveRequiredCount = Math.max(requiredCount, minimumFieldSteps ?? 0)
-  const fieldSteps = steps.filter(s =>
-    ['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX'].includes(s.action.toUpperCase())
-  )
-  const existingFieldTargetsCheck1 = new Set(fieldSteps.map(s => (s.target ?? '').toLowerCase().trim()))
 
-  // Identify which specific required fields are missing
-  const missingRequired = manifestFields
-    ? manifestFields
-        .filter(f => f.required)
-        .filter(f => !existingFieldTargetsCheck1.has(f.label.toLowerCase().trim()))
-        .map(f => `"${f.label}" (${f.type})`)
-    : []
-
-  const check1 = fieldSteps.length >= effectiveRequiredCount && missingRequired.length === 0
-  if (!check1) {
-    const missingMsg = missingRequired.length > 0
-      ? `Missing required fields: [${missingRequired.join(', ')}]. You MUST add steps for EACH of these. `
-      : `Found ${fieldSteps.length} field step(s) but need ${effectiveRequiredCount}. `
-    issues.push(
-      missingMsg +
-      `MANDATORY: generate TYPE/SELECT/LOOKUP/CHECKBOX steps for ALL required fields from the FIELD MANIFEST. ` +
-      `Example for Product: TYPE "PRODUCT NAME", SELECT "Currency", TYPE "SKU". ` +
-      `Check the 🔥 REQUIRED section in the FIELD MANIFEST — every ★ field MUST have a step. ` +
-      `The sequence MUST be: NAVIGATE → fill ★ required fields → CLICK submit → ASSERT_URL.`
+  if (isCreateOrUpdateOrConvert) {
+    const fieldSteps = steps.filter(s =>
+      ['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX'].includes(s.action.toUpperCase())
     )
+    const existingFieldTargetsCheck1 = new Set(fieldSteps.map(s => (s.target ?? '').toLowerCase().trim()))
+
+    // Identify which specific required fields are missing
+    const missingRequired = manifestFields
+      ? manifestFields
+          .filter(f => f.required)
+          .filter(f => !existingFieldTargetsCheck1.has(f.label.toLowerCase().trim()))
+          .map(f => `"${f.label}" (${f.type})`)
+      : []
+
+    check1 = fieldSteps.length >= effectiveRequiredCount && missingRequired.length === 0
+    if (!check1) {
+      const missingMsg = missingRequired.length > 0
+        ? `Missing required fields: [${missingRequired.join(', ')}]. You MUST add steps for EACH of these. `
+        : `Found ${fieldSteps.length} field step(s) but need ${effectiveRequiredCount}. `
+      issues.push(
+        missingMsg +
+        `MANDATORY: generate TYPE/SELECT/LOOKUP/CHECKBOX steps for ALL required fields from the FIELD MANIFEST. ` +
+        `Example for Product: TYPE "PRODUCT NAME", SELECT "Currency", TYPE "SKU". ` +
+        `Check the 🔥 REQUIRED section in the FIELD MANIFEST — every ★ field MUST have a step. ` +
+        `The sequence MUST be: NAVIGATE → fill ★ required fields → CLICK submit → ASSERT_URL.`
+      )
+    }
+
+    // ── Check 1b: Required LOOKUP field audit ─────────────────────────────────
+    // This specifically targets the "Account Name" missed for Opportunity pattern.
+    // A required field with type=lookup MUST have a LOOKUP step — not a TYPE step.
+    // The LLM commonly skips lookup fields when REAL LOOKUP DATA is absent, causing
+    // a runtime validation error ("Account is required") even when all text fields are filled.
+    const requiredLookupFields = manifestFields
+      ? manifestFields.filter(f => f.required && f.type === 'lookup')
+      : []
+    const lookupSteps   = steps.filter(s => s.action.toUpperCase() === 'LOOKUP')
+    const lookupTargets = new Set(lookupSteps.map(s => (s.target ?? '').toLowerCase().trim()))
+    const typeTargets1b = new Set(
+      steps.filter(s => s.action.toUpperCase() === 'TYPE').map(s => (s.target ?? '').toLowerCase().trim())
+    )
+
+    for (const lf of requiredLookupFields) {
+      const lfLower = lf.label.toLowerCase().trim()
+      const hasLookupStep = lookupTargets.has(lfLower)
+      const hasTypeStep   = typeTargets1b.has(lfLower)
+
+      if (!hasLookupStep && !hasTypeStep) {
+        // Missing entirely — exact bug: Account Name skipped for Opportunity
+        issues.push(
+          `Missing required LOOKUP field "${lf.label}": this is a REQUIRED lookup field and MUST have a LOOKUP step. ` +
+          `The form WILL NOT submit without it (server-side validation will reject). ` +
+          `Add: { "action": "LOOKUP", "target": "${lf.label}", "value": "<real record name>", "locator_type": "label" }. ` +
+          `If REAL LOOKUP DATA is not shown, use a plausible name (e.g., "Acme Corp" for Account, "John Smith" for Contact). ` +
+          `Place this step AFTER the form is opened (after the CLICK "${resolveEntityOpenButton(lf.label)}" step) and BEFORE the submit button click.`
+        )
+        check1 = false
+      } else if (hasTypeStep && !hasLookupStep) {
+        // Wrong action type used: TYPE instead of LOOKUP
+        issues.push(
+          `Wrong action for required lookup field "${lf.label}": a TYPE step was generated but this is a LOOKUP (reference) field. ` +
+          `Replace the TYPE step with: { "action": "LOOKUP", "target": "${lf.label}", "value": "<record name>", "locator_type": "label" }. ` +
+          `Lookup fields open a search/autocomplete dialog — they CANNOT be filled with the TYPE action.`
+        )
+        check1 = false
+      }
+    }
   }
 
   // Check 2: URL verification
+  // Strip the base domain from absolute URLs (e.g. "https://app.example.com/quotations" → "/quotations")
+  // so they compare correctly against verifiedPaths which stores relative paths.
   const navSteps = steps.filter(s => s.action.toUpperCase() === 'NAVIGATE')
   let check2 = true
   if (verifiedPaths.length > 0) {
     for (const nav of navSteps) {
-      const val = nav.value ?? ''
-      const ok = verifiedPaths.some(p => p === val || val.startsWith(p))
+      const rawVal = nav.value ?? ''
+      // Normalize: if full URL, extract the path portion
+      let val = rawVal
+      try {
+        if (rawVal.startsWith('http://') || rawVal.startsWith('https://')) {
+          val = new URL(rawVal).pathname
+        }
+      } catch { /* keep rawVal */ }
+      const ok = verifiedPaths.some(p => p === val || p === rawVal || val.startsWith(p) || rawVal.startsWith(p))
       if (!ok) {
-        issues.push(`URL not in verified map: "${val}"`)
+        issues.push(`URL not in verified map: "${rawVal}"`)
         check2 = false
       }
     }
@@ -444,10 +695,14 @@ function validateSteps(
 
   // Check 3: Button name exactness — ensure CLICK targets exist in the known button set
   let check3 = true
+  const isConvertOrSearchForCheck3 = /\b(convert|transform|turn\s+into|move\s+to|search|filter|find|look\s+up)\b/i.test(testEntityHint ?? '')
   const allKnownButtons = [
     ...(submitButton ? [submitButton] : []),
     ...(allButtons ?? []),
   ]
+  // Normalize a button name for fuzzy matching: lowercase, collapse whitespace,
+  // strip leading non-alphanumeric characters (e.g. "+New" === "+ New").
+  const normBtn = (s: string) => s.toLowerCase().replace(/^[^a-z0-9]+/, '').replace(/\s+/g, ' ').trim()
   if (allKnownButtons.length > 0) {
     const clickSteps = steps.filter(s => s.action.toUpperCase() === 'CLICK')
     for (const cs of clickSteps) {
@@ -456,9 +711,19 @@ function validateSteps(
       // Allow if it matches any known button (case-insensitive) OR a CSS selector / role locator
       const isCssOrRole = target.startsWith('.') || target.startsWith('#') || target.startsWith('[') || target.startsWith('role=')
       if (!isCssOrRole) {
-        const matchesKnown = allKnownButtons.some(
-          btn => btn.toLowerCase() === target.toLowerCase() || target.toLowerCase().includes(btn.toLowerCase())
-        )
+        // Skip record-navigation clicks (e.g., clicking a row by date/ID/reference in list view)
+        // These are valid in convert/search/view operations where the user clicks on a record to open it.
+        // Indicators: locator_type is 'text', or the target looks like a data value (date, ENQ-XXXX, etc.)
+        const isTextLocator = (cs as any).locator_type === 'text'
+        const looksLikeDataValue = /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(target)  // date like 5/24/2026
+          || /^[A-Z]{2,5}-\d{3,6}$/.test(target)   // reference like ENQ-0017, QUO-0007, BKG-0003
+          || /^\d+$/.test(target)                    // pure numeric ID
+        if ((isConvertOrSearchForCheck3 || isTextLocator) && looksLikeDataValue) continue
+        const normTarget = normBtn(target)
+        const matchesKnown = allKnownButtons.some(btn => {
+          const normB = normBtn(btn)
+          return normB === normTarget || normTarget.includes(normB) || normB.includes(normTarget)
+        })
         if (!matchesKnown) {
           issues.push(`Button "${target}" is not in the known button list. Use one of: ${allKnownButtons.slice(0, 5).map(b => `"${b}"`).join(', ')}`)
           check3 = false
@@ -629,8 +894,11 @@ function validateSteps(
   // actual Account form has no Email field.
   let check7 = true
   if (manifestFields && manifestFields.length > 0) {
-    // Build case-insensitive set of known field labels
-    const knownFields = new Set(manifestFields.map(f => f.label.toLowerCase().trim()))
+    // Build case-insensitive set of known field labels.
+    // Normalize underscores to spaces so that snake_case canonical labels (e.g. "origin_port")
+    // correctly match LLM-generated targets (e.g. "Origin Port") and vice versa.
+    const normalizeLabel = (s: string) => s.toLowerCase().trim().replace(/_/g, ' ')
+    const knownFields = new Set(manifestFields.map(f => normalizeLabel(f.label)))
 
     const FIELD_ACTIONS = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
     const hallucinated: string[] = []
@@ -638,7 +906,7 @@ function validateSteps(
       if (!FIELD_ACTIONS.has((s.action ?? '').toUpperCase())) continue
       const target = String(s.target ?? '').trim()
       if (!target) continue
-      if (!knownFields.has(target.toLowerCase())) {
+      if (!knownFields.has(normalizeLabel(target))) {
         hallucinated.push(target)
       }
     }
@@ -724,6 +992,44 @@ function validateSteps(
   // Wide match — catches "Edit", "Edit Account", "Edit Lead", "✏️ Edit"
   const EDIT_BTN_RE_C10 = /\bedit\b|\bmodify\b/i
   const isUpdateOpForValidation = /\b(update|edit|modify|change)\b/i.test(testEntityHint ?? '')
+
+  // Check 10b: Create-URL-in-Update guard
+  // An Update test MUST NEVER navigate to a /new, /create, or /add URL.
+  // This is the most common hallucination: LLM generates Create flow for Update tests.
+  if (isUpdateOpForValidation) {
+    const CREATE_URL_IN_UPDATE_RE = /\/(new|create|add)(\?|\/|$)/i
+    const badCreateNavs = steps.filter(s =>
+      s.action.toUpperCase() === 'NAVIGATE' &&
+      CREATE_URL_IN_UPDATE_RE.test(s.value ?? '')
+    )
+    if (badCreateNavs.length > 0) {
+      const badUrl = badCreateNavs[0].value ?? ''
+      const listUrl = badUrl.replace(/\/?(new|create|add)(\?.*)?$/i, '').replace(/\/$/, '') || '/<entity-list>'
+      issues.push(
+        `🚨 UPDATE OPERATION CRITICAL ERROR: NAVIGATE "${badUrl}" goes to a CREATE page. ` +
+        `Update tests MUST NEVER navigate to /new, /create, or /add URLs. ` +
+        `REQUIRED: Change NAVIGATE target to the LIST page "${listUrl}" (no /new suffix). ` +
+        `Then follow: NAVIGATE list → TYPE search → CLICK record → CLICK Edit → modify fields → CLICK Save → ASSERT.`
+      )
+      check10 = false
+    }
+
+    // Also flag CLICK on "+ New <Entity>" / "Create <Entity>" in an Update test
+    const createBtnsInUpdate = steps.filter(s =>
+      s.action.toUpperCase() === 'CLICK' &&
+      /\b(create|\+\s*new)\s+\w/i.test(s.target ?? '')
+    )
+    if (createBtnsInUpdate.length > 0) {
+      const badBtn = createBtnsInUpdate[0].target ?? ''
+      issues.push(
+        `🚨 UPDATE OPERATION CRITICAL ERROR: CLICK "${badBtn}" is a CREATE button — FORBIDDEN in Update tests. ` +
+        `Update tests click "Edit" to enter edit mode, NOT a Create/New button. ` +
+        `Replace with: CLICK "Edit" (or the edit button from the manifest) after opening the record.`
+      )
+      check10 = false
+    }
+  }
+
   if (isUpdateOpForValidation) {
     const FIELD_ACTIONS_C10 = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
     // Find the first TRUE field-edit step — exclude TYPE steps targeting a search box
@@ -780,12 +1086,18 @@ function validateSteps(
   //   b) NAVIGATE must go to the LIST page, NOT directly to a create/new URL. Navigating
   //      directly to /leads/create bypasses the mandatory "+New Lead" CLICK step.
   //   c) If field steps are present but no OPEN_FORM CLICK exists at all, flag it.
+  // NOTE: CONVERT operations are EXCLUDED — they use a different step sequence:
+  //       NAVIGATE → TYPE search → CLICK record → CLICK "Create <Target>" trigger → fields → CLICK submit
+  //       Check 14 handles the convert-specific validation.
   let check11 = true
-  const isCreateOpForCheck11 = minimumFieldSteps === 2 || /\b(create|add|new)\b/i.test(testEntityHint ?? '')
+  const isConvertOpForCheck11 = /\b(convert|transform|turn\s+into|move\s+to)\b/i.test(testEntityHint ?? '')
+  const isCreateOpForCheck11 = !isConvertOpForCheck11 && (minimumFieldSteps === 2 || /\b(create|add|new)\b/i.test(testEntityHint ?? ''))
   if (isCreateOpForCheck11 && !isUpdateOpForValidation) {
     const FIELD_ACTIONS_C11 = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
     const SUBMIT_RE_C11 = /\b(create|save|submit|confirm|done|finish)\b/i
-    const OPEN_FORM_RE_C11 = /\b(new|add|open)\b/i
+    // Match "new", "add", "open" as word boundary, AND also "+new"/"+add" patterns
+    // where "+" is a non-word char before "new" (e.g. "+New Account", "+Add Lead").
+    const OPEN_FORM_RE_C11 = /(?:\b|\+)(new|add|open)\b/i
     // URL pattern that indicates navigating DIRECTLY to a create form — forbidden for Create tests
     const CREATE_URL_RE_C11 = /\/(create|new|add)(?:[?|/]|$)/i
 
@@ -871,6 +1183,59 @@ function validateSteps(
     check12 = false
   }
 
+  // Check 14: Convert operation — full workflow validation gate
+  // Fires ONLY for convert (not create) operations.
+  // Verifies the 3-part mandatory structure:
+  //   Part A: conversion trigger CLICK on source entity detail page
+  //   Part B: ALL required fields of target entity (TYPE/SELECT/LOOKUP)
+  //   Part C: final submit CLICK before the ASSERT steps
+  const isConvertOpForCheck14 = /\b(convert|transform|turn\s+into|move\s+to)\b/i.test(testEntityHint ?? '')
+  if (isConvertOpForCheck14) {
+    // Part A: must have a CLICK step targeting the conversion trigger
+    const hasTriggerClickC14 = steps.some(s =>
+      s.action.toUpperCase() === 'CLICK' &&
+      /create\s+booking|create\s+\w+|convert/i.test(s.target ?? '')
+    )
+    if (!hasTriggerClickC14) {
+      issues.push(
+        'CONVERT CHECK 14A: Missing conversion trigger CLICK step. ' +
+        'Step 4 of PHASE 1 MUST be: CLICK the "Create Booking" (or equivalent) button on the source record detail page. ' +
+        'This is the button that opens the target entity creation form. WITHOUT it the booking form never opens.'
+      )
+    }
+
+    // Part B: minimum required field steps
+    const fieldStepsC14 = steps.filter(s => ['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX'].includes(s.action.toUpperCase()))
+    const minForConvert = Math.max(effectiveRequiredCount, minimumFieldSteps ?? 2)
+    if (fieldStepsC14.length < minForConvert) {
+      issues.push(
+        `CONVERT CHECK 14B: Only ${fieldStepsC14.length} field step(s) found — need at least ${minForConvert}. ` +
+        'PHASE 2 requires a TYPE/SELECT/LOOKUP step for EVERY ★ required field of the target entity (e.g. Booking). ' +
+        'The most common mistake is skipping from PHASE 1 straight to ASSERT_URL. ' +
+        'Generate one step per ★ field: Booking Reference, Service Type, Origin Port, Destination Port, etc.'
+      )
+    }
+
+    // Part C: must have a final submit CLICK between field steps and ASSERTs
+    const assertIndexC14 = steps.findIndex(s => s.action.toUpperCase().startsWith('ASSERT'))
+    const fieldIndexC14  = fieldStepsC14.length > 0
+      ? Math.max(...fieldStepsC14.map(s => steps.indexOf(s)))
+      : -1
+    const hasSubmitBeforeAssertC14 = steps.some((s, idx) =>
+      s.action.toUpperCase() === 'CLICK' &&
+      /create|submit|save|confirm/i.test(s.target ?? '') &&
+      idx > fieldIndexC14 &&
+      (assertIndexC14 < 0 || idx < assertIndexC14)
+    )
+    if (!hasSubmitBeforeAssertC14 && assertIndexC14 >= 0) {
+      issues.push(
+        'CONVERT CHECK 14C: Missing final submit CLICK before ASSERT_URL. ' +
+        'After filling all required fields, you MUST click the final "Create Booking" submit button. ' +
+        'Without this step the form is never submitted and no booking record is created.'
+      )
+    }
+  }
+
   // Check 13: Create operation — strong success validation gate
   // For Create operations the app redirects to the DETAIL PAGE (e.g. /leads/42), NOT the list page.
   // This check enforces that the final assertion either:
@@ -952,8 +1317,37 @@ function validateSteps(
     }
   }
 
+  // Check 15: Anti-placeholder guard — real data enforcement
+  // Fires for TYPE, LOOKUP, and SELECT steps. Rejects values that look like
+  // generic placeholders invented by the LLM ("Test Record", "Sample Account", "John Doe", etc.).
+  // When real data exists (injected via REAL EXISTING RECORDS or REAL LOOKUP DATA blocks),
+  // the LLM MUST use one of those exact values — not an invented placeholder.
+  let check15 = true
+  const GENERIC_PLACEHOLDER_RE = /^(test\s+(record|account|lead|contact|product|sku|item|user|company|order|invoice|customer)|sample\s+\w+|john\s+doe|jane\s+(doe|smith)|john\s+smith|foo\s+bar|bar\s+foo|acme\s+corp(oration)?\s*$|lorem|placeholder|dummy|fake|mock|demo\s+\w+|test\s*\d*$|my\s+(account|company|record)|some\s+(record|company|account)|existing\s+(record|account)|new\s+(record|entry))$/i
+  const FIELD_ACTIONS_C15 = new Set(['TYPE', 'LOOKUP', 'SELECT'])
+  for (const s of steps) {
+    const action = (s.action ?? '').toUpperCase()
+    if (!FIELD_ACTIONS_C15.has(action)) continue
+    const value = (s.value ?? '').trim()
+    if (!value || value.length === 0) continue
+    // Skip NAVIGATE/ASSERT values and very short values (e.g. single characters, codes)
+    if (value.length < 3) continue
+    // Skip values that look like valid codes/IDs (alphanumeric with dashes, dots, underscores)
+    if (/^[A-Z0-9][A-Z0-9\-_.]{2,}$/i.test(value) && !/\s/.test(value)) continue
+    if (GENERIC_PLACEHOLDER_RE.test(value)) {
+      issues.push(
+        `Anti-placeholder violation: step ${steps.indexOf(s) + 1} (${action} "${s.target ?? ''}") uses ` +
+        `placeholder value "${value}" which does NOT exist in the application. ` +
+        `You MUST use a REAL EXISTING RECORD name from the "=== REAL EXISTING RECORDS ===" or ` +
+        `"=== REAL LOOKUP DATA ===" sections. NEVER invent names like "Test Record", "Sample Account", ` +
+        `"John Doe", or "Jane Smith". If no real data section exists, use the sampleValue from the FIELD MANIFEST.`
+      )
+      check15 = false
+    }
+  }
+
   return {
-    passed: check1 && check2 && check3 && check4 && check5 && check6 && check7 && check8 && check9 && check10 && check11 && check12 && check13,
+    passed: check1 && check2 && check3 && check4 && check5 && check6 && check7 && check8 && check9 && check10 && check11 && check12 && check13 && check15,
     checks: {
       requiredFieldCoverage:     check1,
       urlVerification:           check2,
@@ -961,6 +1355,7 @@ function validateSteps(
       locatorTypeValid:          check4,
       dataTypeAlignment:         check5,
       createSuccessValidation:   check13,
+      realDataEnforcement:       check15,
     },
     issues,
   }
@@ -989,6 +1384,8 @@ export interface StepGenInput {
   description?: string
   executionId?: string  // required for HITL
   entityFilter?: string // narrow metadata to one entity
+  brdContent?:  string  // optional override
+  existingTestsContent?: string // optional override
 }
 
 export interface StepGenOutput {
@@ -1014,6 +1411,13 @@ export async function runTestStepGeneratorAgent(
 
   // Detect entity name early for learning registry queries
   const entityHintForLearnings = input.entityFilter ?? (() => {
+    // Priority 0: Convert/Transform flow — extract TARGET entity (word after "to")
+    // "Convert Quotation to Booking - Happy Path" → "Booking"
+    const convertMatchHL = input.testName.match(/\b(?:convert|transform|turn\s+into|move\s+to)\s+\w+\s+to\s+(\w+)/i)
+    if (convertMatchHL) {
+      const t = convertMatchHL[1].trim()
+      return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()
+    }
     const stripped = input.testName
       // Strip leading verb (create, update, etc.)
       .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
@@ -1043,7 +1447,19 @@ export async function runTestStepGeneratorAgent(
   // entityFilter may be empty, ALL-CAPS ("PRODUCT"), or TitleCase ("Product").
   // We normalize it to TitleCase here so buildFieldManifest always gets a
   // clean, non-empty entity name. This is the fix for the case-sensitivity bug.
-  const resolvedEntityFilter = (() => {
+  let resolvedEntityFilter = (() => {
+    // Priority 0: Convert/Transform flow — extract TARGET entity (word after "to" or "into")
+    // e.g. "Convert Quotation to Booking - Happy Path" → "Booking"
+    // The TARGET entity is whose form we fill, so its manifest is what we need.
+    // We prioritize this even if entityFilter is set, because for conversion tests,
+    // entityFilter is often set to the source entity (e.g. "Quotation"), but we must
+    // load the target entity's field manifest (e.g. "Booking") to generate modal inputs.
+    const convertMatchEF = input.testName.match(/\b(?:convert|conversion|transform|move)(?:\s+[\w\-]+)?\s+to\s+(\w+)/i)
+      || input.testName.match(/\b(?:turn)(?:\s+[\w\-]+)?\s+into\s+(\w+)/i)
+    if (convertMatchEF) {
+      const t = convertMatchEF[1].trim()
+      return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()
+    }
     // Priority 1: explicitly passed entityFilter (truthy, length > 2)
     if (input.entityFilter && input.entityFilter.trim().length > 2) {
       const ef = input.entityFilter.trim()
@@ -1084,7 +1500,7 @@ export async function runTestStepGeneratorAgent(
     '[STEP-GEN] Resolved entity filter for manifest lookup',
   )
 
-  const [manifest, urlMap, ragResult, projectArtifacts, learningsText, learnedButtons, sampleTestData, hitlLearnings, fieldTypeCorrections] = await Promise.all([
+  let [manifest, urlMap, ragResult, projectArtifacts, learningsText, learnedButtons, sampleTestData, hitlLearnings, fieldTypeCorrections] = await Promise.all([
     buildFieldManifest(input.projectId, resolvedEntityFilter),
     buildUrlMap(input.projectId),
     ragSearchTool({ projectId: input.projectId, query: `${input.testName} form fields steps`, topK: 8 }),
@@ -1105,6 +1521,7 @@ export async function runTestStepGeneratorAgent(
       ? getButtonMapping(input.projectId, entityHintForLearnings)
       : Promise.resolve({ openButton: null, submitButton: null }),
     // Pull sample test data for realistic value generation
+    // Returns the first matching record — used as sampleTestData for field value injection
     (async () => {
       if (!resolvedEntityFilter || resolvedEntityFilter.length < 2) return null
       try {
@@ -1114,7 +1531,7 @@ export async function runTestStepGeneratorAgent(
             project_id:  input.projectId,
             entity_name: { contains: resolvedEntityFilter, mode: 'insensitive' },
           },
-          take: 3,
+          take: 5,
         })
         for (const row of rows) {
           if (row?.records && Array.isArray(row.records) && row.records.length > 0) {
@@ -1129,6 +1546,57 @@ export async function runTestStepGeneratorAgent(
     // Pull field-type corrections — where humans changed action types (e.g. LOOKUP → TYPE)
     extractFieldTypeCorrections(input.projectId, input.testCaseId ?? '').catch(() => []),
   ])
+
+  // Update resolvedEntityFilter with the canonical entity name if found
+  if (manifest?.entityName && manifest.entityName !== resolvedEntityFilter) {
+    resolvedEntityFilter = manifest.entityName
+
+    // Re-fetch sampleTestData using the correct resolvedEntityFilter if it was not found
+    if (!sampleTestData) {
+      try {
+        const rows = await prisma.web_test_data.findMany({
+          where: {
+            project_id:  input.projectId,
+            entity_name: { contains: resolvedEntityFilter, mode: 'insensitive' },
+          },
+          take: 3,
+        })
+        for (const row of rows) {
+          if (row?.records && Array.isArray(row.records) && row.records.length > 0) {
+            sampleTestData = row.records[0] as Record<string, unknown>
+            break
+          }
+        }
+      } catch { /* non-critical */ }
+    }
+  }
+
+  // ── For Convert operations: fetch SOURCE entity records from web_test_data ──
+  // This provides the real quotation reference (e.g. QUO-0007) to use in the search step.
+  // sampleTestData above loads TARGET entity (Booking) data; this loads SOURCE entity data.
+  let sourceEntityTestData: Record<string, unknown> | null = null
+  if (/\b(convert|transform|turn\s+into|move\s+to)\b/i.test(input.testName)) {
+    const sourceEntityForLookup = (() => {
+      const m = input.testName.match(/\b(?:convert|transform|turn\s+into|move\s+to)\s+(\w+)\s+to\b/i)
+      return m ? m[1] : 'Quotation'
+    })()
+    try {
+      const sourceRows = await prisma.web_test_data.findMany({
+        where: {
+          project_id:  input.projectId,
+          entity_name: { contains: sourceEntityForLookup, mode: 'insensitive' },
+        },
+        take: 3,
+      })
+      for (const row of sourceRows) {
+        if (row?.records && Array.isArray(row.records) && row.records.length > 0) {
+          sourceEntityTestData = row.records[0] as Record<string, unknown>
+          break
+        }
+      }
+      thoughts.push(`THINK: source entity (${sourceEntityForLookup}) test data loaded: ${sourceEntityTestData ? 'YES' : 'none'}`)
+    } catch { /* non-fatal */ }
+  }
 
   // Automatically discover list URLs from create URLs in the URL map
   // e.g. if URL map has "/leads/new", we also allow "/leads" so Check 2 (URL verification)
@@ -1244,39 +1712,36 @@ export async function runTestStepGeneratorAgent(
 
 
   // ── Detect operation type from test name ─────────────────────────────────────
-  // testName may be a short clean title ("Create Product") OR a full paragraph prompt.
-  // We detect create intent anywhere in the string, not just at the start.
-  const isUpdateOperation = /\b(update|edit|modify|change|updating|modifying|editing)\b/i.test(input.testName)
-    // "existing <entity>" is a clear update signal — e.g. "To update the existing Account"
-    || /\bexisting\s+\w+/i.test(input.testName)
-  // Delete/Remove: navigate → search → click → delete button → confirm
-  const isDeleteOperation = !isUpdateOperation &&
-    /\b(delete|remove|archive|deactivate|trash)\b/i.test(input.testName)
-  // View/Open: navigate → search → click → assert detail page
-  const isViewOperation = !isUpdateOperation && !isDeleteOperation &&
-    /\b(view|open|display|read|preview|check details|details of|see details)\b/i.test(input.testName)
-  // Create is only true when update/delete/view is NOT detected — update intent takes priority
-  const isCreateOperation = !isUpdateOperation && !isDeleteOperation && !isViewOperation && (
-    /\b(create|creation|add|new|register|registration|signup|sign-up|generation|generate)\b/i.test(input.testName)
-    || /\b(creating|registering|signing\s*up|generating)\b/i.test(input.testName)
-    || /\bnew\s+(product|lead|contact|account|opportunity|quote|order|invoice|campaign|contract|record|entity)\b/i.test(input.testName)
-  )
-  // Search/Filter/Browse: navigate → [optional tab filter] → type in search → click record → assert
-  // Fires when the test explicitly describes searching/filtering in a list view.
-  // IMPORTANT: Must be checked AFTER all other operations to avoid false positives
-  // (e.g. "Search and Filter" is not Create/Update/Delete/View)
-  const isSearchOperation = !isUpdateOperation && !isDeleteOperation && !isViewOperation && !isCreateOperation && (
-    /\b(search|filter|find|look\s*up|lookup|browse|query)\b/i.test(input.testName)
-    || /\blist\s*view\b/i.test(input.testName)
+  // Uses the centralized detectOperationType() — single source of truth.
+  // This ensures compound test names like "Update SKU weight and dimensions"
+  // are correctly identified as Update, not Create.
+  const opType = detectOperationType(input.testName)
+
+  const isUpdateOperation  = opType === 'update'
+  const isDeleteOperation  = opType === 'delete'
+  const isViewOperation    = opType === 'view'
+  const isConvertOperation = opType === 'convert'
+  const isSearchOperation  = opType === 'search'
+  // isCreateOperation includes 'unknown' to give benefit of doubt for unrecognized test names
+  const isCreateOperation  = opType === 'create' || opType === 'unknown'
+
+  log.info(
+    { projectId: input.projectId, testName: input.testName, opType, isUpdateOperation, isCreateOperation },
+    '[STEP-GEN] Operation type detected',
   )
 
+
   // ── Entity-specific record name fallbacks ─────────────────────────────────
+  // NOTE: These are LAST-RESORT fallbacks only — real data from web_test_data or
+  // knowledge_graph.real_test_data ALWAYS takes precedence over these.
+  // These fallbacks should be plausible real-world values, NEVER generic placeholders.
   const ENTITY_RECORD_FALLBACKS: Record<string, string> = {
     account:     'Acme Corp',
     lead:        'John Smith',
     contact:     'Jane Doe',
     opportunity: 'Q4 Enterprise Deal',
     product:     'Premium Widget',
+    sku:         'SKU-39281',
     campaign:    'Summer Launch 2024',
     invoice:     'INV-0001',
     order:       'ORD-0001',
@@ -1292,12 +1757,15 @@ export async function runTestStepGeneratorAgent(
   }
   const entityKey = (resolvedEntityFilter ?? '').toLowerCase().trim()
     .replace(/ies$/, 'y').replace(/ses$/, 's').replace(/s$/, '').trim()
+  // CRITICAL: Never default to 'Test Record' — it does not exist in any real application.
+  // Instead use an entity-appropriate plausible name or the entity name itself.
   const entityRecordFallback =
     ENTITY_RECORD_FALLBACKS[entityKey] ??
     ENTITY_RECORD_FALLBACKS[Object.keys(ENTITY_RECORD_FALLBACKS).find(k =>
       entityKey.startsWith(k) || k.startsWith(entityKey)
     ) ?? ''] ??
-    'Test Record'
+    // Last resort: use a sensible default based on entity name (still NOT 'Test Record')
+    `${(resolvedEntityFilter ?? 'Record').charAt(0).toUpperCase() + (resolvedEntityFilter ?? 'Record').slice(1)}-0001`
 
   // ── Resolve real edit button from manifest (entity-agnostic) ─────────────
   const resolvedEditButton = manifest?.allButtons?.find(b => /\bedit\b/i.test(b)) ?? 'Edit'
@@ -1308,12 +1776,16 @@ export async function runTestStepGeneratorAgent(
       /search|filter|find|query/i.test(f.label) && f.type === 'input'
     )
     if (searchField) return searchField.label
-    return resolvedEntityFilter ? `Search ${resolvedEntityFilter}s` : 'Search'
+    if (resolvedEntityFilter) {
+      const plural = resolvedEntityFilter.endsWith('s') ? resolvedEntityFilter : resolvedEntityFilter.endsWith('y') ? resolvedEntityFilter.slice(0, -1) + 'ies' : resolvedEntityFilter + 's'
+      return `Search ${plural}`
+    }
+    return 'Search'
   })()
 
-  // Minimum field steps: Create needs ≥2, Update needs ≥1, others 0
+  // Minimum field steps: Create needs ≥2, Convert needs ≥2, Update needs ≥1, others 0
   // Combined with manifest.requiredCount so real manifest always wins if higher.
-  const minimumFieldSteps = isCreateOperation ? 2 : isUpdateOperation ? 1 : 0
+  const minimumFieldSteps = (isCreateOperation || isConvertOperation) ? 2 : isUpdateOperation ? 1 : 0
 
   const manifestText = manifest
     ? formatManifestForPrompt(manifest, isUpdateOperation ? 'update' : isCreateOperation ? 'create' : 'default')
@@ -1356,6 +1828,35 @@ export async function runTestStepGeneratorAgent(
     }
   }
 
+  // ── Change 2: Inject manifest.listUrl into URL map ALWAYS (modal + non-modal) ─
+  // For modal forms the createUrl is /accounts/__modal__/account but the test MUST
+  // NAVIGATE to /accounts. The manifest.listUrl (from business_rules.list_url) is the
+  // authoritative source. Without this injection, Check 2 rejects NAVIGATE /accounts.
+  if (manifest?.listUrl && !urlMap.paths.some(p => p === manifest!.listUrl)) {
+    urlMap.paths.push(manifest.listUrl)
+    log.info({ listUrl: manifest.listUrl }, '[STEP-GEN] Injected manifest.listUrl into URL map')
+  }
+
+  // For Convert operations: ensure BOTH source entity list URL AND target entity detail URL are in the map.
+  // e.g. "Convert Quotation to Booking" needs /quotations (source list) + /bookings/ (target detail).
+  if (isConvertOperation) {
+    const srcEnt = (() => {
+      const m = input.testName.match(/\b(?:convert|transform|turn\s+into|move\s+to)\s+(\w+)\s+to\b/i)
+      return m ? m[1].toLowerCase() : 'quotation'
+    })()
+    const tgtEnt = (resolvedEntityFilter ?? 'booking').toLowerCase()
+    const sourceListPath  = `/${srcEnt.endsWith('s') ? srcEnt : srcEnt.endsWith('y') ? srcEnt.slice(0, -1) + 'ies' : srcEnt + 's'}`
+    const targetListPath  = `/${tgtEnt.endsWith('s') ? tgtEnt : tgtEnt.endsWith('y') ? tgtEnt.slice(0, -1) + 'ies' : tgtEnt + 's'}`
+    if (!urlMap.paths.some(p => p.toLowerCase().includes(srcEnt))) {
+      urlMap.paths.push(sourceListPath)
+      log.info({ sourceListPath }, '[STEP-GEN] Injected source entity list URL for Convert operation')
+    }
+    if (!urlMap.paths.some(p => p.toLowerCase().includes(tgtEnt))) {
+      urlMap.paths.push(targetListPath)
+      log.info({ targetListPath }, '[STEP-GEN] Injected target entity list URL for Convert operation')
+    }
+  }
+
   const urlMapText = urlMap.paths.length > 0
     ? `=== VERIFIED URL MAP ===\nBase URL: ${urlMap.baseUrl}\nPaths (use ONLY these):\n${urlMap.paths.map(p => `  ✅ ${p}`).join('\n')}`
     : '(no crawler URL map — use relative paths inferred from metadata)'
@@ -1379,8 +1880,8 @@ export async function runTestStepGeneratorAgent(
     return raw.slice(0, maxChars)
   }
 
-  const brdText = decodeArtifact((projectArtifacts as any).brd_content)
-  const existingTestsText = decodeArtifact((projectArtifacts as any).existing_tests_content)
+  const brdText = decodeArtifact(input.brdContent ?? (projectArtifacts as any).brd_content)
+  const existingTestsText = decodeArtifact(input.existingTestsContent ?? (projectArtifacts as any).existing_tests_content)
 
   // ── Inject sample test data into manifest fields for realistic values ──────
   if (sampleTestData && manifest && manifest.fields.length > 0) {
@@ -1400,10 +1901,20 @@ export async function runTestStepGeneratorAgent(
     thoughts.push(`THINK: injected ${manifest.fields.filter(f => f.sampleValue).length} sample values from web_test_data`)
   }
 
-  // ── Build sample data text block for LLM ──────────────────────────────────
-  const sampleDataText = sampleTestData
-    ? `=== SAMPLE TEST DATA (use realistic values like these) ===\n` +
-      Object.entries(sampleTestData)
+  // ── Change 1: Build sample data text — prefer canonical sampleRecords over web_test_data ─
+  // web_test_data.records is often empty for modal-form entities (e.g., Account modal).
+  // metadata_canonical.real_test_data always has real records and is the better source.
+  const canonicalSampleRecord: Record<string, unknown> | null = (
+    manifest?.sampleRecords && manifest.sampleRecords.length > 0
+  ) ? (manifest.sampleRecords[0] as Record<string, unknown>) : null
+
+  // Use canonical record first, then fall back to web_test_data
+  const effectiveSampleRecord = canonicalSampleRecord ?? sampleTestData
+
+
+  const sampleDataText = effectiveSampleRecord
+    ? `=== SAMPLE TEST DATA (existing records — use for UPDATE/VIEW/SEARCH only, NOT for create) ===\n` +
+      Object.entries(effectiveSampleRecord)
         .filter(([k, v]) => typeof v === 'string' && v.length > 0 && v.length < 200
           && !['id', 'created_at', 'updated_at'].includes(k.toLowerCase()))
         .slice(0, 15)
@@ -1430,39 +1941,103 @@ export async function runTestStepGeneratorAgent(
       ].join('\n')
     : ''
 
-  // ── Build existing record name text block for Update/Search operations ───────
-  // For update/search tests, the LLM MUST use a real record name that exists in the app.
-  // This block provides the ground truth so the LLM never invents a name.
-  // Also used for Search/Filter operations so the TYPE step uses a real existing record name.
-  const existingRecordNameForPrompt = (() => {
-    if (!isUpdateOperation && !isSearchOperation) return null
-    if (sampleTestData) {
-      const nameKey = Object.keys(sampleTestData).find(k =>
-        /^(name|full.?name|display.?name|title|label|account.?name|contact.?name|lead.?name|company.?name|subject|first.?name)$/i.test(k)
-      ) ?? Object.keys(sampleTestData).find(k => /name$/i.test(k) && !/id$/i.test(k))
-      const val = nameKey ? String(sampleTestData[nameKey] ?? '') : ''
-      if (val && val.length > 0 && val.length < 100) return val
-    }
-    if (realLookupValues.size > 0) {
-      const first = [...realLookupValues.values()][0]
-      if (first?.length) return first[0]
-    }
-    return null
-  })()
+  // ── Build existing record name text block for Update/Search/View/Delete operations ──
+  // For update/search/view/delete tests, the LLM MUST use a real record name that exists in the app.
+  // This block provides the ground truth so the LLM never invents a name or a UUID.
+  // Priority: manifest.sampleRecords (real_test_data from knowledge_graph) > web_test_data > realLookupValues
 
-  const existingRecordsText = existingRecordNameForPrompt
+  // Helper: extract the best name-like field value from a record object
+  const extractNameFromRecord = (rec: Record<string, unknown>): string | null => {
+    // Priority 1: exact name fields
+    const nameKey = Object.keys(rec).find(k =>
+      /^(name|full.?name|display.?name|title|label|account.?name|contact.?name|lead.?name|company.?name|subject|first.?name)$/i.test(k)
+    ) ?? Object.keys(rec).find(k => /name$/i.test(k) && !/id$/i.test(k))
+    const nameVal = nameKey ? String(rec[nameKey] ?? '') : ''
+    if (nameVal && nameVal.length > 0 && nameVal.length < 100) return nameVal
+    // Priority 2: domain-specific identifier keys
+    const idKey = Object.keys(rec).find(k =>
+      /^(bl[_\s]?number|bl[_\s]?no|bl[_\s]?ref|booking[_\s]?number|booking[_\s]?ref|invoice[_\s]?number|order[_\s]?number|reference[_\s]?number|ref[_\s]?no|doc[_\s]?number|document[_\s]?number|quotation[_\s]?number|quote[_\s]?number|delivery[_\s]?number|shipment[_\s]?number|sku[_\s]?number|sku[_\s]?code|number|reference|code|identifier)$/i.test(k)
+    )
+    const idVal = idKey ? String(rec[idKey] ?? '') : ''
+    if (idVal && idVal.length > 0 && idVal.length < 100) return idVal
+    return null
+  }
+
+  // Collect ALL real record names from multiple sources — give the LLM a list of options
+  const allRealRecordNames: string[] = []
+
+  // Source 1: manifest.sampleRecords — real_test_data from knowledge_graph (highest priority)
+  if (manifest?.sampleRecords && manifest.sampleRecords.length > 0) {
+    for (const rec of manifest.sampleRecords.slice(0, 5) as Array<Record<string, unknown>>) {
+      const n = extractNameFromRecord(rec)
+      if (n && !allRealRecordNames.includes(n)) allRealRecordNames.push(n)
+    }
+  }
+
+  // Source 2: sampleTestData from web_test_data (fallback)
+  if (sampleTestData) {
+    const n = extractNameFromRecord(sampleTestData)
+    if (n && !allRealRecordNames.includes(n)) allRealRecordNames.push(n)
+  }
+
+  // Source 3: realLookupValues (secondary fallback)
+  if (allRealRecordNames.length === 0 && realLookupValues.size > 0) {
+    const first = [...realLookupValues.values()][0]
+    if (first?.length && !allRealRecordNames.includes(first[0])) allRealRecordNames.push(first[0])
+  }
+
+  // Also fetch from knowledge_graph.real_test_data via additional web_test_data fetch (if still empty)
+  if (allRealRecordNames.length === 0 && resolvedEntityFilter && resolvedEntityFilter.length >= 2) {
+    try {
+      const extraRows = await prisma.web_test_data.findMany({
+        where: { project_id: input.projectId, entity_name: { contains: resolvedEntityFilter, mode: 'insensitive' } },
+        take: 5,
+      })
+      for (const row of extraRows) {
+        if (!row?.records || !Array.isArray(row.records)) continue
+        for (const rec of (row.records as Array<Record<string, unknown>>).slice(0, 3)) {
+          const n = extractNameFromRecord(rec)
+          if (n && !allRealRecordNames.includes(n)) allRealRecordNames.push(n)
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  thoughts.push(`THINK: real entity record names resolved: [${allRealRecordNames.join(', ')}] (source: manifest.sampleRecords + web_test_data)`)
+
+  const existingRecordNameForPrompt = (
+    (isUpdateOperation || isSearchOperation || isViewOperation || isDeleteOperation) && allRealRecordNames.length > 0
+  ) ? allRealRecordNames[0] : null
+
+  const existingRecordsText = allRealRecordNames.length > 0 && (isUpdateOperation || isSearchOperation || isViewOperation || isDeleteOperation)
     ? [
-        `=== EXISTING RECORD TO SEARCH (MANDATORY for Update/Search/Filter operations) ===`,
-        `⚠️  The following REAL record exists in the application. Use THIS EXACT name`,
-        `   for the TYPE step (search input) AND the CLICK step (record selection).`,
+        `=== REAL EXISTING RECORDS (USE THESE ONLY) ===`,
+        `🔴 CRITICAL: The records below are REAL, EXISTING records in the live application.`,
+        `   You MUST use ONE of these exact values for the search/click steps in this test.`,
+        `   Do NOT invent any other name. If you use a name not listed here, the search`,
+        `   will return zero results and the test will FAIL immediately.`,
         ``,
-        `  ✅ Record name to use: "${existingRecordNameForPrompt}"`,
+        `${resolvedEntityFilter ?? 'Entity'}: [${allRealRecordNames.map(n => `"${n}"`).join(', ')}]`,
         ``,
-        `⛔ FORBIDDEN: Do NOT invent record names like "Acme Corporation", "John Smith",`,
-        `   "Test Record", or any name not listed above.`,
-        `⛔ The search step value AND the record click target MUST BOTH be: "${existingRecordNameForPrompt}"`,
-      ].join('\n')
-    : ''
+        `  ✅ PRIMARY record to use: "${allRealRecordNames[0]}"`,
+        allRealRecordNames.length > 1
+          ? `  ✅ Alternatives (also real):${allRealRecordNames.slice(1).map(n => ` "${n}"`).join(',')}`
+          : '',
+        ``,
+        `⛔ FORBIDDEN: Do NOT use ANY of these invented/placeholder names:`,
+        `   "Test Record", "Test Account", "Sample Account", "John Doe", "Jane Smith",`,
+        `   "Test User", "Acme Corporation" (generic), "Test ${resolvedEntityFilter ?? 'Record'}", or any made-up name.`,
+        `⛔ The search TYPE step value AND the record CLICK target MUST BOTH be: "${allRealRecordNames[0]}"`,
+      ].filter(Boolean).join('\n')
+    : allRealRecordNames.length === 0 && (isUpdateOperation || isSearchOperation || isViewOperation || isDeleteOperation)
+      ? [
+          `=== REAL EXISTING RECORDS — NOT FOUND ===`,
+          `⚠️  No real test data was found in the database for entity: ${resolvedEntityFilter ?? 'unknown'}.`,
+          `   Use the best available sample value from the FIELD MANIFEST (sampleValue field).`,
+          `   If no sample value exists, use a plausible realistic value appropriate for this entity type.`,
+          `⛔ NEVER use "Test Record", "Sample Account", "John Doe", or any generic placeholder.`,
+        ].join('\n')
+      : ''
 
   // Pre-compute whether the manifest has required fields that need explicit enumeration in prompt.
   // This is used by the CREATE OPERATION CONSTRAINT block below.
@@ -1486,12 +2061,75 @@ export async function runTestStepGeneratorAgent(
     manifestText,
     learningsText,   // ← Past learnings: failures, button mappings, corrections
     lookupValuesText, // ← Real lookup values from web_test_data — MANDATORY for LOOKUP steps
-    existingRecordsText, // ← Real existing record name for Update/Search ops — MANDATORY
+    existingRecordsText, // ← Real existing record name for Update/Search/View ops — MANDATORY
     sampleDataText,  // ← Sample test data for realistic values
     ragText,
     brdText ? `=== BRD / SPECIFICATION (business rules to follow) ===\n${brdText}` : '',
     existingTestsText ? `=== EXISTING TEST CASES (for naming conventions and coverage reference) ===\n${existingTestsText}` : '',
     `=== TEST CASE ===\nName: ${input.testName}\nDescription: ${input.description ?? ''}`,
+    // ── VIEW OPERATION CONSTRAINT ─────────────────────────────────────────────────
+    // Injected for "View", "Open", "Preview", "Check Details" tests.
+    // Grounds the LLM in the real record name and manifest-verified buttons.
+    // Without this block the LLM hallucinates UUIDs and non-existent buttons.
+    isViewOperation
+      ? (() => {
+          const listUrl = manifest?.createUrl
+            ? manifest.createUrl.replace(/\/(new|create|add)\b.*$/i, '')
+            : urlMap.paths.find(p =>
+                p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) &&
+                !/new|create|add/i.test(p)
+              ) ?? (() => {
+                const el = (resolvedEntityFilter ?? 'records').toLowerCase()
+                return `/${el.endsWith('s') ? el : el.endsWith('y') ? el.slice(0, -1) + 'ies' : el + 's'}`
+              })()
+
+          const recordName = existingRecordNameForPrompt ?? entityRecordFallback
+
+          // Build list of real buttons from manifest (action buttons only — exclude generic Submit/Save)
+          const realActionButtons = manifest?.allButtons
+            ?.filter(b => b && b.length > 0 && !/^(save|submit|cancel|close|reset|back)$/i.test(b))
+            ?? []
+          const buttonList = realActionButtons.length > 0
+            ? realActionButtons.map(b => `    ✅ "${b}"`).join('\n')
+            : '    (no action buttons found in metadata — do NOT invent button names)'
+
+          return [
+            `🔴 VIEW / PREVIEW OPERATION — ENTITY: ${resolvedEntityFilter ?? 'record'}`,
+            ``,
+            `This test navigates to and views an existing record. Follow EXACTLY these steps:`,
+            ``,
+            `  1. NAVIGATE to the ${resolvedEntityFilter ?? 'entity'} list page:`,
+            `     action: NAVIGATE, value: "${listUrl}"`,
+            `  2. TYPE the record identifier in the search/filter field:`,
+            `     action: TYPE`,
+            `     target: "${resolvedSearchHint}"`,
+            `     locator_type: "placeholder"`,
+            `     value: "${recordName}"`,
+            `     ▶ MANDATORY: use EXACTLY this real record name — do NOT change it, do NOT use a UUID`,
+            `  3. CLICK the matching record name/link from the filtered list:`,
+            `     action: CLICK, target: "${recordName}", locator_type: "text"`,
+            `     ▶ This clicks the record row/link that appeared in the filtered results`,
+            `  4. ASSERT the detail page loaded:`,
+            `     ASSERT_URL with the entity list path pattern (e.g. "${listUrl}/") OR`,
+            `     ASSERT_TEXT with a field value from the record (e.g. "${recordName}")`,
+            ``,
+            `⛔ FORBIDDEN — do NOT generate any of these:`,
+            `   - Search value or CLICK target using a UUID (e.g. "737b1b37-83ec-...") — FORBIDDEN`,
+            `   - Any URL that contains a UUID (e.g. "${listUrl}/737b1b37-...") — FORBIDDEN`,
+            `   - CLICK or ASSERT for buttons that do NOT appear in the list below`,
+            `   - Inventing button names like "Preview Shipping Instructions" that are not in the manifest`,
+            ``,
+            realActionButtons.length > 0
+              ? [
+                  `⚠️ REAL ACTION BUTTONS verified from metadata (only use buttons from this list):`,
+                  buttonList,
+                  ``,
+                  `⛔ ANY button NOT listed above does NOT exist in this application. Do NOT reference it.`,
+                ].join('\n')
+              : `⚠️ No action buttons found in metadata — if the test requires clicking a button after opening the record, use ASSERT_TEXT or ASSERT_URL only (no CLICK on invented buttons).`,
+          ].join('\n')
+        })()
+      : '',
     // ── SEARCH/FILTER OPERATION CONSTRAINT ────────────────────────────────────────
     // Placed before CREATE/UPDATE so it also lands in the recency window.
     // Gives the LLM an explicit step-by-step search flow grounded in this app's behavior.
@@ -1512,7 +2150,10 @@ export async function runTestStepGeneratorAgent(
             : urlMap.paths.find(p =>
                 p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) &&
                 !/new|create|add/i.test(p)
-              ) ?? `/${(resolvedEntityFilter ?? 'records').toLowerCase()}s`
+              ) ?? (() => {
+                const el = (resolvedEntityFilter ?? 'records').toLowerCase()
+                return `/${el.endsWith('s') ? el : el.endsWith('y') ? el.slice(0, -1) + 'ies' : el + 's'}`
+              })()
 
           const recordName = existingRecordNameForPrompt ?? entityRecordFallback
 
@@ -1561,26 +2202,177 @@ export async function runTestStepGeneratorAgent(
         })()
       : '',
 
+    // ── CONVERT OPERATION CONSTRAINT ──────────────────────────────────────────────
+    // Injected for "Convert X to Y" tests. Fires even when manifest is null.
+    // Enumerates ALL required target-entity fields and mandates the submit + assert steps.
+    isConvertOperation
+      ? (() => {
+          const sourceEntity = (() => {
+            const m = input.testName.match(/\bconvert\s+(\w+)\s+to\b/i)
+              ?? input.testName.match(/\btransform\s+(\w+)\s+to\b/i)
+            return m ? m[1] : 'Quotation'
+          })()
+          const targetEntity = resolvedEntityFilter ?? 'Booking'
+          const sourceListUrl = urlMap.paths.find(p =>
+            p.toLowerCase().includes(sourceEntity.toLowerCase()) && !/new|create|add/i.test(p)
+          ) ?? (() => {
+            const se = sourceEntity.toLowerCase()
+            return `/${se.endsWith('s') ? se : se.endsWith('y') ? se.slice(0, -1) + 'ies' : se + 's'}`
+          })()
+          const targetDetailUrlHint = (() => {
+            const te = targetEntity.toLowerCase()
+            const tp = te.endsWith('s') ? te : te.endsWith('y') ? te.slice(0, -1) + 'ies' : te + 's'
+            return `/${tp}/`
+          })()
+          // submitBtn = the FINAL button inside the Booking form to save the record
+          const submitBtn = (manifest?.submitButton ?? learnedButtons.submitButton) ?? `Create ${targetEntity}`
+          // conversionTriggerBtn = the button ON THE SOURCE ENTITY (Quotation) detail page
+          // that opens the conversion form. In DS Logistics this is "Create Booking" — same as submitBtn.
+          // IMPORTANT: Do NOT use learnedButtons.openButton (that is the list-page "+New X" button).
+          // The conversion trigger is always named like "Create <TargetEntity>" on the source detail page.
+          const conversionTriggerBtn = submitBtn
+
+          // Build the required-field list — use manifest if available, otherwise build from TYPICAL_FIELDS
+          const reqFields = manifest?.fields.filter(f => f.required) ?? []
+          const reqList   = reqFields.length > 0
+            ? reqFields.map(f => `  ★ [${f.type.toUpperCase()}] "${f.label}"${f.options?.length ? ' (pick from: ' + f.options.slice(0, 3).join(' | ') + ')' : ''}`).join('\n')
+            : [
+                `  ★ [INPUT]  "Booking Reference"  — unique booking ID (e.g. BK-2024-4821)`,
+                `  ★ [SELECT] "Service Type"        — e.g. Ocean Freight | Air Freight | Road Freight`,
+                `  ★ [INPUT]  "Origin Port"          — departure port/location (e.g. Shanghai Port)`,
+                `  ★ [INPUT]  "Destination Port"     — arrival port/location (e.g. Los Angeles Port)`,
+                `  ★ [INPUT]  "Estimated Departure Date" — MM/DD/YYYY format`,
+                `  ★ [INPUT]  "Estimated Arrival Date"   — MM/DD/YYYY format`,
+                `  ★ [INPUT]  "Carrier"              — shipping carrier name`,
+                `  ★ [INPUT]  "Vessel"               — vessel/flight/truck reference`,
+                `  ★ [SELECT] "Container Type"       — e.g. 20ft Standard | 40ft Standard | LCL`,
+                `  ★ [INPUT]  "Number of Containers" — numeric count`,
+                `  ★ [TEXTAREA] "Cargo Description"  — description of goods`,
+                `  ★ [INPUT]  "Total Weight (kg)"    — total cargo weight`,
+                `  ★ [INPUT]  "Total Volume (CBM)"   — total cargo volume`,
+                `  ★ [INPUT]  "Freight Charges"      — cost of shipment`,
+                `  ★ [SELECT] "Payment Terms"        — e.g. Prepaid | Collect | Third Party`,
+                `  ★ [TEXTAREA] "Special Instructions" — any special handling notes`,
+              ].join('\n')
+
+          // Real source record name from web_test_data (source entity) or fallback
+          // sourceEntityTestData holds real Quotation records from the DS Logistics app
+          const sourceRecordId = (() => {
+            const dataToSearch = sourceEntityTestData ?? (sampleTestData as Record<string,unknown> | null)
+            if (dataToSearch) {
+              const found = Object.entries(dataToSearch)
+                .find(([k]) => /reference|number|quotation_?id|quote_?id|name|id/i.test(k))
+              if (found && typeof found[1] === 'string' && found[1].length > 0) return found[1] as string
+            }
+            return 'QUO-0007'
+          })()
+
+          const uniqueSuffix = String(Date.now()).slice(-4)
+
+          return [
+            `🔴 CONVERT OPERATION — SOURCE: ${sourceEntity} → TARGET: ${targetEntity}`,
+            ``,
+            `This is a multi-step CONVERSION workflow. Follow EXACTLY these steps in order:`,
+            ``,
+            `⚠️ CRITICAL: This is NOT a Create or Search test. The button in PHASE 1 step 4`,
+            `is the CONVERSION TRIGGER on the ${sourceEntity} DETAIL page, not a list-page button.`,
+            `The button name is "${conversionTriggerBtn}" — use this EXACTLY.`,
+            ``,
+            `PHASE 1 — Locate the source ${sourceEntity} record and trigger conversion:`,
+            `  1. NAVIGATE to the ${sourceEntity} list page: ${sourceListUrl}`,
+            `     action: NAVIGATE, value: "${sourceListUrl}"`,
+            `  2. TYPE the ${sourceEntity} identifier in the search/filter field:`,
+            `     action: TYPE`,
+            `     locator_type: "placeholder"`,
+            `     value: "${sourceRecordId}"  ← USE THIS EXACT value (real existing record)`,
+            `  3. CLICK the matching ${sourceEntity} record to open its detail page:`,
+            `     action: CLICK, target: "${sourceRecordId}", locator_type: "text"`,
+            `  4. CLICK the CONVERSION TRIGGER button on the ${sourceEntity} detail page:`,
+            `     action: CLICK, target: "${conversionTriggerBtn}", locator_type: "role"`,
+            `     ▶ This is the button that opens the ${targetEntity} creation form.`,
+            `     ▶ It appears on the ${sourceEntity} DETAIL PAGE — NOT on the list page.`,
+            `     ▶ NEVER use "+New ${sourceEntity}" or any button referencing the source entity.`,
+            `     ▶ Copy the button name EXACTLY: "${conversionTriggerBtn}"`,
+            ``,
+            `PHASE 2 — Fill ALL required fields of the ${targetEntity} booking form:`,
+            `The ${targetEntity} form has the following REQUIRED fields — generate a step for EACH:`,
+            ``,
+            reqList,
+            ``,
+            `Generate ONE TYPE/SELECT/LOOKUP step per ★ field above.`,
+            `  ▶ Every ★ field MUST have its own step. Skipping even one causes form rejection.`,
+            `  ▶ Use the unique booking reference: "BK-2024-${uniqueSuffix}" for the Booking Reference field.`,
+            `  ▶ Use dates in MM/DD/YYYY format.`,
+            `  ▶ Use realistic port names (e.g. "Shanghai Port", "Los Angeles Port", "Dubai Port").`,
+            ``,
+            `FINAL STEPS (MANDATORY — always included, never skip):`,
+            `  CLICK "${submitBtn}" — final submit button to create the ${targetEntity} record`,
+            `     action: CLICK, target: "${submitBtn}", locator_type: "role"`,
+            `  ASSERT_URL — URL contains the ${targetEntity} detail path after successful creation:`,
+            `     action: ASSERT_URL, value: "${targetDetailUrlHint}"`,
+            `  ASSERT_TEXT — the Booking Reference value is visible confirming creation:`,
+            `     action: ASSERT_TEXT, target: "BK-2024-${uniqueSuffix}", locator_type: "text"`,
+            ``,
+            `⛔ FORBIDDEN — NEVER do these:`,
+            `  - CLICK "+New ${sourceEntity}" or "+New ${targetEntity}" (those are list-page buttons, NOT the conversion trigger)`,
+            `  - Skip any ★ field (form validation will reject the submission)`,
+            `  - Omit the CLICK "${submitBtn}" step (form is never submitted)`,
+            `  - Omit the ASSERT_URL and ASSERT_TEXT steps`,
+            `  - ASSERT_URL value "${sourceListUrl}" (bare source list — wrong, must be booking detail path)`,
+          ].join('\n')
+        })()
+      : '',
+
     // ── CREATE/UPDATE OPERATION CONSTRAINT: explicit required fields listed by name ──
     // This is the highest-priority instruction — placed LAST in the prompt so
     // it is in the LLM's recency window. Lists every required field by name so
     // the LLM cannot miss them even if it skimmed the FIELD MANIFEST section.
-    (isCreateOperation || isUpdateOperation || hasMissingRequiredFieldsForPrompt) && manifest
+    !isConvertOperation && (isCreateOperation || isUpdateOperation || hasMissingRequiredFieldsForPrompt)
       ? (() => {
-          const reqFields = manifest.fields.filter(f => f.required)
-          const reqList   = reqFields.map(f => `  ★ [${f.type.toUpperCase()}] "${f.label}"${f.options?.length ? ' (pick from: ' + f.options.slice(0,3).join(' | ') + ')' : ''}`).join('\n')
+          const reqFields = manifest ? manifest.fields.filter(f => f.required) : []
+          const reqList   = reqFields.length > 0
+            ? reqFields.map(f => `  ★ [${f.type.toUpperCase()}] "${f.label}"${f.options?.length ? ' (pick from: ' + f.options.slice(0,3).join(' | ') + ')' : ''}`).join('\n')
+            : `  ★ [INPUT] "Name / Title"`
           if (isUpdateOperation) {
             // Update-specific instructions — fully entity-agnostic
             const listUrl = manifest?.createUrl
               ? manifest.createUrl.replace(/\/(new|create|add)\b.*$/i, '')
               : urlMap.paths.find(p => p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) && !/new|create|add/i.test(p))
-              ?? `/${(resolvedEntityFilter ?? 'records').toLowerCase()}s`
+              ?? (() => {
+                const el = (resolvedEntityFilter ?? 'records').toLowerCase()
+                return `/${getEntityPlural(el)}`
+              })()
+
+            // Build a clear record hint list for the UPDATE constraint block
+            const updateRecordHint = allRealRecordNames.length > 0
+              ? allRealRecordNames[0]
+              : (existingRecordNameForPrompt ?? entityRecordFallback)
+            const updateRecordAlternatives = allRealRecordNames.length > 1
+              ? `\n     ▶ Other real options: ${allRealRecordNames.slice(1).map(n => `"${n}"`).join(', ')}`
+              : ''
 
             return [
               `🔴 UPDATE OPERATION — ENTITY: ${resolvedEntityFilter ?? 'record'}`,
               ``,
               `AVAILABLE FIELDS FOR EDITING (pick at least 1):`,
               reqList || '  (all fields optional — pick any field to modify)',
+              ``,
+              allRealRecordNames.length > 0
+                ? [
+                    `╔══════════════════════════════════════════════════════════════════╗`,
+                    `║  🔴 REAL EXISTING RECORDS — USE ONE OF THESE (MANDATORY)         ║`,
+                    `╠══════════════════════════════════════════════════════════════════╣`,
+                    `║  These records ACTUALLY EXIST in the application.                ║`,
+                    `║  You MUST use one for BOTH the search step and the click step.   ║`,
+                    `║                                                                   ║`,
+                    `║  ✅ Available records for ${(resolvedEntityFilter ?? 'entity').padEnd(38)}║`,
+                    ...allRealRecordNames.slice(0, 5).map(n => `║    → "${n}"${' '.repeat(Math.max(0, 59 - n.length))}║`),
+                    `║                                                                   ║`,
+                    `║  ❌ FORBIDDEN placeholder names (do NOT use these):              ║`,
+                    `║    "Test Record"  "Test Account"  "John Doe"  "Sample Account"   ║`,
+                    `╚══════════════════════════════════════════════════════════════════╝`,
+                  ].join('\n')
+                : '',
               ``,
               `UPDATE WORKFLOW — follow these 7 steps EXACTLY:`,
               `  1. NAVIGATE to: ${listUrl}`,
@@ -1589,11 +2381,11 @@ export async function runTestStepGeneratorAgent(
               `     ▶ action: TYPE`,
               `     ▶ target: "${resolvedSearchHint}"`,
               `     ▶ locator_type: "placeholder"`,
-              `     ▶ value: "${existingRecordNameForPrompt ?? entityRecordFallback}"`,
+              `     ▶ value: "${updateRecordHint}"  ← USE THIS EXACT REAL RECORD NAME${updateRecordAlternatives}`,
               `     ▶ ⛔ MANDATORY: use EXACTLY this record name — do NOT change it or invent a new one`,
               `     ▶ ⚠️ Do NOT use status words ("Active", "Closed", "Prospect") as a record name`,
               `  3. CLICK the record name to open its detail page:`,
-              `     ▶ action: CLICK, target: "${existingRecordNameForPrompt ?? entityRecordFallback}", locator_type: "text"`,
+              `     ▶ action: CLICK, target: "${updateRecordHint}", locator_type: "text"`,
               `     ▶ ⛔ DO NOT click "Create ${resolvedEntityFilter ?? 'Record'}" — FORBIDDEN`,
               `  4. EDIT BUTTON — CLICK to enter edit mode:`,
               `     ▶ action: CLICK`,
@@ -1606,11 +2398,12 @@ export async function runTestStepGeneratorAgent(
               ``,
               `⚠️ CRITICAL: ALL of steps 2, 3, 4 are MANDATORY. Skipping any one will FAIL validation.`,
               `⚠️ CRITICAL: Step 4 MUST be CLICK "${resolvedEditButton}" — NOT "Create ${resolvedEntityFilter ?? 'Record'}".`,
-            ].join('\n')
+            ].filter(Boolean).join('\n')
           }
           // Derive the entity detail-page URL pattern hint for the final assertion
           const entityLower = (resolvedEntityFilter ?? 'record').toLowerCase()
-          const detailUrlHint = `/${entityLower}s/`  // e.g. /leads/, /contacts/, /accounts/
+          const detailPlural = getEntityPlural(entityLower)
+          const detailUrlHint = `/${detailPlural}/`  // e.g. /leads/, /contacts/, /accounts/
           const detailUrlAlt  = `/${entityLower}/`   // e.g. /lead/, /contact/
           // Generate a short, time-derived numeric suffix (4 digits) for unique record names
           const uniqueSuffix = String(Date.now()).slice(-4)
@@ -1627,6 +2420,24 @@ export async function runTestStepGeneratorAgent(
             return `Test ${entityNameForDisplay} ${uniqueSuffix}`
           })()
 
+          // Resolve the open-form and submit button names for explicit mention in the prompt
+          // Change 3: triggerButton (from business_rules.trigger_button) takes highest priority —
+          // it is the user-verified, authoritative name of the button on the list page.
+          const openBtnForPrompt   = manifest?.triggerButton ?? learnedButtons.openButton ?? manifest?.openButton ?? `+ New ${entityNameForDisplay}`
+          const submitBtnForPrompt = learnedButtons.submitButton ?? manifest?.submitButton ?? `Create ${entityNameForDisplay}`
+
+          // Change 4: Use manifest.detailUrlPattern for the ASSERT_URL hint when available
+          const detailUrlHintFinal = manifest?.detailUrlPattern ?? detailUrlHint
+          const detailUrlAltFinal  = detailUrlAlt
+
+          // The list URL for NAVIGATE step (from manifest.listUrl — authoritative for modal forms)
+          const createListUrl = manifest?.listUrl
+            ?? urlMap.paths.find(p =>
+                p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) &&
+                !/new|create|add|modal/i.test(p)
+              )
+            ?? `/${getEntityPlural(entityLower)}`
+
           return [
             `🔴 MANDATORY FIELDS — YOU MUST GENERATE A STEP FOR EVERY ★ FIELD BELOW:`,
             reqList,
@@ -1635,8 +2446,16 @@ export async function runTestStepGeneratorAgent(
             `Rules:`,
             `  1. Generate one TYPE/SELECT/LOOKUP step per ★ field above — NO SKIPPING`,
             `  2. Use the EXACT label string shown (e.g. "${reqFields[0]?.label ?? 'Field'}")`,
-            `  3. Sequence: NAVIGATE → CLICK open-form btn → fill all ★ fields → CLICK submit → ASSERT success`,
+            `  3. MANDATORY STEP SEQUENCE (in this exact order):`,
+            `     Step 1: NAVIGATE to the ${entityNameForDisplay} LIST page → value: "${createListUrl}"`,
+            `     Step 2: CLICK the OPEN FORM button → { "action": "CLICK", "target": "${openBtnForPrompt}", "locator_type": "role" }`,
+            `            ⚠️  This CLICK step MUST come BEFORE any TYPE/SELECT/LOOKUP steps.`,
+            `            ⚠️  Use EXACTLY this button name: "${openBtnForPrompt}"`,
+            `     Steps 3-N: TYPE/SELECT/LOOKUP all ★ required fields listed above`,
+            `     Step N+1: CLICK the SUBMIT button → { "action": "CLICK", "target": "${submitBtnForPrompt}", "locator_type": "role" }`,
+            `     Step N+2: ASSERT_URL and/or ASSERT_TEXT to verify success`,
             `  4. Missing even ONE ★ field will FAIL validation and trigger re-generation`,
+            `  5. The CLICK "${openBtnForPrompt}" step at Step 2 is MANDATORY — omitting it causes test failure`,
             ``,
             `╔══════════════════════════════════════════════════════════════════╗`,
             `║  🆕 UNIQUE TEST DATA — MANDATORY FOR THIS CREATE TEST            ║`,
@@ -1656,22 +2475,72 @@ export async function runTestStepGeneratorAgent(
             `  The app redirects to the DETAIL PAGE after creation (NOT the list page, NO toast).`,
             `  You MUST add BOTH of these final steps:`,
             `  Step A — ASSERT_URL (detail page pattern):`,
-            `    { "action": "ASSERT_URL", "value": "${detailUrlHint}" }`,
-            `    OR: { "action": "ASSERT_URL", "value": "${detailUrlAlt}" }`,
-            `    ⚠️ The URL after save will be "${detailUrlHint}42" or similar — NOT "${detailUrlHint.replace(/\/$/, '')}" (bare list).`,
-            `    ✅ Using "${detailUrlHint}" (with trailing slash) correctly matches "/leads/42" as a contains check.`,
+            `    { "action": "ASSERT_URL", "value": "${detailUrlHintFinal}" }`,
+            `    OR: { "action": "ASSERT_URL", "value": "${detailUrlAltFinal}" }`,
+            `    ⚠️ The URL after save will be "${detailUrlHintFinal}42" or similar — NOT "${detailUrlHintFinal.replace(/\/$/, '')}" (bare list).`,
+            `    ✅ Using "${detailUrlHintFinal}" (with trailing slash) correctly matches "/accounts/636a2bf5..." as a contains check.`,
             `  Step B — ASSERT_TEXT (record title or unique detail field):`,
             `    { "action": "ASSERT_TEXT", "target": "${uniqueNameHint}", "locator_type": "text" }`,
             `    OR: { "action": "ASSERT_TEXT", "target": "${entityNameForDisplay} Details", "locator_type": "text" }`,
-            `  ❌ FORBIDDEN: ASSERT_URL value "${detailUrlHint.replace(/\/$/, '')}" (bare list page — will never match after redirect)`,
+            `  ❌ FORBIDDEN: ASSERT_URL value "${detailUrlHintFinal.replace(/\/$/, '')}" (bare list page — will never match after redirect)`,
             `  ❌ FORBIDDEN: ASSERT_TOAST — no toast is shown on successful creation`,
           ].join('\n')
         })()
       : '',
 
+    // ── DELETE OPERATION CONSTRAINT ──
+    isDeleteOperation
+      ? (() => {
+          const listUrl = manifest?.createUrl
+            ? manifest.createUrl.replace(/\/(new|create|add)\b.*$/i, '')
+            : urlMap.paths.find(p => p.toLowerCase().includes((resolvedEntityFilter ?? '').toLowerCase()) && !/new|create|add/i.test(p))
+            ?? (() => {
+              const el = (resolvedEntityFilter ?? 'records').toLowerCase()
+              return `/${getEntityPlural(el)}`
+            })()
+          
+          const deleteBtn = manifest?.allButtons?.find(b => /\b(delete|remove|archive|deactivate|trash)\b/i.test(b)) ?? 'Delete'
+          const deleteRecordHint = allRealRecordNames.length > 0
+            ? allRealRecordNames[0]
+            : (existingRecordNameForPrompt ?? entityRecordFallback)
+
+          return [
+            `🔴 DELETE OPERATION — ENTITY: ${resolvedEntityFilter ?? 'record'}`,
+            ``,
+            allRealRecordNames.length > 0
+              ? `🔴 REAL EXISTING RECORD TO DELETE: ${allRealRecordNames.map(n => `"${n}"`).join(' | ')} — use ONE of these EXACT names`
+              : '',
+            ``,
+            `DELETE WORKFLOW — follow these 6 steps EXACTLY:`,
+            `  1. NAVIGATE to: ${listUrl}`,
+            `     ▶ This is the LIST page.`,
+            `  2. SEARCH STEP — TYPE the record name in the search input:`,
+            `     ▶ action: TYPE`,
+            `     ▶ target: "${resolvedSearchHint}"`,
+            `     ▶ locator_type: "placeholder"`,
+            `     ▶ value: "${deleteRecordHint}"  ← USE THIS EXACT REAL RECORD NAME`,
+            `     ▶ ⛔ MANDATORY: use EXACTLY this record name — do NOT change it or invent a new one`,
+            `  3. CLICK the record name to open its detail page or select it:`,
+            `     ▶ action: CLICK, target: "${deleteRecordHint}", locator_type: "text"`,
+            `  4. DELETE BUTTON — CLICK to trigger deletion:`,
+            `     ▶ action: CLICK`,
+            `     ▶ target: "${deleteBtn}"`,
+            `     ▶ locator_type: "role"`,
+            `  5. CONFIRM DELETION (if confirmation modal/button appears):`,
+            `     ▶ action: CLICK`,
+            `     ▶ target: "Confirm" (or "Delete", "Yes", "OK" — whatever confirms the prompt)`,
+            `     ▶ locator_type: "role"`,
+            `  6. ASSERT_TEXT / ASSERT_URL to confirm deletion succeeded (e.g. redirected to list page, or "deleted successfully" toast is visible, or record no longer appears in search).`,
+            ``,
+            `⚠️ CRITICAL: ALL of steps 2, 3, 4 are MANDATORY. Skipping any one will FAIL validation.`,
+            `⚠️ CRITICAL: Step 4 MUST be CLICK "${deleteBtn}" — NOT "Create ${resolvedEntityFilter ?? 'Record'}".`,
+          ].filter(Boolean).join('\n')
+        })()
+      : '',
+
     // Inject confirmed button names — learning registry (runtime-confirmed) > manifest (metadata-derived)
     (() => {
-      const openBtn   = learnedButtons.openButton   ?? manifest?.openButton
+      const openBtn   = learnedButtons.openButton   ?? manifest?.triggerButton ?? manifest?.openButton
       const submitBtn = learnedButtons.submitButton ?? manifest?.submitButton
       if (!openBtn && !submitBtn) return ''
       const lines = [`⚠️  CONFIRMED BUTTON NAMES (from metadata/past executions):`]
@@ -1753,7 +2622,15 @@ export async function runTestStepGeneratorAgent(
       ? `update ${testEntityHint}`
       : isCreateOperation
         ? `create ${testEntityHint}`
-        : testEntityHint
+        : isConvertOperation
+          ? input.testName
+          : isDeleteOperation
+            ? `delete ${testEntityHint}`
+            : isViewOperation
+              ? `view ${testEntityHint}`
+              : isSearchOperation
+                ? `search ${testEntityHint}`
+                : testEntityHint
 
     validation = validateSteps(
       steps,
@@ -1792,7 +2669,7 @@ export async function runTestStepGeneratorAgent(
   }
 
   // Extract entity hint early for Safety Nets 0, 2, 3
-  const effectiveEntityHint = input.entityFilter ?? (() => {
+  const effectiveEntityHint = resolvedEntityFilter ?? input.entityFilter ?? (() => {
     const stripped = input.testName
       .replace(/^(create|update|edit|delete|view|add|manage|verify|test|check)\s+/i, '')
       .replace(/\b(new|a|an|the|successfully|with|for|and|or|record|records|details|detail|valid|invalid|existing|required|optional|active|inactive|duplicate|mandatory|basic|empty|updated|given|correct|incorrect|multiple|successful)\b/gi, '')
@@ -1812,30 +2689,66 @@ export async function runTestStepGeneratorAgent(
   // click "Create Account") into Update test cases, breaking them.
   const hasManifestWithFields = manifest && manifest.fields.length > 0
   const hasMissingRequiredFields = hasManifestWithFields && (() => {
+    // Normalize: underscore → space so 'origin_port' ≡ 'origin port' when comparing
+    const normalizeFieldLbl = (s: string) => s.toLowerCase().trim().replace(/_/g, ' ')
     const FIELD_ACTIONS_PRE = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
     const coveredTargets = new Set(
       steps.filter(s => FIELD_ACTIONS_PRE.has((s.action ?? '').toUpperCase()))
-           .map(s => (s.target ?? '').toLowerCase().trim())
+           .map(s => normalizeFieldLbl(s.target ?? ''))
     )
     return manifest!.fields.filter(f => f.required)
-                           .some(f => !coveredTargets.has(f.label.toLowerCase().trim()))
+                           .some(f => !coveredTargets.has(normalizeFieldLbl(f.label)))
   })()
 
-  if ((isCreateOperation || hasMissingRequiredFields) && hasManifestWithFields && !isUpdateOperation) {
+  if ((isCreateOperation || isConvertOperation) && hasManifestWithFields && !isUpdateOperation) {
     const FIELD_ACTIONS_SN0 = new Set(['TYPE', 'SELECT', 'LOOKUP', 'CHECKBOX', 'MULTI_SELECT'])
+    const normalizeFL = (s: string) => s.toLowerCase().trim().replace(/_/g, ' ')
     const existingFieldSteps = steps.filter(s => FIELD_ACTIONS_SN0.has((s.action ?? '').toUpperCase()))
-    const existingFieldTargets = new Set(existingFieldSteps.map(s => (s.target ?? '').toLowerCase().trim()))
+    const existingFieldTargets = new Set(existingFieldSteps.map(s => normalizeFL(s.target ?? '')))
 
     // Check: how many REQUIRED fields are already covered?
     const requiredFields = manifest.fields.filter(f => f.required)
     const requiredCoverage = requiredFields.filter(
-      f => existingFieldTargets.has(f.label.toLowerCase().trim())
+      f => existingFieldTargets.has(normalizeFL(f.label))
     ).length
 
     const needsInjection = (
       existingFieldSteps.length < minimumFieldSteps ||
       (requiredFields.length > 0 && requiredCoverage < requiredFields.length)
     )
+
+    // ── CONVERT TRIGGER SAFETY NET (runs independently of needsInjection) ──
+    // For convert operations, always ensure there is a "Create Booking" (or similar) CLICK
+    // step between the source-record navigation steps and the field-filling steps.
+    // This check runs even when all required field steps are already present,
+    // because the LLM often generates the field steps but forgets the trigger button click.
+    if (isConvertOperation) {
+      const hasTriggerClickSN = steps.some(s =>
+        s.action.toUpperCase() === 'CLICK' &&
+        /create\s+(booking|delivery|order|enquiry)|convert/i.test(s.target ?? '')
+      )
+      if (!hasTriggerClickSN) {
+        const triggerBtnSN = (manifest?.submitButton ?? learnedButtons.submitButton) ?? `Create ${resolvedEntityFilter ?? 'Booking'}`
+        // Insert trigger CLICK: find last CLICK step (source record click) and inject after it
+        let lastClickIdxSN = -1
+        for (let i = 0; i < steps.length; i++) {
+          if (steps[i].action.toUpperCase() === 'CLICK') lastClickIdxSN = i
+        }
+        const triggerStepSN: AgentStep_Playwright = {
+          id: '0', action: 'CLICK', target: triggerBtnSN, locator_type: 'role',
+        }
+        // Insert before the first field step or after last CLICK, whichever comes first
+        const firstFieldIdx = steps.findIndex(s => FIELD_ACTIONS_SN0.has((s.action ?? '').toUpperCase()))
+        const insertAt = firstFieldIdx > 0 ? firstFieldIdx : (lastClickIdxSN >= 0 ? lastClickIdxSN + 1 : steps.length)
+        steps.splice(insertAt, 0, triggerStepSN)
+        steps = steps.map((s, i) => ({ ...s, id: String(i + 1) }))
+        thoughts.push(`CONVERT TRIGGER SAFETY NET: Injected missing trigger CLICK "${triggerBtnSN}" at step ${insertAt + 1}`)
+        log.warn(
+          { projectId: input.projectId, testName: input.testName, triggerBtn: triggerBtnSN, insertedAt: insertAt + 1 },
+          '[STEP-GEN] ⚡ CONVERT TRIGGER SAFETY NET: Injected missing conversion trigger CLICK',
+        )
+      }
+    }
 
     if (needsInjection) {
       thoughts.push(
@@ -1850,8 +2763,8 @@ export async function runTestStepGeneratorAgent(
       // Build field steps from manifest
       const injectedFieldSteps: AgentStep_Playwright[] = []
       for (const field of manifest.fields) {
-        // Skip fields that already have a step
-        if (existingFieldTargets.has(field.label.toLowerCase().trim())) continue
+        // Skip fields that already have a step (normalize underscore → space for matching)
+        if (existingFieldTargets.has((field.label.toLowerCase().trim().replace(/_/g, ' ')))) continue
 
         // Map field type to action
         let action: string
@@ -1917,47 +2830,114 @@ export async function runTestStepGeneratorAgent(
       }
 
       if (injectedFieldSteps.length > 0) {
-        // Strategy: Insert field steps BETWEEN the NAVIGATE and CLICK steps
-        // Find the insertion point: after the last NAVIGATE, before the first CLICK (that's a submit)
-        let navigateIdx = -1
-        for (let i = steps.length - 1; i >= 0; i--) {
-          if ((steps[i].action ?? '').toUpperCase() === 'NAVIGATE') { navigateIdx = i; break }
-        }
-        const submitClickIdx = steps.findIndex(s => {
-          const a = (s.action ?? '').toUpperCase()
-          if (a !== 'CLICK') return false
-          const t = (s.target ?? '').toLowerCase()
-          return /\b(create|save|submit|add|new|update|confirm)\b/.test(t)
-        })
-
-        // Remove any existing minimal field steps (they may be hallucinated)
+        // Remove any existing field steps that are NOT in the manifest (hallucinated)
+        const normalizeFL2 = (s: string) => s.toLowerCase().trim().replace(/_/g, ' ')
         const cleanedSteps = steps.filter(s => {
           if (!FIELD_ACTIONS_SN0.has((s.action ?? '').toUpperCase())) return true
-          // Keep field steps that ARE in the manifest
-          const target = (s.target ?? '').toLowerCase().trim()
-          return manifest.fields.some(f => f.label.toLowerCase().trim() === target)
+          // Keep field steps that ARE in the manifest (normalize underscores)
+          const target = normalizeFL2(s.target ?? '')
+          return manifest.fields.some(f => normalizeFL2(f.label) === target)
         })
 
-        // Find insertion point in cleaned steps
-        const insertIdx = cleanedSteps.findIndex(s => {
-          const a = (s.action ?? '').toUpperCase()
-          if (a === 'CLICK') {
-            const t = (s.target ?? '').toLowerCase()
-            return /\b(create|save|submit|add|new|update|confirm)\b/.test(t)
+        if (isConvertOperation) {
+          // ── CONVERT OPERATION: dedicated injection strategy ──────────────────────
+          // Required structure: [NAVIGATE, TYPE search, CLICK record, CLICK trigger, ...fields, CLICK submit, ASSERT_URL, ASSERT_TEXT]
+          //
+          // Step 1: Ensure conversion trigger CLICK is present.
+          // The trigger button on the source entity detail page is typically named "Create <TargetEntity>"
+          // (e.g. "Create Booking" on the Quotation detail page) — SAME as manifest.submitButton.
+          // Do NOT use manifest.openButton (that is the list-page "+New X" button).
+          const triggerBtnName = (manifest?.submitButton ?? learnedButtons.submitButton) ?? `Create ${resolvedEntityFilter ?? 'Booking'}`
+          const hasTriggerClick = cleanedSteps.some(s =>
+            s.action.toUpperCase() === 'CLICK' &&
+            /create\s+booking|create\s+\w+|convert/i.test(s.target ?? '')
+          )
+          if (!hasTriggerClick) {
+            // Find the last CLICK step (e.g. CLICK quotation record) and insert trigger after it
+            let lastClickIdx = -1
+            for (let i = 0; i < cleanedSteps.length; i++) {
+              if (cleanedSteps[i].action.toUpperCase() === 'CLICK') lastClickIdx = i
+            }
+            const triggerStep: AgentStep_Playwright = {
+              id: '0', action: 'CLICK', target: triggerBtnName, locator_type: 'role',
+            }
+            const insertTriggerAt = lastClickIdx >= 0 ? lastClickIdx + 1 : cleanedSteps.length
+            cleanedSteps.splice(insertTriggerAt, 0, triggerStep)
+            thoughts.push(`SAFETY NET 0 CONVERT: Injected conversion trigger CLICK "${triggerBtnName}"`)
           }
-          return a === 'ASSERT_URL' || a === 'ASSERT_TEXT' || a === 'ASSERT_TOAST'
-        })
 
-        if (insertIdx > 0) {
-          // Insert BEFORE the submit click / assert
-          cleanedSteps.splice(insertIdx, 0, ...injectedFieldSteps)
-        } else if (navigateIdx >= 0) {
-          // Insert AFTER the last navigate
-          cleanedSteps.splice(navigateIdx + 1, 0, ...injectedFieldSteps)
+          // Step 2: Find the position AFTER the trigger click to inject field steps
+          let afterTriggerIdx = cleanedSteps.length - 1
+          for (let i = 0; i < cleanedSteps.length; i++) {
+            if (
+              cleanedSteps[i].action.toUpperCase() === 'CLICK' &&
+              /create\s+booking|create\s+\w+|convert/i.test(cleanedSteps[i].target ?? '')
+            ) {
+              afterTriggerIdx = i + 1
+              break
+            }
+          }
+
+          // Step 3: Find the first ASSERT or final submit CLICK position (inject field steps before it)
+          let beforeAssertIdx = cleanedSteps.length
+          for (let i = afterTriggerIdx; i < cleanedSteps.length; i++) {
+            const action = cleanedSteps[i].action.toUpperCase()
+            if (action.startsWith('ASSERT') || (action === 'CLICK' && /submit|save|create|confirm/i.test(cleanedSteps[i].target ?? ''))) {
+              beforeAssertIdx = i
+              break
+            }
+          }
+
+          cleanedSteps.splice(beforeAssertIdx, 0, ...injectedFieldSteps)
+
+          // Step 4: Ensure final submit CLICK is present before the ASSERTs
+          const submitBtnName = manifest?.submitButton ?? learnedButtons.submitButton ?? `Create ${resolvedEntityFilter ?? 'Booking'}`
+          const hasSubmitClick = cleanedSteps.some(s =>
+            s.action.toUpperCase() === 'CLICK' &&
+            /create\s+booking|submit|save|confirm/i.test(s.target ?? '') &&
+            cleanedSteps.indexOf(s) > beforeAssertIdx   // must come AFTER the fields
+          )
+          if (!hasSubmitClick) {
+            let firstAssertIdx = cleanedSteps.length
+            for (let i = beforeAssertIdx + injectedFieldSteps.length; i < cleanedSteps.length; i++) {
+              if (cleanedSteps[i].action.toUpperCase().startsWith('ASSERT')) {
+                firstAssertIdx = i
+                break
+              }
+            }
+            const submitStep: AgentStep_Playwright = {
+              id: '0', action: 'CLICK', target: submitBtnName, locator_type: 'role',
+            }
+            cleanedSteps.splice(firstAssertIdx, 0, submitStep)
+            thoughts.push(`SAFETY NET 0 CONVERT: Injected final submit CLICK "${submitBtnName}"`)
+          }
+
         } else {
-          // Append before last step (which is typically ASSERT)
-          const lastIdx = cleanedSteps.length > 1 ? cleanedSteps.length - 1 : cleanedSteps.length
-          cleanedSteps.splice(lastIdx, 0, ...injectedFieldSteps)
+          // ── CREATE / EDIT OPERATION: original insertion strategy ──────────────────
+          let navigateIdx = -1
+          for (let i = steps.length - 1; i >= 0; i--) {
+            if ((steps[i].action ?? '').toUpperCase() === 'NAVIGATE') { navigateIdx = i; break }
+          }
+
+          // Find insertion point in cleaned steps (before submit or assert)
+          const insertIdx = cleanedSteps.findIndex(s => {
+            const a = (s.action ?? '').toUpperCase()
+            if (a === 'CLICK') {
+              const t = (s.target ?? '').toLowerCase()
+              return /\b(create|save|submit|add|new|update|confirm)\b/.test(t)
+            }
+            return a === 'ASSERT_URL' || a === 'ASSERT_TEXT' || a === 'ASSERT_TOAST'
+          })
+
+          if (insertIdx > 0) {
+            cleanedSteps.splice(insertIdx, 0, ...injectedFieldSteps)
+          } else if (navigateIdx >= 0) {
+            cleanedSteps.splice(navigateIdx + 1, 0, ...injectedFieldSteps)
+          } else {
+            // Last resort: append before the last step (typically ASSERT)
+            const lastIdx = cleanedSteps.length > 1 ? cleanedSteps.length - 1 : cleanedSteps.length
+            cleanedSteps.splice(lastIdx, 0, ...injectedFieldSteps)
+          }
         }
 
         steps = cleanedSteps.map((s, i) => ({ ...s, id: String(i + 1) }))
@@ -1969,7 +2949,11 @@ export async function runTestStepGeneratorAgent(
 
         // Re-run validation after injection
         const entityHintRe = effectiveEntityHint || input.entityFilter || ''
-        const testNameRe = isCreateOperation ? `create ${entityHintRe}` : entityHintRe
+        const testNameRe = isConvertOperation
+          ? input.testName
+          : isCreateOperation
+            ? `create ${entityHintRe}`
+            : entityHintRe
         validation = validateSteps(
           steps,
           manifest.requiredCount ?? 0,
@@ -2152,18 +3136,26 @@ export async function runTestStepGeneratorAgent(
     // 2. Fix NAVIGATE steps that point to create/new page instead of list page
     // The LLM may navigate to /account/new because that's the CREATE URL in the manifest.
     // For Update operations, we need to navigate to the list page instead.
-    const CREATE_URL_RE = /\/(new|create|add)\b/i
+    // IMPORTANT: NAVIGATE action uses the 'value' field (not 'target') for the URL.
+    const CREATE_URL_RE_SNU = /\/(new|create|add)(\?|\/|$)/i
     for (const s of steps) {
-      if ((s.action ?? '').toUpperCase() === 'NAVIGATE' && s.target && CREATE_URL_RE.test(s.target)) {
-        const originalUrl = s.target
-        const listUrl = s.target.replace(/\/(new|create|add)\b.*$/i, '')
-        if (listUrl && listUrl !== s.target) {
-          s.target = listUrl
-          thoughts.push(`SAFETY NET U: fixed NAVIGATE from create page "${originalUrl}" → list page "${listUrl}"`)
-          log.info(
-            { projectId: input.projectId, originalUrl, listUrl },
-            '[STEP-GEN] ⚡ SAFETY NET U: redirected NAVIGATE from create page to list page',
+      if ((s.action ?? '').toUpperCase() === 'NAVIGATE') {
+        // Check both 'value' (primary) and 'target' (legacy) for the URL
+        const urlVal = (s.value ?? s.target ?? '').trim()
+        if (urlVal && CREATE_URL_RE_SNU.test(urlVal)) {
+          const listUrl = urlVal.replace(/\/?(new|create|add)(\?.*)?$/i, '').replace(/\/$/, '') || '/'
+          const listUrlNorm = listUrl.startsWith('/') ? listUrl : `/${listUrl}`
+          if (s.value !== undefined) s.value = listUrlNorm
+          if (s.target !== undefined && s.target !== s.value) s.target = listUrlNorm
+          thoughts.push(`SAFETY NET U: fixed NAVIGATE from create URL "${urlVal}" → list URL "${listUrlNorm}"`)
+          log.warn(
+            { projectId: input.projectId, testName: input.testName, originalUrl: urlVal, listUrl: listUrlNorm },
+            '[STEP-GEN] ⚡ SAFETY NET U: redirected NAVIGATE from create/new URL to list page for Update test',
           )
+          // Ensure the corrected list URL is in the URL map so Check 2 passes
+          if (listUrlNorm && !urlMap.paths.some(p => p === listUrlNorm || listUrlNorm.startsWith(p))) {
+            urlMap.paths.push(listUrlNorm)
+          }
         }
       }
     }
@@ -2262,8 +3254,16 @@ export async function runTestStepGeneratorAgent(
           ? Object.keys(sampleTestData).find(k => /name$/i.test(k) && !/id$/i.test(k))
           : undefined
         const resolvedKey = nameKey ?? nameKeyFallback
-        const val = resolvedKey ? String(sampleTestData[resolvedKey] ?? '') : ''
-        if (val && val.length > 0 && val.length < 100) return val
+        const nameVal = resolvedKey ? String(sampleTestData[resolvedKey] ?? '') : ''
+        if (nameVal && nameVal.length > 0 && nameVal.length < 100) return nameVal
+
+        // Priority 1b: Domain-specific identifier keys — bl_number, number, reference, code, etc.
+        // (common in logistics/freight/supply-chain apps where records have no generic "name" key)
+        const idKey = Object.keys(sampleTestData).find(k =>
+          /^(bl[_\s]?number|bl[_\s]?no|bl[_\s]?ref|booking[_\s]?number|booking[_\s]?ref|invoice[_\s]?number|order[_\s]?number|reference[_\s]?number|ref[_\s]?no|doc[_\s]?number|document[_\s]?number|quotation[_\s]?number|quote[_\s]?number|delivery[_\s]?number|shipment[_\s]?number|number|reference|code|identifier)$/i.test(k)
+        )
+        const idVal = idKey ? String(sampleTestData[idKey] ?? '') : ''
+        if (idVal && idVal.length > 0 && idVal.length < 100) return idVal
       }
       // Priority 2: real lookup values already fetched for lookup fields
       if (realLookupValues.size > 0) {
@@ -2448,6 +3448,11 @@ export async function runTestStepGeneratorAgent(
 
   if (effectiveEntityHint && effectiveEntityHint.length > 2 && steps.length > 0) {
     const entityLower = effectiveEntityHint.toLowerCase()
+    // For convert operations, also exempt CLICKs referencing the TARGET entity (resolvedEntityFilter)
+    // e.g. "Create Booking" is NOT a cross-entity step — it is the conversion trigger on the Quotation detail page.
+    const targetEntityLower = (isConvertOperation && resolvedEntityFilter)
+      ? resolvedEntityFilter.toLowerCase()
+      : null
     const beforeClickCount = steps.length
 
     steps = steps.filter(s => {
@@ -2460,8 +3465,11 @@ export async function runTestStepGeneratorAgent(
       if (!match) return true
       const entityWord = match[1].trim()
       if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
-      // Keep if it matches the correct entity
+      // Keep if it matches the correct source entity
       if (entityLower.includes(entityWord) || entityWord.includes(entityLower)) return true
+      // For CONVERT operations: also keep CLICKs referencing the TARGET entity
+      // (e.g. "Create Booking" on a Quotation test is the conversion trigger — NOT a cross-entity step)
+      if (targetEntityLower && (targetEntityLower.includes(entityWord) || entityWord.includes(targetEntityLower))) return true
       // Cross-entity → strip
       return false
     })
@@ -2482,9 +3490,15 @@ export async function runTestStepGeneratorAgent(
   // the manifest (even if the agent's own manifest loading failed) and
   // deterministically replaces LLM-invented button names with the real one.
   // ENHANCED: Also checks learning registry for confirmed button names.
+  // For CONVERT operations, use the TARGET entity (resolvedEntityFilter) as the hint so that
+  // "Create Booking" is NOT replaced with "Create Quotation". The correct submit button is
+  // the target entity's, not the source entity's.
   if (steps.length > 0) {
     const stepsAsRecords = steps as unknown as Array<Record<string, any>>
-    await autoCorrectButtonNames(stepsAsRecords, input.projectId, effectiveEntityHint)
+    const correctionEntityHint = (isConvertOperation && resolvedEntityFilter)
+      ? resolvedEntityFilter
+      : effectiveEntityHint
+    await autoCorrectButtonNames(stepsAsRecords, input.projectId, correctionEntityHint)
     steps = stepsAsRecords as unknown as AgentStep_Playwright[]
     thoughts.push('SAFETY NET 3: ran centralized button name auto-correction (metadata + learning registry)')
   }
@@ -2551,6 +3565,35 @@ export async function runTestStepGeneratorAgent(
   }
 
   // ── DELIVER ───────────────────────────────────────────────────────────────
+
+  // Final validation pass: re-validate the cleaned-up steps after ALL safety nets have run.
+  // This ensures the final validation.issues reflect only real remaining problems,
+  // not issues that safety nets already fixed (e.g., stripped hallucinated fields).
+  if (steps.length > 0) {
+    const entityHintFinal = effectiveEntityHint || input.entityFilter || ''
+    const testNameFinal = isConvertOperation
+      ? input.testName
+      : isCreateOperation
+        ? `create ${entityHintFinal}`
+        : isUpdateOperation
+          ? `update ${entityHintFinal}`
+          : entityHintFinal
+    const finalValidation = validateSteps(
+      steps,
+      manifest?.requiredCount ?? 0,
+      urlMap.paths,
+      manifest?.submitButton,
+      manifest?.allButtons,
+      manifest?.fields,
+      testNameFinal,
+      minimumFieldSteps,
+    )
+    // Only use the final re-validation if it improved the result (fewer issues or passed)
+    if (finalValidation.issues.length < validation.issues.length || finalValidation.passed) {
+      validation = finalValidation
+      thoughts.push(`FINAL VALIDATION: re-validated after all safety nets — ${finalValidation.passed ? '✅ PASSED' : `❌ ${finalValidation.issues.length} remaining issues`}`)
+    }
+  }
 
   const confidence = validation.passed ? 0.95 - (loopCount - 1) * 0.1 : 0.4
   thoughts.push(`DELIVER: ${steps.length} steps, confidence: ${confidence}`)

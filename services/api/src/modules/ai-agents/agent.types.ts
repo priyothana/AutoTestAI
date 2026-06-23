@@ -120,6 +120,24 @@ export interface FieldManifest {
    * e.g. "Create Lead", "Save", "Save & New"
    */
   submitButton?: string
+  /** The button used to trigger edit/update of an existing record (e.g., "Edit", "Update") */
+  triggerButton?: string
+  /** The button used to trigger delete/archive of an existing record (e.g., "Delete", "Remove") */
+  deleteButton?: string
+  /** The primary update/edit trigger button (e.g., "Edit") — alias for triggerButton */
+  updateButton?: string
+  /** The main search input label on the entity's list page (e.g., "Search Leads...") */
+  searchField?: string
+  /**
+   * Pre-computed CRUD workflow templates (create / update / delete).
+   * Each key contains trigger_button, required_fields, submit_button, navigate_to.
+   * Built at canonical sync time — eliminates LLM guessing about workflow structure.
+   */
+  actionFlows?: Record<string, unknown>
+  /** Example records to use for testing/validation */
+  sampleRecords?: Record<string, unknown>[]
+  /** Regex or path pattern to identify detail pages (e.g., "/leads/*") */
+  detailUrlPattern?: string
   allButtons?:   string[]         // all button names found on the page (verbatim)
   createUrl?:    string
   listUrl?:      string

@@ -1,12 +1,13 @@
 /**
  * HitlChatPanel — AI-powered Human-in-the-Loop chatbot panel.
  *
- * v4 — AI Step Proposal Acceptance:
- *   • Parses every AI reply for structured step proposals
- *     (NAVIGATE / ADD step / INSERT / LOOKUP / TYPE / CLICK etc.)
- *   • Renders an inline "Proposed Step" acceptance card beneath the AI bubble
- *   • One-click "✓ Accept & Resume Testing" immediately commits the step
- *   • Manual Add / Update / Delete forms still available in the Step Actions toolbar
+ * v5 — Seamless Auto-Resume + Structured Suggestions:
+ *   • Receives structured `suggestions[]` from backend (no regex parsing needed)
+ *   • Each suggestion renders as a numbered card with "Apply & Resume" button
+ *   • When LLM returns suggestion_type="valid" after user chat, auto-resumes
+ *     execution after showing a 1.2s feedback bubble
+ *   • Supports opType: insert | update | delete for all proposals
+ *   • Manual Add / Update / Delete forms still available as fallback
  */
 "use client"
 
@@ -26,15 +27,28 @@ import { Button } from "@/components/ui/button"
 
 type SuggestionType = "advice" | "valid" | "clarify" | "invalid"
 
+/** A structured suggestion from the backend with enough info to apply without parsing */
+interface SuggestionOption {
+    label:  string
+    action: string
+    target: string
+    value:  string
+    opType: "insert" | "update" | "delete"
+}
+
 type HitlMessage = {
-    role:              "user" | "assistant"
+    role:              "user" | "assistant" | "system"
     content:           string
     suggestion_type?:  SuggestionType
     suggested_action?: string
     quick_replies?:    string[]
     options?:          string[]
+    /** Structured suggestions from backend — preferred over options[] */
+    suggestions?:      SuggestionOption[]
     /** Extracted step proposal — populated automatically after parsing the reply */
     proposedStep?:     ProposedStep | null
+    /** Whether this is a feedback/status message (auto-resume notification) */
+    isFeedback?:       boolean
 }
 
 /** A step that the AI proposed and the user can accept with one click */
@@ -42,7 +56,7 @@ interface ProposedStep {
     action:      string   // NAVIGATE | CLICK | TYPE | LOOKUP | SELECT | …
     target:      string   // URL, field label, selector
     value?:      string   // typed value, selected option, etc.
-    opType:      "insert" | "update"  // add before OR patch current
+    opType:      "insert" | "update" | "delete"  // add before, patch current, or remove
     label:       string   // human-readable description shown in the card
 }
 
@@ -84,6 +98,10 @@ interface HitlChatPanelProps {
     onSkip:       () => Promise<void>
     onStop:       () => Promise<void>
     isActioning:  boolean
+    /** True while the test is in the paused state — panel watches this to auto-close when resumed */
+    isPaused?:    boolean
+    /** Called after the panel's slide-out animation finishes so the parent can unmount it */
+    onDismiss?:   () => void
     /** Current test steps (raw) — used to pre-populate the Update form */
     currentSteps?: { action: string; target: string; value: string; id?: string }[]
 }
@@ -106,6 +124,27 @@ const ACTION_OPTIONS = [
 //   "add a TYPE step to enter 'USD' in the Currency field"
 
 function parseProposedStep(text: string): ProposedStep | null {
+    // ── 0. Arrow format: "ACTION → target" (enforced in system prompt for options[]) ────────
+    // "NAVIGATE → /accounts"  |  "CLICK → '+ Add Account'"
+    const arrowRe = /^(NAVIGATE|CLICK|TYPE|SELECT|LOOKUP|WAIT|SCROLL|HOVER|ASSERT_TEXT|ASSERT_URL|ASSERT_VISIBLE|ASSERT_TOAST|CHECKBOX)\s*[\u2192>]\s*[\'"]?(.+?)[\'"]?\s*$/i
+    const arrowM = text.match(arrowRe)
+    if (arrowM) {
+        const action = arrowM[1].toUpperCase()
+        let target = arrowM[2].trim()
+        if (action === "NAVIGATE") {
+            target = target.replace(/\s+page\s*$/i, "").trim()
+            if (!target.startsWith("/") && !target.startsWith("http")) target = `/${target}`
+        }
+        return { action, target, value: "", opType: "insert" as const, label: `${action} to ${target}` }
+    }
+
+    // ── 0b. Bare quoted CLICK: CLICK '+ Add Account' ──────────────────────────────────
+    const bareClickRe = /^CLICK\s+[\'"+]([^\'"]*)[\'"]?\s*$/i
+    const bareClickM = text.match(bareClickRe)
+    if (bareClickM) {
+        const target = bareClickM[1].trim()
+        return { action: "CLICK", target, value: "", opType: "insert" as const, label: `Click "${target}"` }
+    }
 
     // ── 1. NAVIGATE ─────────────────────────────────────────────────────────
     // "Adding a NAVIGATE step to '/bank_details'"  |  "navigate to /bank-details"
@@ -222,6 +261,8 @@ export default function HitlChatPanel({
     onSkip,
     onStop,
     isActioning,
+    isPaused = true,
+    onDismiss,
     currentSteps = [],
 }: HitlChatPanelProps) {
     const [messages, setMessages]       = useState<HitlMessage[]>([])
@@ -249,11 +290,23 @@ export default function HitlChatPanel({
     const [updateValue, setUpdateValue]   = useState("")
 
     const [latestAiSuggestion, setLatestAiSuggestion] = useState<string | null>(null)
+    // Guard to prevent double-resume triggers (e.g., auto-resume + manual click racing)
+    const autoResumeInProgress = useRef(false)
 
     const inputRef  = useRef<HTMLInputElement>(null)
     const bottomRef = useRef<HTMLDivElement>(null)
 
     const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000"
+
+    const determineOpType = (action: string): "insert" | "update" => {
+        if (pausedStep != null && currentSteps && currentSteps.length >= pausedStep) {
+            const pausedStepObj = currentSteps[pausedStep - 1]
+            if (pausedStepObj && pausedStepObj.action?.toUpperCase() === action.toUpperCase()) {
+                return "update"
+            }
+        }
+        return "insert"
+    }
 
     // ── Mount guard + reset stale closing state ────────────────────────────
     useEffect(() => {
@@ -269,13 +322,31 @@ export default function HitlChatPanel({
         setAcceptingIdx(null)
     }, [runId])
 
+    // ── Auto-close with animation when parent reports test is no longer paused ───
+    const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    useEffect(() => {
+        if (!mounted) return
+        if (!isPaused) {
+            // Parent has resumed / skipped / stopped — start slide-out animation
+            setClosing(true)
+            // After animation (250ms + buffer) inform parent so it can unmount us cleanly
+            dismissTimerRef.current = setTimeout(() => {
+                onDismiss?.()
+            }, 320)
+        }
+        return () => {
+            if (dismissTimerRef.current) clearTimeout(dismissTimerRef.current)
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isPaused, mounted])
+
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" })
     }, [messages])
 
-    // ── Auto-focus ──────────────────────────────────────────────────────────
+    // ── Auto-focus (preventScroll stops browser skip-to-content from appearing) ──
     useEffect(() => {
-        if (mounted) setTimeout(() => inputRef.current?.focus(), 200)
+        if (mounted) setTimeout(() => inputRef.current?.focus({ preventScroll: true }), 200)
     }, [mounted])
 
     // ── Pre-populate Update fields from paused step ──────────────────────────
@@ -315,8 +386,12 @@ export default function HitlChatPanel({
             const reply = data.reply || "I'm analysing the failure..."
             // Prefer structured proposed_step from backend; fall back to text parsing
             const proposedStepFromApi = data.proposed_step
-                ? { ...data.proposed_step, opType: "insert" as const }
+                ? { ...data.proposed_step, opType: data.proposed_step.opType ?? determineOpType(data.proposed_step.action) }
                 : null
+            let proposed = proposedStepFromApi ?? parseProposedStep(reply)
+            if (proposed) {
+                proposed = { ...proposed, opType: proposed.opType ?? determineOpType(proposed.action) }
+            }
             setMessages([{
                 role:             "assistant",
                 content:          reply,
@@ -324,7 +399,8 @@ export default function HitlChatPanel({
                 suggested_action: data.suggested_action,
                 quick_replies:    data.quick_replies,
                 options:          data.options,
-                proposedStep:     proposedStepFromApi ?? parseProposedStep(reply),
+                suggestions:      data.suggestions,
+                proposedStep:     proposed,
             }])
         } catch {
             setMessages([{
@@ -368,17 +444,84 @@ export default function HitlChatPanel({
             const reply = data.reply || "Let me know what you see."
             // Prefer structured proposed_step from backend; fall back to text parsing
             const proposedStepFromApi = data.proposed_step
-                ? { ...data.proposed_step, opType: "insert" as const }
+                ? { ...data.proposed_step, opType: data.proposed_step.opType ?? determineOpType(data.proposed_step.action) }
                 : null
-            setMessages(prev => [...prev, {
+            let proposed = proposedStepFromApi ?? parseProposedStep(reply)
+            if (proposed) {
+                proposed = { ...proposed, opType: proposed.opType ?? determineOpType(proposed.action) }
+            }
+
+            const assistantMsg: HitlMessage = {
                 role:             "assistant",
                 content:          reply,
                 suggestion_type:  data.suggestion_type,
                 suggested_action: data.suggested_action,
                 quick_replies:    data.quick_replies,
                 options:          data.options,
-                proposedStep:     proposedStepFromApi ?? parseProposedStep(reply),
-            }])
+                suggestions:      data.suggestions,
+                proposedStep:     proposed,
+            }
+            setMessages(prev => [...prev, assistantMsg])
+
+            // ── Auto-resume when the LLM returns suggestion_type="valid" ──────────
+            // If the AI has confidently resolved the issue, automatically apply and
+            // resume execution after showing a brief feedback message. This avoids
+            // requiring an extra manual "Accept & Resume" button click.
+            if (
+                data.suggestion_type === "valid" &&
+                proposed &&
+                !autoResumeInProgress.current &&
+                !isActioning
+            ) {
+                autoResumeInProgress.current = true
+                // Show a friendly feedback bubble in the chat
+                const feedbackMsg: HitlMessage = {
+                    role:      "system",
+                    content:   `✅ Step ${pausedStep ?? "?"} ${proposed.opType === "delete" ? "removed" : proposed.opType === "update" ? "updated" : "updated with new step"}. Resuming test execution...`,
+                    isFeedback: true,
+                }
+                setMessages(prev => [...prev, feedbackMsg])
+                setClosing(true)
+                // Brief delay so the user can see the feedback before panel animates out
+                await new Promise(resolve => setTimeout(resolve, 1200))
+                try {
+                    if (proposed.opType === "delete") {
+                        await onResume({
+                            delete_step:      true,
+                            user_instruction: msg,
+                            ai_suggestion:    data.suggested_action ?? reply,
+                            paused_step:      pausedStep ?? undefined,
+                            test_case_id:     testCaseId,
+                        })
+                    } else if (proposed.opType === "update") {
+                        await onResume({
+                            step_override: {
+                                action: proposed.action,
+                                target: proposed.target,
+                                value:  proposed.value ?? "",
+                            },
+                            user_instruction: msg,
+                            ai_suggestion:    data.suggested_action ?? reply,
+                            paused_step:      pausedStep ?? undefined,
+                            test_case_id:     testCaseId,
+                        })
+                    } else {
+                        await onResume({
+                            insert_step: {
+                                action: proposed.action,
+                                target: proposed.target,
+                                value:  proposed.value ?? "",
+                            },
+                            user_instruction: msg,
+                            ai_suggestion:    data.suggested_action ?? reply,
+                            paused_step:      pausedStep ?? undefined,
+                            test_case_id:     testCaseId,
+                        })
+                    }
+                } finally {
+                    autoResumeInProgress.current = false
+                }
+            }
         } catch {
             setMessages(prev => [...prev, {
                 role:         "assistant",
@@ -392,34 +535,48 @@ export default function HitlChatPanel({
 
     // ── Accept AI-proposed step inline ────────────────────────────────────────
     const handleAcceptProposal = async (proposal: ProposedStep, msgIdx: number) => {
+        if (autoResumeInProgress.current) return  // prevent race with auto-resume
         setAcceptingIdx(msgIdx)
         setClosing(true)
-        const opts: HitlResumeOpts =
-            proposal.opType === "update"
-                ? {
-                    step_override: {
-                        action: proposal.action,
-                        target: proposal.target,
-                        value:  proposal.value ?? "",
-                    },
-                    user_instruction: proposal.label,
-                    ai_suggestion:    proposal.label,
-                    paused_step:      pausedStep ?? undefined,
-                    test_case_id:     testCaseId,
-                }
-                : {
-                    insert_step: {
-                        action: proposal.action,
-                        target: proposal.target,
-                        value:  proposal.value ?? "",
-                    },
-                    user_instruction: proposal.label,
-                    ai_suggestion:    proposal.label,
-                    paused_step:      pausedStep ?? undefined,
-                    test_case_id:     testCaseId,
-                }
-        await onResume(opts)
-        setAcceptingIdx(null)
+        let opts: HitlResumeOpts
+        if (proposal.opType === "delete") {
+            opts = {
+                delete_step:      true,
+                user_instruction: proposal.label,
+                ai_suggestion:    proposal.label,
+                paused_step:      pausedStep ?? undefined,
+                test_case_id:     testCaseId,
+            }
+        } else if (proposal.opType === "update") {
+            opts = {
+                step_override: {
+                    action: proposal.action,
+                    target: proposal.target,
+                    value:  proposal.value ?? "",
+                },
+                user_instruction: proposal.label,
+                ai_suggestion:    proposal.label,
+                paused_step:      pausedStep ?? undefined,
+                test_case_id:     testCaseId,
+            }
+        } else {
+            opts = {
+                insert_step: {
+                    action: proposal.action,
+                    target: proposal.target,
+                    value:  proposal.value ?? "",
+                },
+                user_instruction: proposal.label,
+                ai_suggestion:    proposal.label,
+                paused_step:      pausedStep ?? undefined,
+                test_case_id:     testCaseId,
+            }
+        }
+        try {
+            await onResume(opts)
+        } finally {
+            setAcceptingIdx(null)
+        }
     }
 
     // ── Manual form helpers ──────────────────────────────────────────────────
@@ -565,7 +722,7 @@ export default function HitlChatPanel({
                                 </span>
                             </div>
                             <p className="text-[10px] text-amber-300 mt-0.5 font-medium truncate">
-                                Test Paused — Step {pausedStep ?? "?"} needs action
+                                Test Paused at Step {pausedStep ?? "?"} — AI Assistant
                             </p>
                         </div>
                     </div>
@@ -633,6 +790,22 @@ export default function HitlChatPanel({
 
                     {messages.map((msg, idx) => (
                         <div key={idx}>
+                            {/* System feedback bubble (auto-resume notification) */}
+                            {msg.role === "system" && msg.isFeedback && (
+                                <div className="flex justify-center my-1">
+                                    <div
+                                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-semibold"
+                                        style={{
+                                            background:  "linear-gradient(135deg, rgba(22,163,74,0.15), rgba(15,23,42,0.1))",
+                                            border:      "1px solid rgba(34,197,94,0.4)",
+                                            color:       "#4ade80",
+                                        }}
+                                    >
+                                        <Loader2 className="h-3 w-3 animate-spin" />
+                                        {msg.content}
+                                    </div>
+                                </div>
+                            )}
                             {msg.role === "user" ? (
                                 <div className="flex justify-end">
                                     <div
@@ -710,7 +883,13 @@ export default function HitlChatPanel({
 
                                                 {/* Step insertion note */}
                                                 <p className="px-3 pb-2 text-[9px] text-emerald-700 dark:text-emerald-500">
-                                                    Will be inserted <strong>before</strong> Step {pausedStep} and executed first
+                                                    {msg.proposedStep.opType === "delete" ? (
+                                                        <>Will <strong>remove</strong> Step {pausedStep} and skip it</>
+                                                    ) : msg.proposedStep.opType === "update" ? (
+                                                        <>Will <strong>update</strong> Step {pausedStep} in-place and re-run</>
+                                                    ) : (
+                                                        <>Will be inserted <strong>before</strong> Step {pausedStep} and executed first</>
+                                                    )}
                                                 </p>
 
                                                 {/* CTA buttons */}
@@ -739,20 +918,101 @@ export default function HitlChatPanel({
                                             </div>
                                         )}
 
-                                        {/* ── AI Options (Accept & Resume cards) ─────────────────
-                                            Shown when AI returns options[] \u2014 each option is an
-                                            actionable resolution the user can apply in one click.
+                                        {/* ── Structured Suggestion Cards ────────────────────────
+                                            Preferred rendering when backend returns suggestions[].
+                                            Each item has full structured data (action/target/value/opType)
+                                            so we can apply the change directly without any regex parsing.
                                         ─────────────────────────────────────────────────────── */}
-                                        {msg.options && msg.options.length > 0 && !msg.proposedStep && (
+                                        {msg.suggestions && msg.suggestions.length > 0 && !msg.proposedStep && (
+                                            <div className="flex flex-col gap-2 max-w-[96%]">
+                                                {msg.suggestions.map((sug, si) => {
+                                                    const proposal: ProposedStep = {
+                                                        action: sug.action,
+                                                        target: sug.target,
+                                                        value:  sug.value,
+                                                        opType: sug.opType,
+                                                        label:  sug.label,
+                                                    }
+                                                    const col = getActionColor(sug.action)
+                                                    const actionKey = idx * 1000 + si
+                                                    const opLabel =
+                                                        sug.opType === "delete" ? "Remove step" :
+                                                        sug.opType === "update" ? "Update step" :
+                                                        "Insert before step"
+                                                    return (
+                                                        <div
+                                                            key={si}
+                                                            className="rounded-xl overflow-hidden border"
+                                                            style={{
+                                                                borderColor: "rgba(34,197,94,0.35)",
+                                                                background: "linear-gradient(135deg, rgba(22,163,74,0.04), rgba(15,23,42,0.02))",
+                                                            }}
+                                                        >
+                                                            {/* Card header: number badge + action badge + op label */}
+                                                            <div className="flex items-center gap-2 px-3 py-1.5" style={{ background: "rgba(22,163,74,0.07)" }}>
+                                                                <span
+                                                                    className="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-black text-white"
+                                                                    style={{ background: "linear-gradient(135deg, #d97706, #b45309)" }}
+                                                                >
+                                                                    {si + 1}
+                                                                </span>
+                                                                <span
+                                                                    className="flex-shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold"
+                                                                    style={{
+                                                                        background: `${col.bg}22`,
+                                                                        border:     `1px solid ${col.border}`,
+                                                                        color:      col.text,
+                                                                    }}
+                                                                >
+                                                                    {getActionIcon(sug.action)}
+                                                                    {sug.action}
+                                                                </span>
+                                                                <span className="text-[9px] text-gray-400 dark:text-gray-500 ml-auto">{opLabel}</span>
+                                                            </div>
+
+                                                            {/* Card body: label + target/value */}
+                                                            <div className="px-3 py-2">
+                                                                <p className="text-[11px] text-gray-700 dark:text-gray-200 font-medium leading-snug">
+                                                                    {sug.label}
+                                                                </p>
+                                                                {(sug.target || sug.value) && (
+                                                                    <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5 font-mono truncate">
+                                                                        {sug.target}{sug.value ? ` = "${sug.value}"` : ""}
+                                                                    </p>
+                                                                )}
+                                                            </div>
+
+                                                            {/* Apply & Resume button */}
+                                                            <Button
+                                                                id={`hitl-suggestion-apply-${idx}-${si}`}
+                                                                size="sm"
+                                                                className="w-full rounded-none h-8 text-[11px] font-bold gap-1.5"
+                                                                style={{ background: "linear-gradient(135deg, #16a34a, #15803d)" }}
+                                                                onClick={() => handleAcceptProposal(proposal, actionKey)}
+                                                                disabled={isActioning || acceptingIdx !== null || autoResumeInProgress.current}
+                                                            >
+                                                                {acceptingIdx === actionKey
+                                                                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                                    : <Check className="h-3.5 w-3.5" />}
+                                                                Apply &amp; Resume
+                                                            </Button>
+                                                        </div>
+                                                    )
+                                                })}
+                                            </div>
+                                        )}
+
+                                        {/* ── Legacy AI Options (fallback when suggestions[] absent) ──
+                                            Shown when AI returns options[] but no suggestions[].
+                                            Each option is parsed via parseProposedStep() for an
+                                            "Apply & Resume" button, or sent as chat if unparseable.
+                                        ─────────────────────────────────────────────────────── */}
+                                        {msg.options && msg.options.length > 0 && !msg.proposedStep && !msg.suggestions?.length && (
                                             <div className="flex flex-col gap-2 max-w-[96%]">
                                                 {msg.options.map((opt, oi) => {
                                                     const parsed = parseProposedStep(opt)
-                                                    const proposal: ProposedStep = parsed ?? {
-                                                        action: "NAVIGATE",
-                                                        target: opt,
-                                                        value:  "",
-                                                        opType: "insert",
-                                                        label:  opt,
+                                                    if (parsed) {
+                                                        parsed.opType = determineOpType(parsed.action)
                                                     }
                                                     return (
                                                         <div
@@ -763,19 +1023,33 @@ export default function HitlChatPanel({
                                                             <p className="px-3 py-2 text-[11px] text-gray-700 dark:text-gray-300 leading-relaxed">
                                                                 {opt}
                                                             </p>
-                                                            <Button
-                                                                id={`hitl-option-apply-${idx}-${oi}`}
-                                                                size="sm"
-                                                                className="w-full rounded-none h-8 text-[11px] font-bold gap-1.5"
-                                                                style={{ background: "linear-gradient(135deg, #16a34a, #15803d)" }}
-                                                                onClick={() => handleAcceptProposal(proposal, idx * 100 + oi)}
-                                                                disabled={isActioning || acceptingIdx !== null}
-                                                            >
-                                                                {acceptingIdx === idx * 100 + oi
-                                                                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                                                    : <Check className="h-3.5 w-3.5" />}
-                                                                Accept &amp; Resume Testing
-                                                            </Button>
+                                                            {parsed ? (
+                                                                <Button
+                                                                    id={`hitl-option-apply-${idx}-${oi}`}
+                                                                    size="sm"
+                                                                    className="w-full rounded-none h-8 text-[11px] font-bold gap-1.5"
+                                                                    style={{ background: "linear-gradient(135deg, #16a34a, #15803d)" }}
+                                                                    onClick={() => handleAcceptProposal(parsed, idx * 100 + oi)}
+                                                                    disabled={isActioning || acceptingIdx !== null}
+                                                                >
+                                                                    {acceptingIdx === idx * 100 + oi
+                                                                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                                        : <Check className="h-3.5 w-3.5" />}
+                                                                    Apply &amp; Resume Testing
+                                                                </Button>
+                                                            ) : (
+                                                                <Button
+                                                                    id={`hitl-option-select-${idx}-${oi}`}
+                                                                    size="sm"
+                                                                    variant="outline"
+                                                                    className="w-full rounded-none h-8 text-[11px] font-medium gap-1.5 border-t border-emerald-200 dark:border-emerald-800"
+                                                                    onClick={() => handleSend(opt)}
+                                                                    disabled={isActioning || isSending}
+                                                                >
+                                                                    <ChevronRight className="h-3.5 w-3.5" />
+                                                                    Select this option
+                                                                </Button>
+                                                            )}
                                                         </div>
                                                     )
                                                 })}

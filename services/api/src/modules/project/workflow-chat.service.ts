@@ -13,6 +13,9 @@ import type { BaseChatModel }    from '@langchain/core/language_models/chat_mode
 import prisma                    from '../../shared/db/prisma.js'
 import { createModuleLogger }    from '../../shared/logger/index.js'
 import { buildFieldManifest, autoCorrectButtonNames } from '../ai-agents/tools/metadata-reader.tool.js'
+import { getRepoConnection } from '../webapp/repository-metadata-extractor.service.js'
+import { fetchJiraStoriesForProject } from '../test-case-generator/test-case-generator.service.js'
+
 
 const log = createModuleLogger('workflow-chat')
 
@@ -550,6 +553,7 @@ async function getProjectContext(projectId: string): Promise<{
   }
 
   // ── Build metadata summary: multi-tier priority ──────────────────────────
+  //   Tier 0: Repository canonical records (source='repository') — highest priority
   //   Tier 1: domain_models with testing_rules (richest — includes page structure)
   //   Tier 2: metadata_normalized structured_json (full page details)
   //   Tier 3: metadata_raw_store page paths (crawled URLs)
@@ -563,43 +567,58 @@ async function getProjectContext(projectId: string): Promise<{
     ? projectDescLines.join('\n') + '\n\n'
     : ''
 
-  let metaSummary = '(no metadata synced yet — run Sync Metadata first)'
+  let metaSummary = ''
 
-  // ── Jira stories context (best-effort) ──────────────────────────────────
-  let jiraStoriesSummary = ''
+
+  // ── Repository Metadata (Tier 0) ─────────────────────────────────────────
+  // When a repository is connected AND has been synced, its canonical records
+  // (source='repository') are the most accurate reflection of the actual UI.
+  // These include form fields parsed directly from JSX/TSX/Vue source.
+  let repoMetaSection = ''
   try {
-    if (jiraIntegration?.jira_token && jiraIntegration.jira_domain && jiraIntegration.jira_board_id) {
-      const { fernetDecrypt } = await import('../../shared/encryption/fernet.js')
-      const token   = fernetDecrypt(jiraIntegration.jira_token)
-      const domain  = jiraIntegration.jira_domain
-      const boardId = jiraIntegration.jira_board_id
-      const authHeader = 'Basic ' + Buffer.from(`${jiraIntegration.jira_email}:${token}`).toString('base64')
-      const url = `${domain}/rest/agile/1.0/board/${boardId}/issue?maxResults=50&fields=summary,description,issuetype,status`
-      const resp = await fetch(url, {
-        headers: { Authorization: authHeader, Accept: 'application/json', 'Content-Type': 'application/json' },
-      })
-      if (resp.ok) {
-        const data = (await resp.json()) as any
-        const issues: any[] = data.issues ?? []
-        if (issues.length > 0) {
-          const lines = issues.slice(0, 40).map((i: any) => {
-            const summary = i.fields?.summary ?? ''
-            const desc = typeof i.fields?.description === 'string'
-              ? i.fields.description.slice(0, 120)
-              : (i.fields?.description?.content ?? [])
-                  .flatMap((b: any) => (b.content ?? []).map((c: any) => c.text ?? ''))
-                  .join(' ')
-                  .slice(0, 120)
-            return `  • [${i.key}] ${summary}${desc ? ` — ${desc}` : ''}`
-          })
-          jiraStoriesSummary = `JIRA STORIES (${issues.length} total):\n${lines.join('\n')}`
-          log.info({ projectId, count: issues.length }, '[WORKFLOW] Jira stories loaded for context')
+    const repoConn = await getRepoConnection(projectId)
+    if (repoConn && (repoConn.status === 'connected' || repoConn.status === 'syncing')) {
+      const repoCanonicals = await prisma.$queryRaw<Array<{
+        entity_name: string
+        form_fields: unknown
+        primary_action_button: string | null
+        all_buttons: unknown
+        page_url: string | null
+        last_synced_at: string | null
+      }>>`
+        SELECT entity_name, form_fields, primary_action_button, all_buttons, page_url, last_synced_at
+        FROM metadata_canonical
+        WHERE project_id = ${projectId}::uuid AND source = 'repository'
+        ORDER BY entity_name
+        LIMIT 50
+      `
+
+      if (repoCanonicals.length > 0) {
+        const lines: string[] = [`REPOSITORY SOURCE ENTITIES (${repoCanonicals.length} entities — parsed directly from source code):`]
+        for (const canon of repoCanonicals) {
+          const fields = Array.isArray(canon.form_fields)
+            ? (canon.form_fields as Array<{ label: string; type: string; required: boolean }>)
+            : []
+          const buttons = Array.isArray(canon.all_buttons) ? (canon.all_buttons as string[]) : []
+          const required = fields.filter(f => f.required).map(f => `${f.label} (${f.type})`)
+          const optional = fields.filter(f => !f.required).map(f => `${f.label}`)
+          let line = `  • ${canon.entity_name}`
+          if (canon.page_url) line += ` [${canon.page_url}]`
+          if (required.length > 0) line += `\n    required fields: ${required.slice(0, 10).join(', ')}`
+          if (optional.length > 0) line += `\n    optional fields: ${optional.slice(0, 8).join(', ')}`
+          if (buttons.length > 0) line += `\n    buttons: ${buttons.slice(0, 6).join(', ')}`
+          lines.push(line)
         }
+        repoMetaSection = lines.join('\n')
+        log.info({ projectId, entityCount: repoCanonicals.length }, '[WORKFLOW] Repository metadata loaded')
       }
     }
-  } catch (jiraErr) {
-    log.warn({ jiraErr }, '[WORKFLOW] Jira stories fetch failed — continuing without')
+  } catch (repoErr) {
+    log.warn({ repoErr }, '[WORKFLOW] Repository metadata check failed — continuing with crawler metadata')
   }
+
+  // ── Crawler Metadata (Tiers 1-4) ─────────────────────────────────────────
+  let crawlerSection = ''
 
   // ── Tier 1: domain_models with testing_rules ─────────────────────────────
   const domainModels = await prisma.domain_models.findMany({
@@ -671,8 +690,7 @@ async function getProjectContext(projectId: string): Promise<{
       lines.push(line)
     }
 
-    const rawMeta = `${projectIdentity}APPLICATION MODULES & PAGES (from crawl metadata, ${byPath.size} pages):\n${lines.join('\n')}`
-    metaSummary = capMeta(rawMeta)
+    crawlerSection = `APPLICATION MODULES & PAGES (from crawl metadata, ${byPath.size} pages):\n${lines.join('\n')}`
 
   } else {
     // ── Tier 2: metadata_normalized structured_json ───────────────────────
@@ -715,7 +733,7 @@ async function getProjectContext(projectId: string): Promise<{
         }
       }
 
-      metaSummary = capMeta(projectIdentity + lines.join('\n'))
+      crawlerSection = lines.join('\n')
 
     } else {
       // ── Tier 3: raw crawl page list ────────────────────────────────────
@@ -742,7 +760,7 @@ async function getProjectContext(projectId: string): Promise<{
           if (buttonNames.length > 0) line += `\n    buttons: ${buttonNames.join(', ')}`
           lines.push(line)
         }
-        metaSummary = capMeta(projectIdentity + lines.join('\n'))
+        crawlerSection = lines.join('\n')
       } else {
         // ── Tier 4: Salesforce object list fallback ─────────────────────
         const normalised = await prisma.metadata_normalized.findMany({
@@ -757,9 +775,19 @@ async function getProjectContext(projectId: string): Promise<{
           // No crawled metadata at all but we have project description/type —
           // use that so the LLM can infer the correct domain.
           metaSummary = projectIdentity + '(no crawled metadata available — derive workflows from the project description above)'
-          log.warn({ projectId }, '[WORKFLOW] No metadata found — using project description for context')
         }
       }
+    }
+  }
+
+  // Combine repo metadata and crawler metadata if not already populated (e.g. Salesforce)
+  if (!metaSummary) {
+    metaSummary = projectIdentity
+    if (repoMetaSection) {
+      metaSummary += repoMetaSection + '\n\n'
+    }
+    if (crawlerSection) {
+      metaSummary += crawlerSection
     }
   }
 
@@ -821,6 +849,17 @@ async function getProjectContext(projectId: string): Promise<{
   // Existing tests content — stored on the project row
   const resolvedExistingTests = project?.existing_tests_content ?? ''
 
+  let jiraStoriesSummary = ''
+  try {
+    const stories = await fetchJiraStoriesForProject(projectId)
+    if (stories.length > 0) {
+      jiraStoriesSummary = 'JIRA USER STORIES:\n' + stories.map(s => `  • [${s.key}] ${s.summary}\n    ${s.description}`).join('\n')
+    }
+  } catch (err) {
+    log.warn({ err }, '[WORKFLOW] Failed to fetch Jira stories — continuing without')
+  }
+
+
   // ── Inject confirmed test-data entities into metadata summary ─────────────
   // These are the DEFINITIVE entity list — the scraper confirmed they exist.
   // They MUST appear in the metadata summary so the LLM generates workflows
@@ -878,10 +917,11 @@ export interface BusinessFlow {
 export async function generateBusinessFlows(
   projectId: string,
   brdContent?: string,
+  existingTestsContent?: string,
 ): Promise<{ flows: BusinessFlow[] }> {
   const ctx = await getProjectContext(projectId)
   const brd = decodeDocContent(brdContent ?? ctx.brdContent, 15000)
-  const existingTests = decodeDocContent(ctx.existingTestsContent)
+  const existingTests = decodeDocContent(existingTestsContent ?? ctx.existingTestsContent)
 
   // ── Detect crawler-unreachable BRD entities (project-agnostic) ─────────────
   // Parse ALL entities from the BRD (any domain — CRM, Logistics, ERP, Healthcare…)
@@ -1178,11 +1218,12 @@ export async function workflowRefinementChat(params: {
   history:     ChatMessage[]
   userMessage: string
   brdContent?: string
+  existingTestsContent?: string
 }): Promise<WorkflowChatResponse> {
-  const { projectId, flow, history, userMessage, brdContent } = params
+  const { projectId, flow, history, userMessage, brdContent, existingTestsContent } = params
   const ctx = await getProjectContext(projectId)
   const brd = decodeDocContent(brdContent ?? ctx.brdContent)
-  const existingTests = decodeDocContent(ctx.existingTestsContent)
+  const existingTests = decodeDocContent(existingTestsContent ?? ctx.existingTestsContent)
 
   const historyText = history
     .slice(-12)
@@ -1421,11 +1462,12 @@ export async function generateTestSuite(params: {
   projectId:  string
   flows:      string[]
   brdContent?: string
+  existingTestsContent?: string
 }): Promise<GenerateTestSuiteResult> {
-  const { projectId, flows, brdContent } = params
+  const { projectId, flows, brdContent, existingTestsContent } = params
   const ctx = await getProjectContext(projectId)
   const brd = decodeDocContent(brdContent ?? ctx.brdContent, 15000)
-  const existingTests = decodeDocContent(ctx.existingTestsContent)
+  const existingTests = decodeDocContent(existingTestsContent ?? ctx.existingTestsContent)
 
   const llm    = buildLlm()
   const parser = new StringOutputParser()

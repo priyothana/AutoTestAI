@@ -44,6 +44,7 @@ import {
   JiraBoardIssuesSchema,
   JiraProjectConfigSchema,
   KeycloakTokenSchema,
+  RepoConnectionSchema,
 } from './project.schema.js'
 import * as svc from './project.service.js'
 import {
@@ -60,10 +61,20 @@ import {
   clearTestData,
   deleteTestDataEntity,
 } from '../webapp/webapp-test-data.service.js'
+import {
+  saveRepoConnection,
+  getRepoConnection,
+  deleteRepoConnection,
+  syncRepoMetadata,
+  hasRepoConnection,
+} from '../webapp/repository-metadata-extractor.service.js'
 import prisma from '../../shared/db/prisma.js'
+import { createModuleLogger } from '../../shared/logger/index.js'
 
+const log = createModuleLogger('project-routes')
 
 /** Tiny helper — re-throw platform errors as Fastify HTTP replies */
+
 function handleErr(err: any, reply: any) {
   if (err?.statusCode) return reply.status(err.statusCode).send({ detail: err.message })
   throw err
@@ -254,14 +265,38 @@ export async function projectRoutes(app: FastifyInstance) {
 
   // ── Web App Metadata Sync ─────────────────────────────────────────────────
   // POST /api/v1/projects/:id/sync-webapp-metadata
-  // Enqueues a Playwright crawl + normalize + domain-build + embed job on the
-  // metadata-sync-queue (same worker, different pipeline branch).
-  // Returns immediately with status='queued' or 'completed' (inline fallback).
+  //
+  // Priority chain:
+  //   1. Repository extractor (highest priority) — if a repo is connected
+  //   2. Playwright crawler (always runs as safety-net fallback)
+  //
+  // Returns immediately with combined results from both sources.
   app.post('/projects/:id/sync-webapp-metadata', async (request, reply) => {
     try {
       const { id } = request.params as { id: string }
-      const result = await syncWebappMetadata(id)
-      return reply.send(result)
+
+      let repoResult: { success: boolean; files_indexed: number; entities_extracted: number; message: string; warning?: string } | null = null
+
+      // ── Priority 1: Repository sync ────────────────────────────────────────
+      const repoConnected = await hasRepoConnection(id)
+      if (repoConnected) {
+        log.info({ projectId: id }, '[SYNC] Repository connected — running repo extractor first')
+        repoResult = await syncRepoMetadata(id)
+        if (repoResult.success) {
+          log.info({ projectId: id, ...repoResult }, '[SYNC] Repository sync succeeded')
+        } else {
+          log.warn({ projectId: id, message: repoResult.message }, '[SYNC] Repository sync failed — continuing with crawler')
+        }
+      }
+
+      // ── Priority 2: Playwright crawler (always runs) ───────────────────────
+      const crawlerResult = await syncWebappMetadata(id)
+
+      // Combine results
+      return reply.send({
+        ...crawlerResult,
+        repo_sync: repoResult ?? null,
+      })
     } catch (err: any) {
       return handleErr(err, reply)
     }
@@ -793,8 +828,8 @@ export async function projectRoutes(app: FastifyInstance) {
   app.post('/projects/:id/generate-workflows', async (request, reply) => {
     try {
       const { id } = request.params as { id: string }
-      const body = request.body as { brdContent?: string }
-      const result = await generateBusinessFlows(id, body.brdContent)
+      const body = request.body as { brdContent?: string; existingTestsContent?: string }
+      const result = await generateBusinessFlows(id, body.brdContent, body.existingTestsContent)
       return reply.send(result)
     } catch (err: any) {
       return handleErr(err, reply)
@@ -812,6 +847,7 @@ export async function projectRoutes(app: FastifyInstance) {
         history:     { role: 'user' | 'assistant'; content: string }[]
         userMessage: string
         brdContent?: string
+        existingTestsContent?: string
       }
       const result = await workflowRefinementChat({
         projectId:   id,
@@ -819,6 +855,7 @@ export async function projectRoutes(app: FastifyInstance) {
         history:     body.history ?? [],
         userMessage: body.userMessage,
         brdContent:  body.brdContent,
+        existingTestsContent: body.existingTestsContent,
       })
       return reply.send(result)
     } catch (err: any) {
@@ -856,7 +893,7 @@ export async function projectRoutes(app: FastifyInstance) {
   app.post('/projects/:id/generate-test-suite', async (request, reply) => {
     try {
       const { id } = request.params as { id: string }
-      const body = request.body as { flows: string[]; brdContent?: string }
+      const body = request.body as { flows: string[]; brdContent?: string; existingTestsContent?: string }
       if (!Array.isArray(body.flows) || body.flows.length === 0) {
         return reply.status(400).send({ error: 'flows array is required' })
       }
@@ -864,6 +901,7 @@ export async function projectRoutes(app: FastifyInstance) {
         projectId:  id,
         flows:      body.flows,
         brdContent: body.brdContent,
+        existingTestsContent: body.existingTestsContent,
       })
       return reply.send(result)
     } catch (err: any) {
@@ -971,6 +1009,86 @@ export async function projectRoutes(app: FastifyInstance) {
         success: true,
         message: 'Keycloak session cleared. Login strategy reset to form-based.',
       })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // ─── Repository Connection ─────────────────────────────────────────────────
+
+  /**
+   * POST /api/v1/projects/:id/repo-connect
+   * Save or update repository connection credentials.
+   * Access token is Fernet-encrypted before storage.
+   */
+  app.post('/projects/:id/repo-connect', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const body = RepoConnectionSchema.parse(request.body)
+      await saveRepoConnection(id, {
+        repo_url:     body.repo_url,
+        branch:       body.branch,
+        access_token: body.access_token ?? null,
+        provider:     body.provider,
+      })
+      return reply.status(201).send({
+        success: true,
+        message: 'Repository connected successfully. Run "Sync Metadata" to index source files.',
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  /**
+   * GET /api/v1/projects/:id/repo-status
+   * Return current repository connection status (without the encrypted token).
+   */
+  app.get('/projects/:id/repo-status', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const conn = await getRepoConnection(id)
+      if (!conn) {
+        return reply.send({ connected: false, repo_url: null, branch: null, provider: null, status: 'disconnected' })
+      }
+      return reply.send({
+        connected: conn.status === 'connected' || conn.status === 'syncing',
+        repo_url:       conn.repo_url,
+        branch:         conn.branch,
+        provider:       conn.provider,
+        status:         conn.status,
+        last_synced_at: conn.last_synced_at,
+        sync_error:     conn.sync_error,
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  /**
+   * DELETE /api/v1/projects/:id/repo-disconnect
+   * Remove the repository connection and all repo-sourced metadata.
+   */
+  app.delete('/projects/:id/repo-disconnect', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      await deleteRepoConnection(id)
+      return reply.send({ success: true, message: 'Repository disconnected and repo metadata removed.' })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  /**
+   * POST /api/v1/projects/:id/sync-repo-metadata
+   * Trigger a standalone repository sync (without running the Playwright crawler).
+   * Useful for quick re-syncs when only the source code has changed.
+   */
+  app.post('/projects/:id/sync-repo-metadata', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const result = await syncRepoMetadata(id)
+      return reply.status(result.success ? 200 : 500).send(result)
     } catch (err: any) {
       return handleErr(err, reply)
     }
