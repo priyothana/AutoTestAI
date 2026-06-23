@@ -342,13 +342,14 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
     where: { project_id: projectId, metadata_type: 'webpage' },
   })
 
-  if (existing && isContinuation) {
-    // Append-mode: merge new pages with previously crawled pages
+  if (existing) {
+    // Always merge: accumulate pages across all runs (first run + continuations).
+    // URL-deduplicate so re-crawled pages update in place.
     const previousData = (existing.raw_json ?? {}) as { base_url?: string; pages?: PageMetadata[] }
     const previousPages = previousData.pages ?? []
     const newPages = crawlResult.pages
 
-    // De-duplicate by URL
+    // De-duplicate by URL — newer data from this run takes precedence
     const existingUrls = new Set(previousPages.map((p: PageMetadata) => p.url))
     const dedupedNew = newPages.filter((p) => !existingUrls.has(p.url))
 
@@ -364,19 +365,9 @@ export async function crawlAndStoreRaw(projectId: string, isContinuation = false
     })
 
     log.info(
-      `[WEB-SYNC] Appended ${dedupedNew.length} new pages ` +
+      `[WEB-SYNC] Merged ${dedupedNew.length} new pages ` +
       `(total: ${mergedData.pages.length}) for project ${projectId}`
     )
-  } else if (existing) {
-    // First run — full replace
-    await prisma.metadata_raw_store.update({
-      where: { id: existing.id },
-      data:  { raw_json: {
-        base_url: crawlResult.base_url,
-        pages:    crawlResult.pages,
-        stats:    crawlResult.stats,
-      } as object },
-    })
   } else {
     await prisma.metadata_raw_store.create({
       data: {
@@ -535,6 +526,17 @@ export async function normalizeWebappMetadata(projectId: string): Promise<number
         options:      s.options ?? [],
       })),
       testids: pm.testids,
+      // ── Modal metadata passthrough ──────────────────────────────────────────
+      // Carry source='modal'/'popup' and trigger button info through to the canonical builder
+      // so it can derive the correct entity name and set entity_type='modal_form'.
+      ...(pm.source === 'modal' || pm.source === 'popup' || pm.is_modal ? {
+        source:                  (pm.source as 'modal' | 'popup') ?? 'modal',
+        is_modal:                true,
+        modal_trigger_button:    pm.modal_trigger_button,
+        modal_parent_url:        pm.modal_parent_url,
+        modal_depth:             pm.modal_depth ?? 1,
+        ...(pm.drawer_trigger_button ? { drawer_trigger_button: pm.drawer_trigger_button } : {}),
+      } : {}),
     }))
 
     const structured = { base_url: baseUrl, pages: normalizedPages }
@@ -715,6 +717,45 @@ export async function buildWebappDomainModels(projectId: string): Promise<number
           required_count: inputs.filter((i) => i['required']).length,
           total_inputs:   inputs.length,
           description:    `Fill all required fields on '${path}' and submit the form`,
+        })
+      }
+
+      // ── Modal/Drawer/Popup: add trigger_sequence rule ─────────────────────
+      // For pages discovered via interactive crawling (dialogs, drawers, popups),
+      // record the full navigation chain so test generation knows the workflow:
+      //   "Navigate to /leads → Click 'New Lead' → Fill modal form → Click Save"
+      const isModalPage = Boolean(page['is_modal']) || path.includes('/__modal__/')
+        || String(page['source'] ?? '') === 'popup'
+      if (isModalPage) {
+        const triggerBtn = String(page['modal_trigger_button'] ?? '')
+        const parentUrl  = String(page['modal_parent_url'] ?? '')
+        const depth      = Number(page['modal_depth'] ?? 1)
+        const submitBtn  = buttons.find(b => {
+          const n = String(b['name'] ?? '').toLowerCase()
+          return n.includes('save') || n.includes('submit') || n.includes('create') || n.includes('ok')
+        })
+
+        const triggerStep = triggerBtn ? `Click '${triggerBtn}'` : 'Open dialog'
+        const submitStep  = submitBtn  ? `Click '${String(submitBtn['name'] ?? 'Save')}'` : 'Submit form'
+        const parentPath  = parentUrl  ? (() => { try { return new URL(parentUrl).pathname } catch { return parentUrl } })() : ''
+
+        const triggerSequence: string[] = []
+        if (parentPath) triggerSequence.push(`Navigate to ${parentPath}`)
+        triggerSequence.push(triggerStep)
+        if (inputs.length > 0 || selects.length > 0) {
+          triggerSequence.push(`Fill form fields (${inputs.filter(i => i['required']).length} required)`)
+        }
+        triggerSequence.push(submitStep)
+
+        actions.push('open_modal', 'fill_modal_form', 'submit_modal')
+        testingRules.push({
+          type:             'modal_workflow_test',
+          trigger_button:   triggerBtn,
+          parent_url:       parentUrl,
+          modal_depth:      depth,
+          trigger_sequence: triggerSequence,
+          source:           String(page['source'] ?? 'modal'),
+          description:      `Full modal workflow: ${triggerSequence.join(' → ')}`,
         })
       }
 

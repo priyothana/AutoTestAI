@@ -141,6 +141,11 @@ export interface CrawlState {
   lastRunAt: string
   /** How many incremental runs have completed */
   runCount: number
+  /**
+   * Persisted Playwright session cookies from the last successful login.
+   * Restored on continuation runs to skip repeating the pre-warm login form.
+   */
+  sessionStorage?: { cookies: any[] }
 }
 
 /** Test-Case Generation queue — consumed by test-case-generator.worker.ts */

@@ -176,6 +176,20 @@ export const JiraProjectConfigSchema = z.object({
   board_name: z.string().optional(),
 })
 
+// ─── Repository Connection ────────────────────────────────────────
+
+/**
+ * Body for POST /api/v1/projects/:id/repo-connect
+ * Saves repository credentials so the extractor service can fetch
+ * source files from GitHub / GitLab / Bitbucket.
+ */
+export const RepoConnectionSchema = z.object({
+  repo_url:     z.string().url('Repository URL must be a valid URL'),
+  branch:       z.string().default('main'),
+  access_token: z.string().optional().nullable(),
+  provider:     z.enum(['github', 'gitlab', 'bitbucket']).default('github'),
+})
+
 // ─── Type Exports ────────────────────────────────────────────────
 
 export type ProjectCreate = z.infer<typeof ProjectCreateSchema>
@@ -187,3 +201,4 @@ export type IntegrationStatusResponse = z.infer<typeof IntegrationStatusResponse
 export type JiraConnect = z.infer<typeof JiraConnectSchema>
 export type JiraProjectConfig = z.infer<typeof JiraProjectConfigSchema>
 export type KeycloakToken = z.infer<typeof KeycloakTokenSchema>
+export type RepoConnection = z.infer<typeof RepoConnectionSchema>

@@ -57,6 +57,10 @@ const GenerateStepsForSelectedSchema = z.object({
   /** Optional: module that was selected when these test cases were generated.
    *  Passed back so step generation stays scoped to the same module. */
   selectedModule: z.string().max(200).optional(),
+  /** Optional: BRD content passed in request */
+  brdContent:     z.string().max(50_000).optional(),
+  /** Optional: existing tests content passed in request */
+  existingTestsContent: z.string().max(30_000).optional(),
 })
 
 // ── Route plugin ─────────────────────────────────────────────────────────────
@@ -139,7 +143,13 @@ export async function testCaseGeneratorRoutes(app: FastifyInstance): Promise<voi
       try {
         const { projectId } = request.params
         const body = GenerateStepsForSelectedSchema.parse(request.body)
-        const result = await generateStepsForTestCases(projectId, body.testCaseIds, body.selectedModule)
+        const result = await generateStepsForTestCases(
+          projectId,
+          body.testCaseIds,
+          body.selectedModule,
+          body.brdContent,
+          body.existingTestsContent,
+        )
         return reply.send(result)
       } catch (err: any) {
         if (err?.name === 'ZodError') return reply.status(400).send({ detail: err.errors })

@@ -94,6 +94,11 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
     const [pausedErrorMessage, setPausedErrorMessage] = useState<string | null>(null)
     const [activeRunId, setActiveRunId] = useState<string | null>(null)
     const [isResumingPause, setIsResumingPause] = useState(false)
+    // Keep the HITL panel mounted while its closing animation plays.
+    // Set to true when paused, and only set back to false via onDismiss
+    // (called by the panel after its slide-out animation finishes).
+    const [showHitlPanel, setShowHitlPanel] = useState(false)
+    const [hitlPanelKey, setHitlPanelKey] = useState(0)
     const [projects, setProjects] = useState<Project[]>([])
     const [selectedProjectId, setSelectedProjectId] = useState<string>("")
     const [priority, setPriority] = useState("medium")
@@ -474,6 +479,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                         )
                         const errMsg = failingLog?.error || failingLog?.message || null
                         setIsPaused(true)
+                        setShowHitlPanel(true)
                         setPausedStepIndex(pausedStep)
                         setPausedErrorMessage(errMsg)
                         setExecutionStatus('paused')
@@ -910,7 +916,7 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             </div>
 
             {/* ── Execution Status Highlight Panel ─────────────────────────── */}
-            {(isRunning || executionStatus === 'paused' || executionStatus === 'passed' || executionStatus === 'failed') && (
+            {(executionStatus !== 'idle') && (
                 <div className={`rounded-xl border-2 shadow-lg overflow-hidden transition-all duration-300 ${
                     executionStatus === 'running'
                         ? 'border-blue-400 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/30 dark:to-indigo-950/20 dark:border-blue-600'
@@ -1009,13 +1015,26 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
                     {/* Pause status strip — compact; full interaction is in the AI panel */}
                     {executionStatus === 'paused' && (
                         <div className="px-4 py-2.5 flex items-center gap-3">
-                            <div className="flex-1">
-                                <p className="font-semibold text-amber-800 dark:text-amber-200 text-sm">
-                                    ⏸ Step {pausedStepIndex ?? '?'} is paused — the AI Assistant has opened to help
-                                </p>
-                                <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5">
-                                    Use the NEXUS HITL panel on the right to get AI guidance, then resume.
-                                </p>
+                            <div className="flex-1 flex items-center justify-between">
+                                <div>
+                                    <p className="font-semibold text-amber-800 dark:text-amber-200 text-sm">
+                                        ⏸ Step {pausedStepIndex ?? '?'} is paused — the AI Assistant has opened to help
+                                    </p>
+                                    <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5">
+                                        Use the NEXUS HITL panel on the right to get AI guidance, then resume.
+                                    </p>
+                                </div>
+                                <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="border-amber-400 text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/30 font-semibold gap-1.5 ml-4 flex-shrink-0"
+                                    onClick={() => {
+                                        setShowHitlPanel(true)
+                                        setHitlPanelKey(prev => prev + 1)
+                                    }}
+                                >
+                                    💬 Open AI Assistant
+                                </Button>
                             </div>
                         </div>
                     )}
@@ -1717,17 +1736,20 @@ export default function TestEditorPage({ params }: { params: Promise<{ id: strin
             />
 
             {/* ── HITL AI Chatbot Panel (auto-opens when test is paused) ─── */}
-            {executionStatus === 'paused' && activeRunId && (
+            {showHitlPanel && activeRunId && (
                 <HitlChatPanel
+                    key={hitlPanelKey}
                     runId={activeRunId}
                     testCaseId={currentId}
                     pausedStep={pausedStepIndex}
                     errorMessage={pausedErrorMessage}
                     currentSteps={steps}
+                    isPaused={executionStatus === 'paused'}
                     onResume={async (opts) => handlePauseAction('resume', opts)}
                     onSkip={async () => handlePauseAction('skip')}
                     onStop={handleStopTest}
                     isActioning={isResumingPause}
+                    onDismiss={() => setShowHitlPanel(false)}
                 />
             )}
         </div>

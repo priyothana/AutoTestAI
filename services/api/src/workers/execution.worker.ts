@@ -742,26 +742,47 @@ async function detectPostSaveError(page: Page): Promise<string | null> {
  *   getByRole('button', { name: 'Save' }) → "Save"
  *   "Account Type"                      → "Account Type"  (passthrough)
  */
-function extractLabelFromTarget(raw: string): string {
+export function extractLabelFromTarget(raw: string): string {
   if (!raw) return raw
 
+  let labelVal = raw
   // getByLabel('...') / getByText('...') / getByPlaceholder('...')
   const simpleMatch = raw.match(
     /^(?:page\.)?getBy(?:Label|Text|Placeholder|Title|AltText)\s*\(\s*['"]([^'"]+)['"]/i,
   )
-  if (simpleMatch) return simpleMatch[1].trim()
+  if (simpleMatch) {
+    labelVal = simpleMatch[1].trim()
+  } else {
+    // getByRole('button', { name: 'Save' }) or getByRole("combobox", {name:"Type"})
+    const roleMatch = raw.match(
+      /^(?:page\.)?getByRole\s*\(\s*['"][^'"]+['"]\s*,\s*\{\s*name\s*:\s*['"]([^'"]+)['"]/i,
+    )
+    if (roleMatch) {
+      labelVal = roleMatch[1].trim()
+    } else {
+      // locator('label=Type') or locator('text=Type')
+      const locatorPrefixMatch = raw.match(/^(?:page\.)?locator\s*\(\s*['"](?:label=|text=)([^'"]+)['"]/i)
+      if (locatorPrefixMatch) {
+        labelVal = locatorPrefixMatch[1].trim()
+      }
+    }
+  }
 
-  // getByRole('button', { name: 'Save' }) or getByRole("combobox", {name:"Type"})
-  const roleMatch = raw.match(
-    /^(?:page\.)?getByRole\s*\(\s*['"][^'"]+['"]\s*,\s*\{\s*name\s*:\s*['"]([^'"]+)['"]/i,
-  )
-  if (roleMatch) return roleMatch[1].trim()
+  let cleaned = labelVal.trim()
+  // Strip "Search and select " prefix
+  cleaned = cleaned.replace(/^Search\s+and\s+select\s+/i, '')
+  // Strip "Search " prefix if followed by more words (e.g. "Search Account" -> "Account")
+  cleaned = cleaned.replace(/^Search\s+(?=\w)/i, '')
+  // Strip "lookup" suffix
+  cleaned = cleaned.replace(/\s+lookup$/i, '')
+  // Strip trailing dots
+  cleaned = cleaned.replace(/\.{2,}$/, '')
+  cleaned = cleaned.trim()
 
-  // locator('label=Type') or locator('text=Type')
-  const locatorPrefixMatch = raw.match(/^(?:page\.)?locator\s*\(\s*['"](?:label=|text=)([^'"]+)['"]/i)
-  if (locatorPrefixMatch) return locatorPrefixMatch[1].trim()
-
-  return raw
+  if (cleaned.length > 0) {
+    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1)
+  }
+  return cleaned
 }
 
 // ─── SF-aware label resolver ──────────────────────────────────────────────────
@@ -1404,7 +1425,47 @@ async function selectSFLookup(page: Page, rawLabel: string, searchValue: string)
     return
   }
 
-  throw new Error(`[SF-LOOKUP] Could not select "${searchValue}" in lookup "${fieldLabel}" — no Advanced Search modal opened (${dialogCountAfter} dialogs on page).`)
+  // ── FINAL SAFETY NET: page-scope option click ──────────────────────────
+  // At this point, the Advanced Search modal did NOT open. However, the inline
+  // dropdown options may still be visible at page scope (outside our scoped
+  // lookupContainer). Try a direct page-level click on any matching option.
+  //
+  // This handles SF layouts where the autocomplete listbox is rendered in an
+  // overlay portal outside the lightning-lookup shadow boundary, causing our
+  // scoped queries to miss it while it's visually present on screen.
+  log.warn(`[SF-LOOKUP] Adv Search modal did not open — trying page-scope option click for "${searchValue}"`)
+  try {
+    // Re-type to ensure the dropdown is still active
+    await activateAndType(searchValue)
+    await page.waitForTimeout(2_000)  // longer wait — SF can be slow after Enter
+
+    const pageOption = page.locator('[role="option"]').filter({ hasText: searchValue }).first()
+    if (await pageOption.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await pageOption.scrollIntoViewIfNeeded().catch(() => {})
+      await pageOption.click({ force: true })
+      await page.waitForTimeout(1_200)
+      // Verify the field got populated (input cleared/changed or dropdown closed)
+      const inputValAfter = await lookupInput.inputValue().catch(() => '')
+      const optionStillVisible = await pageOption.isVisible({ timeout: 300 }).catch(() => false)
+      if (!optionStillVisible || (inputValAfter && inputValAfter !== searchValue)) {
+        log.info(`[SF-LOOKUP] ✅ Page-scope option click succeeded for "${searchValue}" in "${fieldLabel}"`)
+        return
+      }
+    }
+
+    // Also try first visible option if exact text match fails
+    const firstPageOption = page.locator('[role="option"]').first()
+    if (await firstPageOption.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await firstPageOption.click({ force: true })
+      await page.waitForTimeout(1_000)
+      log.info(`[SF-LOOKUP] ✅ Clicked first page-scope option for "${fieldLabel}" (no exact text match)`)
+      return
+    }
+  } catch (safeguardErr) {
+    log.warn({ safeguardErr }, `[SF-LOOKUP] Page-scope option click failed (non-fatal)`)
+  }
+
+  throw new Error(`[SF-LOOKUP] Could not select "${searchValue}" in lookup "${fieldLabel}" — Advanced Search modal did not open (dialogs before=1, after=${dialogCountAfter}) and no page-scope option matched.`)
 }
 
 
@@ -2948,6 +3009,74 @@ async function smartWebAppClick(
     } catch { /* try next */ }
   }
 
+  // ── Strategy 0b: has-text() CSS + prefix-stripped button/link ───────────────
+  // Handles targets like "+ Add Account", "+ New Record", "> Submit" where the
+  // leading symbol is a separate <span> or <svg> element.
+  // Playwright's has-text() matches against the full concatenated visible text,
+  // so it finds buttons/links even when the '+' is a child icon element.
+  try {
+    // Try exact has-text match on button/link/a
+    const escapedTarget = target.replace(/"/g, '\\"')
+    const hasTextLoc = page.locator(
+      `button:has-text("${escapedTarget}"), a:has-text("${escapedTarget}"), [role="button"]:has-text("${escapedTarget}")`
+    ).first()
+    if (await hasTextLoc.isVisible({ timeout: 2_500 }).catch(() => false)) {
+      await hasTextLoc.scrollIntoViewIfNeeded().catch(() => {})
+      await hasTextLoc.click()
+      logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 0b (has-text CSS): "${target}"`)
+      return true
+    }
+  } catch { /* try next */ }
+
+  // ── Strategy 0c: Strip leading symbol prefix and retry button / link ─────────
+  // "+ Add Account" → "Add Account", "> Submit" → "Submit", "• Item" → "Item"
+  const strippedTarget = target.replace(/^[+\-–—>•·→★☆●○□■◆◇▶▷►»«\s]+/, '').trim()
+  if (strippedTarget && strippedTarget !== target) {
+    // Try role=button with stripped name (partial match)
+    try {
+      const btnLoc = page.getByRole('button', { name: strippedTarget, exact: false }).first()
+      if (await btnLoc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await btnLoc.scrollIntoViewIfNeeded().catch(() => {})
+        await btnLoc.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 0c (stripped prefix, role=button): "${strippedTarget}" (from "${target}")`)
+        return true
+      }
+    } catch { /* try next */ }
+    // Try role=link with stripped name
+    try {
+      const linkLoc = page.getByRole('link', { name: strippedTarget, exact: false }).first()
+      if (await linkLoc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await linkLoc.scrollIntoViewIfNeeded().catch(() => {})
+        await linkLoc.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 0c (stripped prefix, role=link): "${strippedTarget}" (from "${target}")`)
+        return true
+      }
+    } catch { /* try next */ }
+    // Try has-text with stripped name
+    try {
+      const escapedStripped = strippedTarget.replace(/"/g, '\\"')
+      const strippedHasText = page.locator(
+        `button:has-text("${escapedStripped}"), a:has-text("${escapedStripped}"), [role="button"]:has-text("${escapedStripped}")`
+      ).first()
+      if (await strippedHasText.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await strippedHasText.scrollIntoViewIfNeeded().catch(() => {})
+        await strippedHasText.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 0c (stripped prefix, has-text): "${strippedTarget}" (from "${target}")`)
+        return true
+      }
+    } catch { /* try next */ }
+    // Try generic text match with stripped name (handles styled div/span without button/link role)
+    try {
+      const strippedTextLoc = page.getByText(strippedTarget, { exact: false }).first()
+      if (await strippedTextLoc.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await strippedTextLoc.scrollIntoViewIfNeeded().catch(() => {})
+        await strippedTextLoc.click()
+        logger.info(`[WEBAPP-SMART-CLICK] ✅ Strategy 0c (stripped prefix, getByText): "${strippedTarget}" (from "${target}")`)
+        return true
+      }
+    } catch { /* try next */ }
+  }
+
   // ── Strategy 1: Exact text match (fastest) ───────────────────────────────────
   try {
     const loc = page.getByText(target, { exact: true }).first()
@@ -3108,7 +3237,7 @@ async function smartWebAppClick(
 
   throw new Error(
     `smartWebAppClick: all 8 strategies failed to locate "${target}". ` +
-    `Tried: CSS selector, exact text, role=link, role=menuitem, role=button, ` +
+    `Tried: CSS selector, has-text, prefix-stripped button/link, exact text, role=link, role=menuitem, role=button, ` +
     `aria-label, hamburger toggle, nav scroll, partial text.`
   )
 }
@@ -5079,180 +5208,8 @@ async function loginWithKeycloak(
     )
   }
 
-  // ── Inject tokens via addInitScript (runs before every page load) ────────
-  //
-  // addInitScript() is the correct approach for sessionStorage because:
-  //  a) sessionStorage is per-tab, not shared across contexts like cookies.
-  //  b) It runs before the page's own JS, ensuring the tokens are available
-  //     the instant the app script checks sessionStorage on load.
-  //  c) It persists across client-side navigations (SPA routing) within
-  //     the same tab without needing an extra evaluate() after each goto().
-  const authTokenVal = activeAuthToken
-  const idTokenVal = activeIdToken ?? ''
-
-  await browserCtx.addInitScript(
-    ({ authToken, idToken }: { authToken: string; idToken: string }) => {
-      // Inject into sessionStorage on every page load.
-      // This runs in the browser context — window / sessionStorage are available.
-      try {
-        sessionStorage.setItem('auth_token', authToken)
-        if (idToken) sessionStorage.setItem('id_token', idToken)
-      } catch {
-        // sessionStorage may be blocked in sandboxed iframes — safe to ignore
-      }
-    },
-    { authToken: authTokenVal, idToken: idTokenVal },
-  )
-  log.info('[KEYCLOAK] 🔑 addInitScript registered — sessionStorage[auth_token] and [id_token] will be set on every page load')
-
-  // ── Navigate to base URL so the app initialises with the injected session ───
-  const targetUrl = webLoginUrl ?? context.baseUrl
-  if (targetUrl) {
-    log.info(`[KEYCLOAK] Navigating to ${targetUrl} to initialise authenticated session`)
-    try {
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-      await page.waitForTimeout(2_000)
-
-      // Verify session storage was injected on this page
-      const injectedToken = await page.evaluate(() => sessionStorage.getItem('auth_token')).catch(() => null)
-      if (injectedToken) {
-        log.info('[KEYCLOAK] ✅ sessionStorage[auth_token] confirmed on page')
-      } else {
-        // This can happen on pages that clear sessionStorage on load — log and continue
-        log.warn('[KEYCLOAK] ⚠️ sessionStorage[auth_token] not detected after navigation — app may clear storage on load')
-        // Fallback: inject directly on current page
-        await page.evaluate(
-          ({ authToken, idToken }: { authToken: string; idToken: string }) => {
-            try {
-              sessionStorage.setItem('auth_token', authToken)
-              if (idToken) sessionStorage.setItem('id_token', idToken)
-            } catch { /* blocked */ }
-          },
-          { authToken: authTokenVal, idToken: idTokenVal },
-        )
-        log.info('[KEYCLOAK] Direct sessionStorage injection applied as fallback')
-      }
-    } catch (navErr) {
-      log.warn({ navErr }, '[KEYCLOAK] Navigation to target URL failed (non-fatal) — tokens still registered for subsequent navigations')
-    }
-  }
-
-  // Save a Playwright storageState snapshot for session reuse
   await saveSession(projectId, browserCtx)
   log.info('[KEYCLOAK] ✅ Keycloak session injected and saved')
-}
-
-// ─── Browser state highlighting ─────────────────────────────────────────────
-
-/**
- * The border-injection script, used in both addInitScript (for future pages)
- * and page.evaluate() (for the current page). Self-contained — creates the
- * border overlay + badge, defaults to 'running' state, and watches for
- * changes to document.body[data-autotest-state] via MutationObserver.
- */
-const BORDER_INJECTION_SCRIPT = `
-(function() {
-  function inject() {
-    if (document.getElementById('autotest-state-border')) return;
-    if (!document.body) {
-      if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', inject, { once: true });
-      } else {
-        setTimeout(inject, 30);
-      }
-      return;
-    }
-
-    // ── Inject keyframe animations for 'running' flicker ──────────────────
-    if (!document.getElementById('autotest-state-style')) {
-      var styleEl = document.createElement('style');
-      styleEl.id = 'autotest-state-style';
-      styleEl.textContent =
-        '@keyframes at-border-flicker{' +
-          '0%,100%{border-color:#f59e0b;box-shadow:inset 0 0 20px rgba(245,158,11,0.35),0 0 0 2px rgba(245,158,11,0)}' +
-          '50%{border-color:#fbbf24;box-shadow:inset 0 0 48px rgba(251,191,36,0.75),0 0 0 4px rgba(251,191,36,0.3)}' +
-        '}' +
-        '@keyframes at-badge-flicker{' +
-          '0%,100%{opacity:1;background:#f59e0b}' +
-          '50%{opacity:0.65;background:#fbbf24}' +
-        '}';
-      (document.head || document.documentElement).appendChild(styleEl);
-    }
-
-    var colors = {
-      running: { border: '#f59e0b', shadow: 'rgba(245,158,11,0.35)', label: '\u25b6 RUNNING' },
-      paused:  { border: '#3b82f6', shadow: 'rgba(59,130,246,0.35)',  label: '\u23f8 PAUSED' },
-      passed:  { border: '#22c55e', shadow: 'rgba(34,197,94,0.35)',   label: '\u2705 PASSED' },
-      failed:  { border: '#ef4444', shadow: 'rgba(239,68,68,0.35)',   label: '\u274c FAILED' }
-    };
-
-    var overlay = document.createElement('div');
-    overlay.id = 'autotest-state-border';
-    // Start with flicker animation active (running state)
-    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:2147483646;border:4px solid #f59e0b;box-sizing:border-box;animation:at-border-flicker 1s ease-in-out infinite;box-shadow:inset 0 0 20px rgba(245,158,11,0.35)';
-
-    var badge = document.createElement('div');
-    badge.id = 'autotest-state-badge';
-    badge.textContent = '\u25b6 RUNNING';
-    badge.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483646;pointer-events:none;padding:4px 16px;border-radius:0 0 10px 10px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;color:#fff;background:#f59e0b;animation:at-badge-flicker 1s ease-in-out infinite';
-
-    document.body.appendChild(overlay);
-    document.body.appendChild(badge);
-
-    function applyState() {
-      var state = document.body.getAttribute('data-autotest-state') || 'running';
-      var cfg = colors[state];
-      if (!cfg) return;
-      if (state === 'running') {
-        // Flickering yellow — disable transition so animation takes full control
-        overlay.style.transition  = 'none';
-        overlay.style.animation   = 'at-border-flicker 1s ease-in-out infinite';
-        overlay.style.borderColor = cfg.border;
-        badge.style.animation     = 'at-badge-flicker 1s ease-in-out infinite';
-        badge.style.background    = cfg.border;
-      } else {
-        // Solid color with smooth transition for paused / passed / failed
-        overlay.style.animation   = 'none';
-        overlay.style.transition  = 'border-color 0.4s ease,box-shadow 0.4s ease';
-        overlay.style.borderColor = cfg.border;
-        overlay.style.boxShadow   = 'inset 0 0 20px ' + cfg.shadow;
-        badge.style.animation     = 'none';
-        badge.style.background    = cfg.border;
-      }
-      badge.textContent = cfg.label;
-    }
-
-    applyState();
-
-    new MutationObserver(applyState).observe(document.body, {
-      attributes: true,
-      attributeFilter: ['data-autotest-state']
-    });
-  }
-
-  inject();
-})();
-`
-
-/**
- * Sets up the browser state border for interactive mode.
- * Uses addInitScript so the border appears automatically on every page load.
- * Does NOT run page.evaluate on the current page (about:blank) — instead
- * the border appears naturally on the first real navigation.
- */
-async function setupBrowserStateBorder(ctx: BrowserContext): Promise<void> {
-  await ctx.addInitScript({ content: BORDER_INJECTION_SCRIPT })
-}
-
-/**
- * Changes the browser window border color. Call this to transition between states.
- */
-async function setBrowserState(page: Page, state: 'running' | 'paused' | 'passed' | 'failed' | ''): Promise<void> {
-  try {
-    await page.evaluate((s) => {
-      if (document.body) document.body.setAttribute('data-autotest-state', s)
-    }, state)
-  } catch { /* page may have navigated — non-fatal */ }
 }
 
 // ─── HITL: In-browser AI chatbot overlay ──────────────────────────────────────
@@ -5292,24 +5249,37 @@ async function injectPauseOverlay(
   const jRemSec   = JSON.stringify(remSec)
   const jSecs     = JSON.stringify(secs)
 
-  const script = `(function(){
+const script = `(function(){
 try {
 var stepNum=${jStepNum},tgt=${jTgt},valHtml=${jVal},errTxt=${jErr},minSec=${jMinSec},remSec=${jRemSec},secs=${jSecs};
 
-/* Remove existing overlay */
+/* ── Clean up any previous overlay ── */
 var prev=document.getElementById('autotest-pause-overlay');if(prev)prev.remove();
-var ps=document.getElementById('at-hitl-style');if(ps)ps.remove();
+var prevReo=document.getElementById('autotest-hitl-reopen');if(prevReo)prevReo.remove();
+var prevStyle=document.getElementById('at-hitl-style');if(prevStyle)prevStyle.remove();
 if(document.body)document.body.removeAttribute('data-autotest-hitl-action');
 try{sessionStorage.removeItem('autotest-hitl-action');}catch(e){}
 
-/* Inject CSS */
-var styleEl=document.createElement('style');
-styleEl.id='at-hitl-style';
-styleEl.textContent=
+/* ── Shadow-DOM host ── appended to <html> to bypass body overflow:hidden */
+var host=document.createElement('div');
+host.id='autotest-pause-overlay';
+/* Reset ALL inherited styles, then pin to viewport */
+host.style.cssText=[
+  'all:initial','position:fixed','bottom:20px','right:20px',
+  'z-index:2147483647','width:380px','max-width:calc(100vw - 32px)',
+  'display:block','pointer-events:auto','box-sizing:border-box'
+].join(' !important;')+' !important';
+
+var shadow=host.attachShadow({mode:'open'});
+
+/* ── Shadow-scoped CSS ── */
+var sEl=document.createElement('style');
+sEl.textContent=
+  ':host{display:block;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif}'+
   '@keyframes at-in{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}'+
   '@keyframes at-fd{from{opacity:0}to{opacity:1}}'+
   '@keyframes at-b{0%,60%,100%{transform:scale(0)}30%{transform:scale(1)}}'+
-  '#at-card{animation:at-in .35s cubic-bezier(.2,.8,.4,1) both}'+
+  '#at-card{animation:at-in .35s cubic-bezier(.2,.8,.4,1) both;background:linear-gradient(160deg,#0d1117,#161d2e);border:1px solid rgba(217,119,6,.5);border-radius:16px;overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,.85);display:flex;flex-direction:column;max-height:calc(100vh - 44px)}'+
   '.at-msg{animation:at-fd .2s ease both}'+
   '.at-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#d97706;margin:0 2px}'+
   '.at-dot:nth-child(1){animation:at-b 1.1s 0s infinite}'+
@@ -5317,171 +5287,193 @@ styleEl.textContent=
   '.at-dot:nth-child(3){animation:at-b 1.1s .4s infinite}'+
   '.at-chip{border:1px solid rgba(217,119,6,.4);background:rgba(217,119,6,.12);color:#fbbf24;font-size:10px;padding:3px 8px;border-radius:999px;cursor:pointer;font-family:inherit}'+
   '.at-chip:hover{background:rgba(217,119,6,.28)}';
-(document.head||document.documentElement).appendChild(styleEl);
+shadow.appendChild(sEl);
 
-/* Host container — fixed to viewport, appended to <html> to bypass body overflow:hidden */
-var host=document.createElement('div');
-host.id='autotest-pause-overlay';
-host.setAttribute('style',
-  'all:initial !important;position:fixed !important;bottom:20px !important;right:20px !important;'+
-  'z-index:2147483647 !important;width:380px !important;max-width:calc(100vw - 32px) !important;'+
-  'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif !important;'+
-  'display:block !important;pointer-events:auto !important;box-sizing:border-box !important'
-);
-
-/* Main card */
+/* ── Build UI inside shadow root ── */
 var inner=document.createElement('div');
 inner.id='at-card';
-inner.setAttribute('style',
-  'background:linear-gradient(160deg,#0d1117,#161d2e) !important;'+
-  'border:1px solid rgba(217,119,6,.5) !important;border-radius:16px !important;'+
-  'overflow:hidden !important;box-shadow:0 24px 64px rgba(0,0,0,.85) !important;'+
-  'display:flex !important;flex-direction:column !important;max-height:calc(100vh - 44px) !important'
-);
 
 /* Header */
 var hdr=document.createElement('div');
 hdr.id='at-drag';
-hdr.setAttribute('style','display:flex;align-items:center;gap:10px;padding:11px 14px;background:linear-gradient(135deg,#3b1500,#161d2e);border-bottom:1px solid rgba(217,119,6,.2);cursor:grab;flex-shrink:0;user-select:none;-webkit-user-select:none');
+hdr.style.cssText='display:flex;align-items:center;gap:10px;padding:11px 14px;background:linear-gradient(135deg,#3b1500,#161d2e);border-bottom:1px solid rgba(217,119,6,.2);cursor:grab;flex-shrink:0;user-select:none;-webkit-user-select:none';
+
 var hdrIcon=document.createElement('div');
-hdrIcon.setAttribute('style','width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0');
+hdrIcon.style.cssText='width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0';
 hdrIcon.textContent='\u23f8';
+
 var hdrText=document.createElement('div');
-hdrText.setAttribute('style','flex:1');
+hdrText.style.cssText='flex:1';
 var hdrTitle=document.createElement('div');
-hdrTitle.setAttribute('style','color:#fff;font-size:11px;font-weight:800;letter-spacing:.12em;display:flex;align-items:center;gap:5px');
+hdrTitle.style.cssText='color:#fff;font-size:11px;font-weight:800;letter-spacing:.12em;display:flex;align-items:center;gap:5px';
 hdrTitle.textContent='NEXUS ';
 var badge=document.createElement('span');
-badge.setAttribute('style','font-size:8px;padding:1px 5px;border-radius:999px;background:rgba(217,119,6,.22);color:#fbbf24;font-weight:700;border:1px solid rgba(217,119,6,.35)');
+badge.style.cssText='font-size:8px;padding:1px 5px;border-radius:999px;background:rgba(217,119,6,.22);color:#fbbf24;font-weight:700;border:1px solid rgba(217,119,6,.35)';
 badge.textContent='HITL';
 hdrTitle.appendChild(badge);
 var hdrSub=document.createElement('div');
-hdrSub.setAttribute('style','color:#d97706;font-size:10px;font-weight:600;margin-top:2px');
+hdrSub.style.cssText='color:#d97706;font-size:10px;font-weight:600;margin-top:2px';
 hdrSub.textContent='Step '+stepNum+' paused \u2014 needs action';
 hdrText.appendChild(hdrTitle);hdrText.appendChild(hdrSub);
-/* Close button — hides the overlay, test keeps running */
+
 var closeBtn=document.createElement('button');
-closeBtn.setAttribute('style','background:none;border:none;cursor:pointer;color:rgba(217,119,6,.6);font-size:14px;width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-left:auto;transition:background .15s');
-closeBtn.innerHTML='\u00d7';
-closeBtn.title='Hide panel (test keeps running)';
+closeBtn.style.cssText='background:none;border:none;cursor:pointer;color:rgba(217,119,6,.6);font-size:14px;width:26px;height:26px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-left:auto;transition:background .15s';
+closeBtn.textContent='\u00d7';
+closeBtn.title='Minimize panel (testing stays paused)';
 closeBtn.onmouseenter=function(){closeBtn.style.background='rgba(239,68,68,.18)';closeBtn.style.color='#fca5a5';};
 closeBtn.onmouseleave=function(){closeBtn.style.background='none';closeBtn.style.color='rgba(217,119,6,.6)';};
-closeBtn.addEventListener('click',function(e){e.stopPropagation();host.style.display='none';clearInterval(timerRef);});
+
 hdr.appendChild(hdrIcon);hdr.appendChild(hdrText);hdr.appendChild(closeBtn);
 
-/* Step info section */
+/* Step info */
 var info=document.createElement('div');
-info.setAttribute('style','padding:9px 12px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0');
+info.style.cssText='padding:9px 12px 8px;border-bottom:1px solid rgba(255,255,255,.05);flex-shrink:0';
 var stepBox=document.createElement('div');
-stepBox.setAttribute('style','background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:7px 10px;margin-bottom:6px');
+stepBox.style.cssText='background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:7px 10px;margin-bottom:6px';
 var stepLabel=document.createElement('span');
-stepLabel.setAttribute('style','color:#e2e8f0;font-size:12px;font-weight:700');
+stepLabel.style.cssText='color:#e2e8f0;font-size:12px;font-weight:700';
 stepLabel.textContent='Step '+stepNum+' \u2014 ';
-var stepTarget=document.createElement('span');
-stepTarget.setAttribute('style','color:#fbbf24;font-size:12px;font-weight:700');
-stepTarget.textContent=tgt;
-stepBox.appendChild(stepLabel);stepBox.appendChild(stepTarget);
-if(valHtml){var vSpan=document.createElement('span');vSpan.setAttribute('style','color:#10b981;font-size:11px;display:block;margin-top:2px');vSpan.textContent=valHtml;stepBox.appendChild(vSpan);}
+var stepTargetEl=document.createElement('span');
+stepTargetEl.style.cssText='color:#fbbf24;font-size:12px;font-weight:700';
+stepTargetEl.textContent=tgt;
+stepBox.appendChild(stepLabel);stepBox.appendChild(stepTargetEl);
+if(valHtml){var vSpan=document.createElement('span');vSpan.style.cssText='color:#10b981;font-size:11px;display:block;margin-top:2px';vSpan.textContent=valHtml;stepBox.appendChild(vSpan);}
 var errBox=document.createElement('div');
-errBox.setAttribute('style','background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.22);border-radius:8px;padding:7px 10px;max-height:52px;overflow-y:auto');
+errBox.style.cssText='background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.22);border-radius:8px;padding:7px 10px;max-height:52px;overflow-y:auto';
 var errSpan=document.createElement('span');
-errSpan.setAttribute('style','color:#fca5a5;font-size:10px;line-height:1.5');
+errSpan.style.cssText='color:#fca5a5;font-size:10px;line-height:1.5';
 errSpan.textContent=errTxt;
 errBox.appendChild(errSpan);
 info.appendChild(stepBox);info.appendChild(errBox);
 
-/* Chat area */
+/* Chat */
 var chatEl=document.createElement('div');
 chatEl.id='at-chat';
-chatEl.setAttribute('style','flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:6px;min-height:80px;max-height:180px');
+chatEl.style.cssText='flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:6px;min-height:80px;max-height:180px';
 var typingEl=document.createElement('div');
-typingEl.id='at-typing';
-typingEl.setAttribute('style','display:flex;align-items:center;gap:6px');
+typingEl.style.cssText='display:flex;align-items:center;gap:6px';
 var typingIcon=document.createElement('div');
-typingIcon.setAttribute('style','width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0');
+typingIcon.style.cssText='width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0';
 typingIcon.textContent='\ud83e\udd16';
 var typingBubble=document.createElement('div');
-typingBubble.setAttribute('style','padding:8px 10px;border-radius:9px;border-top-left-radius:2px;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.25)');
+typingBubble.style.cssText='padding:8px 10px;border-radius:9px;border-top-left-radius:2px;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.25)';
 for(var di=0;di<3;di++){var dot=document.createElement('span');dot.className='at-dot';typingBubble.appendChild(dot);}
 typingEl.appendChild(typingIcon);typingEl.appendChild(typingBubble);
 chatEl.appendChild(typingEl);
 
 /* Footer */
 var footer=document.createElement('div');
-footer.setAttribute('style','padding:8px 12px 10px;border-top:1px solid rgba(255,255,255,.07);flex-shrink:0');
+footer.style.cssText='padding:8px 12px 10px;border-top:1px solid rgba(255,255,255,.07);flex-shrink:0';
 
 var inpRow=document.createElement('div');
-inpRow.setAttribute('style','display:flex;gap:6px;align-items:center;margin-bottom:7px');
+inpRow.style.cssText='display:flex;gap:6px;align-items:center;margin-bottom:7px';
 var inpEl=document.createElement('input');
-inpEl.id='at-inp';inpEl.type='text';inpEl.placeholder='Describe your fix\u2026';
-inpEl.setAttribute('style','background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);border-radius:8px;color:#e2e8f0;font-size:12px;padding:0 10px;height:34px;flex:1;box-sizing:border-box;font-family:inherit;outline:none');
+inpEl.type='text';inpEl.placeholder='Describe your fix\u2026';
+inpEl.style.cssText='background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);border-radius:8px;color:#e2e8f0;font-size:12px;padding:0 10px;height:34px;flex:1;box-sizing:border-box;font-family:inherit;outline:none';
 var sndEl=document.createElement('button');
-sndEl.id='at-snd';
-sndEl.setAttribute('style','background:linear-gradient(135deg,#d97706,#b45309);border:none;border-radius:8px;color:#fff;cursor:pointer;width:34px;height:34px;flex-shrink:0;font-size:14px;display:flex;align-items:center;justify-content:center');
+sndEl.style.cssText='background:linear-gradient(135deg,#d97706,#b45309);border:none;border-radius:8px;color:#fff;cursor:pointer;width:34px;height:34px;flex-shrink:0;font-size:14px;display:flex;align-items:center;justify-content:center';
 sndEl.textContent='\u27a4';
 inpRow.appendChild(inpEl);inpRow.appendChild(sndEl);
 
 var actionRow=document.createElement('div');
-actionRow.setAttribute('style','display:flex;gap:6px;margin-bottom:6px');
+actionRow.style.cssText='display:flex;gap:6px;margin-bottom:6px';
 var rBtn=document.createElement('button');
-rBtn.id='autotest-resume-btn';
-rBtn.setAttribute('style','flex:1;padding:9px 0;border-radius:9px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit');
+rBtn.style.cssText='flex:1;padding:9px 0;border-radius:9px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit';
 rBtn.textContent='\u25b6 Resume';
 var sBtn=document.createElement('button');
-sBtn.id='autotest-skip-btn';
-sBtn.setAttribute('style','flex:1;padding:9px 0;border-radius:9px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:#cbd5e1;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit');
+sBtn.style.cssText='flex:1;padding:9px 0;border-radius:9px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:#cbd5e1;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit';
 sBtn.textContent='\u23ed Skip';
 actionRow.appendChild(rBtn);actionRow.appendChild(sBtn);
 
 var xBtn=document.createElement('button');
-xBtn.id='autotest-stop-btn';
-xBtn.setAttribute('style','width:100%;padding:8px 0;border-radius:9px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;box-sizing:border-box');
+xBtn.style.cssText='width:100%;padding:8px 0;border-radius:9px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#fca5a5;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;box-sizing:border-box';
 xBtn.textContent='\u23f9 Stop Testing';
 
 var timerDiv=document.createElement('div');
-timerDiv.setAttribute('style','margin-top:6px;text-align:center');
-var timerLbl=document.createElement('span');timerLbl.setAttribute('style','color:#4b5563;font-size:10px');timerLbl.textContent='Auto-timeout in ';
-var timerEl=document.createElement('span');timerEl.id='at-timer';timerEl.setAttribute('style','color:#6b7280;font-size:10px;font-weight:600');timerEl.textContent=minSec+':'+remSec;
+timerDiv.style.cssText='margin-top:6px;text-align:center';
+var timerLbl=document.createElement('span');timerLbl.style.cssText='color:#4b5563;font-size:10px';timerLbl.textContent='Auto-timeout in ';
+var timerEl=document.createElement('span');timerEl.id='at-timer';timerEl.style.cssText='color:#6b7280;font-size:10px;font-weight:600';timerEl.textContent=minSec+':'+remSec;
 timerDiv.appendChild(timerLbl);timerDiv.appendChild(timerEl);
 
 footer.appendChild(inpRow);footer.appendChild(actionRow);footer.appendChild(xBtn);footer.appendChild(timerDiv);
 
-/* Assemble tree */
+/* Assemble */
 inner.appendChild(hdr);inner.appendChild(info);inner.appendChild(chatEl);inner.appendChild(footer);
-host.appendChild(inner);
-
-/* CRITICAL: append to <html> tag, not <body>, to bypass overflow:hidden/clip on body */
+shadow.appendChild(inner);
 document.documentElement.appendChild(host);
-console.log('[NEXUS-HITL] Overlay mounted, step='+stepNum);
+console.log('[NEXUS-HITL] Shadow overlay mounted, step='+stepNum);
 
-/* === Logic === */
+/* ── Re-open pill (outside shadow, in real DOM) ── */
+var reopenBtn=document.createElement('button');
+reopenBtn.id='autotest-hitl-reopen';
+reopenBtn.style.cssText=[
+  'all:initial','position:fixed','bottom:20px','right:20px',
+  'z-index:2147483646','background:linear-gradient(135deg,#d97706,#b45309)',
+  'color:#fff','border:none','border-radius:9999px',
+  'padding:9px 16px','font:700 11px -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif',
+  'cursor:pointer','box-shadow:0 4px 16px rgba(0,0,0,.45)',
+  'display:none','align-items:center','gap:6px',
+  'pointer-events:auto','letter-spacing:.04em'
+].join(' !important;')+' !important';
+reopenBtn.textContent='\u23f8 NEXUS HITL \u2014 Click to Reopen';
+document.documentElement.appendChild(reopenBtn);
+
+/* ── Logic ── */
 var hist=[],busy=false,timerRef;
 var scrollBot=function(){chatEl.scrollTop=chatEl.scrollHeight;};
 var showTyping=function(v){typingEl.style.display=v?'flex':'none';if(v)scrollBot();};
 
+closeBtn.addEventListener('click',function(){
+  host.style.setProperty('display','none','important');
+  reopenBtn.style.setProperty('display','flex','important');
+});
+reopenBtn.addEventListener('click',function(){
+  host.style.setProperty('display','block','important');
+  reopenBtn.style.setProperty('display','none','important');
+  inpEl.focus();
+});
+
 var userBubble=function(t){
-  var d=document.createElement('div');d.className='at-msg';d.setAttribute('style','display:flex;justify-content:flex-end');
-  var b=document.createElement('div');b.setAttribute('style','max-width:85%;padding:7px 10px;border-radius:9px;border-top-right-radius:2px;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;font-size:11px;line-height:1.5;word-break:break-word');
+  var d=document.createElement('div');d.className='at-msg';d.style.cssText='display:flex;justify-content:flex-end';
+  var b=document.createElement('div');b.style.cssText='max-width:85%;padding:7px 10px;border-radius:9px;border-top-right-radius:2px;background:linear-gradient(135deg,#d97706,#b45309);color:#fff;font-size:11px;line-height:1.5;word-break:break-word';
   b.textContent=t;d.appendChild(b);chatEl.insertBefore(d,typingEl);scrollBot();
 };
 
 var parseStepFromOption=function(txt){
-  var navM=txt.match(/navigat\\w*\\s+(?:step\\s+)?to\\s+['"]?(\\/[\\w\\-_./?#=&%]*|[\\w\\-_]+(?:\\/[\\w\\-_.]+)+)['"]?/i);
+  var navM=txt.match(/navigat\\w*\\s+(?:step\\s+)?to\\s+['""]?(\\/[\\w\\-_./?#=&%]*|[\\w\\-_]+(?:\\/[\\w\\-_.]+)+)['""]?/i);
   if(navM){var u=navM[1].startsWith('/')?navM[1]:'/'+navM[1];return{action:'NAVIGATE',target:u,value:''};}
-  var lookM=txt.match(/(?:LOOKUP|SELECT)\\s+(?:\\S+\\s+){0,4}?(?:the\\s+)?['"]?([A-Za-z][A-Za-z ]{2,30}?)['"]?\\s*field/i);
+  var lookM=txt.match(/(?:LOOKUP|SELECT)\\s+(?:\\S+\\s+){0,4}?(?:the\\s+)?['""]?([A-Za-z][A-Za-z ]{2,30}?)['""]?\\s*field/i);
   if(lookM)return{action:'LOOKUP',target:lookM[1].trim(),value:''};
-  var fillM=txt.match(/(?:fill\\s+in|populate|enter|select)\\s+(?:the\\s+)?['"]?([A-Za-z][A-Za-z ]{1,30}?)['"]?\\s*(?:field|dropdown|input)/i);
+  var fillM=txt.match(/(?:fill\\s+in|populate|enter|select)\\s+(?:the\\s+)?['""]?([A-Za-z][A-Za-z ]{1,30}?)['""]?\\s*(?:field|dropdown|input)/i);
   if(fillM)return{action:'LOOKUP',target:fillM[1].trim(),value:''};
   return null;
 };
 
+var doSignal=function(action){
+  clearInterval(timerRef);
+  inner.style.opacity='.65';inner.style.pointerEvents='none';
+  reopenBtn.style.setProperty('display','none','important');
+  try{if(typeof window.__autotestHitlSignal==='function')window.__autotestHitlSignal(action);}catch(e){}
+  if(document.body)document.body.setAttribute('data-autotest-hitl-action',action);
+  try{sessionStorage.setItem('autotest-hitl-action',action);}catch(e){}
+};
+
+var callAnalyze=function(){return new Promise(function(resolve){try{var fn=window.__hitlAnalyze;if(typeof fn!=='function')throw 0;fn().then(resolve).catch(function(){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data exists','Page did not load','Wrong field']});});}catch(e){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data exists','Page did not load','Wrong field']});}});};
+var callChat=function(text){return new Promise(function(resolve){try{var fn=window.__hitlChat;if(typeof fn!=='function')throw 0;fn(text,hist.slice(-6)).then(resolve).catch(function(){resolve({reply:"Could not process. Describe what you see.",suggestion_type:'clarify'});});}catch(e){resolve({reply:"Could not process. Describe what you see.",suggestion_type:'clarify'});}});};
+
+var doSend=function(text){
+  text=text.trim();if(!text||busy)return;busy=true;sndEl.disabled=true;
+  userBubble(text);hist.push({role:'user',content:text});showTyping(true);
+  callChat(text).then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies,d.options,d.proposed_step);hist.push({role:'assistant',content:d.reply});busy=false;sndEl.disabled=false;inpEl.focus();});
+};
+
 var showOptionCards=function(opts,container){
   if(!opts||!opts.length)return;
-  var oc=document.createElement('div');oc.setAttribute('style','display:flex;flex-direction:column;gap:5px;margin-top:8px');
+  var oc=document.createElement('div');oc.style.cssText='display:flex;flex-direction:column;gap:5px;margin-top:8px';
   for(var oi=0;oi<opts.length;oi++){(function(opt){
-    var card=document.createElement('div');card.setAttribute('style','border:1px solid rgba(34,197,94,.35);border-radius:9px;overflow:hidden');
-    var lbl=document.createElement('div');lbl.setAttribute('style','padding:6px 10px;font-size:10.5px;color:#e2e8f0;line-height:1.4');lbl.textContent=opt;
-    var btn=document.createElement('button');btn.setAttribute('style','width:100%;padding:6px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:11px;font-weight:700;border:none;cursor:pointer;font-family:inherit');
+    var card=document.createElement('div');card.style.cssText='border:1px solid rgba(34,197,94,.35);border-radius:9px;overflow:hidden';
+    var lbl=document.createElement('div');lbl.style.cssText='padding:6px 10px;font-size:10.5px;color:#e2e8f0;line-height:1.4';lbl.textContent=opt;
+    var btn=document.createElement('button');btn.style.cssText='width:100%;padding:6px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:11px;font-weight:700;border:none;cursor:pointer;font-family:inherit';
     btn.textContent='\u2713 Apply & Resume Testing';
     btn.addEventListener('click',function(){
       var parsed=parseStepFromOption(opt);
@@ -5497,32 +5489,31 @@ var showOptionCards=function(opts,container){
 var aiBubble=function(content,type,chips,options,proposedStep){
   var bc=type==='valid'?'rgba(34,197,94,.35)':type==='invalid'?'rgba(239,68,68,.35)':type==='clarify'?'rgba(59,130,246,.35)':'rgba(217,119,6,.3)';
   var bg=type==='valid'?'rgba(34,197,94,.07)':type==='invalid'?'rgba(239,68,68,.07)':type==='clarify'?'rgba(59,130,246,.07)':'rgba(217,119,6,.07)';
-  var d=document.createElement('div');d.className='at-msg';d.setAttribute('style','display:flex;gap:7px;align-items:flex-start');
-  var icon=document.createElement('div');icon.setAttribute('style','width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:2px');icon.textContent='\ud83e\udd16';
-  var right=document.createElement('div');right.setAttribute('style','flex:1;min-width:0');
-  var bubble=document.createElement('div');bubble.setAttribute('style','padding:7px 10px;border-radius:9px;border-top-left-radius:2px;background:'+bg+';border:1px solid '+bc+';color:#e2e8f0;font-size:11px;line-height:1.5;word-break:break-word');
+  var d=document.createElement('div');d.className='at-msg';d.style.cssText='display:flex;gap:7px;align-items:flex-start';
+  var icon=document.createElement('div');icon.style.cssText='width:20px;height:20px;border-radius:50%;background:linear-gradient(135deg,#d97706,#b45309);display:flex;align-items:center;justify-content:center;font-size:9px;flex-shrink:0;margin-top:2px';icon.textContent='\ud83e\udd16';
+  var right=document.createElement('div');right.style.cssText='flex:1;min-width:0';
+  var bubble=document.createElement('div');bubble.style.cssText='padding:7px 10px;border-radius:9px;border-top-left-radius:2px;background:'+bg+';border:1px solid '+bc+';color:#e2e8f0;font-size:11px;line-height:1.5;word-break:break-word';
   bubble.textContent=content;right.appendChild(bubble);
-  /* ── proposed_step: show a prominent Accept & Resume card ── */
   if(proposedStep&&proposedStep.action){
     var ps=proposedStep;
     var pcard=document.createElement('div');
-    pcard.setAttribute('style','margin-top:8px;border:2px solid rgba(34,197,94,.5);border-radius:10px;overflow:hidden;background:rgba(22,163,74,.05)');
+    pcard.style.cssText='margin-top:8px;border:2px solid rgba(34,197,94,.5);border-radius:10px;overflow:hidden;background:rgba(22,163,74,.05)';
     var phdr=document.createElement('div');
-    phdr.setAttribute('style','padding:5px 10px;background:rgba(22,163,74,.12);display:flex;align-items:center;gap:5px');
-    var picon=document.createElement('span');picon.textContent='\ud83d\udccc';picon.setAttribute('style','font-size:11px');
-    var ptitle=document.createElement('span');ptitle.setAttribute('style','font-size:9px;font-weight:800;letter-spacing:.1em;color:#4ade80;text-transform:uppercase');ptitle.textContent='Step to Insert';
+    phdr.style.cssText='padding:5px 10px;background:rgba(22,163,74,.12);display:flex;align-items:center;gap:5px';
+    var picon=document.createElement('span');picon.textContent='\ud83d\udccc';picon.style.cssText='font-size:11px';
+    var ptitle=document.createElement('span');ptitle.style.cssText='font-size:9px;font-weight:800;letter-spacing:.1em;color:#4ade80;text-transform:uppercase';ptitle.textContent='Step to Insert';
     phdr.appendChild(picon);phdr.appendChild(ptitle);
-    var pbody=document.createElement('div');pbody.setAttribute('style','padding:6px 10px;display:flex;align-items:center;gap:6px');
+    var pbody=document.createElement('div');pbody.style.cssText='padding:6px 10px;display:flex;align-items:center;gap:6px';
     var pact=document.createElement('span');
     var actColors={NAVIGATE:'#38bdf8',CLICK:'#fb923c',TYPE:'#a78bfa',LOOKUP:'#34d399',SELECT:'#34d399',WAIT:'#94a3b8',NAVIGATE2:'#38bdf8'};
     var actColor=actColors[ps.action]||'#fbbf24';
-    pact.setAttribute('style','font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;background:'+actColor+'22;border:1px solid '+actColor+'55;color:'+actColor);pact.textContent=ps.action;
-    var ptgt=document.createElement('span');ptgt.setAttribute('style','font-size:11px;color:#e2e8f0;font-weight:600;word-break:break-all');ptgt.textContent=ps.target||(ps.label||'');
+    pact.style.cssText='font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;background:'+actColor+'22;border:1px solid '+actColor+'55;color:'+actColor;pact.textContent=ps.action;
+    var ptgt=document.createElement('span');ptgt.style.cssText='font-size:11px;color:#e2e8f0;font-weight:600;word-break:break-all';ptgt.textContent=ps.target||(ps.label||'');
     pbody.appendChild(pact);pbody.appendChild(ptgt);
-    var pnote=document.createElement('p');pnote.setAttribute('style','padding:2px 10px 4px;font-size:9px;color:#4ade80;margin:0');pnote.textContent='Will be inserted before step '+stepNum+' and run first';
+    var pnote=document.createElement('p');pnote.style.cssText='padding:2px 10px 4px;font-size:9px;color:#4ade80;margin:0';pnote.textContent='Will be inserted before step '+stepNum+' and run first';
     var pbtn=document.createElement('button');
-    pbtn.setAttribute('style','width:100%;padding:9px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:5px');
-    pbtn.innerHTML='<span>\u2713</span><span>Accept & Resume Testing</span>';
+    pbtn.style.cssText='width:100%;padding:9px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:5px';
+    pbtn.textContent='\u2713 Accept & Resume Testing';
     pbtn.addEventListener('click',function(){
       pbtn.textContent='Applying\u2026';pbtn.style.opacity='.6';pbtn.style.pointerEvents='none';
       try{
@@ -5535,7 +5526,7 @@ var aiBubble=function(content,type,chips,options,proposedStep){
     right.appendChild(pcard);
   } else if(options&&options.length){showOptionCards(options,right);}
   else if(chips&&chips.length){
-    var cr=document.createElement('div');cr.setAttribute('style','display:flex;flex-wrap:wrap;gap:4px;margin-top:5px');
+    var cr=document.createElement('div');cr.style.cssText='display:flex;flex-wrap:wrap;gap:4px;margin-top:5px';
     for(var ci=0;ci<chips.length;ci++){(function(cv){var btn=document.createElement('button');btn.className='at-chip';btn.textContent=cv;btn.addEventListener('click',function(){doSend(cv);});cr.appendChild(btn);})(chips[ci]);}
     right.appendChild(cr);
   }
@@ -5545,6 +5536,7 @@ var aiBubble=function(content,type,chips,options,proposedStep){
 var doSignal=function(action){
   clearInterval(timerRef);
   inner.style.opacity='.65';inner.style.pointerEvents='none';
+  reopenBtn.style.setProperty('display','none','important');
   try{if(typeof window.__autotestHitlSignal==='function')window.__autotestHitlSignal(action);}catch(e){}
   if(document.body)document.body.setAttribute('data-autotest-hitl-action',action);
   try{sessionStorage.setItem('autotest-hitl-action',action);}catch(e){}
@@ -5556,19 +5548,38 @@ var doSend=function(text){
   callChat(text).then(function(d){showTyping(false);aiBubble(d.reply,d.suggestion_type,d.quick_replies,d.options,d.proposed_step);hist.push({role:'assistant',content:d.reply});busy=false;sndEl.disabled=false;inpEl.focus();});
 };
 
-rBtn.addEventListener('click',function(e){e.stopPropagation();doSignal('resume');});
-sBtn.addEventListener('click',function(e){e.stopPropagation();doSignal('skip');});
-xBtn.addEventListener('click',function(e){e.stopPropagation();doSignal('stop');});
+rBtn.addEventListener('click',function(){doSignal('resume');});
+sBtn.addEventListener('click',function(){doSignal('skip');});
+xBtn.addEventListener('click',function(){doSignal('stop');});
 sndEl.addEventListener('click',function(){var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}});
-inpEl.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}}});
-
-var callAnalyze=function(){return new Promise(function(resolve){try{var fn=window.__hitlAnalyze;if(typeof fn!=='function')throw 0;fn().then(resolve).catch(function(){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data exists','Page did not load','Wrong field']});});}catch(e){resolve({reply:"Describe what you see and I'll help.",suggestion_type:'advice',quick_replies:['Element not visible','Data exists','Page did not load','Wrong field']});}});};
-var callChat=function(text){return new Promise(function(resolve){try{var fn=window.__hitlChat;if(typeof fn!=='function')throw 0;fn(text,hist.slice(-6)).then(resolve).catch(function(){resolve({reply:"Could not process. Describe what you see.",suggestion_type:'clarify'});});}catch(e){resolve({reply:"Could not process. Describe what you see.",suggestion_type:'clarify'});}});};
+inpEl.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();var t=inpEl.value.trim();if(t){inpEl.value='';doSend(t);}}})
 
 var dragOn=false,dragOX=0,dragOY=0;
-hdr.addEventListener('mousedown',function(e){if(e.button!==0)return;if(host.style.bottom!=='auto'){var r=host.getBoundingClientRect();host.style.bottom='auto';host.style.right='auto';host.style.left=r.left+'px';host.style.top=r.top+'px';}dragOn=true;dragOX=e.clientX-host.getBoundingClientRect().left;dragOY=e.clientY-host.getBoundingClientRect().top;hdr.style.cursor='grabbing';e.preventDefault();},true);
-window.addEventListener('mousemove',function(e){if(!dragOn)return;var ml=window.innerWidth-host.offsetWidth-4,mt=window.innerHeight-host.offsetHeight-4;host.style.left=Math.max(4,Math.min(e.clientX-dragOX,ml))+'px';host.style.top=Math.max(4,Math.min(e.clientY-dragOY,mt))+'px';e.preventDefault();},{capture:true,passive:false});
-window.addEventListener('mouseup',function(){if(!dragOn)return;dragOn=false;hdr.style.cursor='grab';},true);
+hdr.addEventListener('pointerdown',function(e){
+  if(e.button!==0)return;
+  if(host.style.bottom!=='auto'){
+    var r=host.getBoundingClientRect();
+    host.style.setProperty('bottom','auto','important');
+    host.style.setProperty('right','auto','important');
+    host.style.setProperty('left',r.left+'px','important');
+    host.style.setProperty('top',r.top+'px','important');
+  }
+  dragOn=true;
+  dragOX=e.clientX-host.getBoundingClientRect().left;
+  dragOY=e.clientY-host.getBoundingClientRect().top;
+  hdr.style.cursor='grabbing';
+  hdr.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+hdr.addEventListener('pointermove',function(e){
+  if(!dragOn)return;
+  var ml=window.innerWidth-host.offsetWidth-4,mt=window.innerHeight-host.offsetHeight-4;
+  host.style.setProperty('left',Math.max(4,Math.min(e.clientX-dragOX,ml))+'px','important');
+  host.style.setProperty('top',Math.max(4,Math.min(e.clientY-dragOY,mt))+'px','important');
+  e.preventDefault();
+});
+hdr.addEventListener('pointerup',function(e){dragOn=false;hdr.style.cursor='grab';hdr.releasePointerCapture(e.pointerId);});
+hdr.addEventListener('pointercancel',function(){dragOn=false;hdr.style.cursor='grab';});
 
 var rem=secs;
 timerRef=setInterval(function(){rem--;if(rem<=0){clearInterval(timerRef);return;}if(timerEl)timerEl.textContent=Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0');},1000);
@@ -5591,11 +5602,98 @@ console.log('[NEXUS-HITL] Initialised for step '+stepNum);
 
 async function removePauseOverlay(page: Page): Promise<void> {
   try {
-    await page.evaluate(() => document.getElementById('autotest-pause-overlay')?.remove())
+    await page.evaluate(() => {
+      document.getElementById('autotest-pause-overlay')?.remove()
+      document.getElementById('autotest-hitl-reopen')?.remove()
+    })
+  } catch { /* page may have navigated — non-fatal */ }
+}
+
+
+// ─── Browser state highlighting ─────────────────────────────────────────────
+
+const BORDER_INJECTION_SCRIPT = `
+(function() {
+  var colors = {
+    running: { border: '#f59e0b', shadow: 'rgba(245,158,11,0.35)', label: '\\u25b6 RUNNING' },
+    paused:  { border: '#3b82f6', shadow: 'rgba(59,130,246,0.35)',  label: '\\u23f8 PAUSED' },
+    passed:  { border: '#22c55e', shadow: 'rgba(34,197,94,0.35)',   label: '\\u2705 PASSED' },
+    failed:  { border: '#ef4444', shadow: 'rgba(239,68,68,0.35)',   label: '\\u274c FAILED' }
+  };
+  function applyState(overlay, badge) {
+    var root = document.documentElement || document.body;
+    if (!root) return;
+    var state = root.getAttribute('data-autotest-state') || (document.body && document.body.getAttribute('data-autotest-state')) || 'running';
+    var cfg = colors[state];
+    if (!cfg) return;
+    if (state === 'running') {
+      overlay.style.animation   = 'at-border-flicker 1s ease-in-out infinite';
+      overlay.style.borderColor = cfg.border;
+      badge.style.animation     = 'at-badge-flicker 1s ease-in-out infinite';
+      badge.style.background    = cfg.border;
+    } else {
+      overlay.style.animation   = 'none';
+      overlay.style.transition  = 'border-color 0.4s ease,box-shadow 0.4s ease';
+      overlay.style.borderColor = cfg.border;
+      overlay.style.boxShadow   = 'inset 0 0 20px ' + cfg.shadow;
+      badge.style.animation     = 'none';
+      badge.style.background    = cfg.border;
+    }
+    badge.textContent = cfg.label;
+  }
+  function inject() {
+    var root = document.documentElement || document.body;
+    if (!root) { setTimeout(inject, 30); return; }
+    if (!document.getElementById('autotest-state-style')) {
+      var styleEl = document.createElement('style');
+      styleEl.id = 'autotest-state-style';
+      styleEl.textContent =
+        '@keyframes at-border-flicker{0%,100%{border-color:#f59e0b;box-shadow:inset 0 0 20px rgba(245,158,11,0.35)}50%{border-color:#fbbf24;box-shadow:inset 0 0 48px rgba(251,191,36,0.75)}}' +
+        '@keyframes at-badge-flicker{0%,100%{opacity:1;background:#f59e0b}50%{opacity:0.65;background:#fbbf24}}';
+      (document.head || root).appendChild(styleEl);
+    }
+    var overlay = document.getElementById('autotest-state-border');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'autotest-state-border';
+      overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:2147483646;border:4px solid #f59e0b;box-sizing:border-box;animation:at-border-flicker 1s ease-in-out infinite';
+      root.appendChild(overlay);
+    }
+    var badge = document.getElementById('autotest-state-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'autotest-state-badge';
+      badge.style.cssText = 'position:fixed;top:0;left:50%;transform:translateX(-50%);z-index:2147483646;pointer-events:none;padding:4px 16px;border-radius:0 0 10px 10px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;color:#fff;background:#f59e0b;animation:at-badge-flicker 1s ease-in-out infinite';
+      root.appendChild(badge);
+    }
+    applyState(overlay, badge);
+    if (window.__autotestStateObserver) { try { window.__autotestStateObserver.disconnect(); } catch(e) {} }
+    var observer = new MutationObserver(function() { observer.disconnect(); inject(); });
+    observer.observe(root, { childList: true, attributes: true, attributeFilter: ['data-autotest-state'] });
+    if (document.body && document.body !== root) {
+      observer.observe(document.body, { childList: true, attributes: true, attributeFilter: ['data-autotest-state'] });
+    }
+    window.__autotestStateObserver = observer;
+  }
+  if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', inject, { once: true }); } else { inject(); }
+})();
+`
+
+async function setupBrowserStateBorder(ctx: BrowserContext): Promise<void> {
+  await ctx.addInitScript({ content: BORDER_INJECTION_SCRIPT })
+}
+
+async function setBrowserState(page: Page, state: 'running' | 'paused' | 'passed' | 'failed' | ''): Promise<void> {
+  try {
+    await page.evaluate((s) => {
+      if (document.documentElement) document.documentElement.setAttribute('data-autotest-state', s)
+      if (document.body) document.body.setAttribute('data-autotest-state', s)
+    }, state)
   } catch { /* page may have navigated — non-fatal */ }
 }
 
 async function injectAiRecoveryBanner(page: Page): Promise<void> {
+
   try {
     await page.evaluate(() => {
       let banner = document.getElementById('autotest-ai-recovery-banner')
@@ -5645,6 +5743,26 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
 
   try {
     const isInteractive = context.interactive === true
+    let currentBrowserState: 'running' | 'paused' | 'passed' | 'failed' | '' = 'running'
+
+    const updateBrowserState = async (state: 'running' | 'paused' | 'passed' | 'failed' | '') => {
+      currentBrowserState = state
+      if (!isInteractive || !browserContext) return
+      const pages = browserContext.pages()
+      await Promise.all(
+        pages.map(async (p) => {
+          try {
+            await setBrowserState(p, state)
+          } catch { /* page closed or navigated */ }
+        })
+      )
+    }
+
+    const applyCurrentState = async (p: Page) => {
+      try {
+        await setBrowserState(p, currentBrowserState)
+      } catch { /* page closed or navigated */ }
+    }
     browser = await chromium.launch(
       isInteractive
         ? { headless: false, args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox', '--ignore-certificate-errors'] }
@@ -5661,6 +5779,9 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
         viewport: { width: 1280, height: 800 },
         ignoreHTTPSErrors: true,
       })
+      await ctx.addInitScript(() => {
+        (window as any).__name = (fn: any) => fn;
+      });
       await ctx.tracing.start({ screenshots: true, snapshots: true })
       return { ctx, pg: await ctx.newPage() }
     }
@@ -5679,6 +5800,9 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           viewport: { width: 1280, height: 800 },
           ignoreHTTPSErrors: true,
         })
+        await browserContext.addInitScript(() => {
+          (window as any).__name = (fn: any) => fn;
+        });
         await browserContext.tracing.start({ screenshots: true, snapshots: true })
         page = await browserContext.newPage()
       } catch (loadErr) {
@@ -5698,17 +5822,31 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
       await setupBrowserStateBorder(browserContext)
     }
 
-    // ── Wire up browser/page close detection ─────────────────────────────
-    // If user closes the testing browser window, set userClosedBrowser = true.
-    // The step loop checks this flag before each step and exits immediately.
+    // ── Wire up browser/page close detection & state synchronization ─────────
     if (isInteractive && page) {
       page.on('close', () => {
         log.warn(`[EXEC] ⚠️  Testing browser window CLOSED by user — aborting execution ${executionId}`)
         userClosedBrowser = true
       })
+      page.on('domcontentloaded', () => {
+        applyCurrentState(page!).catch(() => {})
+      })
+      page.on('load', () => {
+        applyCurrentState(page!).catch(() => {})
+      })
+      applyCurrentState(page).catch(() => {})
     }
+
     if (isInteractive && browserContext) {
       browserContext.on('page', (newPage) => {
+        newPage.on('domcontentloaded', () => {
+          applyCurrentState(newPage).catch(() => {})
+        })
+        newPage.on('load', () => {
+          applyCurrentState(newPage).catch(() => {})
+        })
+        applyCurrentState(newPage).catch(() => {})
+
         if (userClosedBrowser) return  // already flagged
         newPage.on('close', () => {
           const allPages = browserContext?.pages() ?? []
@@ -6156,6 +6294,60 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                     })
                     hitlStepInserted = true
                     log.info({ newStep, insertIdx }, '[HITL-APPLY] ✅ Step inserted into DB at index ' + insertIdx)
+
+                    // ── HITL Learning: write confirmed button name back to metadata_canonical ──
+                    // When the user applies a CLICK step with a button name via HITL,
+                    // learn it as the canonical button name for this entity so future
+                    // test generation uses the correct name (closes the hallucination loop).
+                    if (finalAction === 'CLICK' && finalTarget && projectId) {
+                      try {
+                        const isOpenBtn   = /\\b(new|add)\\b|^\\+/i.test(finalTarget)
+                        const isSubmitBtn = /\\b(save|create|submit|update|confirm)\\b/i.test(finalTarget) && !/\\b(new|add)\\b|^\\+/i.test(finalTarget)
+
+                        if (isOpenBtn || isSubmitBtn) {
+                          // Determine entity hint from the paused step's target field
+                          const entityFromTarget = step.target
+                            ? step.target.replace(/\\b(ID|Name|Email|Phone|Date|Type|Status|Source|Stage|Amount)$\\b/i, '').trim()
+                            : undefined
+
+                          if (entityFromTarget && entityFromTarget.length > 2) {
+                            const existingCanon = await prisma.metadata_canonical.findFirst({
+                              where: {
+                                project_id: projectId,
+                                entity_name: { contains: entityFromTarget, mode: 'insensitive' },
+                              },
+                              select: { id: true, business_rules: true, primary_action_button: true },
+                            })
+
+                            if (existingCanon) {
+                              const br = (existingCanon.business_rules ?? {}) as Record<string, unknown>
+                              if (isOpenBtn) {
+                                br['trigger_button'] = finalTarget
+                                await prisma.metadata_canonical.update({
+                                  where: { id: existingCanon.id },
+                                  data:  { business_rules: br as any },
+                                })
+                                log.info(
+                                  { projectId, entity: entityFromTarget, button: finalTarget },
+                                  '[HITL-LEARN] ✅ Learned open-form button name from HITL correction',
+                                )
+                              } else if (isSubmitBtn) {
+                                await prisma.metadata_canonical.update({
+                                  where: { id: existingCanon.id },
+                                  data:  { primary_action_button: finalTarget },
+                                })
+                                log.info(
+                                  { projectId, entity: entityFromTarget, button: finalTarget },
+                                  '[HITL-LEARN] ✅ Learned submit button name from HITL correction',
+                                )
+                              }
+                            }
+                          }
+                        }
+                      } catch (learnErr) {
+                        log.warn({ learnErr }, '[HITL-LEARN] Button name learning failed (non-fatal)')
+                      }
+                    }
                   }
                 }
               } catch (dbErr) {
@@ -6180,7 +6372,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             agentFailureReason,
             testCaseId,
           )
-          await setBrowserState(page, 'paused')
+          await updateBrowserState('paused')
 
           // ── Re-inject overlay after page navigation ─────────
           let hitlPauseSettled = false
@@ -6199,7 +6391,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                 testCaseId,
               )
               log.info(`[HITL] ♻️ Overlay re-injected after page navigation for step ${i + 1}`)
-              await setBrowserState(page!, 'paused')
+              await updateBrowserState('paused')
             } catch (err) {
               log.warn({ err }, '[HITL] Could not re-inject overlay after navigation (non-fatal)')
             }
@@ -6284,7 +6476,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             hitlSettleFn = null
             try { page.off('load', reInjectOverlay) } catch { }
             await removePauseOverlay(page)
-            await setBrowserState(page, 'failed')
+            await updateBrowserState('failed')
             finalStatus = 'FAILED'
             firstFailedLocator = step.target ?? ''
             break
@@ -6305,7 +6497,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             errorMessage = 'Test stopped by user'
             firstFailedLocator = step.target ?? ''
             // Set failed border, then close browser
-            await setBrowserState(page, 'failed').catch(() => {})
+            await updateBrowserState('failed').catch(() => {})
             await page.waitForTimeout(800).catch(() => {})
             userClosedBrowser = true  // prevent further steps
             // Close the browser gracefully
@@ -6320,7 +6512,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           // ── Post-pause: handle resume / skip ──────────────────────────────
 
           await removePauseOverlay(page)
-          await setBrowserState(page, 'running')
+          await updateBrowserState('running')
 
           if (pauseAction === 'skip') {
             // User-skipped steps do NOT mark the overall run as FAILED.
@@ -6439,7 +6631,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
 
     // ── Set final browser state color + capture result screenshot ──────
     if (isInteractive && page) {
-      await setBrowserState(page, finalStatus === 'PASSED' ? 'passed' : 'failed')
+      await updateBrowserState(finalStatus === 'PASSED' ? 'passed' : 'failed')
       // Wait for the 400ms CSS transition to fully settle before screenshotting
       await page.waitForTimeout(600).catch(() => { })
 

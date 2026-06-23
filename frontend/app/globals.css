@@ -592,8 +592,9 @@
 }
 
 .nexus-slide-out {
-  animation: nexus-slide-out 0.25s ease-in;
-  /* Note: no 'forwards' fill — prevents panel from staying at opacity:0 before React unmounts it */
+  /* 'forwards' keeps panel at opacity:0/translateX(100%) after animation
+     so it doesn't flash back before React unmounts it (parent waits 320ms) */
+  animation: nexus-slide-out 0.25s ease-in forwards;
 }
 
 .nexus-dot-1 {
@@ -606,6 +607,11 @@
 
 .nexus-dot-3 {
   animation: nexus-dot-bounce 1.4s ease-in-out 400ms infinite;
+}
+
+/* ── Hide Radix UI focus guards (they can show 'Skip to Content' in some environments) ── */
+[data-radix-focus-guard] {
+  display: none !important;
 }
 
 /* ── Logo icon animations ── */

@@ -32,7 +32,7 @@ export const REQUIRED_FIELD_OVERRIDE_MAP: Record<string, string[]> = {
   // CRM core objects
   product:          ['name', 'currency'],
   lead:             ['first name', 'last name', 'company', 'email', 'lead status', 'status'],
-  opportunity:      ['opportunity name', 'name', 'stage', 'close date', 'account name'],
+  opportunity:      ['opportunity name', 'name', 'stage', 'close date', 'account name', 'account'],
   contact:          ['last name'],
   account:          ['account name', 'name'],
   campaign:         ['campaign name', 'name', 'status', 'start date', 'type'],
@@ -49,6 +49,9 @@ export const REQUIRED_FIELD_OVERRIDE_MAP: Record<string, string[]> = {
   // Logistics
   shipment:         ['origin', 'destination', 'status'],
   inventory:        ['name', 'quantity', 'unit'],
+  // Freight / DS Logistics specific — fragments match both space and underscore-separated field labels
+  booking:          ['shipper', 'consignee', 'origin_port', 'origin port', 'destination_port', 'destination port', 'service_type', 'service type', 'carrier', 'booking reference', 'departure date', 'arrival date'],
+  quotation:        ['reference', 'customer', 'origin', 'destination', 'service type', 'validity'],
   // HR
   employee:         ['name', 'first name', 'last name', 'department'],
   job:              ['title', 'name', 'department'],
@@ -104,9 +107,9 @@ export function applyRequiredFieldOverrides(
   let patched = 0
   const result = fields.map(f => {
     if (f.required) return f  // already required — leave unchanged
-    const labelLower = f.label.toLowerCase().trim()
+    const labelLower = f.label.toLowerCase().trim().replace(/_/g, ' ')  // normalize snake_case to space-separated
     const shouldBeRequired = overrideFragments.some(fragment =>
-      labelLower.includes(fragment) || fragment.includes(labelLower)
+      labelLower.includes(fragment.replace(/_/g, ' ')) || fragment.replace(/_/g, ' ').includes(labelLower)
     )
     if (shouldBeRequired) {
       patched++
@@ -251,6 +254,32 @@ export const TYPICAL_FIELDS_BY_ENTITY: Record<string, FieldEntry[]> = {
     { label: 'Branch', type: 'input', required: false, locatorType: 'label' },
     { label: 'Country', type: 'input', required: false, locatorType: 'label' },
   ],
+  // DS Logistics / Freight specific — field labels match the actual "Create Booking" modal
+  // from the DS Logistics app (discovered via Playwright modal scrape on quotation detail page).
+  // submitButton: 'Create Booking' (set in buildFieldManifest Path D below)
+  booking: [
+    { label: 'shipper', type: 'lookup', required: true, locatorType: 'label' },
+    { label: 'consignee', type: 'lookup', required: true, locatorType: 'label' },
+    { label: 'origin_port', type: 'input', required: true, locatorType: 'label' },
+    { label: 'destination_port', type: 'input', required: true, locatorType: 'label' },
+    { label: 'service_type', type: 'select', required: true, locatorType: 'label', options: ['FCL', 'LCL', 'Air', 'Road'] },
+    { label: 'carrier', type: 'lookup', required: false, locatorType: 'label' },
+    { label: 'vessel_name', type: 'input', required: false, locatorType: 'label' },
+    { label: 'voyage_number', type: 'input', required: false, locatorType: 'label' },
+    { label: 'etd', type: 'input', required: false, locatorType: 'label' },
+    { label: 'eta', type: 'input', required: false, locatorType: 'label' },
+    { label: 'commodity', type: 'input', required: false, locatorType: 'label' },
+    { label: 'remarks', type: 'textarea', required: false, locatorType: 'label' },
+  ],
+  quotation: [
+    { label: 'Quotation Reference', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Customer', type: 'lookup', required: true, locatorType: 'label' },
+    { label: 'Service Type', type: 'select', required: true, locatorType: 'label', options: ['Ocean Freight', 'Air Freight', 'Road Freight', 'Rail Freight'] },
+    { label: 'Origin', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Destination', type: 'input', required: true, locatorType: 'label' },
+    { label: 'Validity Date', type: 'input', required: false, locatorType: 'label' },
+    { label: 'Status', type: 'select', required: false, locatorType: 'label', options: ['Draft', 'Sent', 'Accepted', 'Rejected', 'Expired'] },
+  ],
 
 
 }
@@ -364,6 +393,20 @@ export async function buildFieldManifest(
 
           if (fields.length === 0) continue
 
+          // ── Guard: skip list pages that only have search-bar placeholder fields ──
+          // e.g. "/bookings" has only "Search bookings..." — it is a list page, not a form.
+          // Fall through to TYPICAL_FIELDS_BY_ENTITY (Path D) which has the real modal fields.
+          const isSearchOnlyPageA = fields.every(f =>
+            /^search\b|\.{3}$|search\s+\w/i.test(f.label.trim())
+          )
+          if (isSearchOnlyPageA) {
+            log.info(
+              { projectId, entityFilter, path: page.path },
+              '[META-TOOL] Path A: skipping search-only list page — will fall through to TYPICAL_FIELDS',
+            )
+            continue
+          }
+
           // ── FIX 2: Entity-aware submit button detection ───────────────────────
           // Two-tier strategy:
           //   Tier 1 (preferred): button contains BOTH the entity name AND a create/save keyword
@@ -473,7 +516,7 @@ export async function buildFieldManifest(
           }
           // Default: synthesise from entity name so the prompt always shows something
           if (!openBtn && entityFilter) {
-            openBtn = `+New ${entityFilter.charAt(0).toUpperCase() + entityFilter.slice(1)}`
+            openBtn = `+ New ${entityFilter.charAt(0).toUpperCase() + entityFilter.slice(1)}`
           }
 
           return {
@@ -695,6 +738,7 @@ export async function buildFieldManifest(
         const entityName = entityFilter.charAt(0).toUpperCase() + entityFilter.slice(1)
         const reqCount = typicalFields.filter(f => f.required).length
         // Generate entity-specific button names (e.g. "Create Lead", not generic "Save")
+        // For booking specifically the submit button in DS Logistics is "Create Booking"
         const submitBtn = `Create ${entityName}`
         const openBtn   = `+ New ${entityName}`
         log.info(
@@ -708,6 +752,7 @@ export async function buildFieldManifest(
           openButton:    openBtn,
           submitButton:  submitBtn,
           allButtons:    [submitBtn, openBtn, 'Save', 'Cancel'],
+          createUrl:     `/${entityFilter.toLowerCase()}s/new`,
         }
       }
     }
@@ -958,61 +1003,201 @@ async function tryCanonicalManifest(
 ): Promise<FieldManifest | null> {
   if (!entityFilter || entityFilter.length < 2) return null
 
+  const cleanFilter = entityFilter.trim()
+  // Inline depluralizer to match singular/plural forms
+  const depluralize = (word: string): string => {
+    const w = word.toLowerCase().trim()
+    if (w === 'skus') return 'sku'
+    if (w === 'menus') return 'menu'
+    if (w.length < 3) return word
+    const keepAsIs = new Set(['status', 'address', 'process', 'access', 'success', 'business', 'class', 'analysis'])
+    if (keepAsIs.has(w)) return word
+
+    if (w.endsWith('ies') && w.length > 4) return w.slice(0, -3) + 'y'
+    if (w.endsWith('sses')) return w.slice(0, -2)
+    if (w.endsWith('ses') && w.length > 4) return w.slice(0, -1)
+    if (w.endsWith('s') && !w.endsWith('ss') && !w.endsWith('us') && !w.endsWith('is')) {
+      return w.slice(0, -1)
+    }
+    return word
+  }
+  const singularFilter = depluralize(cleanFilter)
+
   // Query canonical table — prefer form-type records over list pages, then most recent
   // This ensures we always get the create-form record (with actual form fields)
   // instead of the list-page record (which has navigation buttons but no form fields).
-  const canonicalRows = await prisma.metadata_canonical.findMany({
+  const allCanonicalRows = await prisma.metadata_canonical.findMany({
     where: {
       project_id:  projectId,
-      entity_name: { contains: entityFilter, mode: 'insensitive' },
     },
     orderBy: { last_synced_at: 'desc' },
-    take: 10,
   })
 
-  if (canonicalRows.length === 0) return null
+  if (allCanonicalRows.length === 0) return null
 
-  // Prefer form-type entities first, then fall back to any type
-  const canonical = canonicalRows.find(r => r.entity_type === 'form') ?? canonicalRows[0]
+  const cleanFilterDep = depluralize(cleanFilter)
+  const singularFilterDep = depluralize(singularFilter)
 
-  // Map canonical fields to FieldEntry[]
-  const formFields   = (canonical.form_fields ?? []) as Array<Record<string, unknown>>
-  const reqFields    = (canonical.required_fields ?? []) as Array<Record<string, unknown>>
-  const optFields    = (canonical.optional_fields ?? []) as Array<Record<string, unknown>>
-  const allButtons   = (canonical.all_buttons ?? []) as string[]
-  const sampleData   = (canonical.real_test_data ?? []) as Array<Record<string, unknown>>
-  const learnedRules = (canonical.learned_rules ?? {}) as Record<string, unknown>
+  // Filter canonicalRows to prioritize exact matches on cleanFilter or singularFilter (ignoring parentheses/suffixes)
+  const matchesExactly = (name: string): boolean => {
+    const cleanDbName = depluralize(name.replace(/\s*\(.*?\)/g, '').trim())
+    return cleanDbName === cleanFilterDep || cleanDbName === singularFilterDep
+  }
 
-  // Build FieldEntry[] from form_fields (which has the complete set)
-  const fields: FieldEntry[] = formFields.map(f => ({
-    label:       String(f.label ?? ''),
-    type:        (f.type as FieldEntry['type']) ?? 'input',
-    required:    Boolean(f.required ?? false),
-    options:     Array.isArray(f.options) ? f.options.map(String) : undefined,
-    sampleValue: typeof f.sample_value === 'string' ? f.sample_value : undefined,
-    locatorType: (f.locator_type as FieldEntry['locatorType']) ?? 'label',
-  })).filter(f => f.label.length > 0)
+  // Also allow substring matching if the database entity_name (singularized) is contained within the filter as a whole word
+  const matchesAsSubstring = (name: string): boolean => {
+    const cleanDbName = depluralize(name.replace(/\s*\(.*?\)/g, '').trim())
+    if (cleanDbName.length < 2) return false
+    const regex = new RegExp(`\\b${cleanDbName}\\b`, 'i')
+    return regex.test(cleanFilterDep) || regex.test(singularFilterDep)
+  }
 
-  // If form_fields is empty, fall back to required + optional fields
-  if (fields.length === 0) {
-    for (const f of [...reqFields, ...optFields]) {
-      fields.push({
-        label:       String(f.label ?? ''),
-        type:        (f.type as FieldEntry['type']) ?? 'input',
-        required:    Boolean(f.required ?? false),
-        options:     Array.isArray(f.options) ? f.options.map(String) : undefined,
-        sampleValue: typeof f.sample_value === 'string' ? f.sample_value : undefined,
-        locatorType: (f.locator_type as FieldEntry['locatorType']) ?? 'label',
-      })
+  let filteredRows = allCanonicalRows.filter(r => matchesExactly(r.entity_name ?? ''))
+  if (filteredRows.length === 0) {
+    // Try substring match, sorting by the length of the database entity name descending (most specific match wins)
+    const substringMatches = allCanonicalRows.filter(r => matchesAsSubstring(r.entity_name ?? ''))
+    if (substringMatches.length > 0) {
+      const maxLen = Math.max(...substringMatches.map(r => depluralize((r.entity_name ?? '').replace(/\s*\(.*?\)/g, '').trim()).length))
+      filteredRows = substringMatches.filter(r => depluralize((r.entity_name ?? '').replace(/\s*\(.*?\)/g, '').trim()).length === maxLen)
     }
   }
 
-  if (fields.length === 0) return null  // no fields → not useful as a manifest
+  if (filteredRows.length === 0) return null
+
+  // Prefer modal_form > form > web_page > list_page — ensures we always use
+  // the creation form manifest (not the list-page search bar) when both exist.
+  const TYPE_PRIORITY: Record<string, number> = { modal_form: 0, form: 1, web_page: 2, list_page: 3 }
+
+  // Load both repository-sourced and crawler-sourced records
+  const repoRow = filteredRows.find(r => r.source === 'repository')
+  const crawlerRows = filteredRows.filter(r => r.source !== 'repository')
+  const crawlerRow = [...crawlerRows].sort((a, b) =>
+    (TYPE_PRIORITY[a.entity_type ?? ''] ?? 4) - (TYPE_PRIORITY[b.entity_type ?? ''] ?? 4)
+  )[0]
+
+  const primaryActionButton = repoRow?.primary_action_button || crawlerRow?.primary_action_button || null
+  const pageUrl = repoRow?.page_url || crawlerRow?.page_url || null
+
+  const canonical = {
+    entity_name: repoRow?.entity_name ?? crawlerRow?.entity_name ?? cleanFilter,
+    entity_type: repoRow?.entity_type ?? crawlerRow?.entity_type ?? 'form',
+    primary_action_button: primaryActionButton,
+    page_url: pageUrl,
+  }
+
+  // Extract fields, buttons, rules, and test data from both sources and merge them
+  const getFieldsFromRow = (row: typeof allCanonicalRows[0] | undefined): FieldEntry[] => {
+    if (!row) return []
+    const formFields = (row.form_fields ?? []) as Array<Record<string, unknown>>
+    const reqFields  = (row.required_fields ?? []) as Array<Record<string, unknown>>
+    const optFields  = (row.optional_fields ?? []) as Array<Record<string, unknown>>
+
+    let parsed: FieldEntry[] = formFields.map(f => ({
+      label:       String(f.label ?? ''),
+      type:        (f.type as FieldEntry['type']) ?? 'input',
+      required:    Boolean(f.required ?? false),
+      options:     Array.isArray(f.options) ? f.options.map(String) : undefined,
+      sampleValue: typeof f.sample_value === 'string' ? f.sample_value : undefined,
+      locatorType: (f.locator_type as FieldEntry['locatorType']) ?? 'label',
+    })).filter(f => f.label.length > 0)
+
+    if (parsed.length === 0) {
+      for (const f of [...reqFields, ...optFields]) {
+        parsed.push({
+          label:       String(f.label ?? ''),
+          type:        (f.type as FieldEntry['type']) ?? 'input',
+          required:    Boolean(f.required ?? false),
+          options:     Array.isArray(f.options) ? f.options.map(String) : undefined,
+          sampleValue: typeof f.sample_value === 'string' ? f.sample_value : undefined,
+          locatorType: (f.locator_type as FieldEntry['locatorType']) ?? 'label',
+        })
+      }
+    }
+    return parsed
+  }
+
+  const repoFields = getFieldsFromRow(repoRow)
+  const crawlerFields = getFieldsFromRow(crawlerRow)
+
+  // Merge field arrays
+  const mergedFieldsMap = new Map<string, FieldEntry>()
+  for (const f of crawlerFields) {
+    mergedFieldsMap.set(f.label.toLowerCase(), f)
+  }
+  for (const f of repoFields) {
+    const key = f.label.toLowerCase()
+    const existing = mergedFieldsMap.get(key)
+    if (existing) {
+      existing.type = f.type
+      existing.required = existing.required || f.required
+      if (f.options) existing.options = f.options
+      if (f.sampleValue) existing.sampleValue = f.sampleValue
+      if (f.locatorType) existing.locatorType = f.locatorType
+    } else {
+      mergedFieldsMap.set(key, f)
+    }
+  }
+
+  const fields = Array.from(mergedFieldsMap.values())
+
+  // Merge buttons, rules, and test data
+  const allButtons = Array.from(new Set([
+    ...((repoRow?.all_buttons ?? []) as string[]),
+    ...((crawlerRow?.all_buttons ?? []) as string[]),
+  ]))
+
+  const sampleData = [
+    ...((repoRow?.real_test_data ?? []) as Array<Record<string, unknown>>),
+    ...((crawlerRow?.real_test_data ?? []) as Array<Record<string, unknown>>),
+  ]
+
+  const learnedRules = {
+    ...((crawlerRow?.learned_rules ?? {}) as Record<string, unknown>),
+    ...((repoRow?.learned_rules ?? {}) as Record<string, unknown>),
+  }
+
+  const businessRulesRaw = {
+    ...((crawlerRow?.business_rules ?? {}) as Record<string, unknown>),
+    ...((repoRow?.business_rules ?? {}) as Record<string, unknown>),
+  }
+
+  const relationshipsRaw = {
+    ...((crawlerRow?.relationships ?? {}) as Record<string, string>),
+    ...((repoRow?.relationships ?? {}) as Record<string, string>),
+  }
+
+  if (fields.length === 0) {
+    // Even with no form fields, if the canonical row has valid button metadata
+    // (trigger_button, open_button, primary_action_button), return a minimal manifest
+    // so the step generator gets the correct button name rather than falling back to
+    // synthesized names like "+ New Terms" (pluralized from the test name).
+    const hasTriggerButton = typeof businessRulesRaw.trigger_button === 'string' && (businessRulesRaw.trigger_button as string).length > 0
+    const hasLearnedButton = typeof learnedRules.open_button === 'string' && (learnedRules.open_button as string).length > 0
+    const hasPrimaryButton = typeof canonical.primary_action_button === 'string' && canonical.primary_action_button.length > 0
+
+    if (!hasTriggerButton && !hasLearnedButton && !hasPrimaryButton) {
+      log.info(
+        { projectId, entityFilter, entityType: canonical.entity_type },
+        '[META-TOOL] tryCanonicalManifest: no fields AND no button metadata — returning null (cannot help LLM)',
+      )
+      return null  // no fields AND no button data → truly not useful
+    }
+
+    // Has button metadata but no fields — return minimal manifest with just button data
+    // The step generator will use the button names and skip field generation constraints.
+    log.info(
+      { projectId, entityFilter, entityType: canonical.entity_type, hasTriggerButton, hasLearnedButton },
+      '[META-TOOL] tryCanonicalManifest: no form fields, but has button metadata — returning minimal manifest',
+    )
+    // Fall through — we continue to build the manifest with empty fields but valid buttons
+  }
 
   // ── Guard: list_page records with ONLY search-bar fields are not form manifests ──
   // List pages have a search input (e.g. "Search leads...") but no actual form fields.
   // These should NOT be used as a form field manifest — fall through to TYPICAL_FIELDS_BY_ENTITY.
-  const isOnlySearchBarFields = fields.every(f =>
+  // NOTE: fields.every() on an empty array always returns true (JS vacuous truth) — guard
+  //       against that explicitly so modal forms with no crawled fields are not discarded here.
+  const isOnlySearchBarFields = fields.length > 0 && fields.every(f =>
     /^search\b|\.{3}$|search\s+\w/i.test(f.label.trim())
   )
   if (isOnlySearchBarFields) {
@@ -1040,10 +1225,6 @@ async function tryCanonicalManifest(
     }
   }
 
-  // Extract Knowledge Graph data
-  const relationshipsRaw = (canonical.relationships ?? {}) as Record<string, string>
-  const businessRulesRaw = (canonical.business_rules ?? {}) as Record<string, unknown>
-
   // Apply required-field overrides for any fields the crawler may have missed
   const patchedFields = applyRequiredFieldOverrides(fields, canonical.entity_name)
 
@@ -1063,8 +1244,12 @@ async function tryCanonicalManifest(
   // We also try to detect it from all_buttons.
   let resolvedOpenButton: string | undefined
 
-  // Priority 1: learned_rules.open_button (user-confirmed or runtime-discovered)
-  if (typeof learnedRules.open_button === 'string' && learnedRules.open_button.length > 0) {
+  // Priority 1: business_rules.trigger_button (from business_rules.trigger_button) — takes highest priority
+  if (typeof businessRulesRaw.trigger_button === 'string' && (businessRulesRaw.trigger_button as string).length > 0) {
+    resolvedOpenButton = businessRulesRaw.trigger_button as string
+  }
+  // Priority 2: learned_rules.open_button (user-confirmed or runtime-discovered)
+  else if (typeof learnedRules.open_button === 'string' && learnedRules.open_button.length > 0) {
     resolvedOpenButton = learnedRules.open_button
   }
 
@@ -1085,24 +1270,153 @@ async function tryCanonicalManifest(
   // Priority 3: synthesise a sensible default from the entity name
   // so the prompt always has something concrete rather than generic "Save"
   if (!resolvedOpenButton) {
-    resolvedOpenButton = `+New ${canonical.entity_name}`
+    resolvedOpenButton = `+ New ${canonical.entity_name}`
   }
 
+  // ── Resolve submit button — never leave it undefined ──────────────────────
+  // The canonical primary_action_button can be null when:
+  //   (a) The Playwright crawler visited the page but detected no "create/save" button
+  //   (b) The canonical build ran before web_test_data.create_button_name was populated
+  //   (c) The page uses a non-standard button that the heuristic detector missed
+  //
+  // ROOT CAUSE OF "Save" HALLUCINATION: if submitButton is undefined, the LLM
+  // has no constraint and defaults to the generic word "Save" — which almost
+  // never matches the real button (e.g., "Create Opportunity", "Save Contact").
+  //
+  // FIX: synthesize an entity-appropriate button name so the prompt ALWAYS has
+  // a concrete button name constraint, even when the DB is missing it.
+  let resolvedSubmitButton: string | undefined = canonical.primary_action_button ?? undefined
+
+  if (!resolvedSubmitButton) {
+    // Priority 1: look in all_buttons for a create/save button matching the entity
+    const entityBtnLower = canonical.entity_name.toLowerCase()
+    if (allButtons.length > 0) {
+      // Tier 1: button that contains both the entity name and a create/save keyword
+      resolvedSubmitButton = allButtons.find(b => {
+        const n = b.toLowerCase().trim()
+        return (n.includes(entityBtnLower) || entityBtnLower.includes(n.replace(/[^a-z]/g, '')))
+          && (n.includes('create') || n.includes('save') || n.includes('submit') || n.includes('add'))
+      })
+      // Tier 2: generic save/create button that doesn't belong to another entity
+      if (!resolvedSubmitButton) {
+        resolvedSubmitButton = allButtons.find(b => {
+          const n = b.toLowerCase().trim()
+          const isCreateSave = n.includes('create') || n.includes('save') || n.includes('submit')
+          // Exclude buttons that explicitly name a DIFFERENT entity
+          const entityWordMatch = n.match(/\b(create|save|submit)\s+([a-z]+(?:\s+[a-z]+)?)\b/)
+          const entityWord = entityWordMatch?.[2]?.trim() ?? ''
+          const isDifferentEntity = entityWord.length > 2
+            && !entityBtnLower.includes(entityWord)
+            && !entityWord.includes(entityBtnLower)
+          return isCreateSave && !isDifferentEntity
+        })
+      }
+    }
+
+    // Priority 2: synthesize entity-specific name (always better than nothing)
+    if (!resolvedSubmitButton) {
+      // Use "Create <Entity>" as the synthesized default — matches the most common
+      // real button naming convention ("Create Opportunity", "Create Account", etc.)
+      resolvedSubmitButton = `Create ${canonical.entity_name}`
+      log.info(
+        { projectId, entityFilter, entity: canonical.entity_name, synthesized: resolvedSubmitButton },
+        '[META-TOOL] tryCanonicalManifest: synthesized submit button name (DB had null) — prevents "Save" hallucination',
+      )
+    }
+  }
+
+  // ── Build enriched allButtons including the open-form trigger ─────────────
+  // The canonical all_buttons only contains buttons INSIDE the form/modal.
+  // The open-form trigger (e.g. "+ Add Account") lives in learned_rules/business_rules.
+  // We prepend it so Check 3 never rejects a CLICK on the trigger button.
+  const enrichedAllButtons = (() => {
+    const base = allButtons.length > 0 ? [...allButtons] : []
+    // Also include the trigger_button from business_rules if different from learned open_button
+    const triggerBtn = typeof businessRulesRaw.trigger_button === 'string' ? businessRulesRaw.trigger_button as string : null
+    for (const btn of [triggerBtn, resolvedOpenButton]) {
+      if (btn && !base.some(b => b.toLowerCase().trim() === btn.toLowerCase().trim())) {
+        base.unshift(btn)
+      }
+    }
+    return base.length > 0 ? base : undefined
+  })()
+
+  // ── Resolve listUrl — business_rules.list_url is the most authoritative source ─
+  // For modal forms, page_url is the modal URL (e.g. /accounts/__modal__/account).
+  // business_rules.list_url is the actual list page URL (/accounts) — use it directly.
+  const resolvedListUrl = (() => {
+    if (typeof businessRulesRaw.list_url === 'string' && (businessRulesRaw.list_url as string).length > 0) {
+      return businessRulesRaw.list_url as string
+    }
+    // Fallback: strip modal/new/create suffix from page_url
+    return canonical.page_url
+      ?.replace(/\/__modal__\/.*$/i, '')
+      ?.replace(/\/(new|create|add)\/?$/i, '') || undefined
+  })()
+
+  // ── Resolve detailUrlPattern for post-create ASSERT_URL ─────────────────────
+  const resolvedDetailUrlPattern = (() => {
+    if (typeof businessRulesRaw.detail_url_pattern === 'string' && (businessRulesRaw.detail_url_pattern as string).length > 0) {
+      return businessRulesRaw.detail_url_pattern as string
+    }
+    // Derive: /accounts → /accounts/
+    if (resolvedListUrl) return resolvedListUrl.replace(/\/?$/, '/')
+    return undefined
+  })()
+
+  // ── Expose trigger button (definitive list-page button name) ─────────────────
+  const resolvedTriggerButton = (() => {
+    if (typeof businessRulesRaw.trigger_button === 'string' && (businessRulesRaw.trigger_button as string).length > 0) {
+      return businessRulesRaw.trigger_button as string
+    }
+    return resolvedOpenButton
+  })()
+
+  // ── Read new single-source-of-truth columns ────────────────────────────────
+  // These are written by the canonical builder at sync time and take priority
+  // over anything derived at generation time. Universal — entity-agnostic.
+  const resolvedCanonicalCreateButton: string | undefined =
+    (crawlerRow as any)?.create_button
+    ?? (repoRow   as any)?.create_button
+    ?? resolvedOpenButton  // fall back to the runtime-resolved open button
+
+  const resolvedCanonicalUpdateButton: string | undefined =
+    (crawlerRow as any)?.update_button
+    ?? (repoRow   as any)?.update_button
+
+  const resolvedCanonicalDeleteButton: string | undefined =
+    (crawlerRow as any)?.delete_button
+    ?? (repoRow   as any)?.delete_button
+
+  const resolvedCanonicalSearchField: string | undefined =
+    (crawlerRow as any)?.primary_search_field
+    ?? (repoRow   as any)?.primary_search_field
+
+  const resolvedActionFlows: Record<string, unknown> | undefined = (() => {
+    const af = (crawlerRow as any)?.action_flows ?? (repoRow as any)?.action_flows
+    return af && typeof af === 'object' && Object.keys(af).length > 0 ? af : undefined
+  })()
+
   return {
-    entityName:    canonical.entity_name,
-    requiredCount: patchedFields.filter(f => f.required).length,
-    fields:        patchedFields,
-    openButton:    resolvedOpenButton,
-    submitButton:  canonical.primary_action_button ?? undefined,
-    allButtons:    allButtons.length > 0 ? allButtons : undefined,
-    createUrl:     canonical.page_url ?? undefined,
-    // Derive listUrl from page_url when a learned open_button rule is present
-    listUrl:       typeof learnedRules.open_button === 'string'
-                     ? (canonical.page_url?.replace(/\/(new|create|add)\b.*$/i, '') || undefined)
-                     : undefined,
+    entityName:       canonical.entity_name,
+    requiredCount:    patchedFields.filter(f => f.required).length,
+    fields:           patchedFields,
+    openButton:       resolvedCanonicalCreateButton ?? resolvedOpenButton,
+    triggerButton:    resolvedTriggerButton,
+    submitButton:     resolvedSubmitButton,
+    updateButton:     resolvedCanonicalUpdateButton,
+    deleteButton:     resolvedCanonicalDeleteButton,
+    searchField:      resolvedCanonicalSearchField,
+    actionFlows:      resolvedActionFlows,
+    allButtons:       enrichedAllButtons,
+    createUrl:        canonical.page_url ?? undefined,
+    listUrl:          resolvedListUrl,
+    detailUrlPattern: resolvedDetailUrlPattern,
+    // Real test data rows — preferred over web_test_data (which may be empty for modal forms)
+    sampleRecords:    sampleData.length > 0 ? sampleData as Array<Record<string, unknown>> : undefined,
     // Knowledge Graph data
-    relationships:  Object.keys(relationshipsRaw).length > 0 ? relationshipsRaw : undefined,
-    businessRules:  Object.keys(businessRulesRaw).length > 0 ? businessRulesRaw : undefined,
+    relationships:    Object.keys(relationshipsRaw).length > 0 ? relationshipsRaw : undefined,
+    businessRules:    Object.keys(businessRulesRaw).length > 0 ? businessRulesRaw : undefined,
   }
 }
 
@@ -1127,7 +1441,7 @@ const FORM_ACTION_RE = /\b(create|save|submit|add|new|update|edit|delete|remove|
  * @param entityHint - Optional entity name to scope the manifest lookup
  * @returns          - The same steps array with corrected button names (mutated in-place)
  */
-function getEntityPlural(entity: string): string {
+export function getEntityPlural(entity: string): string {
   // Use only the first word so multi-word hints like "Product Valid" → "products" not "product valids"
   const e = entity.toLowerCase().trim().split(/\s+/)[0] ?? entity.toLowerCase().trim()
   if (e.endsWith('y')) return e.slice(0, -1) + 'ies'
@@ -1173,12 +1487,41 @@ export async function autoCorrectButtonNames(
     // filtered all_buttons, so we try it first before any other strategy.
     if (process.env.ENABLE_CANONICAL_METADATA !== 'false') {
       try {
+        const cleanHint = entityHint.trim()
+        const depluralize = (word: string): string => {
+          const w = word.toLowerCase().trim()
+          if (w.length < 3) return word
+          const keepAsIs = new Set(['status', 'address', 'process', 'access', 'success', 'business', 'class', 'analysis'])
+          if (keepAsIs.has(w)) return word
+
+          if (w.endsWith('ies') && w.length > 4) return w.slice(0, -3) + 'y'
+          if (w.endsWith('sses')) return w.slice(0, -2)
+          if (w.endsWith('ses') && w.length > 4) return w.slice(0, -1)
+          if (w.endsWith('s') && !w.endsWith('ss') && !w.endsWith('us') && !w.endsWith('is')) {
+            return w.slice(0, -1)
+          }
+          return word
+        }
+        // ── Strip common LLM noise suffixes BEFORE querying ──────────────────
+        // entityHint may arrive as "Account Record", "Term Management", "Account records"
+        // etc. Strip the suffix words so the DB lookup matches the real entity_name.
+        const NOISE_SUFFIXES = /\s+(record|records|management|list|module|page|entry|entries|item|items|form|data)$/i
+        const coreHint = cleanHint.replace(NOISE_SUFFIXES, '').trim()
+        const singularHint = depluralize(coreHint)
+        // Also try just the FIRST word of the hint as a last-resort fallback
+        // e.g. "Account Record" → "Account" as a separate OR clause
+        const firstWord = coreHint.split(/\s+/)[0] ?? coreHint
+
         const canonical = await prisma.metadata_canonical.findFirst({
           where: {
             project_id:  projectId,
-            entity_name: { contains: entityHint, mode: 'insensitive' },
+            OR: [
+              { entity_name: { contains: coreHint,     mode: 'insensitive' } },
+              { entity_name: { contains: singularHint, mode: 'insensitive' } },
+              { entity_name: { equals:   firstWord,    mode: 'insensitive' } },
+            ],
           },
-          select: { primary_action_button: true, all_buttons: true, learned_rules: true },
+          select: { primary_action_button: true, all_buttons: true, learned_rules: true, business_rules: true },
         })
         if (canonical) {
           if (!realSubmitBtn && canonical.primary_action_button) {
@@ -1188,13 +1531,22 @@ export async function autoCorrectButtonNames(
               '[META-TOOL] autoCorrectButtonNames: using CANONICAL submit button',
             )
           }
-          // Check learned_rules.open_button FIRST — highest priority (user-confirmed)
+          // Priority 0: business_rules.trigger_button — highest priority (user-verified, authoritative)
+          const bizRules = (canonical.business_rules ?? {}) as Record<string, unknown>
+          if (!realOpenBtn && typeof bizRules.trigger_button === 'string' && bizRules.trigger_button.length > 0) {
+            realOpenBtn = bizRules.trigger_button as string
+            log.info(
+              { projectId, entityHint, button: realOpenBtn },
+              '[META-TOOL] autoCorrectButtonNames: using CANONICAL business_rules.trigger_button (highest priority)',
+            )
+          }
+          // Priority 1: learned_rules.open_button (user-confirmed or runtime-discovered)
           const rules = (canonical.learned_rules ?? {}) as Record<string, unknown>
           if (!realOpenBtn && typeof rules.open_button === 'string' && rules.open_button.length > 0) {
             realOpenBtn = rules.open_button
             log.info(
               { projectId, entityHint, button: realOpenBtn },
-              '[META-TOOL] autoCorrectButtonNames: using CANONICAL learned_rules.open_button (highest priority)',
+              '[META-TOOL] autoCorrectButtonNames: using CANONICAL learned_rules.open_button',
             )
           }
           // Fall back: scan all_buttons for "+New X" patterns (entity-specific first)
@@ -1300,7 +1652,7 @@ export async function autoCorrectButtonNames(
     if (cleaned) {
       const capitalized = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase()
       if (!realOpenBtn) {
-        realOpenBtn = `+New ${capitalized}`
+        realOpenBtn = `+ New ${capitalized}`
       }
       if (!realSubmitBtn) {
         realSubmitBtn = `Create ${capitalized}`
@@ -1371,6 +1723,11 @@ export async function autoCorrectButtonNames(
       if (!target) continue
 
       if (knownButtonsLower.has(target.toLowerCase().trim())) continue
+      
+      // Exclude delete/confirm/cancel buttons from submit button correction
+      const isDeleteOrConfirmBtn = /\b(delete|remove|confirm|cancel|yes|ok|close)\b/i.test(target)
+      if (isDeleteOrConfirmBtn) continue
+
       if (!FORM_ACTION_RE.test(target)) continue
 
       const targetLower = target.toLowerCase()

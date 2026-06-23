@@ -87,6 +87,7 @@ async function ensureCanonicalTable(): Promise<void> {
         real_test_data        JSONB        DEFAULT '[]',
         stable_locators       JSONB        DEFAULT '{}',
         learned_rules         JSONB        DEFAULT '{}',
+        source                TEXT         DEFAULT 'crawler',
         last_synced_at        TIMESTAMPTZ  DEFAULT now(),
         version               INT          DEFAULT 1,
         UNIQUE(project_id, entity_name)
@@ -112,8 +113,28 @@ async function ensureCanonicalTable(): Promise<void> {
   try {
     await prisma.$executeRaw`ALTER TABLE metadata_canonical ADD COLUMN IF NOT EXISTS relationships JSONB DEFAULT '{}'`
     await prisma.$executeRaw`ALTER TABLE metadata_canonical ADD COLUMN IF NOT EXISTS business_rules JSONB DEFAULT '{}'`
+    await prisma.$executeRaw`ALTER TABLE metadata_canonical ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'crawler'`
   } catch { /* columns may already exist */ }
+
+  // ── Stage 4 enrichment columns: single-source-of-truth fields ────────────────
+  // These are added incrementally so existing deployments are upgraded in-place.
+  // Each ALTER is idempotent (IF NOT EXISTS) — safe to run on every boot.
+  const enrichmentCols: Array<[string, string]> = [
+    ['create_button',        'TEXT'],
+    ['update_button',        'TEXT'],
+    ['delete_button',        'TEXT'],
+    ['primary_search_field', 'TEXT'],
+    ['action_flows',         "JSONB DEFAULT '{}'"],
+  ]
+  for (const [col, colType] of enrichmentCols) {
+    try {
+      await prisma.$executeRawUnsafe(
+        `ALTER TABLE metadata_canonical ADD COLUMN IF NOT EXISTS ${col} ${colType}`
+      )
+    } catch { /* column already exists — safe to ignore */ }
+  }
 }
+
 
 // ─── Entity Name Derivation ───────────────────────────────────────────────────
 
@@ -174,6 +195,8 @@ function deriveEntityName(path: string): string {
  */
 function depluralize(word: string): string {
   const w = word.toLowerCase()
+  if (w === 'skus') return 'sku'
+  if (w === 'menus') return 'menu'
   if (w.length < 3) return word
 
   // Keep words that are already singular-ish
@@ -192,12 +215,19 @@ function depluralize(word: string): string {
 
 // ─── Page Classification ──────────────────────────────────────────────────────
 
-/** Classify a page as form, list_page, or web_page based on its path and content. */
+/** Classify a page as form, list_page, modal_form, popup_page, or web_page based on its path and content. */
 function classifyPage(
   path: string,
   inputs: number,
   selects: number,
-): 'form' | 'list_page' | 'web_page' {
+  source?: string,
+): 'form' | 'modal_form' | 'popup_page' | 'list_page' | 'web_page' {
+  // Modal pages are always 'modal_form' — highest-priority classification
+  if (source === 'modal' || path.includes('/__modal__/')) return 'modal_form'
+
+  // Popup window pages (new-tab crawls opened by button clicks)
+  if (source === 'popup') return 'popup_page'
+
   const pathLower = path.toLowerCase()
   const isFormPath = /\/(new|create|add|edit|update)\b/i.test(pathLower)
   const hasFormElements = (inputs + selects) >= 2
@@ -277,6 +307,85 @@ function filterCrossEntityButtons(
     // Keep only if it matches the current entity
     return entityLower.includes(entityWord) || entityWord.includes(entityLower)
   })
+}
+
+/**
+ * Universally detect the UPDATE trigger button from a page's button list.
+ * Matches common patterns across any app: Edit, Update, Modify, Pencil etc.
+ * Returns the first match or undefined.
+ */
+function detectUpdateButton(buttons: Array<{ name?: string }>): string | undefined {
+  const UPDATE_RE = /^(edit|update|modify|change|revise|amend)\b/i
+  return buttons.find(b => UPDATE_RE.test(String(b.name ?? '').trim()))?.name
+}
+
+/**
+ * Universally detect the DELETE trigger button from a page's button list.
+ * Matches patterns: Delete, Remove, Archive, Deactivate, Trash, Discard etc.
+ */
+function detectDeleteButton(buttons: Array<{ name?: string }>): string | undefined {
+  const DELETE_RE = /^(delete|remove|archive|deactivate|discard|trash|destroy)\b/i
+  return buttons.find(b => DELETE_RE.test(String(b.name ?? '').trim()))?.name
+}
+
+/**
+ * Detect the primary search/filter input for the entity's list page.
+ * Returns the locator of the first input whose label matches search/filter patterns.
+ */
+function detectPrimarySearchField(
+  inputs: Array<{ locator?: string; type?: string }>,
+): string | undefined {
+  const SEARCH_RE = /\b(search|filter|find|query|lookup|keyword)\b/i
+  return inputs.find(inp => SEARCH_RE.test(inp.locator ?? ''))?.locator
+}
+
+/**
+ * Build the action_flows JSONB block for an entity.
+ * This pre-computes the CREATE / UPDATE / DELETE workflow template at sync time
+ * so the LLM receives concrete, app-verified step sequences instead of guessing.
+ *
+ * All params are universal — derived from whatever was discovered for this entity,
+ * regardless of entity type or application.
+ */
+function buildActionFlows(params: {
+  createButton:     string | undefined
+  submitButton:     string | undefined
+  updateButton:     string | undefined
+  deleteButton:     string | undefined
+  requiredFields:   Array<{ label: string }>
+  listUrl:          string
+  formUrl:          string
+  isTriggerModal:   boolean
+}): Record<string, unknown> {
+  const {
+    createButton, submitButton, updateButton, deleteButton,
+    requiredFields, listUrl, formUrl, isTriggerModal,
+  } = params
+
+  const requiredLabels = requiredFields.map(f => f.label)
+
+  return {
+    create: {
+      navigate_to:     listUrl || formUrl,
+      trigger_button:  createButton  ?? `+New`,
+      is_modal:        isTriggerModal,
+      required_fields: requiredLabels,
+      submit_button:   submitButton ?? 'Save',
+      assert_after:    'ASSERT_URL or ASSERT_TEXT confirming record created',
+    },
+    update: {
+      navigate_to:    listUrl || formUrl,
+      trigger_button: updateButton ?? 'Edit',
+      submit_button:  'Save',
+      assert_after:   'ASSERT_TEXT confirming updated values visible',
+    },
+    delete: {
+      navigate_to:     listUrl || formUrl,
+      trigger_button:  deleteButton ?? 'Delete',
+      confirm_button:  'Confirm',
+      assert_after:    'ASSERT_TEXT confirming record removed from list',
+    },
+  }
 }
 
 // ─── Field Type Detection ─────────────────────────────────────────────────────
@@ -421,6 +530,11 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
       // Skip login/auth pages — by URL pattern
       if (/^\/(login|logout|signin|signout|signup|register|auth|callback|oauth)\b/i.test(path)) continue
 
+      // ── Modal page: entity name comes from the trigger button label, not the URL ──
+      // e.g. path = "/quotations/QUO-0007/__modal__/booking"
+      //      modal_trigger_button = "Create Booking" → entityName = "Booking"
+      const isModalPage = (page as any).source === 'modal' || path.includes('/__modal__/')
+
       // Skip login/auth pages — by content analysis (defense-in-depth)
       // Catches pages where the URL doesn't contain /login but the content
       // is entirely login-page pollution due to an auth redirect.
@@ -446,8 +560,26 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
       // Skip pages with zero interactive elements
       if (inputCount + selectCount + buttonCount === 0) continue
 
-      const entityName = deriveEntityName(path)
-      const entityType = classifyPage(path, inputCount, selectCount)
+      // For modal pages, derive entity name from the trigger button label.
+      // Covers ALL action verbs that TRIGGER_RE in the crawler matches:
+      //   "Create Booking" → "Booking", "+ New Enquiry" → "Enquiry",
+      //   "Raise Invoice" → "Invoice", "Add Delivery Order" → "Delivery Order"
+      const entityName = isModalPage
+        ? (() => {
+            const triggerBtn = String((page as any).modal_trigger_button ?? '')
+            // Strip leading icon chars (+, -, •, ●, ▶) and whitespace first
+            const cleanBtn = triggerBtn.replace(/^[+\-\s•●▶]+/, '').trim()
+            const ACTION_VERBS_RE = /^(?:create|add|new|edit|open|manage|configure|upload|view\s+details?|convert(?:\s+to)?|start|book|schedule|generate|invite|raise|submit|record|log|send|assign|clone|duplicate|refresh|sync|register|process|issue|approve|reject|dispatch|ship|quote|enquire|order|purchase|receive)\s+/i
+            const nameFromBtn = cleanBtn.replace(ACTION_VERBS_RE, '').trim()
+            if (nameFromBtn && nameFromBtn.length > 1 && nameFromBtn.split(/\s+/).length <= 5) {
+              // Title-case: "booking" → "Booking", "bill of lading" → "Bill Of Lading"
+              return nameFromBtn.split(/\s+/).map((w: string) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ')
+            }
+            // Fallback: last segment of the /__modal__/<entity-slug> path
+            return deriveEntityName(path.split('/__modal__/').pop() ?? path)
+          })()
+        : deriveEntityName(path)
+      const entityType = classifyPage(path, inputCount, selectCount, (page as any).source)
       const entityLower = entityName.toLowerCase()
 
       // ── Build field lists ─────────────────────────────────────────────
@@ -549,9 +681,18 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
         primaryButton = detectPrimaryButton(page.buttons ?? [], entityName)
       }
 
+      // ── Detect update / delete / search field buttons ─────────────────
+      // Scans ALL buttons on this page universally — no entity-specific logic.
+      // Combines buttons from the current page with all previously-seen buttons.
+      const allPageButtons = page.buttons ?? []
+      const updateButton = detectUpdateButton(allPageButtons)
+      const deleteButton = detectDeleteButton(allPageButtons)
+      const primarySearchField = detectPrimarySearchField(page.inputs ?? [])
+
       // ── Merge real test data ──────────────────────────────────────────
 
       const testData = testDataMap.get(entityLower)
+      // Increase to top 8 records for richer test data coverage
       const sampleRecords = testData?.records ?? []
 
       // Inject sample values into fields from test data
@@ -590,6 +731,8 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
       }
 
       // ── Build stable locators map ─────────────────────────────────────
+      // Maps field label → { selector, type } for every field that has a
+      // HEALTHY selector in the registry. Universal — works for any entity.
 
       const stableLocators: Record<string, { selector: string; type: string }> = {}
       for (const field of allFields) {
@@ -601,6 +744,20 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
           }
         }
       }
+
+      // ── Resolve create_button (open-form trigger) universally ────────
+      // Priority: 1) execution_learnings open button  2) web_test_data.open_button_name
+      // 3) DOM scan for +New/New pattern  4) synthesize from entity name
+      let resolvedCreateButton: string | undefined
+      if (learned?.openButton)         resolvedCreateButton = learned.openButton
+      if (!resolvedCreateButton && testData?.openButtonName)  resolvedCreateButton = testData.openButtonName
+      if (!resolvedCreateButton) {
+        // Scan the current page buttons for a universal open-form pattern
+        const newBtnPattern = /^\+?\s*(new|add)\s+/i
+        const foundNew = filteredButtons.find(n => newBtnPattern.test(n))
+        if (foundNew) resolvedCreateButton = foundNew
+      }
+      if (!resolvedCreateButton) resolvedCreateButton = `+New ${entityName}`
 
       // ── Build learned rules ───────────────────────────────────────────
 
@@ -689,9 +846,63 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
 
       // Add navigation business rule
       businessRules['form_url'] = path
-      businessRules['list_url'] = '/' + (entityName.toLowerCase() + 's')
+      let plural = entityName.toLowerCase()
+      if (!plural.endsWith('s')) {
+        if (plural.endsWith('y')) {
+          plural = plural.slice(0, -1) + 'ies'
+        } else {
+          plural += 's'
+        }
+      }
+      businessRules['list_url'] = '/' + plural
 
-      // ── Upsert into metadata_canonical ────────────────────────────────
+      // ── Build action_flows (universal CRUD workflow template) ─────────
+      // Pre-computes the CREATE / UPDATE / DELETE step skeleton at sync time.
+      // The LLM reads this instead of guessing the workflow structure.
+      const isModalPage2 = isModalPage  // re-use the boolean from entity name derivation above
+      const listUrlForFlows = businessRules['list_url'] as string ?? `/${entityName.toLowerCase()}s`
+      const formUrlForFlows = path
+      const actionFlows = buildActionFlows({
+        createButton:   resolvedCreateButton,
+        submitButton:   primaryButton,
+        updateButton:   updateButton,
+        deleteButton:   deleteButton,
+        requiredFields: requiredFields,
+        listUrl:        listUrlForFlows,
+        formUrl:        formUrlForFlows,
+        isTriggerModal: isModalPage2,
+      })
+
+      // ── Modal/Popup: add trigger_sequence to business rules ───────────────
+      // Records the full navigation chain for modal/drawer/popup forms so
+      // test generation can reconstruct the exact workflow.
+      const isModalOrPopup = (page as any).is_modal === true
+        || (page as any).source === 'modal'
+        || (page as any).source === 'popup'
+        || path.includes('/__modal__/')
+      if (isModalOrPopup) {
+        const triggerBtn     = String((page as any).modal_trigger_button ?? '')
+        const parentPageUrl  = String((page as any).modal_parent_url ?? '')
+        const modalDepth     = Number((page as any).modal_depth ?? 1)
+        const source         = String((page as any).source ?? 'modal')
+        const submitButton   = primaryButton ?? undefined
+        const triggerStep    = triggerBtn ? `Click '${triggerBtn}'` : 'Open dialog'
+        const submitStep     = submitButton ? `Click '${submitButton}'` : 'Submit form'
+        const parentPath     = parentPageUrl ? (() => { try { return new URL(parentPageUrl).pathname } catch { return parentPageUrl } })() : ''
+        const triggerSequence: string[] = []
+        if (parentPath) triggerSequence.push(`Navigate to ${parentPath}`)
+        triggerSequence.push(triggerStep)
+        if (allFields.length > 0) triggerSequence.push(`Fill form fields (${requiredFields.length} required)`)
+        triggerSequence.push(submitStep)
+        businessRules['trigger_sequence'] = triggerSequence
+        businessRules['trigger_button']   = triggerBtn
+        businessRules['modal_parent_url'] = parentPageUrl
+        businessRules['modal_depth']      = modalDepth
+        businessRules['overlay_source']   = source
+        businessRules['is_modal']         = true
+      }
+
+      // ── Upsert into metadata_canonical (with all enrichment columns) ──────
 
       try {
         await prisma.$executeRaw`
@@ -701,6 +912,8 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
             all_buttons, form_fields, real_test_data,
             stable_locators, learned_rules,
             relationships, business_rules,
+            create_button, update_button, delete_button,
+            primary_search_field, action_flows,
             last_synced_at, version
           ) VALUES (
             gen_random_uuid(),
@@ -713,58 +926,113 @@ export async function buildCanonicalMetadata(projectId: string): Promise<number>
             ${primaryButton ?? null},
             ${JSON.stringify(filteredButtons)}::jsonb,
             ${JSON.stringify(allFields)}::jsonb,
-            ${JSON.stringify(sampleRecords.slice(0, 5))}::jsonb,
+            ${JSON.stringify(sampleRecords.slice(0, 8))}::jsonb,
             ${JSON.stringify(stableLocators)}::jsonb,
             ${JSON.stringify(learnedRules)}::jsonb,
             ${JSON.stringify(relationships)}::jsonb,
             ${JSON.stringify(businessRules)}::jsonb,
+            ${resolvedCreateButton ?? null},
+            ${updateButton ?? null},
+            ${deleteButton ?? null},
+            ${primarySearchField ?? null},
+            ${JSON.stringify(actionFlows)}::jsonb,
             now(),
             1
           )
           ON CONFLICT (project_id, entity_name) DO UPDATE SET
             entity_type           = CASE
-                                      -- Prefer 'form' type over 'list_page'/'web_page'
-                                      WHEN EXCLUDED.entity_type = 'form' THEN EXCLUDED.entity_type
-                                      WHEN metadata_canonical.entity_type = 'form' THEN metadata_canonical.entity_type
+                                      WHEN EXCLUDED.entity_type = 'form'       THEN EXCLUDED.entity_type
+                                      WHEN metadata_canonical.entity_type = 'form'       THEN metadata_canonical.entity_type
+                                      WHEN EXCLUDED.entity_type = 'modal_form' THEN EXCLUDED.entity_type
+                                      WHEN metadata_canonical.entity_type = 'modal_form' THEN metadata_canonical.entity_type
                                       ELSE EXCLUDED.entity_type
                                     END,
             page_url              = CASE
-                                      WHEN EXCLUDED.entity_type = 'form' THEN EXCLUDED.page_url
-                                      WHEN metadata_canonical.entity_type = 'form' THEN metadata_canonical.page_url
+                                      WHEN EXCLUDED.entity_type = 'form'       THEN EXCLUDED.page_url
+                                      WHEN metadata_canonical.entity_type = 'form'       THEN metadata_canonical.page_url
+                                      WHEN EXCLUDED.entity_type = 'modal_form' THEN EXCLUDED.page_url
+                                      WHEN metadata_canonical.entity_type = 'modal_form' THEN metadata_canonical.page_url
                                       ELSE EXCLUDED.page_url
                                     END,
             required_fields       = CASE
-                                      -- Only update required_fields if the new data has more fields
-                                      -- OR the existing data is not a form (list_page search bars etc.)
                                       WHEN jsonb_array_length(EXCLUDED.required_fields) >= jsonb_array_length(COALESCE(metadata_canonical.required_fields, '[]'::jsonb))
-                                        OR metadata_canonical.entity_type != 'form'
+                                        OR (metadata_canonical.entity_type NOT IN ('form', 'modal_form'))
                                       THEN EXCLUDED.required_fields
                                       ELSE metadata_canonical.required_fields
                                     END,
             optional_fields       = CASE
                                       WHEN jsonb_array_length(EXCLUDED.form_fields) >= jsonb_array_length(COALESCE(metadata_canonical.form_fields, '[]'::jsonb))
-                                        OR metadata_canonical.entity_type != 'form'
+                                        OR (metadata_canonical.entity_type NOT IN ('form', 'modal_form'))
                                       THEN EXCLUDED.optional_fields
                                       ELSE metadata_canonical.optional_fields
                                     END,
             primary_action_button = COALESCE(EXCLUDED.primary_action_button, metadata_canonical.primary_action_button),
             all_buttons           = CASE
                                       WHEN jsonb_array_length(EXCLUDED.form_fields) >= jsonb_array_length(COALESCE(metadata_canonical.form_fields, '[]'::jsonb))
-                                        OR metadata_canonical.entity_type != 'form'
+                                        OR (metadata_canonical.entity_type NOT IN ('form', 'modal_form'))
                                       THEN EXCLUDED.all_buttons
                                       ELSE metadata_canonical.all_buttons
                                     END,
             form_fields           = CASE
-                                      -- Always keep the version with MORE form fields
                                       WHEN jsonb_array_length(EXCLUDED.form_fields) >= jsonb_array_length(COALESCE(metadata_canonical.form_fields, '[]'::jsonb))
                                       THEN EXCLUDED.form_fields
                                       ELSE metadata_canonical.form_fields
                                     END,
             real_test_data        = COALESCE(EXCLUDED.real_test_data, metadata_canonical.real_test_data),
             stable_locators       = EXCLUDED.stable_locators,
-            learned_rules         = EXCLUDED.learned_rules,
+            -- COALESCE preserves existing confirmed values; only update when new crawl brings richer data
+            create_button         = COALESCE(metadata_canonical.create_button, EXCLUDED.create_button),
+            update_button         = COALESCE(metadata_canonical.update_button, EXCLUDED.update_button),
+            delete_button         = COALESCE(metadata_canonical.delete_button, EXCLUDED.delete_button),
+            primary_search_field  = COALESCE(metadata_canonical.primary_search_field, EXCLUDED.primary_search_field),
+            action_flows          = EXCLUDED.action_flows,
+            learned_rules         = CASE
+                                      WHEN EXCLUDED.learned_rules IS NULL
+                                      THEN metadata_canonical.learned_rules
+                                      ELSE (
+                                        COALESCE(metadata_canonical.learned_rules, '{}'::jsonb)
+                                        ||
+                                        jsonb_strip_nulls(
+                                          jsonb_build_object(
+                                            'open_button',
+                                              CASE
+                                                WHEN EXCLUDED.learned_rules->>'open_button' IS NOT NULL AND EXCLUDED.learned_rules->>'open_button' != ''
+                                                THEN EXCLUDED.learned_rules->>'open_button'
+                                                ELSE metadata_canonical.learned_rules->>'open_button'
+                                              END,
+                                            'submit_button',
+                                              CASE
+                                                WHEN EXCLUDED.learned_rules->>'submit_button' IS NOT NULL AND EXCLUDED.learned_rules->>'submit_button' != ''
+                                                THEN EXCLUDED.learned_rules->>'submit_button'
+                                                ELSE metadata_canonical.learned_rules->>'submit_button'
+                                              END
+                                          )
+                                        )
+                                      )
+                                    END,
             relationships         = EXCLUDED.relationships,
-            business_rules        = EXCLUDED.business_rules,
+            -- Smart merge for business_rules: preserve trigger_button if the incoming crawl
+            -- doesn't have one, so manual DB corrections survive re-sync.
+            business_rules        = CASE
+                                      WHEN EXCLUDED.business_rules IS NULL
+                                      THEN metadata_canonical.business_rules
+                                      ELSE (
+                                        COALESCE(metadata_canonical.business_rules, '{}'::jsonb)
+                                        ||
+                                        EXCLUDED.business_rules
+                                        ||
+                                        jsonb_strip_nulls(
+                                          jsonb_build_object(
+                                            'trigger_button',
+                                              CASE
+                                                WHEN EXCLUDED.business_rules->>'trigger_button' IS NOT NULL AND EXCLUDED.business_rules->>'trigger_button' != ''
+                                                THEN EXCLUDED.business_rules->>'trigger_button'
+                                                ELSE metadata_canonical.business_rules->>'trigger_button'
+                                              END
+                                          )
+                                        )
+                                      )
+                                    END,
             last_synced_at        = now(),
             version               = metadata_canonical.version + 1
         `
@@ -987,17 +1255,34 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
         error_message: vr.error_message,
       }))
     }
-
     // ── Resolve button names ────────────────────────────────────────────
-
-    const learned = buttonMap.get(entityLower)
-    const primaryButton = learned?.submitButton ?? `Save`
-    const openButton = learned?.openButton ?? null
+    const learned       = buttonMap.get(entityLower)
+    const primaryButton = learned?.submitButton ?? 'Save'
+    const openButton    = learned?.openButton   ?? null
 
     const learnedRules: Record<string, unknown> = {}
     if (openButton) learnedRules.open_button = openButton
 
-    // ── Upsert into metadata_canonical ──────────────────────────────────
+    // ── Resolve enrichment fields (universally \u2014 same helpers as webapp builder) ─
+    // Salesforce standard buttons are well-known, but learned buttons take priority.
+    const sfCreateButton = openButton ?? `+New ${objectLabel}`
+    const sfUpdateButton = 'Edit'
+    const sfDeleteButton = 'Delete'
+    const sfSearchField  = `Search ${objectLabel}s...`
+
+    // Build universal action_flows template for this SF object
+    const sfActionFlows = buildActionFlows({
+      createButton:   sfCreateButton,
+      submitButton:   primaryButton,
+      updateButton:   sfUpdateButton,
+      deleteButton:   sfDeleteButton,
+      requiredFields: requiredFields,
+      listUrl:        `/${objectName.toLowerCase()}`,
+      formUrl:        `/${objectName.toLowerCase()}/new`,
+      isTriggerModal: false,
+    })
+
+    // ── Upsert into metadata_canonical (with all enrichment columns) ──────────
 
     try {
       await prisma.$executeRaw`
@@ -1007,6 +1292,8 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
           all_buttons, form_fields, real_test_data,
           stable_locators, learned_rules,
           relationships, business_rules,
+          create_button, update_button, delete_button,
+          primary_search_field, action_flows,
           last_synced_at, version
         ) VALUES (
           gen_random_uuid(),
@@ -1024,6 +1311,11 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
           ${JSON.stringify(learnedRules)}::jsonb,
           ${JSON.stringify(relationships)}::jsonb,
           ${JSON.stringify(businessRules)}::jsonb,
+          ${sfCreateButton},
+          ${sfUpdateButton},
+          ${sfDeleteButton},
+          ${sfSearchField},
+          ${JSON.stringify(sfActionFlows)}::jsonb,
           now(),
           1
         )
@@ -1038,6 +1330,12 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
           learned_rules         = EXCLUDED.learned_rules,
           relationships         = EXCLUDED.relationships,
           business_rules        = EXCLUDED.business_rules,
+          -- Preserve existing confirmed button values on re-sync
+          create_button         = COALESCE(metadata_canonical.create_button, EXCLUDED.create_button),
+          update_button         = COALESCE(metadata_canonical.update_button, EXCLUDED.update_button),
+          delete_button         = COALESCE(metadata_canonical.delete_button, EXCLUDED.delete_button),
+          primary_search_field  = COALESCE(metadata_canonical.primary_search_field, EXCLUDED.primary_search_field),
+          action_flows          = EXCLUDED.action_flows,
           last_synced_at        = now(),
           version               = metadata_canonical.version + 1
       `

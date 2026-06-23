@@ -33,8 +33,8 @@ import type { TestCaseGenerationJob } from '../../shared/queue/job-types.js'
 // Cross-module: RAG retrieval lives in generation.service
 import { retrieveRagChunks }       from '../test-generation/generation.service.js'
 
-// Cross-module: field manifest for button name auto-correction
-import { autoCorrectButtonNames } from '../ai-agents/tools/metadata-reader.tool.js'
+// Cross-module: field manifest for button name auto-correction + canonical lookup
+import { autoCorrectButtonNames, buildFieldManifest } from '../ai-agents/tools/metadata-reader.tool.js'
 
 const log = createModuleLogger('test-case-generator')
 
@@ -165,7 +165,12 @@ async function buildEntityFieldManifest(projectId: string): Promise<string> {
       orderBy: { object_name: 'asc' },
     })
 
-    if (rows.length === 0) {
+    const repoCanonicals = await prisma.metadata_canonical.findMany({
+      where: { project_id: projectId, source: 'repository' },
+      select: { entity_name: true, form_fields: true },
+    })
+
+    if (rows.length === 0 && repoCanonicals.length === 0) {
       // Fallback: try webapp_crawl entity pages for field labels
       const webRows = await prisma.metadata_normalized.findMany({
         where: { project_id: projectId, entity_type: 'webapp_crawl' },
@@ -251,13 +256,67 @@ async function buildEntityFieldManifest(projectId: string): Promise<string> {
           }
         }
       }
+      // ── Inject REAL trigger/open-form button names from metadata_canonical ──
+      // The LLM needs the EXACT button text to use in CLICK steps for opening
+      // create/add forms (e.g. "+ New Term", "+ Add Account"). Without this,
+      // the LLM hallucinates pluralized or incorrectly-spaced button names.
+      try {
+        const canonicalRows = await prisma.metadata_canonical.findMany({
+          where: { project_id: projectId },
+          select: {
+            entity_name:            true,
+            business_rules:         true,
+            learned_rules:          true,
+            primary_action_button:  true,
+          },
+        })
+
+        if (canonicalRows.length > 0) {
+          lines.push('')
+          lines.push('=== ENTITY BUTTON MANIFEST (STRICT — use these EXACT button names) ===')
+          lines.push('When generating CLICK steps to open a create/add form, you MUST use the')
+          lines.push('EXACT button name listed below. DO NOT pluralize, singularize, add/remove')
+          lines.push('spaces, or change capitalization. Copy the button name CHARACTER-FOR-CHARACTER.')
+          lines.push('')
+
+          for (const row of canonicalRows) {
+            const br = (row.business_rules ?? {}) as Record<string, unknown>
+            const lr = (row.learned_rules ?? {}) as Record<string, unknown>
+
+            const triggerBtn = typeof br.trigger_button === 'string' && br.trigger_button.length > 0
+              ? br.trigger_button : undefined
+            const openBtn    = typeof lr.open_button === 'string' && lr.open_button.length > 0
+              ? lr.open_button : undefined
+            const submitBtn  = typeof row.primary_action_button === 'string' && row.primary_action_button.length > 0
+              ? row.primary_action_button : undefined
+
+            const effectiveOpenBtn = triggerBtn ?? openBtn
+            if (!effectiveOpenBtn && !submitBtn) continue
+
+            lines.push(`[${row.entity_name}]`)
+            if (effectiveOpenBtn) {
+              lines.push(`  🔘 OPEN FORM BUTTON: "${effectiveOpenBtn}" — use this EXACT text in the CLICK step to open the create/add form`)
+            }
+            if (submitBtn) {
+              lines.push(`  ⚡ SUBMIT BUTTON: "${submitBtn}" — use this EXACT text in the CLICK step to save/submit the form`)
+            }
+            lines.push('')
+          }
+
+          lines.push('⚠️ CRITICAL: The button names above are CHARACTER-EXACT copies from the real app.')
+          lines.push(`Using "+New Terms" when the real button says "+ New Term" will cause test FAILURE.`)
+        }
+      } catch (btnErr) {
+        log.warn({ err: btnErr }, '[TCG] Failed to fetch canonical button names — skipping')
+      }
+
       lines.push('')
       lines.push('⚡ = Lookup field: use LOOKUP action, not TYPE. Value must be a real record name from REAL ENTITY RECORDS.')
       return lines.length > 5 ? lines.join('\n') : ''
     }
 
     // Group by object
-    const byObject = new Map<string, Array<{ label: string; type: string; required: boolean }>>()
+    const byObject = new Map<string, Array<{ label: string; type: string; required: boolean; source?: string }>>()
     for (const row of rows) {
       const obj  = row.object_name ?? 'Unknown'
       const json = (row.structured_json ?? {}) as Record<string, any>
@@ -266,7 +325,31 @@ async function buildEntityFieldManifest(projectId: string): Promise<string> {
       const label = (row.label ?? '').trim()
       if (!label) continue
       if (!byObject.has(obj)) byObject.set(obj, [])
-      byObject.get(obj)!.push({ label, type, required })
+      byObject.get(obj)!.push({ label, type, required, source: 'crawler' })
+    }
+
+    for (const canon of repoCanonicals) {
+      const obj = canon.entity_name
+      const fields = Array.isArray(canon.form_fields)
+        ? (canon.form_fields as Array<{ label: string; type: string; required: boolean }>)
+        : []
+      for (const f of fields) {
+        const label = (f.label ?? '').trim()
+        if (!label) continue
+        if (!byObject.has(obj)) byObject.set(obj, [])
+        const existing = byObject.get(obj)!.find(x => x.label.toLowerCase() === label.toLowerCase())
+        if (existing) {
+          existing.source = 'merged'
+          if (f.required) existing.required = true
+        } else {
+          byObject.get(obj)!.push({
+            label,
+            type: String(f.type ?? 'text').toLowerCase(),
+            required: Boolean(f.required),
+            source: 'repository'
+          })
+        }
+      }
     }
 
     if (byObject.size === 0) return ''
@@ -286,7 +369,8 @@ async function buildEntityFieldManifest(projectId: string): Promise<string> {
         const isLookup = f.type === 'reference' || f.type === 'lookup'
         const req = f.required ? ' ★REQUIRED' : ''
         const lookupHint = isLookup ? ' ⚡LOOKUP' : ''
-        lines.push(`  • "${f.label}" (${f.type}${req}${lookupHint})`)
+        const sourceStr = f.source ? ` (source: ${f.source})` : ''
+        lines.push(`  • "${f.label}" (${f.type}${req}${lookupHint})${sourceStr}`)
       }
       lines.push('')
     }
@@ -354,6 +438,138 @@ async function buildVerifiedUrlMap(projectId: string): Promise<{
   } catch (err) {
     log.warn({ err }, '[TCG] buildVerifiedUrlMap failed — skipping URL map injection')
     return { baseUrl: '', paths: [] }
+  }
+}
+// ── Canonical Entity Context builder ───────────────────────────────────────────────────────────
+
+/**
+ * Query metadata_canonical for the entity derived from selectedModule and
+ * return a formatted prompt block with:
+ *   - Exact create_button, update_button, delete_button
+ *   - Required fields list
+ *   - action_flows (pre-computed CRUD workflow templates)
+ *   - Up to 3 real_test_data records as concrete value examples
+ *
+ * Universal: works for ANY entity in ANY app — no entity-specific logic.
+ * Returns empty string if no canonical record exists for this entity.
+ */
+async function buildCanonicalEntityContext(
+  projectId: string,
+  selectedModule?: string,
+): Promise<string> {
+  if (!selectedModule) return ''
+
+  const entityHint = selectedModule
+    .replace(/\s*(Management|List|Module|Feature|Settings)$/i, '')
+    .trim()
+  if (!entityHint || entityHint.length < 2) return ''
+
+  try {
+    const manifest = await buildFieldManifest(projectId, entityHint)
+    if (!manifest) return ''
+
+    // Only render this block when we have canonical data with action buttons
+    // (prevents rendering an empty/useless block when canonical is missing)
+    const hasActionData = manifest.openButton || manifest.submitButton || manifest.actionFlows
+    if (!hasActionData) return ''
+
+    const lines: string[] = [
+      `## 🎯 CANONICAL ENTITY MANIFEST — ${manifest.entityName.toUpperCase()} (PRIMARY SOURCE — READ BEFORE EVERYTHING ELSE)`,
+      '',
+      `This is the AUTHORITATIVE data for the "${manifest.entityName}" entity, sourced from the live application.`,
+      `All button names, field names, and test data below are EXACT — copy them CHARACTER-FOR-CHARACTER.`,
+      '',
+    ]
+
+    // ── Action flows (canonical CRUD workflow) ───────────────────────────
+    if (manifest.actionFlows && typeof manifest.actionFlows === 'object') {
+      const flows = manifest.actionFlows as Record<string, {
+        navigate_to?: string; trigger_button?: string; is_modal?: boolean;
+        required_fields?: string[]; submit_button?: string;
+        confirm_button?: string; assert_after?: string
+      }>
+
+      lines.push('### CRUD Workflow Templates (use EXACTLY — do not invent alternatives)')
+      lines.push('')
+
+      if (flows['create']) {
+        const c = flows['create']
+        lines.push(`**CREATE flow:**`)
+        if (c.navigate_to)     lines.push(`  → Step 1 — NAVIGATE to: ${c.navigate_to}`)
+        if (c.trigger_button)  lines.push(`  → Step 2 — CLICK: "${c.trigger_button}"  ← OPEN FORM BUTTON (exact)`)
+        if (c.is_modal)        lines.push(`              (this opens a MODAL/DIALOG — do NOT navigate to a new page)`)
+        if (c.required_fields?.length) {
+          lines.push(`  → Fill required fields: ${c.required_fields.map(f => `"${f}" ★`).join(', ')}`)
+        }
+        if (c.submit_button)   lines.push(`  → Final CLICK: "${c.submit_button}"  ← SUBMIT BUTTON (exact)`)
+        if (c.assert_after)    lines.push(`  → Then: ${c.assert_after}`)
+        lines.push('')
+      }
+
+      if (flows['update']) {
+        const u = flows['update']
+        lines.push(`**UPDATE flow:**`)
+        if (u.navigate_to)    lines.push(`  → Navigate to: ${u.navigate_to}`)
+        if (u.trigger_button) lines.push(`  → CLICK: "${u.trigger_button}"  ← EDIT TRIGGER (exact)`)
+        if (u.submit_button)  lines.push(`  → CLICK: "${u.submit_button}"  ← SAVE BUTTON`)
+        lines.push('')
+      }
+
+      if (flows['delete']) {
+        const d = flows['delete']
+        lines.push(`**DELETE flow:**`)
+        if (d.navigate_to)    lines.push(`  → Navigate to: ${d.navigate_to}`)
+        if (d.trigger_button) lines.push(`  → CLICK: "${d.trigger_button}"  ← DELETE TRIGGER (exact)`)
+        if (d.confirm_button) lines.push(`  → CLICK: "${d.confirm_button}"  ← CONFIRM button`)
+        lines.push('')
+      }
+    } else {
+      // No action_flows — render basic button info
+      lines.push('### Buttons (exact names — copy character-for-character)')
+      if (manifest.openButton)   lines.push(`  🔘 OPEN FORM BUTTON:  "${manifest.openButton}"`)
+      if (manifest.submitButton) lines.push(`  ⚡ SUBMIT BUTTON:    "${manifest.submitButton}"`)
+      if (manifest.updateButton) lines.push(`  ✏️  EDIT BUTTON:      "${manifest.updateButton}"`)
+      if (manifest.deleteButton) lines.push(`  🗑️  DELETE BUTTON:   "${manifest.deleteButton}"`)
+      if (manifest.searchField)  lines.push(`  🔍 SEARCH FIELD:    "${manifest.searchField}"`)
+      lines.push('')
+    }
+
+    // ── Required fields ───────────────────────────────────────────────────
+    const reqFields = manifest.fields.filter(f => f.required)
+    if (reqFields.length > 0) {
+      lines.push('### Required Fields (★ = MUST fill or form refuses to save)')
+      for (const f of reqFields) {
+        const typeLabel = f.type === 'lookup' ? '⚡LOOKUP' : f.type === 'select' ? '▼ SELECT' : '✏️  TYPE'
+        const opts = f.options?.length ? ` (options: ${f.options.slice(0, 4).join(', ')})` : ''
+        const sample = f.sampleValue ? ` [e.g.: "${f.sampleValue}"]` : ''
+        lines.push(`  ★ ${f.label} [${typeLabel}]${opts}${sample}`)
+      }
+      lines.push('')
+    }
+
+    // ── Real test data samples ───────────────────────────────────────────────
+    // Use up to 3 records as concrete value examples — avoids made-up data
+    const samples = manifest.sampleRecords?.slice(0, 3) ?? []
+    if (samples.length > 0) {
+      lines.push('### Real Test Data (use these EXACT values in your steps — they exist in the app)')
+      for (let i = 0; i < samples.length; i++) {
+        const rec = samples[i] as Record<string, unknown>
+        const pairs = Object.entries(rec)
+          .filter(([k]) => !['id','created_at','updated_at','created_by','deleted_at'].includes(k.toLowerCase()))
+          .slice(0, 8)
+          .map(([k, v]) => `"${k}": "${String(v ?? '')}"`)  
+          .join(', ')
+        lines.push(`  Record ${i + 1}: { ${pairs} }`)
+      }
+      lines.push('')
+    }
+
+    lines.push('---')
+    return lines.join('\n')
+
+  } catch (err) {
+    log.warn({ err, projectId, entityHint }, '[TCG] buildCanonicalEntityContext failed (non-fatal)')
+    return ''
   }
 }
 
@@ -486,7 +702,10 @@ export async function buildGenerationContext(params: {
 Those are smoke tests, NOT CRUD tests.
 
 Each CRUD test case MUST be a complete multi-step workflow:
-- **CREATE**: Navigate to the create/new form → fill required fields with realistic data → click Save/Submit → assert success (URL change OR success toast)
+- **CREATE**: Navigate to the entity list page → CLICK the EXACT 🔘 OPEN FORM BUTTON from the Entity Button Manifest → fill required fields with realistic data → click the EXACT ⚡ SUBMIT BUTTON → assert success (URL change OR success toast)
+   ⚠️ The OPEN FORM BUTTON name in your CLICK step MUST match the Entity Button Manifest CHARACTER-FOR-CHARACTER.
+   ❌ WRONG: "+New Terms" when manifest says "+ New Term" — extra space and plural cause FAILURE.
+   ✅ RIGHT: "+ New Term" — copied exactly from the manifest.
 - **READ**: Navigate to the list → ASSERT_TEXT with the entity page heading (e.g. target="Opportunities", value="Opportunities") OR search/filter by a specific value then ASSERT_TEXT with that EXACT value. NEVER use an empty string for target or value in ASSERT_TEXT.
 - **UPDATE**: Navigate to an existing record → click Edit → change at least 2 field values → save → verify the updated values are shown
 - **DELETE**: Navigate to an existing record → trigger delete → confirm the confirmation dialog → verify the record is removed from the list
@@ -542,6 +761,15 @@ Each negative test MUST include the EXACT expected error message text in expecte
 
   const userPromptParts: string[] = []
 
+  // ── Canonical entity context (primary source — injected FIRST) ───────────
+  // Queries metadata_canonical for the selected entity and renders a prompt block
+  // with exact button names, required fields, and real data records.
+  // Universal — works for any entity / any app without entity-specific logic.
+  const canonicalEntityBlock = await buildCanonicalEntityContext(projectId, selectedModule)
+  if (canonicalEntityBlock) {
+    log.info({ projectId, selectedModule }, '[TCG] ✅ Canonical entity context injected into prompt')
+  }
+
   // ★ ZERO: inject verified URL map FIRST so the LLM never invents paths
   if (verifiedPaths.length > 0 || projectBaseUrl) {
     const urlMapLines: string[] = [
@@ -574,6 +802,13 @@ Each negative test MUST include the EXACT expected error message text in expecte
       urlMapLines.push('Still use ONLY relative paths starting with / — NEVER include a domain or full URL.')
     }
     userPromptParts.push(urlMapLines.join('\n'))
+  }
+
+  // ★ CANONICAL: inject the canonical entity block right after the URL map
+  // This is the SECOND thing the LLM reads — more specific than the field
+  // manifest and directly actionable (exact buttons + real data).
+  if (canonicalEntityBlock) {
+    userPromptParts.push(canonicalEntityBlock)
   }
 
   // ★ FIRST: inject field manifest so the LLM reads it before anything else
@@ -654,14 +889,15 @@ Each negative test MUST include the EXACT expected error message text in expecte
     "description": "Business scenario being validated",
     "priority": "low | medium | high",
     "steps": [
-      { "id": "1", "action": "NAVIGATE", "value": "/contacts/new" },
-      { "id": "2", "action": "TYPE", "target": "First Name", "value": "Sam", "locator_type": "label" },
-      { "id": "3", "action": "TYPE", "target": "Email", "value": "", "locator_type": "label" },
-      { "id": "4", "action": "CLICK", "target": "Save", "locator_type": "role" },
-      { "id": "5", "action": "ASSERT_TEXT", "target": "Email is required", "locator_type": "text" }
+      { "id": "1", "action": "NAVIGATE", "value": "/contacts" },
+      { "id": "2", "action": "CLICK", "target": "+ New Contact", "locator_type": "role" },
+      { "id": "3", "action": "TYPE", "target": "First Name", "value": "Sam", "locator_type": "label" },
+      { "id": "4", "action": "TYPE", "target": "Email", "value": "sam@example.com", "locator_type": "label" },
+      { "id": "5", "action": "CLICK", "target": "Save", "locator_type": "role" },
+      { "id": "6", "action": "ASSERT_URL", "value": "/contacts/", "locator_type": "url" }
     ],
     "expected_outcome": "Specific, measurable outcome with exact text/URL",
-    "tags": ["CRUD", "Create", "Negative"]
+    "tags": ["CRUD", "Create"]
   }
 ]
 
@@ -688,7 +924,12 @@ Each negative test MUST include the EXACT expected error message text in expecte
 8. ⛔ NAVIGATE steps MUST use ONLY relative paths from the VERIFIED APPLICATION URL MAP above.
    NEVER include a full URL with domain. NEVER pluralize or guess a path.
    WRONG example: "https://d2d-uem.datasirpi.com/softwares"  —  RIGHT example: "/software"
-   WRONG example: "/patchs"  —  RIGHT example: "/patches" (only if it appears in the verified map)`)
+   WRONG example: "/patchs"  —  RIGHT example: "/patches" (only if it appears in the verified map)
+9. 🔴 MANDATORY FOR ALL CREATE TESTS — Step 2 MUST be a CLICK to open the create form:
+   ❌ WRONG: NAVIGATE /accounts/new → TYPE (no open-form click — test will FAIL at runtime)
+   ✅ RIGHT:  NAVIGATE /accounts → CLICK "+ Add Account" → TYPE fields → CLICK "Save" → ASSERT_URL
+   Use the EXACT button name from the 🔘 OPEN FORM BUTTON in the Entity Button Manifest above.
+   NEVER navigate directly to /entity/new — ALWAYS navigate to the list page then CLICK the button.`)
 
   const userPrompt = userPromptParts.join('\n')
 
@@ -1071,6 +1312,63 @@ export async function persistGeneratedTestCases(params: {
         await autoCorrectButtonNames(rawSteps, projectId, entityHint)
       }
 
+      // ── Inject missing open-form CLICK step for CREATE tests ─────────────────
+      // If the LLM skipped the open-form button click (going NAVIGATE→TYPE directly),
+      // inject it here so the test doesn't fail at runtime due to no modal being open.
+      const isCreateTest = /^(create|add|new)\b/i.test(tcName.trim())
+      if (isCreateTest && rawSteps.length >= 2) {
+        const firstStep  = rawSteps[0] as Record<string, any>
+        const secondStep = rawSteps[1] as Record<string, any>
+        const firstIsNav  = String(firstStep?.action ?? '').toUpperCase() === 'NAVIGATE'
+        const secondIsType = ['TYPE','SELECT','LOOKUP','CHECKBOX','MULTI_SELECT'].includes(
+          String(secondStep?.action ?? '').toUpperCase()
+        )
+
+        if (firstIsNav && secondIsType && entityHint && entityHint.length > 2) {
+          // Resolve the real open-form button name from metadata_canonical
+          try {
+            const cleanHint = entityHint.trim()
+            const depluralizeHint = cleanHint.endsWith('s') && !cleanHint.endsWith('ss')
+              ? cleanHint.slice(0, -1) : cleanHint
+            const canonical = await prisma.metadata_canonical.findFirst({
+              where: {
+                project_id: projectId,
+                OR: [
+                  { entity_name: { contains: cleanHint,      mode: 'insensitive' } },
+                  { entity_name: { contains: depluralizeHint, mode: 'insensitive' } },
+                ],
+              },
+              select: { business_rules: true, learned_rules: true },
+            })
+
+            const br = (canonical?.business_rules ?? {}) as Record<string, unknown>
+            const lr = (canonical?.learned_rules  ?? {}) as Record<string, unknown>
+            const openBtn = (
+              (typeof br.trigger_button === 'string' && br.trigger_button.length > 0 ? br.trigger_button : undefined) ??
+              (typeof lr.open_button   === 'string' && lr.open_button.length   > 0 ? lr.open_button   : undefined) ??
+              `+ New ${cleanHint}`
+            )
+
+            const clickStep = {
+              id:           '2',
+              action:       'CLICK',
+              target:       openBtn,
+              locator_type: 'role',
+            }
+            // Insert after step 1 (NAVIGATE), before step 2 (TYPE)
+            rawSteps.splice(1, 0, clickStep)
+            // Renumber all steps
+            rawSteps.forEach((s: any, i: number) => { s.id = String(i + 1) })
+            log.info(
+              { tcName, openBtn, entityHint },
+              '[TCG] ✅ Injected missing open-form CLICK step — LLM skipped it',
+            )
+          } catch (injectErr) {
+            log.warn({ err: injectErr, tcName }, '[TCG] Failed to inject open-form CLICK — skipping injection')
+          }
+        }
+      }
+
       // ── Sanitize: drop / fix degenerate assert steps before storing ──────────
       const cleanSteps = sanitizeTestCaseSteps(rawSteps, tcName)
 
@@ -1364,6 +1662,8 @@ export async function generateStepsForTestCases(
   projectId: string,
   testCaseIds: string[],
   selectedModule?: string,
+  brdContent?: string,
+  existingTestsContent?: string,
 ): Promise<{ generated: number; failed: number; errors: string[] }> {
   let generated = 0
   let failed = 0
@@ -1376,17 +1676,21 @@ export async function generateStepsForTestCases(
 
   // Lazily import the STEP_GEN_MODEL agent (avoids circular deps at module load)
   let runTestStepGeneratorAgent: typeof import('../ai-agents/test-step-generator.agent.js').runTestStepGeneratorAgent
+  let detectOperationType: typeof import('../ai-agents/test-step-generator.agent.js').detectOperationType | undefined
   try {
     const agentMod = await import('../ai-agents/test-step-generator.agent.js')
     runTestStepGeneratorAgent = agentMod.runTestStepGeneratorAgent
+    detectOperationType = agentMod.detectOperationType
   } catch (importErr) {
     log.warn({ err: importErr }, '[TCG] Could not import runTestStepGeneratorAgent — will use direct LLM fallback')
   }
 
   // Fetch RAG context once for all cases (used for direct-LLM fallback path)
+  // NOTE: We use a general query here — per-test-case queries happen inside the agent.
+  // The fallback path only needs broad context.
   const ragQuery = selectedModule
-    ? `${selectedModule} create edit update delete form fields buttons navigation`
-    : 'create edit update delete form fields buttons navigation'
+    ? `${selectedModule} create edit update delete form fields buttons navigation existing records`
+    : 'create edit update delete form fields buttons navigation existing records'
   let ragContext = ''
   try {
     const chunks = await retrieveRagChunks(projectId, ragQuery, 15)
@@ -1406,6 +1710,9 @@ export async function generateStepsForTestCases(
       // Must strip verb prefixes ("Create", "Update", etc.) and noise words
       // to get the actual entity noun. This is used by BOTH the agent path
       // and the cross-entity CLICK filter below.
+      const tcOpType = detectOperationType ? detectOperationType(tc.name) : 'unknown'
+      log.info({ tcId: tc.id, tcName: tc.name, tcOpType }, '[TCG] Detected operation type for test case')
+
       const entityFilter = selectedModule
         ? selectedModule.replace(/\s*(Management|List|Module|Feature)$/i, '').trim()
         : (() => {
@@ -1419,6 +1726,7 @@ export async function generateStepsForTestCases(
             const entity = words[0] ?? stripped.split(/\s+/)[0] ?? ''
             return entity.charAt(0).toUpperCase() + entity.slice(1)
           })()
+
 
       // ── Primary path: STEP_GEN_MODEL agent ──────────────────────────────────
       // The agent has a 6-check validation gate + up to 3 self-correction loops:
@@ -1441,6 +1749,8 @@ export async function generateStepsForTestCases(
             testName:     tc.name,
             description:  tc.description ?? tc.name,
             entityFilter: entityFilter || undefined,
+            brdContent,
+            existingTestsContent,
           })
 
           log.info(
@@ -1512,15 +1822,49 @@ export async function generateStepsForTestCases(
           '4. css   — LAST RESORT',
           '',
           // Null-manifest fallback: tell LLM to use BRD/RAG when no manifest available
-          !fieldManifest && /^(create|add|new)\b/i.test(tc.name.trim())
-            ? [
-                '## 🔴 CREATE OPERATION — NO FIELD MANIFEST',
-                `This is a CREATE test. You MUST generate at least 2 TYPE/SELECT/LOOKUP steps.`,
-                `Use the Project Metadata section below to discover which fields exist on the form.`,
-                `Common create-form fields: Name, Description, Type/Category, Status, SKU, Currency.`,
-                `DO NOT generate only NAVIGATE + CLICK + ASSERT — that WILL FAIL validation.`,
-              ].join('\n')
-            : '',
+          // Operation-aware fallback instructions — use tcOpType for strict operation-specific guidance
+          (() => {
+            if (tcOpType === 'update') return [
+              '## 🔴 UPDATE OPERATION — MANDATORY SEQUENCE (DO NOT DEVIATE):',
+              `This is an UPDATE/EDIT test for entity: "${entityFilter}".`,
+              '⛔ FORBIDDEN: Do NOT navigate to /new, /create, /add URLs.',
+              '⛔ FORBIDDEN: Do NOT click "+ New <Entity>" or "Create <Entity>" buttons.',
+              '',
+              'REQUIRED 7-STEP SEQUENCE:',
+              `  1. NAVIGATE to the ${entityFilter} LIST page (NOT /new or /create)`,
+              `  2. TYPE the record name in the search input (use a real record from SAMPLE DATA above)`,
+              `  3. CLICK the record name to open its detail page`,
+              `  4. CLICK "Edit" (or the edit button from the manifest) to enter edit mode`,
+              `  5. TYPE/SELECT the fields mentioned in the test name (e.g. Weight, Dimensions, SKU)`,
+              `  6. CLICK the Save button to save changes`,
+              `  7. ASSERT_URL or ASSERT_TEXT to verify the update succeeded`,
+            ].join('\n')
+            if (tcOpType === 'delete') return [
+              '## 🔴 DELETE OPERATION — MANDATORY SEQUENCE:',
+              `  1. NAVIGATE to the ${entityFilter} LIST page`,
+              `  2. TYPE the record name in the search input`,
+              `  3. CLICK the record to open its detail page`,
+              `  4. CLICK the Delete button`,
+              `  5. CLICK Confirm (if a confirmation dialog appears)`,
+              `  6. ASSERT that the record was deleted (e.g. redirected to list, or toast message)`,
+            ].join('\n')
+            if (tcOpType === 'view') return [
+              '## 🔴 VIEW OPERATION — MANDATORY SEQUENCE:',
+              `  1. NAVIGATE to the ${entityFilter} LIST page`,
+              `  2. TYPE the record name in the search input`,
+              `  3. CLICK the record to open its detail page`,
+              `  4. ASSERT_URL or ASSERT_TEXT to verify the record detail page loaded`,
+            ].join('\n')
+            // CREATE (default)
+            if (!fieldManifest) return [
+              '## 🔴 CREATE OPERATION — NO FIELD MANIFEST',
+              `This is a CREATE test. You MUST generate at least 2 TYPE/SELECT/LOOKUP steps.`,
+              `Use the Project Metadata section below to discover which fields exist on the form.`,
+              `Common create-form fields: Name, Description, Type/Category, Status, SKU, Currency.`,
+              `DO NOT generate only NAVIGATE + CLICK + ASSERT — that WILL FAIL validation.`,
+            ].join('\n')
+            return ''
+          })(),
           fieldManifest ? `## Entity Field Manifest (ONLY use these fields)\n${fieldManifest}` : '',
           ragContext ? `## Project Metadata\n${ragContext}` : '',
           '## Output Format',
@@ -1540,10 +1884,11 @@ export async function generateStepsForTestCases(
           `Priority: ${tc.priority ?? 'medium'}`,
           `Expected Outcome: ${tc.expected_result ?? '(no expected outcome)'}`,
           '',
-          // Hard constraint reminder for Create operations
-          /^(create|add|new)\b/i.test(tc.name.trim())
-            ? `⚠️ CREATE CONSTRAINT: You MUST include at least 2 TYPE/SELECT/LOOKUP steps that fill in form fields.\nDo NOT produce only NAVIGATE+CLICK+ASSERT steps.`
-            : '',
+          tcOpType === 'update'
+            ? `⚠️ UPDATE CONSTRAINT: This test UPDATES an existing ${entityFilter} record. Navigate to the LIST page, search for an existing record, click it, click Edit, modify the relevant fields, click Save, and assert success. NEVER navigate to /new or /create.`
+            : tcOpType === 'create'
+              ? `⚠️ CREATE CONSTRAINT: You MUST include at least 2 TYPE/SELECT/LOOKUP steps that fill in form fields.\nDo NOT produce only NAVIGATE+CLICK+ASSERT steps.`
+              : '',
           'Return ONLY a valid JSON array of step objects. No markdown, no code fences.',
         ].filter(Boolean).join('\n')
 

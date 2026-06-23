@@ -399,6 +399,7 @@ model metadata_canonical {
   business_rules        Json     @default("{}")                   // Knowledge Graph: {"stage_required": true, "close_date_must_be_future": "..."}
   last_synced_at        DateTime @default(now()) @db.Timestamptz(6)
   version               Int      @default(1)
+  source                String?  @default("crawler")
   project               projects @relation(fields: [project_id], references: [id], onDelete: Cascade)
 
   @@unique([project_id, entity_name])
