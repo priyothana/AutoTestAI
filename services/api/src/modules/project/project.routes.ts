@@ -822,6 +822,24 @@ export async function projectRoutes(app: FastifyInstance) {
   })
   // ─── AI Workflow Chat Endpoints ──────────────────────────────────────────────
 
+  // GET /api/v1/projects/:id/discovered-workflows
+  // Retrieves previously saved business flows for the project.
+  app.get('/projects/:id/discovered-workflows', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const items = await svc.getDiscoveredWorkflows(id)
+      return reply.send({
+        flows: items.map(item => ({
+          name: item.workflow_title,
+          description: item.description ?? '',
+        })),
+        discoveredAt: items[0]?.discovered_at?.toISOString() ?? null,
+      })
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
   // POST /api/v1/projects/:id/generate-workflows
   // Generates a list of business flow / end-to-end journey options from metadata + BRD.
   // Body: { brdContent?: string }
@@ -830,7 +848,14 @@ export async function projectRoutes(app: FastifyInstance) {
       const { id } = request.params as { id: string }
       const body = request.body as { brdContent?: string; existingTestsContent?: string }
       const result = await generateBusinessFlows(id, body.brdContent, body.existingTestsContent)
-      return reply.send(result)
+      
+      // Save newly discovered workflows into the database (overriding old ones)
+      const saved = await svc.saveDiscoveredWorkflows(id, result.flows, 'ai_discovery')
+
+      return reply.send({
+        flows: result.flows,
+        discoveredAt: saved[0]?.discovered_at?.toISOString() ?? new Date().toISOString(),
+      })
     } catch (err: any) {
       return handleErr(err, reply)
     }

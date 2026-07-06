@@ -61,9 +61,15 @@ function buildDiscoveryLlm(): BaseChatModel {
 
 /**
  * Hard cap on assembled metadata string to keep total prompt under model limits.
- * ~18 000 chars ≈ ~4 500 tokens — leaves ample room for the system prompt + BRD.
+ * Increased to 60,000 to accommodate larger metadata sets without truncation.
  */
-const META_CHAR_BUDGET = 18_000
+const META_CHAR_BUDGET = 60_000
+
+const SYSTEM_FIELDS = new Set([
+  'id', 'isdeleted', 'createdbyid', 'createddate', 'lastmodifiedbyid', 
+  'lastmodifieddate', 'systemmodstamp', 'ownerid', 'currencyisocode',
+  'mayedit', 'islocked', 'connectionreceivedid', 'connectionsentid'
+])
 
 /** Trim a string to at most `budget` chars, appending a truncation notice. */
 function capMeta(s: string, budget = META_CHAR_BUDGET): string {
@@ -670,11 +676,11 @@ async function getProjectContext(projectId: string): Promise<{
         ? (dm.testing_rules as Record<string, unknown>[])
         : []
 
-      // Extract field names from testing_rules for rich context
+      // Extract field names from testing_rules for rich context, excluding system fields
       const fields = rules
         .filter(r => r['field'] && typeof r['field'] === 'string')
         .map(r => String(r['field']))
-        .filter(Boolean)
+        .filter(f => f && !SYSTEM_FIELDS.has(f.toLowerCase()))
         .slice(0, 12)
 
       const buttons = rules

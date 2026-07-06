@@ -27,9 +27,7 @@ async function main() {
   });
   
   // Inject the global __name fix immediately
-  await context.addInitScript(() => {
-    (window as any).__name = (fn: any) => fn;
-  });
+  await context.addInitScript('window.__name = (fn) => fn;');
 
   const page = await context.newPage();
   

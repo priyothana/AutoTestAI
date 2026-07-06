@@ -83,7 +83,7 @@ export async function testRunRoutes(app: FastifyInstance) {
         return reply.status(409).send({ detail: 'This run is not currently paused.' })
       }
 
-      // ── INSERT new step before the paused step ────────────────────────────
+      // ── INSERT new step before/replace the paused step ────────────────────
       if (action === 'resume' && insert_step && test_case_id && paused_step != null) {
         try {
           const tc = await prisma.test_cases.findUnique({ where: { id: test_case_id } })
@@ -96,17 +96,23 @@ export async function testRunRoutes(app: FastifyInstance) {
               target: insert_step.target ?? '',
               value:  insert_step.value  ?? '',
             }
-            const patched = [
-              ...steps.slice(0, insertIdx),
-              newStep,
-              ...steps.slice(insertIdx),
-            ]
+            const patched = delete_step
+              ? [
+                  ...steps.slice(0, insertIdx),
+                  newStep,
+                  ...steps.slice(insertIdx + 1),
+                ]
+              : [
+                  ...steps.slice(0, insertIdx),
+                  newStep,
+                  ...steps.slice(insertIdx),
+                ]
             await prisma.test_cases.update({
               where: { id: test_case_id },
               data:  { steps: patched as any },
             })
             routeLog.info(
-              `[HITL-RESUME] Inserted new step ${JSON.stringify(newStep)} ` +
+              `[HITL-RESUME] ${delete_step ? 'Replaced' : 'Inserted'} new step ${JSON.stringify(newStep)} ` +
               `at position ${paused_step} in test case ${test_case_id}`,
             )
           }
@@ -116,7 +122,7 @@ export async function testRunRoutes(app: FastifyInstance) {
       }
 
       // ── DELETE the paused step ────────────────────────────────────────────
-      if (action === 'resume' && delete_step && test_case_id && paused_step != null) {
+      if (action === 'resume' && delete_step && !insert_step && test_case_id && paused_step != null) {
         try {
           const tc = await prisma.test_cases.findUnique({ where: { id: test_case_id } })
           if (tc) {

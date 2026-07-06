@@ -248,9 +248,7 @@ export class BrowserPool {
       ...(storageState ? { storageState } : {}),
     })
 
-    await context.addInitScript(() => {
-      (window as any).__name = (fn: any) => fn;
-    });
+    await context.addInitScript('window.__name = (fn) => fn;');
 
     if (tracePath) {
       await context.tracing.start({ screenshots: true, snapshots: true }).catch(() => {})

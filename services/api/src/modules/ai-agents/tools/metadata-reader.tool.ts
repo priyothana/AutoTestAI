@@ -284,6 +284,28 @@ export const TYPICAL_FIELDS_BY_ENTITY: Record<string, FieldEntry[]> = {
 
 }
 
+export async function checkIfSalesforce(projectId: string): Promise<boolean> {
+  try {
+    const project = prisma.projects?.findUnique
+      ? await prisma.projects.findUnique({
+          where:  { id: projectId },
+          select: { category: true },
+        }).catch(() => null)
+      : null
+
+    const sfIntegration = prisma.project_integrations?.findFirst
+      ? await prisma.project_integrations.findFirst({
+          where:  { project_id: projectId },
+          select: { category: true },
+        }).catch(() => null)
+      : null
+
+    return (sfIntegration?.category ?? project?.category ?? '').toLowerCase().trim() === 'salesforce'
+  } catch {
+    return false
+  }
+}
+
 // ── Field manifest builder ────────────────────────────────────────────────────
 
 /**
@@ -295,6 +317,7 @@ export async function buildFieldManifest(
   entityFilter?: string,   // optional: scope to one entity name
 ): Promise<FieldManifest | null> {
   try {
+    const isSalesforce = await checkIfSalesforce(projectId)
     // ── Path 0: Canonical metadata (highest priority — Tier 2 layer) ─────────
     // The canonical record pre-merges metadata_normalized + web_test_data +
     // execution_learnings at sync time, so we get ONE definitive record with
@@ -562,7 +585,9 @@ export async function buildFieldManifest(
           else if (type === 'boolean') fieldType = 'checkbox'
           else if (type === 'textarea') fieldType = 'textarea'
 
-          fields.push({ label, type: fieldType, required: req, locatorType: 'label' })
+          const referenceTo = Array.isArray(json.referenceTo) ? (json.referenceTo as string[]).map(String) : undefined
+
+          fields.push({ label, type: fieldType, required: req, locatorType: 'label', referenceTo })
         }
 
         // Apply required-field overrides for Salesforce field rows
@@ -572,6 +597,11 @@ export async function buildFieldManifest(
           entityName,
           requiredCount: patchedFieldsSF.filter(f => f.required).length,
           fields:        patchedFieldsSF,
+          openButton:    isSalesforce ? 'New' : undefined,
+          submitButton:  isSalesforce ? 'Save' : undefined,
+          updateButton:  isSalesforce ? 'Edit' : undefined,
+          deleteButton:  isSalesforce ? 'Delete' : undefined,
+          allButtons:    isSalesforce ? ['New', 'Save', 'Cancel', 'Edit', 'Delete'] : undefined,
         }
       }
     }
@@ -749,9 +779,11 @@ export async function buildFieldManifest(
           entityName,
           requiredCount: reqCount,
           fields:        typicalFields,
-          openButton:    openBtn,
-          submitButton:  submitBtn,
-          allButtons:    [submitBtn, openBtn, 'Save', 'Cancel'],
+          openButton:    isSalesforce ? 'New' : openBtn,
+          submitButton:  isSalesforce ? 'Save' : submitBtn,
+          updateButton:  isSalesforce ? 'Edit' : undefined,
+          deleteButton:  isSalesforce ? 'Delete' : undefined,
+          allButtons:    isSalesforce ? ['New', 'Save', 'Cancel', 'Edit', 'Delete'] : [submitBtn, openBtn, 'Save', 'Cancel'],
           createUrl:     `/${entityFilter.toLowerCase()}s/new`,
         }
       }
@@ -771,16 +803,91 @@ const SKIP_PATHS = /^(login|logout|signin|signout|signup|register|auth|callback|
 
 /**
  * Return all crawler-verified paths for the project.
+ *
+ * For Salesforce projects: builds Lightning URL paths from synced SF object
+ * API names (e.g. /lightning/o/Account__c/list) using the org's instance_url
+ * as the base URL. This ensures NAVIGATE steps use valid absolute Salesforce
+ * URLs instead of invented paths.
+ *
+ * For web-app projects: reads webapp_crawl and metadata_canonical as before.
  */
 export async function buildUrlMap(projectId: string): Promise<VerifiedUrlMap> {
   try {
     const project = await prisma.projects.findUnique({
       where:  { id: projectId },
-      select: { base_url: true },
+      select: { base_url: true, category: true },
     })
     let baseUrl = ''
     try { baseUrl = project?.base_url ? new URL(project.base_url).origin : '' } catch { /* */ }
 
+    // ── Determine project category (integration row takes priority over projects.category) ──
+    const sfIntegration = await prisma.project_integrations.findFirst({
+      where:  { project_id: projectId },
+      select: { category: true, instance_url: true, salesforce_login_url: true },
+    }).catch(() => null)
+
+    const rawCategory =
+      (sfIntegration?.category ?? project?.category ?? '').toLowerCase().trim()
+    const isSalesforce = rawCategory === 'salesforce'
+
+    // ── Salesforce path: build Lightning URL map from SF object API names ──────
+    // Salesforce projects have no webapp_crawl rows. We derive the verified URL
+    // map from the objects synced into metadata_normalized (entity_type = 'object')
+    // combined with the org's instance URL stored in project_integrations.
+    if (isSalesforce) {
+      // Prefer instance_url (the actual org endpoint after OAuth); fall back to
+      // salesforce_login_url (e.g. https://login.salesforce.com or sandbox URL).
+      const sfInstanceUrl =
+        (sfIntegration?.instance_url ?? '').trim().replace(/\/$/, '') ||
+        (sfIntegration?.salesforce_login_url ?? '').trim().replace(/\/$/, '') ||
+        baseUrl
+
+      // Collect all SF object API names from entity_type = 'object'
+      const sfObjects = await prisma.metadata_normalized.findMany({
+        where:  { project_id: projectId, entity_type: 'object' },
+        select: { object_name: true },
+      })
+
+      const pathSet = new Set<string>()
+
+      for (const obj of sfObjects) {
+        const apiName = (obj.object_name ?? '').trim()
+        if (!apiName || apiName.length < 2) continue
+        // Standard Lightning URL patterns used in NAVIGATE steps:
+        //   List view:  /lightning/o/{ObjectApiName}/list
+        //   New record: /lightning/o/{ObjectApiName}/new
+        //   Home view:  /lightning/o/{ObjectApiName}/home  (alias for list)
+        pathSet.add(`/lightning/o/${apiName}/list`)
+        pathSet.add(`/lightning/o/${apiName}/new`)
+        pathSet.add(`/lightning/o/${apiName}/home`)
+      }
+
+      // Fall back to field-based object names if no 'object' rows exist
+      if (pathSet.size === 0) {
+        const fieldObjects = await prisma.metadata_normalized.findMany({
+          where:    { project_id: projectId, entity_type: 'field' },
+          select:   { object_name: true },
+          distinct: ['object_name'],
+        })
+        for (const row of fieldObjects) {
+          const apiName = (row.object_name ?? '').trim()
+          if (!apiName || apiName.length < 2) continue
+          pathSet.add(`/lightning/o/${apiName}/list`)
+          pathSet.add(`/lightning/o/${apiName}/new`)
+        }
+      }
+
+      // Always include the Lightning home page
+      pathSet.add('/lightning/page/home')
+
+      log.info(
+        { projectId, sfInstanceUrl, pathCount: pathSet.size },
+        '[META-TOOL] Salesforce URL map built from Lightning object paths',
+      )
+      return { baseUrl: sfInstanceUrl, paths: [...pathSet].sort() }
+    }
+
+    // ── Web-app path: crawler + canonical metadata ────────────────────────────
     const webRows = await prisma.metadata_normalized.findMany({
       where:  { project_id: projectId, entity_type: 'webapp_crawl' },
       select: { structured_json: true },
@@ -836,15 +943,33 @@ export async function buildUrlMap(projectId: string): Promise<VerifiedUrlMap> {
 export function formatManifestForPrompt(manifest: FieldManifest, operationMode: 'create' | 'update' | 'default' = 'default'): string {
   const allFieldNames = manifest.fields.map(f => f.label)
 
+
   const lines: string[] = [
     `=== ENTITY FIELD MANIFEST: ${manifest.entityName} ===`,
     '',
-    '╔══════════════════════════════════════════════════════════════╗',
-    '║  HARD BOUNDARY — ANTI-HALLUCINATION                         ║',
-    `║  The ONLY fields that exist on this form are listed below.  ║`,
-    '║  DO NOT generate TYPE/SELECT/LOOKUP steps for ANY other     ║',
-    '║  field. If a field is not in this list it does NOT exist.   ║',
-    '╚══════════════════════════════════════════════════════════════╝',
+    '╔══════════════════════════════════════════════════════════════════════╗',
+    '║  🛡️  METADATA GROUNDING RULES (STRICT) — READ BEFORE GENERATING    ║',
+    '╠══════════════════════════════════════════════════════════════════════╣',
+    `║  Entity: ${manifest.entityName.padEnd(59)}║`,
+    '║                                                                      ║',
+    '║  BUTTON RULES (ABSOLUTE):                                            ║',
+    '║  • Use ONLY button names listed under PRIMARY ACTION BUTTON or       ║',
+    '║    ALL PAGE BUTTONS below. NO exceptions.                            ║',
+    '║  • Copy button names CHARACTER-FOR-CHARACTER (incl. +, spaces).      ║',
+    `║  • ❌ Do NOT invent: "+New Add ${manifest.entityName}", "Save Record"${' '.repeat(Math.max(0, 17 - manifest.entityName.length))}║`,
+    '║                                                                      ║',
+    '║  FIELD RULES (ABSOLUTE):                                             ║',
+    '║  • Use ONLY field labels from ALLOWED FIELDS below.                  ║',
+    '║  • Every ★ required field MUST have a TYPE/SELECT/LOOKUP step.       ║',
+    '║  • Do NOT use fields from your training data — use ONLY this list.   ║',
+    '╚══════════════════════════════════════════════════════════════════════╝',
+    '',
+    '╔══════════════════════════════════════════════════════════════════════╗',
+    '║  HARD BOUNDARY — ANTI-HALLUCINATION                                  ║',
+    `║  The ONLY fields that exist on this form are listed below.           ║`,
+    '║  DO NOT generate TYPE/SELECT/LOOKUP steps for ANY other field.       ║',
+    '║  If a field is not in this list it does NOT exist.                   ║',
+    '╚══════════════════════════════════════════════════════════════════════╝',
     '',
     `ALLOWED FIELDS (${allFieldNames.length} total): ${allFieldNames.map(n => `"${n}"`).join(', ')}`,
     '',
@@ -1003,6 +1128,9 @@ async function tryCanonicalManifest(
 ): Promise<FieldManifest | null> {
   if (!entityFilter || entityFilter.length < 2) return null
 
+  // ── Salesforce project detection ──
+  const isSalesforce = await checkIfSalesforce(projectId)
+
   const cleanFilter = entityFilter.trim()
   // Inline depluralizer to match singular/plural forms
   const depluralize = (word: string): string => {
@@ -1099,6 +1227,7 @@ async function tryCanonicalManifest(
       options:     Array.isArray(f.options) ? f.options.map(String) : undefined,
       sampleValue: typeof f.sample_value === 'string' ? f.sample_value : undefined,
       locatorType: (f.locator_type as FieldEntry['locatorType']) ?? 'label',
+      referenceTo:  Array.isArray(f.referenceTo) ? (f.referenceTo as string[]).map(String) : undefined,
     })).filter(f => f.label.length > 0)
 
     if (parsed.length === 0) {
@@ -1110,6 +1239,7 @@ async function tryCanonicalManifest(
           options:     Array.isArray(f.options) ? f.options.map(String) : undefined,
           sampleValue: typeof f.sample_value === 'string' ? f.sample_value : undefined,
           locatorType: (f.locator_type as FieldEntry['locatorType']) ?? 'label',
+          referenceTo:  Array.isArray(f.referenceTo) ? (f.referenceTo as string[]).map(String) : undefined,
         })
       }
     }
@@ -1317,7 +1447,7 @@ async function tryCanonicalManifest(
     if (!resolvedSubmitButton) {
       // Use "Create <Entity>" as the synthesized default — matches the most common
       // real button naming convention ("Create Opportunity", "Create Account", etc.)
-      resolvedSubmitButton = `Create ${canonical.entity_name}`
+      resolvedSubmitButton = isSalesforce ? 'Save' : `Create ${canonical.entity_name}`
       log.info(
         { projectId, entityFilter, entity: canonical.entity_name, synthesized: resolvedSubmitButton },
         '[META-TOOL] tryCanonicalManifest: synthesized submit button name (DB had null) — prevents "Save" hallucination',
@@ -1325,11 +1455,19 @@ async function tryCanonicalManifest(
     }
   }
 
+  if (isSalesforce) {
+    resolvedOpenButton = 'New'
+    resolvedSubmitButton = 'Save'
+  }
+
   // ── Build enriched allButtons including the open-form trigger ─────────────
   // The canonical all_buttons only contains buttons INSIDE the form/modal.
   // The open-form trigger (e.g. "+ Add Account") lives in learned_rules/business_rules.
   // We prepend it so Check 3 never rejects a CLICK on the trigger button.
   const enrichedAllButtons = (() => {
+    if (isSalesforce) {
+      return ['New', 'Save', 'Cancel', 'Edit', 'Delete']
+    }
     const base = allButtons.length > 0 ? [...allButtons] : []
     // Also include the trigger_button from business_rules if different from learned open_button
     const triggerBtn = typeof businessRulesRaw.trigger_button === 'string' ? businessRulesRaw.trigger_button as string : null
@@ -1463,6 +1601,9 @@ export async function autoCorrectButtonNames(
   entityHint?: string,
 ): Promise<Array<Record<string, any>>> {
   if (!steps || steps.length === 0) return steps
+
+  // ── Salesforce project detection ──
+  const isSalesforce = await checkIfSalesforce(projectId)
 
   // Sanitize entityHint to prevent field name context (like "Last Name", "First Name", "Company")
   // from being used as a business entity, which would mangle button name corrections.
@@ -1660,8 +1801,22 @@ export async function autoCorrectButtonNames(
     }
   }
 
+  if (isSalesforce) {
+    realOpenBtn = 'New'
+    realSubmitBtn = 'Save'
+  }
+
   // Create a case-insensitive check set of valid buttons
   const knownButtonsLower = new Set<string>()
+  if (isSalesforce) {
+    knownButtonsLower.add('new')
+    knownButtonsLower.add('save')
+    knownButtonsLower.add('edit')
+    knownButtonsLower.add('delete')
+    knownButtonsLower.add('cancel')
+    knownButtonsLower.add('save & new')
+    knownButtonsLower.add('save and new')
+  }
   if (realOpenBtn) {
     knownButtonsLower.add(realOpenBtn.toLowerCase().trim())
     knownButtonsLower.add(realOpenBtn.toLowerCase().replace(/\s+/g, ''))
@@ -1724,9 +1879,9 @@ export async function autoCorrectButtonNames(
 
       if (knownButtonsLower.has(target.toLowerCase().trim())) continue
       
-      // Exclude delete/confirm/cancel buttons from submit button correction
-      const isDeleteOrConfirmBtn = /\b(delete|remove|confirm|cancel|yes|ok|close)\b/i.test(target)
-      if (isDeleteOrConfirmBtn) continue
+      // Exclude edit/update/delete/confirm/cancel buttons from submit button correction
+      const isEditOrDeleteOrConfirmBtn = /\b(edit|update|delete|remove|confirm|cancel|yes|ok|close)\b/i.test(target)
+      if (isEditOrDeleteOrConfirmBtn) continue
 
       if (!FORM_ACTION_RE.test(target)) continue
 

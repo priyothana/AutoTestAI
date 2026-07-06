@@ -20,6 +20,7 @@ import type { BaseChatModel }               from '@langchain/core/language_model
 import prisma                               from '../../shared/db/prisma.js'
 import { createModuleLogger }               from '../../shared/logger/index.js'
 import { loadLearnings, formatLearningsBlock } from './hitl-learning.service.js'
+import { hitlContextStore }                 from '../ai-agents/tools/hitl.tool.js'
 
 const log = createModuleLogger('hitl-ai')
 
@@ -450,6 +451,24 @@ async function callLlm(systemPrompt: string, userMessage: string): Promise<HitlA
 export async function hitlAnalyze(req: HitlAnalyzeRequest): Promise<HitlAiResponse> {
   const { runId, testCaseId, pausedStep, errorMessage } = req
   log.info({ testCaseId, pausedStep, errorMessage }, '[HITL-AI] Analyzing paused step')
+
+  // Check if we have pre-calculated suggestions in the context store
+  const cachedContext = hitlContextStore.get(runId)
+  if (cachedContext && cachedContext.structuredSuggestions && cachedContext.structuredSuggestions.length > 0) {
+    log.info({ runId }, '[HITL-AI] Found pre-calculated structured suggestions in context store')
+    // Construct options string array for backward compatibility
+    const options = cachedContext.structuredSuggestions.map(s =>
+      s.value ? `${s.action} '${s.value}' into ${s.target}` : `${s.action} → ${s.target}`
+    )
+    return {
+      reply: `Step ${pausedStep ?? '?'} failed: "${errorMessage ?? 'Unknown error'}".\n\n${cachedContext.reason}`,
+      suggestion_type: 'advice',
+      suggested_action: cachedContext.reason,
+      suggestions: cachedContext.structuredSuggestions,
+      options,
+      quick_replies: ['Skip this step', 'Delete this step']
+    }
+  }
 
   const { testCase, steps, pausedStepObj } = await loadContext(testCaseId, pausedStep)
 

@@ -44,6 +44,7 @@ interface CanonicalField {
   locator?:     string           // stable CSS/label locator
   locator_type: 'label' | 'role' | 'placeholder' | 'css' | 'testid'
   sample_value?: string          // realistic test data from web_test_data
+  referenceTo?: string[]
 }
 
 /** Shape of the structured_json in metadata_normalized for webapp_crawl entries */
@@ -1199,6 +1200,7 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
         type:         fieldType,
         required:     f.required,
         locator_type: 'label',
+        referenceTo:  f.referenceTo,
         ...(options && options.length > 0 ? { options } : {}),
       }
 
@@ -1265,7 +1267,7 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
 
     // ── Resolve enrichment fields (universally \u2014 same helpers as webapp builder) ─
     // Salesforce standard buttons are well-known, but learned buttons take priority.
-    const sfCreateButton = openButton ?? `+New ${objectLabel}`
+    const sfCreateButton = openButton ?? 'New'
     const sfUpdateButton = 'Edit'
     const sfDeleteButton = 'Delete'
     const sfSearchField  = `Search ${objectLabel}s...`
@@ -1304,7 +1306,7 @@ export async function buildSalesforceCanonicalMetadata(projectId: string): Promi
           ${JSON.stringify(requiredFields)}::jsonb,
           ${JSON.stringify(optionalFields.slice(0, 30))}::jsonb,
           ${primaryButton},
-          ${JSON.stringify(['Save', 'Save & New', 'Cancel'])}::jsonb,
+          ${JSON.stringify(['New', 'Save', 'Save & New', 'Cancel', 'Edit', 'Delete'])}::jsonb,
           ${JSON.stringify(allFields.slice(0, 50))}::jsonb,
           '[]'::jsonb,
           '{}'::jsonb,

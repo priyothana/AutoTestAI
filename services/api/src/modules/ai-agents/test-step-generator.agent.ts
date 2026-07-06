@@ -147,6 +147,49 @@ Your job: generate EXECUTABLE Playwright test steps grounded in real metadata.
 ║      click Save, and assert the update succeeded.                     ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
+╔══════════════════════════════════════════════════════════════════════╗
+║  🛡️  METADATA GROUNDING RULES (STRICT) — UNIVERSAL, NON-NEGOTIABLE  ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  These rules apply to ALL projects (Salesforce + Web Apps) and ALL  ║
+║  entities. They are ABSOLUTE and OVERRIDE any other instruction.     ║
+║                                                                      ║
+║  BUTTON RULES:                                                       ║
+║  1. You MUST use ONLY button names that appear in the                ║
+║     "PRIMARY ACTION BUTTON" or "ALL PAGE BUTTONS" list from          ║
+║     the FIELD MANIFEST provided in this prompt.                      ║
+║  2. NEVER invent, modify, shorten, expand, or combine button names.  ║
+║     ❌ FORBIDDEN: "+New Add Account" if metadata says "+ Add Account"║
+║     ❌ FORBIDDEN: "Save Record" if metadata says "Save Account"      ║
+║     ❌ FORBIDDEN: "Create New Lead" if metadata says "+ New Lead"    ║
+║     ✅ REQUIRED: copy the button name CHARACTER-FOR-CHARACTER,       ║
+║        including +, spaces, punctuation, and capitalization.         ║
+║  3. For any CLICK step, the "target" must EXACTLY match a button     ║
+║     from the metadata button list. No fuzzy matching.                ║
+║                                                                      ║
+║  FIELD RULES:                                                        ║
+║  4. For field-filling steps (TYPE/SELECT/LOOKUP/CHECKBOX), the       ║
+║     "target" must exactly match a field label from the               ║
+║     "required_fields" or "form_fields" (ALLOWED FIELDS) in the       ║
+║     FIELD MANIFEST. Do NOT use your own knowledge of form fields.    ║
+║  5. For Create/Update operations, you MUST include ALL required      ║
+║     fields (★ fields) from the FIELD MANIFEST. Missing even one      ║
+║     causes the form to reject submission and the test to fail.       ║
+║                                                                      ║
+║  DATA RULES:                                                         ║
+║  6. Use real test data from the "real_test_data" / "REAL EXISTING     ║
+║     RECORDS" sections when filling values. NEVER use placeholders.   ║
+║                                                                      ║
+║  FLOW TEMPLATES (enforce these for every operation type):            ║
+║  CREATE:  NAVIGATE list → CLICK open-form btn → fill ★ fields →     ║
+║           CLICK submit btn → ASSERT detail URL + record title        ║
+║  UPDATE:  NAVIGATE list → TYPE search → CLICK record →              ║
+║           CLICK edit btn → update fields → CLICK save → ASSERT URL  ║
+║  DELETE:  NAVIGATE list → TYPE search → CLICK record →              ║
+║           CLICK delete btn → CLICK confirm → ASSERT removed         ║
+║  VIEW:    NAVIGATE list → TYPE search → CLICK record → ASSERT URL   ║
+║  SEARCH:  NAVIGATE list → TYPE search → CLICK record → ASSERT URL   ║
+╚══════════════════════════════════════════════════════════════════════╝
+
 MANDATORY PRE-FLIGHT (complete BEFORE writing any step):
   A. Identify PRIMARY ENTITY from the test case name.
   B. Find the EXACT page URL from the URL MAP — never invent.
@@ -591,6 +634,8 @@ export function validateSteps(
   manifestFields?:    import('./agent.types.js').FieldEntry[],
   testEntityHint?:    string,
   minimumFieldSteps?: number,   // override for Create/Add operations when requiredCount=0
+  hasRealRecordData?: boolean,  // false = no real records loaded; skip Check 15 to avoid contradiction with fallback names
+  realLookupValues?:  Map<string, string[]>,
 ): StepValidationResult {
   const issues: string[] = []
 
@@ -694,21 +739,30 @@ export function validateSteps(
   }
 
   // Check 3: Button name exactness — ensure CLICK targets exist in the known button set
+  // ── STRICT MATCHING (Change C) ──────────────────────────────────────────────
+  // Uses exact normalized match ONLY — strips leading symbols and collapses spaces,
+  // but does NOT allow bidirectional word-level inclusion.
+  // Rationale: the old includes() check allowed "+New Add Account" to pass against
+  // "Add Account" because "add account" ⊂ "new add account". This is the direct
+  // root cause of hallucinated button names surviving all 3 loops.
   let check3 = true
   const isConvertOrSearchForCheck3 = /\b(convert|transform|turn\s+into|move\s+to|search|filter|find|look\s+up)\b/i.test(testEntityHint ?? '')
   const allKnownButtons = [
     ...(submitButton ? [submitButton] : []),
     ...(allButtons ?? []),
   ]
-  // Normalize a button name for fuzzy matching: lowercase, collapse whitespace,
-  // strip leading non-alphanumeric characters (e.g. "+New" === "+ New").
+  // Normalize a button name for STRICT matching:
+  //   - lowercase everything
+  //   - strip ALL leading non-alphanumeric characters (+ ✓ → stripped)
+  //   - collapse internal whitespace to a single space
+  // IMPORTANT: we do NOT apply bidirectional includes() — only exact normalized match.
   const normBtn = (s: string) => s.toLowerCase().replace(/^[^a-z0-9]+/, '').replace(/\s+/g, ' ').trim()
   if (allKnownButtons.length > 0) {
     const clickSteps = steps.filter(s => s.action.toUpperCase() === 'CLICK')
     for (const cs of clickSteps) {
       const target = (cs.target ?? '').trim()
       if (!target) continue
-      // Allow if it matches any known button (case-insensitive) OR a CSS selector / role locator
+      // Allow CSS selectors and role= locators — they are not button names
       const isCssOrRole = target.startsWith('.') || target.startsWith('#') || target.startsWith('[') || target.startsWith('role=')
       if (!isCssOrRole) {
         // Skip record-navigation clicks (e.g., clicking a row by date/ID/reference in list view)
@@ -720,12 +774,27 @@ export function validateSteps(
           || /^\d+$/.test(target)                    // pure numeric ID
         if ((isConvertOrSearchForCheck3 || isTextLocator) && looksLikeDataValue) continue
         const normTarget = normBtn(target)
+        // STRICT: exact normalized match only.
+        // We also allow one-way prefix tolerance for buttons like "Edit Account" when
+        // the manifest says "Edit" — the LLM correctly scoped the button to the entity.
+        // But we do NOT allow "new add account" to match "add account" (bidirectional inclusion removed).
         const matchesKnown = allKnownButtons.some(btn => {
           const normB = normBtn(btn)
-          return normB === normTarget || normTarget.includes(normB) || normB.includes(normTarget)
+          return normB === normTarget
+            // Allow LLM to scope a generic button (e.g. "Edit") to entity (e.g. "Edit Account")
+            // by checking if the target STARTS with the known button name
+            || (normTarget.startsWith(normB) && normB.length >= 3)
+            // Allow known button to be a more specific version of the target
+            // (e.g. manifest has "Save Account" and LLM says "Save") — only if known is longer
+            || (normB.startsWith(normTarget) && normTarget.length >= 3 && normB.length > normTarget.length)
         })
         if (!matchesKnown) {
-          issues.push(`Button "${target}" is not in the known button list. Use one of: ${allKnownButtons.slice(0, 5).map(b => `"${b}"`).join(', ')}`)
+          issues.push(
+            `🚨 BUTTON GROUNDING VIOLATION: "${target}" is NOT in the known button list. ` +
+            `You MUST use ONLY buttons from the METADATA GROUNDING RULES. ` +
+            `Valid buttons: ${allKnownButtons.slice(0, 8).map(b => `"${b}"`).join(', ')}. ` +
+            `Copy the button name CHARACTER-FOR-CHARACTER — do NOT modify, combine, or invent names.`
+          )
           check3 = false
         }
       }
@@ -734,10 +803,10 @@ export function validateSteps(
     // Legacy: if no allButtons but submitButton is known, just check for it
     const clickSteps = steps.filter(s => s.action.toUpperCase() === 'CLICK')
     const hasCorrectBtn = clickSteps.some(s =>
-      (s.target ?? '').toLowerCase() === submitButton.toLowerCase()
+      normBtn(s.target ?? '') === normBtn(submitButton)
     )
     if (clickSteps.length > 0 && !hasCorrectBtn) {
-      issues.push(`Submit button mismatch. Expected: "${submitButton}"`)
+      issues.push(`Submit button mismatch. Expected: "${submitButton}" — use this EXACT name.`)
       check3 = false
     }
   }
@@ -1318,36 +1387,75 @@ export function validateSteps(
   }
 
   // Check 15: Anti-placeholder guard — real data enforcement
-  // Fires for TYPE, LOOKUP, and SELECT steps. Rejects values that look like
-  // generic placeholders invented by the LLM ("Test Record", "Sample Account", "John Doe", etc.).
-  // When real data exists (injected via REAL EXISTING RECORDS or REAL LOOKUP DATA blocks),
-  // the LLM MUST use one of those exact values — not an invented placeholder.
+  // Only fires when real records were actually loaded (hasRealRecordData === true).
+  // When no real records exist the prompt tells the LLM to use a fallback name (e.g. "John Smith"
+  // for Lead). Firing this check in that case creates an unresolvable contradiction — the prompt
+  // says use "John Smith" but the regex rejects it — causing all 3 correction loops to fail and
+  // returning empty steps.
   let check15 = true
-  const GENERIC_PLACEHOLDER_RE = /^(test\s+(record|account|lead|contact|product|sku|item|user|company|order|invoice|customer)|sample\s+\w+|john\s+doe|jane\s+(doe|smith)|john\s+smith|foo\s+bar|bar\s+foo|acme\s+corp(oration)?\s*$|lorem|placeholder|dummy|fake|mock|demo\s+\w+|test\s*\d*$|my\s+(account|company|record)|some\s+(record|company|account)|existing\s+(record|account)|new\s+(record|entry))$/i
-  const FIELD_ACTIONS_C15 = new Set(['TYPE', 'LOOKUP', 'SELECT'])
-  for (const s of steps) {
-    const action = (s.action ?? '').toUpperCase()
-    if (!FIELD_ACTIONS_C15.has(action)) continue
-    const value = (s.value ?? '').trim()
-    if (!value || value.length === 0) continue
-    // Skip NAVIGATE/ASSERT values and very short values (e.g. single characters, codes)
-    if (value.length < 3) continue
-    // Skip values that look like valid codes/IDs (alphanumeric with dashes, dots, underscores)
-    if (/^[A-Z0-9][A-Z0-9\-_.]{2,}$/i.test(value) && !/\s/.test(value)) continue
-    if (GENERIC_PLACEHOLDER_RE.test(value)) {
-      issues.push(
-        `Anti-placeholder violation: step ${steps.indexOf(s) + 1} (${action} "${s.target ?? ''}") uses ` +
-        `placeholder value "${value}" which does NOT exist in the application. ` +
-        `You MUST use a REAL EXISTING RECORD name from the "=== REAL EXISTING RECORDS ===" or ` +
-        `"=== REAL LOOKUP DATA ===" sections. NEVER invent names like "Test Record", "Sample Account", ` +
-        `"John Doe", or "Jane Smith". If no real data section exists, use the sampleValue from the FIELD MANIFEST.`
-      )
-      check15 = false
+  if (hasRealRecordData !== false) {
+    const GENERIC_PLACEHOLDER_RE = /^(test\s+(record|account|lead|contact|product|sku|item|user|company|order|invoice|customer)|sample\s+\w+|john\s+doe|jane\s+(doe|smith)|john\s+smith|foo\s+bar|bar\s+foo|acme\s+corp(oration)?\s*$|lorem|placeholder|dummy|fake|mock|demo\s+\w+|test\s*\d*$|my\s+(account|company|record)|some\s+(record|company|account)|existing\s+\w+(?:\s+\w+)*|new\s+(record|entry))$/i
+    const FIELD_ACTIONS_C15 = new Set(['TYPE', 'LOOKUP', 'SELECT'])
+    for (const s of steps) {
+      const action = (s.action ?? '').toUpperCase()
+      if (!FIELD_ACTIONS_C15.has(action)) continue
+      const value = (s.value ?? '').trim()
+      if (!value || value.length === 0) continue
+      if (value.length < 3) continue
+      if (/^[A-Z0-9][A-Z0-9\-_.]{2,}$/i.test(value) && !/\s/.test(value)) continue
+      if (GENERIC_PLACEHOLDER_RE.test(value)) {
+        issues.push(
+          `Anti-placeholder violation: step ${steps.indexOf(s) + 1} (${action} "${s.target ?? ''}") uses ` +
+          `placeholder value "${value}" which does NOT exist in the application. ` +
+          `You MUST use a REAL EXISTING RECORD name from the "=== REAL EXISTING RECORDS ===" or ` +
+          `"=== REAL LOOKUP DATA ===" sections. NEVER invent names like "Test Record", "Sample Account", ` +
+          `"John Doe", or "Jane Smith". If no real data section exists, use the sampleValue from the FIELD MANIFEST.`
+        )
+        check15 = false
+      }
+    }
+  }
+
+  // Check 16: LOOKUP field value enforcement
+  // Every LOOKUP step value MUST match one of the values in the real lookup data.
+  let check16 = true
+  if (manifestFields && manifestFields.length > 0 && realLookupValues && realLookupValues.size > 0) {
+    const lookupFields = manifestFields.filter(f => f.type === 'lookup')
+    const lookupSteps = steps.filter(s => s.action.toUpperCase() === 'LOOKUP')
+
+    for (const step of lookupSteps) {
+      const targetLower = (step.target ?? '').toLowerCase().trim()
+      const value = (step.value ?? '').trim()
+      if (!value) continue
+
+      // Find the corresponding lookup field entry in the manifest
+      const fieldEntry = lookupFields.find(f => f.label.toLowerCase().trim() === targetLower)
+      if (fieldEntry) {
+        // Find if we have real lookup values for this field label
+        // Let's do a case-insensitive check on keys of realLookupValues
+        const realVals = (() => {
+          for (const [k, vals] of realLookupValues.entries()) {
+            if (k.toLowerCase().trim() === targetLower) return vals
+          }
+          return null
+        })()
+
+        if (realVals && realVals.length > 0) {
+          const isMatched = realVals.some(v => v.toLowerCase().trim() === value.toLowerCase().trim())
+          if (!isMatched) {
+            issues.push(
+              `🚨 LOOKUP VALUE VIOLATION: lookup field "${step.target}" has value "${value}" which is NOT an existing record. ` +
+              `You MUST use one of the existing records from the REAL LOOKUP DATA section: [${realVals.map(v => `"${v}"`).join(', ')}].`
+            )
+            check16 = false
+          }
+        }
+      }
     }
   }
 
   return {
-    passed: check1 && check2 && check3 && check4 && check5 && check6 && check7 && check8 && check9 && check10 && check11 && check12 && check13 && check15,
+    passed: check1 && check2 && check3 && check4 && check5 && check6 && check7 && check8 && check9 && check10 && check11 && check12 && check13 && check15 && check16,
     checks: {
       requiredFieldCoverage:     check1,
       urlVerification:           check2,
@@ -1500,7 +1608,7 @@ export async function runTestStepGeneratorAgent(
     '[STEP-GEN] Resolved entity filter for manifest lookup',
   )
 
-  let [manifest, urlMap, ragResult, projectArtifacts, learningsText, learnedButtons, sampleTestData, hitlLearnings, fieldTypeCorrections] = await Promise.all([
+  let [manifest, urlMap, ragResult, projectArtifacts, learningsText, learnedButtons, sampleTestData, hitlLearnings, fieldTypeCorrections, projectMeta] = await Promise.all([
     buildFieldManifest(input.projectId, resolvedEntityFilter),
     buildUrlMap(input.projectId),
     ragSearchTool({ projectId: input.projectId, query: `${input.testName} form fields steps`, topK: 8 }),
@@ -1545,6 +1653,27 @@ export async function runTestStepGeneratorAgent(
     loadLearnings(input.projectId, input.testCaseId ?? '').catch(() => []),
     // Pull field-type corrections — where humans changed action types (e.g. LOOKUP → TYPE)
     extractFieldTypeCorrections(input.projectId, input.testCaseId ?? '').catch(() => []),
+    // Pull project category and integration for Salesforce detection
+    (async () => {
+      const [proj, integ] = await Promise.all([
+        prisma.projects.findUnique({
+          where:  { id: input.projectId },
+          select: { category: true },
+        }).catch(() => null),
+        prisma.project_integrations.findFirst({
+          where:  { project_id: input.projectId },
+          select: { category: true, instance_url: true, salesforce_login_url: true },
+        }).catch(() => null),
+      ])
+      const rawCat = (integ?.category ?? proj?.category ?? '').toLowerCase().trim()
+      return {
+        isSalesforce: rawCat === 'salesforce',
+        instanceUrl: (
+          (integ?.instance_url ?? '').trim().replace(/\/$/, '') ||
+          (integ?.salesforce_login_url ?? '').trim().replace(/\/$/, '')
+        ),
+      }
+    })(),
   ])
 
   // Update resolvedEntityFilter with the canonical entity name if found
@@ -1637,15 +1766,19 @@ export async function runTestStepGeneratorAgent(
           // Derive the likely related entity name from the field label:
           //   "User" → "User", "Account Name" → "Account", "Role" → "Role"
           const fieldLabel = field.label
-          const relatedEntity = fieldLabel
+          let relatedEntity = fieldLabel
             .replace(/\bname\b/gi, '').replace(/\bId\b/gi, '').replace(/\bref\b/gi, '').trim()
             || fieldLabel
 
+          if (field.referenceTo && field.referenceTo.length > 0) {
+            relatedEntity = field.referenceTo[0]
+          }
+
           // Find a web_test_data row whose entity_name is closest to the related entity
           const matchingRow = allTestDataRows.find(r => {
-            const en = (r.entity_name ?? '').toLowerCase()
-            const re = relatedEntity.toLowerCase()
-            return en.includes(re) || re.includes(en)
+            const en = (r.entity_name ?? '').toLowerCase().trim().replace(/__c$/i, '').replace(/ies$/i, 'y').replace(/s$/i, '')
+            const re = relatedEntity.toLowerCase().trim().replace(/__c$/i, '').replace(/ies$/i, 'y').replace(/s$/i, '')
+            return en === re || en.includes(re) || re.includes(en)
           })
 
           if (matchingRow?.records && Array.isArray(matchingRow.records) && matchingRow.records.length > 0) {
@@ -1857,9 +1990,58 @@ export async function runTestStepGeneratorAgent(
     }
   }
 
-  const urlMapText = urlMap.paths.length > 0
-    ? `=== VERIFIED URL MAP ===\nBase URL: ${urlMap.baseUrl}\nPaths (use ONLY these):\n${urlMap.paths.map(p => `  ✅ ${p}`).join('\n')}`
-    : '(no crawler URL map — use relative paths inferred from metadata)'
+  // ── Salesforce project detection ─────────────────────────────────────────────
+  const isSalesforceProject = projectMeta?.isSalesforce ?? false
+  const sfInstanceUrl       = projectMeta?.instanceUrl ?? urlMap.baseUrl
+
+  log.info(
+    { projectId: input.projectId, isSalesforceProject, sfInstanceUrl },
+    '[STEP-GEN] Salesforce project detection',
+  )
+
+  const urlMapText = (() => {
+    if (isSalesforceProject) {
+      // ── Salesforce-specific URL MAP block ────────────────────────────────────
+      // For Salesforce projects the AI MUST use full absolute Salesforce Lightning
+      // URLs. The baseUrl is the org instance URL (e.g. https://orgname.my.salesforce.com).
+      // Paths follow the pattern /lightning/o/{ObjectApiName}/list|new|home.
+      // Custom objects ALWAYS have the __c suffix (e.g. Invoice__c, Order__c).
+      // Standard objects have NO suffix (e.g. Account, Contact, Lead, Opportunity).
+      const instanceDisplay = sfInstanceUrl || '<your-org>.my.salesforce.com'
+      const pathLines = urlMap.paths.length > 0
+        ? urlMap.paths.map(p => `  ✅ ${instanceDisplay}${p}`).join('\n')
+        : '  (No objects synced yet — use the patterns below as a guide)'
+
+      return [
+        `=== VERIFIED SALESFORCE LIGHTNING URL MAP ===`,
+        `Salesforce Instance URL (Base): ${instanceDisplay}`,
+        ``,
+        `⚠️  SALESFORCE NAVIGATE RULES (ABSOLUTE — NEVER VIOLATE):`,
+        `1. NAVIGATE value MUST be the FULL absolute URL: ${instanceDisplay}/lightning/o/{ObjectApiName}/list`,
+        `2. Standard objects (Account, Contact, Lead, Opportunity, Case, etc.) use NO suffix.`,
+        `3. Custom objects ALWAYS use the __c suffix: Invoice__c, Order__c, CustomObj__c.`,
+        `4. URL pattern for list view:  ${instanceDisplay}/lightning/o/{ObjectApiName}/list`,
+        `5. URL pattern for new record: ${instanceDisplay}/lightning/o/{ObjectApiName}/new`,
+        `6. NEVER use relative paths like /lightning/o/Account/list without the instance URL prefix.`,
+        `7. NEVER use invented paths like /accounts, /leads — these do NOT exist in Salesforce.`,
+        ``,
+        `VERIFIED PATHS (use ONLY these — full absolute URL with instance prefix):`,
+        pathLines,
+        ``,
+        `EXAMPLES of correct NAVIGATE step values:`,
+        `  ✅ { "action": "NAVIGATE", "value": "${instanceDisplay}/lightning/o/Account/list" }`,
+        `  ✅ { "action": "NAVIGATE", "value": "${instanceDisplay}/lightning/o/Contact/list" }`,
+        `  ✅ { "action": "NAVIGATE", "value": "${instanceDisplay}/lightning/o/Invoice__c/list" }`,
+        `  ❌ WRONG: { "action": "NAVIGATE", "value": "/accounts" }  ← NOT a valid Salesforce path`,
+        `  ❌ WRONG: { "action": "NAVIGATE", "value": "/lightning/o/Account/list" }  ← missing instance URL prefix`,
+      ].join('\n')
+    }
+
+    // Web-app: standard relative-path URL map
+    return urlMap.paths.length > 0
+      ? `=== VERIFIED URL MAP ===\nBase URL: ${urlMap.baseUrl}\nPaths (use ONLY these):\n${urlMap.paths.map(p => `  ✅ ${p}`).join('\n')}`
+      : '(no crawler URL map — use relative paths inferred from metadata)'
+  })()
 
   const ragText = ragResult.chunks.length > 0
     ? `=== PROJECT METADATA (RAG) ===\n${ragResult.chunks.join('\n\n---\n\n')}`
@@ -2372,7 +2554,19 @@ export async function runTestStepGeneratorAgent(
                     `║    "Test Record"  "Test Account"  "John Doe"  "Sample Account"   ║`,
                     `╚══════════════════════════════════════════════════════════════════╝`,
                   ].join('\n')
-                : '',
+                : [
+                    `╔══════════════════════════════════════════════════════════════════╗`,
+                    `║  ⚠️ NO REAL RECORDS LOADED — USE THIS FALLBACK NAME EXACTLY      ║`,
+                    `╠══════════════════════════════════════════════════════════════════╣`,
+                    `║  No pre-loaded records exist for this entity in the metadata.    ║`,
+                    `║  ✅ USE THIS fallback name for search AND click steps:            ║`,
+                    `║     "${updateRecordHint}"${' '.repeat(Math.max(0, 62 - updateRecordHint.length))}║`,
+                    `║                                                                   ║`,
+                    `║  ❌ FORBIDDEN — do NOT invent placeholder names like:            ║`,
+                    `║    "Existing ${(resolvedEntityFilter ?? 'Entity') + ' Name'}"  "Test Record"  "Sample ${resolvedEntityFilter ?? 'Entity'}"${' '.repeat(Math.max(0, 14 - (resolvedEntityFilter ?? 'Entity').length * 2))}║`,
+                    `║  ⛔ Using invented names will FAIL validation.                   ║`,
+                    `╚══════════════════════════════════════════════════════════════════╝`,
+                  ].join('\n'),
               ``,
               `UPDATE WORKFLOW — follow these 7 steps EXACTLY:`,
               `  1. NAVIGATE to: ${listUrl}`,
@@ -2538,23 +2732,56 @@ export async function runTestStepGeneratorAgent(
         })()
       : '',
 
-    // Inject confirmed button names — learning registry (runtime-confirmed) > manifest (metadata-derived)
+    // ── Change A: Universal Metadata Grounding Block ──────────────────────────
+    // This block ALWAYS fires when canonical metadata has any button data.
+    // It no longer depends solely on learnedButtons — canonical metadata is the
+    // primary source of truth, learning-registry only extends it.
+    // Priority: learning-registry > triggerButton > openButton > synthesized
     (() => {
       const openBtn   = learnedButtons.openButton   ?? manifest?.triggerButton ?? manifest?.openButton
       const submitBtn = learnedButtons.submitButton ?? manifest?.submitButton
-      if (!openBtn && !submitBtn) return ''
-      const lines = [`⚠️  CONFIRMED BUTTON NAMES (from metadata/past executions):`]
+      const updateBtn = manifest?.updateButton ?? learnedButtons.openButton
+      const deleteBtn = manifest?.deleteButton
+      const allKnown  = manifest?.allButtons ?? []
+      // Always fire this block if ANY button is known — not just when both open+submit are set
+      if (!openBtn && !submitBtn && allKnown.length === 0) return ''
+      const lines = [
+        `╔══════════════════════════════════════════════════════════════════╗`,
+        `║  🔴 CONFIRMED BUTTON NAMES — AUTHORITATIVE METADATA SOURCE       ║`,
+        `║  (from canonical metadata + past executions)                      ║`,
+        `╠══════════════════════════════════════════════════════════════════╣`,
+        `║  ⛔ ABSOLUTE RULE: You MUST use ONLY the button names below.      ║`,
+        `║  NEVER invent, modify, shorten, expand, or combine these names.  ║`,
+        `║  Copy them CHARACTER-FOR-CHARACTER including +, spaces, symbols.  ║`,
+        `╚══════════════════════════════════════════════════════════════════╝`,
+      ]
       if (openBtn) {
-        lines.push(`  🔓 OPEN FORM button (Step 2 — CLICK on the LIST page to open the form):`)
-        lines.push(`     "${openBtn}"`)
-        lines.push(`     → This opens the create form. DO NOT use this as the save button.`)
+        lines.push(`  🔓 OPEN FORM button (CLICK this on the LIST page to open the create/edit form):`)
+        lines.push(`     ✅ EXACT NAME: "${openBtn}"`)
+        lines.push(`     ❌ FORBIDDEN variations: "+New ${openBtn.replace(/^[^a-z]*/i, '')}", "New ${openBtn.replace(/^[^a-z]*/i, '')}", any other variation`)
+        lines.push(`     → Step 2 CLICK must be EXACTLY: { "action": "CLICK", "target": "${openBtn}", "locator_type": "role" }`)
       }
       if (submitBtn) {
-        lines.push(`  💾 SUBMIT FORM button (last CLICK — inside the form to save the record):`)
-        lines.push(`     "${submitBtn}"`)
-        lines.push(`     → This saves/creates the record. DO NOT use this to open the form.`)
+        lines.push(`  💾 SUBMIT FORM button (CLICK this INSIDE the form to save the record):`)
+        lines.push(`     ✅ EXACT NAME: "${submitBtn}"`)
+        lines.push(`     ❌ FORBIDDEN: "Save", "Submit", "OK", any generic name unless it exactly matches above`)
+        lines.push(`     → Final CLICK must be EXACTLY: { "action": "CLICK", "target": "${submitBtn}", "locator_type": "role" }`)
       }
-      lines.push(`  ⛔ NEVER substitute, abbreviate, or invent button names. Copy EXACTLY character-for-character.`)
+      if (updateBtn && updateBtn !== openBtn) {
+        lines.push(`  ✏️  EDIT/UPDATE button (CLICK this to enter edit mode for an existing record):`)
+        lines.push(`     ✅ EXACT NAME: "${updateBtn}"`)
+      }
+      if (deleteBtn) {
+        lines.push(`  🗑️  DELETE button (CLICK this to delete a record):`)
+        lines.push(`     ✅ EXACT NAME: "${deleteBtn}"`)
+      }
+      if (allKnown.length > 0) {
+        lines.push(`  📋 ALL KNOWN BUTTONS for this entity (the ONLY valid CLICK targets):`)
+        for (const btn of allKnown.slice(0, 12)) {
+          lines.push(`     → "${btn}"`)
+        }
+      }
+      lines.push(`  ⛔ Any CLICK target NOT listed above will FAIL the validation gate and trigger re-generation.`)
       return lines.join('\n')
     })(),
     `Generate executable Playwright steps for this test case. Output ONLY a JSON array.`,
@@ -2641,6 +2868,8 @@ export async function runTestStepGeneratorAgent(
       manifest?.fields,            // ← pass field list for Check 7 (hallucination guard)
       testNameForValidation,       // ← pass entity hint for Check 3b + Check 10 (update guard)
       minimumFieldSteps,           // ← enforce min field steps for Create/Add operations
+      allRealRecordNames.length > 0,
+      realLookupValues,
     )
 
 
@@ -2963,6 +3192,8 @@ export async function runTestStepGeneratorAgent(
           manifest.fields,
           testNameRe,
           minimumFieldSteps,
+          allRealRecordNames.length > 0,
+          realLookupValues,
         )
         thoughts.push(`SAFETY NET 0: re-validation ${validation.passed ? '✅ PASSED' : '❌ still failing'} — ${validation.issues.join('; ')}`)
       }
@@ -3383,8 +3614,146 @@ export async function runTestStepGeneratorAgent(
       manifest?.fields,
       testNameReU,
       minimumFieldSteps,
+      allRealRecordNames.length > 0,
+      realLookupValues,
     )
     thoughts.push(`SAFETY NET U: re-validation ${validation.passed ? '✅ PASSED' : '❌ still failing'} — ${validation.issues.join('; ')}`)
+  }
+
+  // ── SAFETY NET B: Deterministic button name hard-correction ─────────────────
+  // Fires after all LLM loops and Safety Nets 0/P/U complete.
+  // Walks every CLICK step and hard-replaces any fuzzy-wrong button target with
+  // the EXACT canonical button name from the manifest.
+  //
+  // Root cause this fixes:
+  //   LLM generates "+New Add Account" instead of "+ Add Account".
+  //   Even with the tightened Check 3, there are paths (e.g. allButtons is empty
+  //   but we still want to correct the open-button) where this deterministic fix
+  //   provides the final safety layer.
+  //
+  // Priority order for canonical button names (same as prompt grounding):
+  //   1. learnedButtons (runtime-confirmed via HITL)
+  //   2. manifest.triggerButton (business_rules.trigger_button)
+  //   3. manifest.openButton (canonical open-form button)
+  //   4. manifest.submitButton (canonical submit button)
+  if (manifest && steps.length > 0) {
+    const canonicalOpenBtn   = learnedButtons.openButton ?? manifest.triggerButton ?? manifest.openButton
+    const canonicalSubmitBtn = learnedButtons.submitButton ?? manifest.submitButton
+    const canonicalUpdateBtn = manifest.updateButton
+    const canonicalDeleteBtn = manifest.deleteButton
+
+    // Normalize for matching (strip leading non-alphanum, lowercase, collapse spaces)
+    const normForMatch = (s: string) => s.toLowerCase().replace(/^[^a-z0-9]+/, '').replace(/\s+/g, ' ').trim()
+
+    // Determine if a CLICK step looks like it's trying to be the open-form button
+    const looksLikeOpenFormClick = (step: AgentStep_Playwright): boolean => {
+      if (step.action.toUpperCase() !== 'CLICK') return false
+      const t = normForMatch(step.target ?? '')
+      // Must come before any field-filling step in the sequence
+      const stepIdx = steps.indexOf(step)
+      const firstFieldIdx2 = steps.findIndex(s2 =>
+        ['TYPE','SELECT','LOOKUP','CHECKBOX','MULTI_SELECT'].includes((s2.action ?? '').toUpperCase())
+      )
+      const isBeforeFields = firstFieldIdx2 < 0 || stepIdx < firstFieldIdx2
+      if (!isBeforeFields) return false
+      // Must contain a "new" or "add" keyword suggesting open-form intent
+      return /\b(new|add)\b/.test(t) || t.startsWith('+')
+    }
+
+    // Determine if a CLICK step looks like it's trying to be the submit button
+    const looksLikeSubmitClick = (step: AgentStep_Playwright): boolean => {
+      if (step.action.toUpperCase() !== 'CLICK') return false
+      const t = normForMatch(step.target ?? '')
+      // Must come after the last field-filling step
+      const stepIdx = steps.indexOf(step)
+      const lastFieldIdx = (() => {
+        let li = -1
+        for (let i = 0; i < steps.length; i++) {
+          if (['TYPE','SELECT','LOOKUP','CHECKBOX','MULTI_SELECT'].includes((steps[i].action ?? '').toUpperCase())) li = i
+        }
+        return li
+      })()
+      const isAfterFields = lastFieldIdx < 0 || stepIdx > lastFieldIdx
+      if (!isAfterFields) return false
+      return /\b(create|save|submit|add|confirm|done|finish)\b/.test(t)
+    }
+
+    let correctedButtons = 0
+    for (const step of steps) {
+      if (step.action.toUpperCase() !== 'CLICK') continue
+      const originalTarget = step.target ?? ''
+      const normOriginal = normForMatch(originalTarget)
+
+      // ── Correct open-form button ──
+      if (canonicalOpenBtn && looksLikeOpenFormClick(step)) {
+        const normCanonical = normForMatch(canonicalOpenBtn)
+        if (normOriginal !== normCanonical) {
+          // Only correct if the target is clearly trying to be this button
+          // (contains a partial match to the canonical name, or is a generic new/add click)
+          const partialMatch = normOriginal.includes(normCanonical.split(' ').pop() ?? '') ||
+                               normCanonical.includes(normOriginal.split(' ').pop() ?? '')
+          const isGenericNewAdd = /^(new|add|\+\s*new|\+\s*add)/.test(normOriginal)
+          if (partialMatch || isGenericNewAdd) {
+            step.target = canonicalOpenBtn
+            correctedButtons++
+            thoughts.push(`SAFETY NET B: corrected open-form button "${originalTarget}" → "${canonicalOpenBtn}"`)
+            log.warn(
+              { projectId: input.projectId, testName: input.testName, from: originalTarget, to: canonicalOpenBtn },
+              '[STEP-GEN] ⚡ SAFETY NET B: corrected hallucinated open-form button name',
+            )
+          }
+        }
+      }
+
+      // ── Correct submit button ──
+      if (canonicalSubmitBtn && looksLikeSubmitClick(step)) {
+        const normCanonical = normForMatch(canonicalSubmitBtn)
+        if (normOriginal !== normCanonical) {
+          const partialMatch = normOriginal.includes(normCanonical.split(' ').pop() ?? '') ||
+                               normCanonical.includes(normOriginal.split(' ').pop() ?? '')
+          if (partialMatch) {
+            step.target = canonicalSubmitBtn
+            correctedButtons++
+            thoughts.push(`SAFETY NET B: corrected submit button "${originalTarget}" → "${canonicalSubmitBtn}"`)
+            log.warn(
+              { projectId: input.projectId, testName: input.testName, from: originalTarget, to: canonicalSubmitBtn },
+              '[STEP-GEN] ⚡ SAFETY NET B: corrected hallucinated submit button name',
+            )
+          }
+        }
+      }
+
+      // ── Correct update/edit button ──
+      if (canonicalUpdateBtn && isUpdateOperation) {
+        const normCanonical = normForMatch(canonicalUpdateBtn)
+        const normOrig = normForMatch(step.target ?? '')
+        if (normOrig !== normCanonical && /\b(edit|update|modify)\b/.test(normOrig)) {
+          step.target = canonicalUpdateBtn
+          correctedButtons++
+          thoughts.push(`SAFETY NET B: corrected edit button "${originalTarget}" → "${canonicalUpdateBtn}"`)
+        }
+      }
+
+      // ── Correct delete button ──
+      if (canonicalDeleteBtn && isDeleteOperation) {
+        const normCanonical = normForMatch(canonicalDeleteBtn)
+        const normOrig = normForMatch(step.target ?? '')
+        if (normOrig !== normCanonical && /\b(delete|remove|archive)\b/.test(normOrig)) {
+          step.target = canonicalDeleteBtn
+          correctedButtons++
+          thoughts.push(`SAFETY NET B: corrected delete button "${originalTarget}" → "${canonicalDeleteBtn}"`)
+        }
+      }
+    }
+
+    if (correctedButtons > 0) {
+      log.info(
+        { projectId: input.projectId, correctedButtons },
+        '[STEP-GEN] ✅ SAFETY NET B: deterministic button correction complete',
+      )
+    } else {
+      thoughts.push('SAFETY NET B: no button corrections needed — all CLICK targets match canonical metadata')
+    }
   }
 
   // ── Safety net: forcefully strip hallucinated field steps ─────────────────
@@ -3587,6 +3956,8 @@ export async function runTestStepGeneratorAgent(
       manifest?.fields,
       testNameFinal,
       minimumFieldSteps,
+      allRealRecordNames.length > 0,
+      realLookupValues,
     )
     // Only use the final re-validation if it improved the result (fewer issues or passed)
     if (finalValidation.issues.length < validation.issues.length || finalValidation.passed) {

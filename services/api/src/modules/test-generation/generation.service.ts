@@ -5678,6 +5678,7 @@ Phase 2 steps: Navigate to or click through to ${multiFlow.secondaryEntity} → 
 
           try {
             const context = await browser.newContext()
+            await context.addInitScript('window.__name = (fn) => fn;');
             const page = await context.newPage()
             page.setDefaultTimeout(15_000)
 

@@ -56,7 +56,7 @@ interface ProposedStep {
     action:      string   // NAVIGATE | CLICK | TYPE | LOOKUP | SELECT | …
     target:      string   // URL, field label, selector
     value?:      string   // typed value, selected option, etc.
-    opType:      "insert" | "update" | "delete"  // add before, patch current, or remove
+    opType?:     "insert" | "update" | "delete"  // add before, patch current, or remove
     label:       string   // human-readable description shown in the card
 }
 
@@ -135,7 +135,7 @@ function parseProposedStep(text: string): ProposedStep | null {
             target = target.replace(/\s+page\s*$/i, "").trim()
             if (!target.startsWith("/") && !target.startsWith("http")) target = `/${target}`
         }
-        return { action, target, value: "", opType: "insert" as const, label: `${action} to ${target}` }
+        return { action, target, value: "", label: `${action} to ${target}` }
     }
 
     // ── 0b. Bare quoted CLICK: CLICK '+ Add Account' ──────────────────────────────────
@@ -143,7 +143,7 @@ function parseProposedStep(text: string): ProposedStep | null {
     const bareClickM = text.match(bareClickRe)
     if (bareClickM) {
         const target = bareClickM[1].trim()
-        return { action: "CLICK", target, value: "", opType: "insert" as const, label: `Click "${target}"` }
+        return { action: "CLICK", target, value: "", label: `Click "${target}"` }
     }
 
     // ── 1. NAVIGATE ─────────────────────────────────────────────────────────
@@ -153,7 +153,7 @@ function parseProposedStep(text: string): ProposedStep | null {
     if (navM) {
         const raw = navM[1]
         const url = raw.startsWith("/") ? raw : `/${raw}`
-        return { action: "NAVIGATE", target: url, value: "", opType: "insert", label: `Navigate to ${url}` }
+        return { action: "NAVIGATE", target: url, value: "", label: `Navigate to ${url}` }
     }
 
     // ── 2. LOOKUP/SELECT … targeting the <Field> field ──────────────────────
@@ -164,7 +164,7 @@ function parseProposedStep(text: string): ProposedStep | null {
     if (lookTargM) {
         const field = lookTargM[1].trim()
         if (field.length > 1 && field.length < 40)
-            return { action: "LOOKUP", target: field, value: "", opType: "insert", label: `Lookup / Select "${field}"` }
+            return { action: "LOOKUP", target: field, value: "", label: `Lookup / Select "${field}"` }
     }
 
     // ── 3. "add a step … that uses LOOKUP action targeting the <Field> field" ─
@@ -174,7 +174,7 @@ function parseProposedStep(text: string): ProposedStep | null {
     if (addLookM) {
         const field = addLookM[1].trim()
         if (field.length > 1 && field.length < 40)
-            return { action: "LOOKUP", target: field, value: "", opType: "insert", label: `Lookup / Select "${field}"` }
+            return { action: "LOOKUP", target: field, value: "", label: `Lookup / Select "${field}"` }
     }
 
     // ── 4. "add a step to fill in / populate / enter the <Field> field" ─────
@@ -184,17 +184,17 @@ function parseProposedStep(text: string): ProposedStep | null {
     if (fillM) {
         const field = fillM[1].trim()
         if (field.length > 1 && field.length < 40)
-            return { action: "LOOKUP", target: field, value: "", opType: "insert", label: `Lookup / Select "${field}"` }
+            return { action: "LOOKUP", target: field, value: "", label: `Lookup / Select "${field}"` }
     }
 
     // ── 5. TYPE with quoted value ─────────────────────────────────────────────
     // "type 'USD' into the Currency field"  |  "enter 'John' in Name"
-    const typeRe = /(?:type|fill\s+in|enter)\s+['"]([^'"]{1,60})['"]\s+(?:in(?:to)?|for)\s+(?:the\s+)?['"]?([A-Za-z][A-Za-z ]{1,30}?)['"]?\s*(?:field|input|box)?(?:\s|$|[.,!?])/i
+    const typeRe = /(?:type|fill\s+in|enter)\s+['']([^'"]{1,60})['"]\s+(?:in(?:to)?|for)\s+(?:the\s+)?['"]?([A-Za-z][A-Za-z ]{1,30}?)['"]?\s*(?:field|input|box)?(?:\s|$|[.,!?])/i
     const typeM = text.match(typeRe)
     if (typeM) {
         const val   = typeM[1]
         const field = typeM[2].trim()
-        return { action: "TYPE", target: field, value: val, opType: "insert", label: `Type "${val}" in "${field}"` }
+        return { action: "TYPE", target: field, value: val, label: `Type "${val}" in "${field}"` }
     }
 
     // ── 6. "add a <ACTION_KEYWORD> step" ─────────────────────────────────────
@@ -204,7 +204,7 @@ function parseProposedStep(text: string): ProposedStep | null {
     if (addM) {
         const action = addM[1].toUpperCase()
         const target = addM[2].trim()
-        return { action, target, value: "", opType: "insert", label: `${action} → "${target}"` }
+        return { action, target, value: "", label: `${action} → "${target}"` }
     }
 
     // ── 7. "add a step to click <Target>" ────────────────────────────────────
@@ -212,7 +212,7 @@ function parseProposedStep(text: string): ProposedStep | null {
     const addClickM = text.match(addClickRe)
     if (addClickM) {
         const target = addClickM[1].trim()
-        return { action: "CLICK", target, value: "", opType: "insert", label: `Click "${target}"` }
+        return { action: "CLICK", target, value: "", label: `Click "${target}"` }
     }
 
     return null
@@ -299,13 +299,11 @@ export default function HitlChatPanel({
     const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000"
 
     const determineOpType = (action: string): "insert" | "update" => {
-        if (pausedStep != null && currentSteps && currentSteps.length >= pausedStep) {
-            const pausedStepObj = currentSteps[pausedStep - 1]
-            if (pausedStepObj && pausedStepObj.action?.toUpperCase() === action.toUpperCase()) {
-                return "update"
-            }
+        const uppercaseAction = action.toUpperCase()
+        if (["NAVIGATE", "WAIT", "SCROLL", "HOVER"].includes(uppercaseAction)) {
+            return "insert"
         }
-        return "insert"
+        return "update"
     }
 
     // ── Mount guard + reset stale closing state ────────────────────────────

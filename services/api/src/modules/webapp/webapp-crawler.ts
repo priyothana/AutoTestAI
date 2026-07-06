@@ -523,9 +523,7 @@ export class WebMetadataService {
       let page: import('playwright').Page
 
       const initBypass = async (ctx: import('playwright').BrowserContext) => {
-        await ctx.addInitScript(() => {
-          (window as any).__name = (fn: any) => fn;
-        });
+        await ctx.addInitScript('window.__name = (fn) => fn;');
       };
 
       if (authSessionPath) {
