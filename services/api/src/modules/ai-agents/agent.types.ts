@@ -59,6 +59,14 @@ export interface AgentState {
 
 // ── HITL tool contract ────────────────────────────────────────────────────────
 
+export interface SuggestionOption {
+  label:  string
+  action: string
+  target: string
+  value:  string
+  opType: 'insert' | 'update' | 'delete'
+}
+
 export interface HITLInput {
   agentName:    AgentName
   executionId:  string              // test execution ID for pause-gate
@@ -67,9 +75,11 @@ export interface HITLInput {
   errorMessage?: string
   screenshot?:  string             // base64
   suggestions:  string[]           // 2-3 concrete options for the user
+  structuredSuggestions?: SuggestionOption[]
   metadata?:    Record<string, unknown>
   timeoutMs?:   number             // default: 600_000 (10 min)
 }
+
 
 export interface HITLOutput {
   action:      'resume' | 'skip' | 'stop'
@@ -86,6 +96,7 @@ export interface FieldEntry {
   options?:     string[]           // valid picklist values
   sampleValue?: string
   locatorType:  'label' | 'role' | 'placeholder'
+  referenceTo?: string[]
 }
 
 /**
@@ -180,6 +191,7 @@ export interface StepValidationResult {
     locatorTypeValid:        boolean
     dataTypeAlignment:       boolean
     createSuccessValidation: boolean
+    realDataEnforcement:     boolean
   }
   issues: string[]               // human-readable failure descriptions
 }

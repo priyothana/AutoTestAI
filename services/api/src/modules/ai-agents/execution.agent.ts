@@ -156,7 +156,7 @@ Output ONLY valid JSON (no markdown):
   "alternativeLocator": "suggested alternative locator string (if ALTERNATIVE_LOCATOR)"
 }`
 
-interface RecoveryPlan {
+export interface RecoveryPlan {
   failureType:          FailureClass
   recoveryAction:       'WAIT_AND_RETRY' | 'ALTERNATIVE_LOCATOR' | 'DISMISS_MODAL' | 'RE_AUTHENTICATE' | 'SKIP_STEP' | 'REGENERATE_AND_RETRY' | 'CALL_HITL'
   reason:               string
@@ -167,7 +167,7 @@ interface RecoveryPlan {
   correctedValue?:      string     // populated when INVALID_TEST_DATA — realistic replacement value
 }
 
-async function planRecovery(
+export async function planRecovery(
   step:         StepData,
   errorMessage: string,
   pageHtml?:    string,

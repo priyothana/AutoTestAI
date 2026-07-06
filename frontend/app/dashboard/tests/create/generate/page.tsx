@@ -15,41 +15,7 @@ import { toast } from "sonner"
 const API = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000") + "/api/v1"
 type Phase = "discover" | "generating" | "review" | "running" | "results"
 
-// ── localStorage persistence helpers ────────────────────────────────────────
-interface StoredFlowsEntry {
-  flows: FlowItem[]
-  discoveredAt: string   // ISO timestamp
-  projectName: string
-}
-const STORAGE_KEY = "autotest_discovered_flows"
-function getStoredFlows(projectId: string): StoredFlowsEntry | null {
-  if (typeof window === "undefined") return null
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return null
-    const all: Record<string, StoredFlowsEntry> = JSON.parse(raw)
-    return all[projectId] ?? null
-  } catch { return null }
-}
-function saveStoredFlows(projectId: string, entry: StoredFlowsEntry) {
-  if (typeof window === "undefined") return
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    const all: Record<string, StoredFlowsEntry> = raw ? JSON.parse(raw) : {}
-    all[projectId] = entry
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(all))
-  } catch { /* quota exceeded – silently ignore */ }
-}
-function clearStoredFlows(projectId: string) {
-  if (typeof window === "undefined") return
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return
-    const all: Record<string, StoredFlowsEntry> = JSON.parse(raw)
-    delete all[projectId]
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(all))
-  } catch { }
-}
+// ── database persistence is used instead of localStorage ──
 function fmtRelativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
   const mins  = Math.floor(diff / 60_000)
@@ -215,8 +181,8 @@ export default function GenerateWizardPage() {
   const [flowsLoading, setFlowsLoading] = useState(false)
   const [selectedFlows, setSelectedFlows] = useState<Set<string>>(new Set())
 
-  // Stored flows from localStorage (per project)
-  const [storedEntry, setStoredEntry] = useState<StoredFlowsEntry | null>(null)
+  // Discovered at timestamp from backend
+  const [discoveredAt, setDiscoveredAt] = useState<string | null>(null)
   // Whether user is "using existing" stored flows or has triggered a new discovery
   const [usingStored, setUsingStored] = useState(false)
   const [customFlowInput, setCustomFlowInput] = useState("")
@@ -256,24 +222,44 @@ export default function GenerateWizardPage() {
       }).catch(() => { }).finally(() => setProjLoading(false))
   }, [])
 
-  // ── When project changes, check localStorage for stored flows ────────────────
+  const fetchDiscoveredWorkflows = useCallback(async (pid: string) => {
+    if (!pid) return
+    setFlowsLoading(true)
+    try {
+      const res = await fetch(`${API}/projects/${pid}/discovered-workflows`)
+      if (!res.ok) throw new Error()
+      const d = await res.json()
+      if (Array.isArray(d.flows) && d.flows.length > 0) {
+        setFlows(d.flows)
+        setSelectedFlows(new Set(d.flows.map((f: FlowItem) => f.name)))
+        setDiscoveredAt(d.discoveredAt)
+        setUsingStored(true)
+      } else {
+        setFlows([])
+        setSelectedFlows(new Set())
+        setDiscoveredAt(null)
+        setUsingStored(false)
+      }
+    } catch {
+      toast.error("Failed to load workflows")
+    } finally {
+      setFlowsLoading(false)
+    }
+  }, [])
+
+  // ── When project changes, fetch stored flows from DB ────────────────
   useEffect(() => {
-    if (!projectId) { setStoredEntry(null); setFlows([]); setSelectedFlows(new Set()); setUsingStored(false); return }
-    const entry = getStoredFlows(projectId)
-    setStoredEntry(entry)
-    // If there are stored flows, pre-load them and mark as using-stored
-    if (entry) {
-      setFlows(entry.flows)
-      setSelectedFlows(new Set(entry.flows.map(f => f.name)))
-      setUsingStored(true)
-    } else {
+    if (!projectId) {
+      setDiscoveredAt(null)
       setFlows([])
       setSelectedFlows(new Set())
       setUsingStored(false)
+      return
     }
-  }, [projectId])
+    fetchDiscoveredWorkflows(projectId)
+  }, [projectId, fetchDiscoveredWorkflows])
 
-  // ── Load flows (fresh discovery — overwrites stored) ──────────────────────────
+  // ── Load flows (fresh discovery — overwrites stored in DB) ───────────────────
   const loadFlows = async () => {
     if (!projectId) { toast.error("Select a project first"); return }
     setFlowsLoading(true); setFlows([]); setSelectedFlows(new Set()); setUsingStored(false)
@@ -283,25 +269,18 @@ export default function GenerateWizardPage() {
       })
       if (!res.ok) throw new Error()
       const d = await res.json()
-      // Support both legacy string[] and new {name, description}[] shapes
       const raw: unknown[] = Array.isArray(d.flows) ? d.flows : []
       const items: FlowItem[] = raw.map((f: any) =>
         typeof f === "string" ? { name: f, description: "" } : { name: f.name ?? f, description: f.description ?? "" }
       )
       setFlows(items)
-      // Only persist non-empty results — an empty list must never create a dead-state
-      // where storedEntry exists but there are no flows to show or interact with.
       if (items.length > 0) {
-        const projName = projects.find(p => p.id === projectId)?.name ?? projectId
-        const entry: StoredFlowsEntry = { flows: items, discoveredAt: new Date().toISOString(), projectName: projName }
-        saveStoredFlows(projectId, entry)
-        setStoredEntry(entry)
+        setDiscoveredAt(d.discoveredAt || new Date().toISOString())
         setUsingStored(true)
-        toast.success(`Discovered ${items.length} business flows — saved for later reference`)
+        setSelectedFlows(new Set(items.map(f => f.name)))
+        toast.success(`Discovered ${items.length} business flows — saved to database`)
       } else {
-        // Clear any stale stored entry so the discover button re-appears
-        clearStoredFlows(projectId)
-        setStoredEntry(null)
+        setDiscoveredAt(null)
         setUsingStored(false)
         toast.warning("No business flows were discovered for this project. Try again or check your project metadata.")
       }
@@ -607,162 +586,185 @@ export default function GenerateWizardPage() {
                   </select>}
             </div>
 
-            {/* ── Stored-flows banner: shown when localStorage has data ── */}
-            {projectId && storedEntry && usingStored && flows.length > 0 && (
-              <div className="rounded-2xl border-2 border-violet-200 dark:border-violet-800 bg-gradient-to-br from-violet-50/80 to-indigo-50/60 dark:from-violet-950/30 dark:to-indigo-950/20 overflow-hidden">
-                {/* Banner header */}
-                <div className="flex items-center gap-3 px-5 py-4 border-b border-violet-100 dark:border-violet-800/60">
-                  <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: "linear-gradient(135deg,#7c3aed,#4f46e5)" }}>
-                    <History className="h-4.5 w-4.5 text-white h-5 w-5" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-bold text-violet-800 dark:text-violet-200">Previously Discovered Workflows</p>
-                    <p className="text-[11px] text-violet-600/80 dark:text-violet-400/80 mt-0.5">
-                      {flows.length} flows saved · Discovered {fmtRelativeTime(storedEntry.discoveredAt)}
-                    </p>
-                  </div>
-                  <Badge className="bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300 border border-violet-200 dark:border-violet-700 text-[11px]">
-                    {flows.length} flows
-                  </Badge>
-                </div>
+            {/* ── Flows Discovered & List State ── */}
+            {projectId && (
+              <>
+                {flows.length > 0 ? (
+                  <div className="space-y-6">
+                    {/* Modern Glassmorphic Status Header Card */}
+                    <div className="relative overflow-hidden rounded-2xl border border-violet-100 dark:border-violet-850/40 bg-gradient-to-br from-violet-50/60 to-indigo-50/30 dark:from-slate-900/60 dark:to-violet-950/10 p-5 md:p-6 shadow-sm">
+                      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                        <div className="space-y-1.5">
+                          <h2 className="text-lg font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
+                            <Sparkles className="h-4.5 w-4.5 text-violet-600 dark:text-violet-400" />
+                            Business Journey Catalog
+                          </h2>
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-slate-500 dark:text-slate-400">
+                            <span className="font-semibold text-violet-700 dark:text-violet-400 bg-violet-100/60 dark:bg-violet-950/40 px-2 py-0.5 rounded-md">
+                              {flows.length} flows discovered
+                            </span>
+                            {discoveredAt && (
+                              <span className="flex items-center gap-1">
+                                <Clock className="h-3.5 w-3.5 opacity-70" />
+                                Last sync: {fmtRelativeTime(discoveredAt)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
 
-                {/* Collapsed flow chips */}
-                <div className="px-5 py-4 space-y-3">
-                  <div className="flex flex-wrap gap-2">
-                    {flows.slice(0, 12).map((f, i) => (
-                      <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-white dark:bg-slate-900 border border-violet-200 dark:border-violet-700 text-violet-700 dark:text-violet-300">
-                        <GitBranch className="h-3 w-3 opacity-70" />{f.name}
-                      </span>
-                    ))}
-                    {flows.length > 12 && (
-                      <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-medium bg-violet-100 dark:bg-violet-900/40 text-violet-600 dark:text-violet-400">
-                        +{flows.length - 12} more
-                      </span>
-                    )}
-                  </div>
+                        <div className="flex items-center gap-3">
+                          <Button
+                            type="button"
+                            onClick={loadFlows}
+                            disabled={flowsLoading}
+                            variant="outline"
+                            className="h-10 px-4 gap-2 border border-violet-300 text-violet-700 dark:border-violet-800 dark:text-violet-300 bg-white dark:bg-slate-900 hover:bg-violet-50 dark:hover:bg-violet-950/30 font-semibold text-xs transition-all shadow-sm rounded-lg"
+                          >
+                            {flowsLoading ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                Discovering…
+                              </>
+                            ) : (
+                              <>
+                                <RefreshCw className="h-3.5 w-3.5" />
+                                Discover New Workflows
+                              </>
+                            )}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
 
-                  {/* Action row */}
-                  <div className="flex items-center gap-3 pt-1">
+                    {/* Flow List and Selection */}
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between px-1">
+                        <p className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                          {flows.length} flows discovered — select the ones you want to test
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedFlows(selectedFlows.size === flows.length ? new Set() : new Set(flows.map(f => f.name)))}
+                          className="text-xs font-semibold text-violet-600 dark:text-violet-400 hover:text-violet-700 dark:hover:text-violet-300 hover:underline transition-colors"
+                        >
+                          {selectedFlows.size === flows.length ? "Deselect all" : "Select all"}
+                        </button>
+                      </div>
+
+                      {/* Flow cards grid */}
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        {flows.map((f, i) => {
+                          const sel = selectedFlows.has(f.name)
+                          return (
+                            <button
+                              key={i}
+                              onClick={() => toggleFlow(f.name)}
+                              type="button"
+                              className={`text-left p-4.5 rounded-xl border transition-all duration-200 flex flex-col gap-2.5 shadow-sm hover:-translate-y-0.5 ${
+                                sel
+                                  ? "border-violet-500 bg-violet-50/40 dark:bg-violet-950/20 ring-1 ring-violet-500 shadow-violet-100 dark:shadow-none"
+                                  : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40 hover:border-violet-300 dark:hover:border-violet-700 hover:bg-slate-50/50 dark:hover:bg-slate-900/20"
+                              }`}
+                            >
+                              <div className="flex items-start gap-3 w-full">
+                                <div
+                                  className={`mt-0.5 w-5 h-5 rounded flex-shrink-0 flex items-center justify-center border-2 transition-all duration-150 ${
+                                    sel
+                                      ? "bg-violet-600 border-violet-600"
+                                      : "border-slate-300 dark:border-slate-600"
+                                  }`}
+                                >
+                                  {sel && <Check className="h-3 w-3 text-white" />}
+                                </div>
+                                <div className="flex-1 min-w-0">
+                                  <p className={`text-sm font-semibold leading-snug transition-colors ${
+                                    sel ? "text-violet-800 dark:text-violet-200" : "text-slate-850 dark:text-slate-200"
+                                  }`}>
+                                    {f.name}
+                                  </p>
+                                </div>
+                                <GitBranch className={`h-4 w-4 flex-shrink-0 mt-0.5 transition-colors ${
+                                  sel ? "text-violet-600 dark:text-violet-400" : "text-slate-400 dark:text-slate-600"
+                                }`} />
+                              </div>
+                              {f.description && (
+                                <p className={`text-xs leading-relaxed pl-8 ${
+                                  sel ? "text-violet-700/80 dark:text-violet-300/70" : "text-slate-500 dark:text-slate-400"
+                                }`}>
+                                  {f.description}
+                                </p>
+                              )}
+                            </button>
+                          )
+                        })}
+                      </div>
+
+                      {/* ── Custom workflow input ── */}
+                      <div className="rounded-xl border border-dashed border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-900/10 p-5 space-y-3.5">
+                        <div className="space-y-1">
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-350 flex items-center gap-1.5">
+                            <Zap className="h-3.5 w-3.5 text-violet-500" />
+                            Add a custom business flow
+                          </p>
+                          <p className="text-[11px] text-slate-450 dark:text-slate-400">
+                            Don't see a flow you need? Type any workflow name below to add it to your custom test catalog.
+                          </p>
+                        </div>
+                        <div className="flex gap-2.5">
+                          <input
+                            value={customFlowInput}
+                            onChange={e => setCustomFlowInput(e.target.value)}
+                            onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addCustomFlow() } }}
+                            placeholder='e.g. "Generate Invoice for Account and Send to Customer"'
+                            className="flex-1 px-3.5 py-2.5 rounded-lg text-xs border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-400 text-slate-800 dark:text-slate-200 placeholder-slate-400 transition-shadow"
+                          />
+                          <Button
+                            type="button"
+                            onClick={addCustomFlow}
+                            disabled={!customFlowInput.trim()}
+                            variant="outline"
+                            className="flex-shrink-0 gap-1.5 border border-violet-300 text-violet-700 dark:border-violet-850 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-950/30 font-semibold text-xs rounded-lg"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                            Add
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  /* Premium Empty State */
+                  <div className="text-center p-8 md:p-12 border border-dashed border-slate-200 dark:border-slate-800 rounded-2xl bg-white dark:bg-slate-900/30 shadow-sm max-w-xl mx-auto space-y-6">
+                    <div className="w-12 h-12 rounded-2xl bg-violet-100 dark:bg-violet-950/50 flex items-center justify-center mx-auto">
+                      <Sparkles className="h-6 w-6 text-violet-600 dark:text-violet-400" />
+                    </div>
+                    <div className="space-y-2">
+                      <h3 className="text-base font-bold text-slate-800 dark:text-slate-100">No Journeys Discovered Yet</h3>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 max-w-sm mx-auto leading-relaxed">
+                        Use our AI Discovery Agent to analyze your project metadata, specifications, and business rules to map out E2E journeys.
+                      </p>
+                    </div>
                     <Button
-                      onClick={() => {
-                        // Use existing — scroll down to the full flow selector
-                        setUsingStored(true)
-                        setSelectedFlows(new Set(flows.map(f => f.name)))
-                      }}
-                      className="flex-1 h-10 gap-2 text-white text-sm font-semibold shadow-md shadow-violet-200 dark:shadow-violet-900/30"
+                      onClick={loadFlows}
+                      disabled={flowsLoading}
+                      className="px-6 h-11 text-white text-xs font-bold shadow-md shadow-violet-200 dark:shadow-none gap-2 rounded-lg"
                       style={{ background: "linear-gradient(135deg,#7c3aed,#4f46e5)" }}
                     >
-                      <FolderOpen className="h-4 w-4" />Use Existing Workflows
-                    </Button>
-                    <Button
-                      onClick={() => {
-                        clearStoredFlows(projectId)
-                        setStoredEntry(null)
-                        setFlows([])
-                        setSelectedFlows(new Set())
-                        setUsingStored(false)
-                        loadFlows()
-                      }}
-                      disabled={flowsLoading}
-                      variant="outline"
-                      className="flex-1 h-10 gap-2 border-2 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 text-sm font-semibold"
-                    >
-                      {flowsLoading
-                        ? <><Loader2 className="h-4 w-4 animate-spin" />Discovering…</>
-                        : <><RefreshCw className="h-4 w-4" />Discover New Workflows</>}
+                      {flowsLoading ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Analyzing project metadata & spec…
+                        </>
+                      ) : (
+                        <>
+                          <Zap className="h-4 w-4" />
+                          Discover Business Flows
+                        </>
+                      )}
                     </Button>
                   </div>
-                  <p className="text-[10px] text-violet-500/70 dark:text-violet-500/50 text-center">
-                    Discovering new workflows will replace the saved set above.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Discover button — shown when no stored flows exist, OR if flows came back empty.
-                Always provide an escape hatch so the user is never left with a blank screen. */}
-            {projectId && (!storedEntry || flows.length === 0) && (
-              <Button onClick={loadFlows} disabled={flowsLoading} variant="outline"
-                className="w-full h-12 border-2 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 gap-2 text-sm font-semibold">
-                {flowsLoading
-                  ? <><Loader2 className="h-4 w-4 animate-spin" />Analysing project metadata & BRD…</>
-                  : <><Zap className="h-4 w-4" />{storedEntry ? "Discover Business Flows Again" : "Discover Business Flows"}</>}
-              </Button>
-            )}
-
-            {/* Flow cards (multi-select) */}
-            {flows.length > 0 && (
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                    {flows.length} flows discovered — select the ones to test
-                  </p>
-                  <button
-                    onClick={() => setSelectedFlows(selectedFlows.size === flows.length ? new Set() : new Set(flows.map(f => f.name)))}
-                    className="text-[11px] font-semibold text-violet-600 dark:text-violet-400 hover:underline">
-                    {selectedFlows.size === flows.length ? "Deselect all" : "Select all"}
-                  </button>
-                </div>
-
-                {/* Flow cards grid */}
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {flows.map((f, i) => {
-                    const sel = selectedFlows.has(f.name)
-                    return (
-                      <button key={i} onClick={() => toggleFlow(f.name)} type="button"
-                        className={`text-left p-4 rounded-xl border-2 transition-all duration-150 flex flex-col gap-2 ${sel
-                          ? "border-violet-500 bg-violet-50 dark:bg-violet-950/40 shadow-sm shadow-violet-100 dark:shadow-violet-900/20"
-                          : "border-slate-200 dark:border-slate-700 hover:border-violet-300 dark:hover:border-violet-600 hover:bg-violet-50/30 dark:hover:bg-violet-950/10"}`}>
-                        {/* Row 1: checkbox + name + icon */}
-                        <div className="flex items-start gap-3">
-                          <div className={`mt-0.5 w-5 h-5 rounded flex-shrink-0 flex items-center justify-center border-2 transition-colors ${sel ? "bg-violet-600 border-violet-600" : "border-slate-300 dark:border-slate-600"}`}>
-                            {sel && <Check className="h-3 w-3 text-white" />}
-                          </div>
-                          <p className={`flex-1 text-sm font-semibold leading-snug ${sel ? "text-violet-800 dark:text-violet-200" : "text-slate-700 dark:text-slate-300"}`}>
-                            {f.name}
-                          </p>
-                          <GitBranch className={`h-4 w-4 flex-shrink-0 mt-0.5 ${sel ? "text-violet-500" : "text-slate-300 dark:text-slate-600"}`} />
-                        </div>
-                        {/* Row 2: description */}
-                        {f.description && (
-                          <p className={`text-[11px] leading-relaxed pl-8 ${sel ? "text-violet-700/80 dark:text-violet-300/80" : "text-slate-400 dark:text-slate-500"}`}>
-                            {f.description}
-                          </p>
-                        )}
-                      </button>
-                    )
-                  })}
-                </div>
-
-                {/* ── Custom workflow input ── */}
-                <div className="mt-2 rounded-xl border-2 border-dashed border-slate-200 dark:border-slate-700 p-4 space-y-3">
-                  <p className="text-xs font-bold text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
-                    <Zap className="h-3.5 w-3.5 text-violet-500" />
-                    Add a custom business flow
-                  </p>
-                  <p className="text-[11px] text-slate-400 -mt-1">
-                    Don't see a flow you need? Type any workflow name below and it will be added to the list.
-                  </p>
-                  <div className="flex gap-2">
-                    <input
-                      value={customFlowInput}
-                      onChange={e => setCustomFlowInput(e.target.value)}
-                      onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addCustomFlow() } }}
-                      placeholder='e.g. "Generate Invoice for Account and Send to Customer"'
-                      className="flex-1 px-3 py-2.5 rounded-lg text-[12px] border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-violet-400 text-slate-800 dark:text-slate-200 placeholder-slate-400"
-                    />
-                    <Button
-                      type="button"
-                      onClick={addCustomFlow}
-                      disabled={!customFlowInput.trim()}
-                      variant="outline"
-                      className="flex-shrink-0 gap-1.5 border-violet-300 text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950/30 font-semibold text-[12px]"
-                    >
-                      <Check className="h-3.5 w-3.5" />Add
-                    </Button>
-                  </div>
-                </div>
-              </div>
+                )}
+              </>
             )}
 
             {/* CTA */}

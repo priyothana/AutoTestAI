@@ -59,6 +59,7 @@ model projects {
   selector_registry          selector_registry[]
   execution_metrics          execution_metrics[]
   metadata_canonical         metadata_canonical[]
+  discovered_workflows       discovered_workflows[]
 }
 
 model environments {
@@ -405,4 +406,18 @@ model metadata_canonical {
   @@unique([project_id, entity_name])
   @@index([project_id], map: "idx_metadata_canonical_project")
   @@map("metadata_canonical")
+}
+
+model discovered_workflows {
+  id                      String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  project_id              String    @db.Uuid
+  workflow_title          String    @db.VarChar(255)
+  description             String?
+  generated_steps_summary String?
+  source                  String    @default("ai_discovery") @db.VarChar(50)
+  discovered_at           DateTime  @default(now()) @db.Timestamptz(6)
+  last_used_at            DateTime? @db.Timestamptz(6)
+  project                 projects  @relation(fields: [project_id], references: [id], onDelete: Cascade)
+
+  @@map("discovered_workflows")
 }

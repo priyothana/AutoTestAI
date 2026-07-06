@@ -967,12 +967,19 @@ A CREATE test MUST:
   a step for EVERY field marked ★REQUIRED or ⚡LOOKUP in the Entity Field Manifest.
   Zero exceptions — missing one required field causes the test to FAIL at runtime.
 
-An UPDATE test MUST:
-  1. Navigate to an existing record (use a realistic record name from metadata)
-  2. Click Edit
-  3. Change at least 2 field values
-  4. Save
-  5. Assert the new values are visible
+An UPDATE test MUST follow this EXACT flow — no shortcuts:
+  1. NAVIGATE to the entity LIST page (e.g. /terms/list) — NEVER to /new or /create
+  2. TYPE the existing record name into the search/filter input to locate it
+     ▶ Use a REAL record name from the "Real Test Data" section if provided
+     ▶ If no real data is listed, use "[EntityName]-001" format (e.g. "Term-001") — NOT "Existing Term Name"
+     ▶ ⛔ NEVER invent placeholders like "Existing Term Name", "Test Record", "Sample [Entity]"
+  3. CLICK on the record row/link to open its detail view
+  4. CLICK the Edit button (e.g. "Edit") to enter edit mode
+  5. TYPE or SELECT at least 1 field with the new value
+  6. CLICK the Save button (e.g. "Save", "Save Changes", "Update") — this is the SUBMIT button, NOT a create button
+  7. ASSERT the update succeeded (new value visible on page, or success toast)
+  ⛔ FORBIDDEN in UPDATE tests: CLICK "Create [Entity]", "+ New [Entity]", or any create/add button
+  ⛔ FORBIDDEN in UPDATE tests: NAVIGATE to /new, /create, or any form creation URL
 
 A DELETE test MUST:
   1. Navigate to the entity list
@@ -1369,6 +1376,28 @@ export async function persistGeneratedTestCases(params: {
         }
       }
 
+      // ── Strip Create-flow CLICK buttons from UPDATE tests (HARD GUARD) ──────────
+      // Bulk LLM sometimes generates "Click 'Create Term'" in an "Update Term..." test.
+      // The cross-entity filter only catches wrong-entity buttons; this catches wrong-operation buttons.
+      const isUpdateTest = /\b(update|edit|modify|change)\b/i.test(tcName.trim())
+      if (isUpdateTest) {
+        const CREATE_BTN_UPDATE_RE = /\b(create|\+\s*new)\s+\w+/i
+        const beforeUpdateFilter = rawSteps.length
+        const filteredForUpdate = rawSteps.filter((s: any) => {
+          if (String(s.action ?? '').toUpperCase() !== 'CLICK') return true
+          return !CREATE_BTN_UPDATE_RE.test(String(s.target ?? '').trim())
+        })
+        if (filteredForUpdate.length < beforeUpdateFilter) {
+          rawSteps.length = 0
+          rawSteps.push(...filteredForUpdate)
+          rawSteps.forEach((s: any, i: number) => { s.id = String(i + 1) })
+          log.warn(
+            { tcName, removed: beforeUpdateFilter - filteredForUpdate.length },
+            '[TCG] ⚠️ Stripped Create-flow CLICK steps from Update test (operation mismatch guard)',
+          )
+        }
+      }
+
       // ── Sanitize: drop / fix degenerate assert steps before storing ──────────
       const cleanSteps = sanitizeTestCaseSteps(rawSteps, tcName)
 
@@ -1675,8 +1704,8 @@ export async function generateStepsForTestCases(
   })
 
   // Lazily import the STEP_GEN_MODEL agent (avoids circular deps at module load)
-  let runTestStepGeneratorAgent: typeof import('../ai-agents/test-step-generator.agent.js').runTestStepGeneratorAgent
-  let detectOperationType: typeof import('../ai-agents/test-step-generator.agent.js').detectOperationType | undefined
+  let runTestStepGeneratorAgent: typeof import('../ai-agents/test-step-generator.agent.js').runTestStepGeneratorAgent | undefined = undefined
+  let detectOperationType: typeof import('../ai-agents/test-step-generator.agent.js').detectOperationType | undefined = undefined
   try {
     const agentMod = await import('../ai-agents/test-step-generator.agent.js')
     runTestStepGeneratorAgent = agentMod.runTestStepGeneratorAgent
@@ -1736,7 +1765,7 @@ export async function generateStepsForTestCases(
       //   Check 4: Locator type validity
       //   Check 5: Data type alignment (rejects Industry="Tara", Website=number, etc.)
       //   Check 6: Action name validity (rejects FILL_FORM, ENTER, SET, SUBMIT, etc.)
-      if (runTestStepGeneratorAgent!) {
+      if (runTestStepGeneratorAgent) {
         try {
 
           log.info(
@@ -1929,6 +1958,15 @@ export async function generateStepsForTestCases(
           if (!match) return true
           const entityWord = match[1].trim()
           if (entityWord.length < 3 || ['the', 'a', 'an', 'new', 'all', 'item', 'record', 'entry'].includes(entityWord)) return true
+          // For UPDATE operations: strip ALL Create/New/Add CLICK buttons even for the same entity.
+          // e.g. "Create Term" is wrong for an "Update Term Name..." test.
+          if (tcOpType === 'update') {
+            log.warn(
+              { tcId: tc.id, tcName: tc.name, target: s.target },
+              '[TCG] ⚠️ Stripped Create-flow CLICK from Update test (operation mismatch)',
+            )
+            return false
+          }
           if (eLower.includes(entityWord) || entityWord.includes(eLower)) return true
           log.warn(
             { tcId: tc.id, tcName: tc.name, target: s.target, entityWord, effectiveEntity },

@@ -636,7 +636,7 @@ export async function syncMetadataRaw(projectId: string): Promise<number> {
   try {
     const conn = await getSfConnection(projectId)
     const global = await conn.describeGlobal()
-    const stdNames = new Set(['Account', 'Contact', 'Opportunity', 'Lead', 'Case'])
+    const stdNames = new Set(['Account', 'Contact', 'Opportunity', 'Lead', 'Case', 'Quote', 'Order', 'Contract', 'Pricebook2', 'Product2', 'Asset'])
     const targets = global.sobjects.filter((s) => s.custom || stdNames.has(s.name))
 
     for (const sobj of targets) {

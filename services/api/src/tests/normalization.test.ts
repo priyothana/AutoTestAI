@@ -10,6 +10,9 @@ const { mockPrisma } = vi.hoisted(() => {
     project_integrations: {
       findFirst: vi.fn(),
     },
+    projects: {
+      findUnique: vi.fn(),
+    },
   }
   return { mockPrisma }
 })
@@ -218,5 +221,50 @@ describe('Canonical Manifest Resolution (buildFieldManifest & tryCanonicalManife
 
     const manifest = await buildFieldManifest('project-123', 'NonExistentObject')
     expect(manifest).toBeNull()
+  })
+
+  describe('Salesforce Button and Lookup Fixes', () => {
+    it('should auto-correct button names for Salesforce projects to New and Save', async () => {
+      mockPrisma.projects.findUnique.mockResolvedValue({
+        category: 'salesforce'
+      })
+      mockPrisma.project_integrations.findFirst.mockResolvedValue({
+        category: 'salesforce'
+      })
+
+      const steps = [
+        { action: 'CLICK', target: 'Create Lead' },
+        { action: 'CLICK', target: '+New Lead' },
+        { action: 'CLICK', target: 'Edit' },
+      ]
+
+      const corrected = await autoCorrectButtonNames(steps, 'project-sf', 'Lead')
+      expect(corrected[0].target).toBe('Save') // Create Lead -> Save
+      expect(corrected[1].target).toBe('New')  // +New Lead -> New
+      expect(corrected[2].target).toBe('Edit') // Edit -> Edit (not modified to Save)
+    })
+
+    it('should validate LOOKUP field values using real lookup values list', () => {
+      const fields = [
+        { label: 'Parent Account', type: 'lookup' as const, required: true, locatorType: 'label' as const, referenceTo: ['Account'] }
+      ]
+      
+      const realLookupValues = new Map<string, string[]>()
+      realLookupValues.set('parent account', ['Acme Corp', 'Wayne Enterprises'])
+
+      const validSteps = [
+        { action: 'LOOKUP', target: 'Parent Account', value: 'Wayne Enterprises', locator_type: 'label' }
+      ]
+      const invalidSteps = [
+        { action: 'LOOKUP', target: 'Parent Account', value: 'Fake Company', locator_type: 'label' }
+      ]
+
+      const validRes = validateSteps(validSteps, 1, [], 'Save', ['New', 'Save'], fields, 'Account', 0, true, realLookupValues)
+      expect(validRes.passed).toBe(true)
+
+      const invalidRes = validateSteps(invalidSteps, 1, [], 'Save', ['New', 'Save'], fields, 'Account', 0, true, realLookupValues)
+      expect(invalidRes.passed).toBe(false)
+      expect(invalidRes.issues[0]).toContain('Fake Company')
+    })
   })
 })

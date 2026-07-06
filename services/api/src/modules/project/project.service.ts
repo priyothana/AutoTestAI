@@ -1204,3 +1204,46 @@ export async function clearKeycloakSession(projectId: string): Promise<void> {
 
   log.info({ projectId }, '[KEYCLOAK] Session cleared')
 }
+
+/**
+ * Retrieve discovered workflows for a project.
+ */
+export async function getDiscoveredWorkflows(projectId: string) {
+  return prisma.discovered_workflows.findMany({
+    where: { project_id: projectId },
+    orderBy: { discovered_at: 'desc' },
+  })
+}
+
+/**
+ * Save newly discovered workflows for a project (overrides previous ones).
+ */
+export async function saveDiscoveredWorkflows(
+  projectId: string,
+  flows: { name: string; description?: string }[],
+  source: string = 'ai_discovery'
+) {
+  return prisma.$transaction(async (tx) => {
+    // Delete previous workflows for this project
+    await tx.discovered_workflows.deleteMany({
+      where: { project_id: projectId },
+    })
+
+    // Insert new ones
+    if (flows.length > 0) {
+      await tx.discovered_workflows.createMany({
+        data: flows.map((f) => ({
+          project_id: projectId,
+          workflow_title: f.name,
+          description: f.description ?? null,
+          source,
+        })),
+      })
+    }
+
+    return tx.discovered_workflows.findMany({
+      where: { project_id: projectId },
+      orderBy: { discovered_at: 'desc' },
+    })
+  })
+}

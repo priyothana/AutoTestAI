@@ -31,7 +31,8 @@ import type { ExecutionJob, HealingJob, StepData } from '../shared/queue/job-typ
 import type { ExecutionStepResult } from '../modules/execution/execution.schema.js'
 import { generateAiSuggestions } from '../modules/self-healing/self-healing.service.js'
 import { waitForResume, clearPause, resolvePause } from '../shared/execution/pause-gate.js'
-import { handleStepFailure } from '../modules/ai-agents/execution.agent.js'
+import { handleStepFailure, planRecovery } from '../modules/ai-agents/execution.agent.js'
+import { hitlContextStore } from '../modules/ai-agents/tools/hitl.tool.js'
 import { hitlAnalyze, hitlChat } from '../modules/test-run/hitl.service.js'
 import {
   fillWebAppField,
@@ -5479,7 +5480,8 @@ var showOptionCards=function(opts,container){
       var parsed=parseStepFromOption(opt);
       var sa=parsed?parsed.action:'NAVIGATE',st=parsed?parsed.target:opt,sv=parsed?parsed.value:'';
       btn.textContent='Applying\u2026';btn.style.opacity='.6';btn.style.pointerEvents='none';
-      try{if(typeof window.__hitlApplyStep==='function'){window.__hitlApplyStep(opt,sa,st,sv).then(function(){doSignal('resume');}).catch(function(){doSignal('resume');});}else{doSignal('resume');}}catch(e){doSignal('resume');}
+      var op=parsed?((['NAVIGATE','WAIT','SCROLL','HOVER'].indexOf(sa)!==-1)?'insert':'update'):'update';
+      try{if(typeof window.__hitlApplyStep==='function'){window.__hitlApplyStep(opt,sa,st,sv,op).then(function(){doSignal('resume');}).catch(function(){doSignal('resume');});}else{doSignal('resume');}}catch(e){doSignal('resume');}
     });
     card.appendChild(lbl);card.appendChild(btn);oc.appendChild(card);
   })(opts[oi]);}
@@ -5510,7 +5512,9 @@ var aiBubble=function(content,type,chips,options,proposedStep){
     pact.style.cssText='font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;background:'+actColor+'22;border:1px solid '+actColor+'55;color:'+actColor;pact.textContent=ps.action;
     var ptgt=document.createElement('span');ptgt.style.cssText='font-size:11px;color:#e2e8f0;font-weight:600;word-break:break-all';ptgt.textContent=ps.target||(ps.label||'');
     pbody.appendChild(pact);pbody.appendChild(ptgt);
-    var pnote=document.createElement('p');pnote.style.cssText='padding:2px 10px 4px;font-size:9px;color:#4ade80;margin:0';pnote.textContent='Will be inserted before step '+stepNum+' and run first';
+    var pnote=document.createElement('p');pnote.style.cssText='padding:2px 10px 4px;font-size:9px;color:#4ade80;margin:0';
+    var finalPsOp = ps.opType || (['NAVIGATE','WAIT','SCROLL','HOVER'].indexOf(ps.action)!==-1 ? 'insert' : 'update');
+    pnote.textContent=finalPsOp==='delete'?'Will remove the failing step and skip it':(finalPsOp==='update'?'Will update the failed step in-place and retry':'Will be inserted before step '+stepNum+' and run first');
     var pbtn=document.createElement('button');
     pbtn.style.cssText='width:100%;padding:9px 0;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;font-size:12px;font-weight:700;border:none;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:5px';
     pbtn.textContent='\u2713 Accept & Resume Testing';
@@ -5518,7 +5522,7 @@ var aiBubble=function(content,type,chips,options,proposedStep){
       pbtn.textContent='Applying\u2026';pbtn.style.opacity='.6';pbtn.style.pointerEvents='none';
       try{
         if(typeof window.__hitlApplyStep==='function'){
-          window.__hitlApplyStep(ps.label||ps.target,ps.action,ps.target,ps.value||'').then(function(){doSignal('resume');}).catch(function(){doSignal('resume');});
+          window.__hitlApplyStep(ps.label||ps.target,ps.action,ps.target,ps.value||'',finalPsOp).then(function(){doSignal('resume');}).catch(function(){doSignal('resume');});
         }else{doSignal('resume');}
       }catch(e){doSignal('resume');}
     });
@@ -5692,20 +5696,7 @@ async function setBrowserState(page: Page, state: 'running' | 'paused' | 'passed
   } catch { /* page may have navigated — non-fatal */ }
 }
 
-async function injectAiRecoveryBanner(page: Page): Promise<void> {
 
-  try {
-    await page.evaluate(() => {
-      let banner = document.getElementById('autotest-ai-recovery-banner')
-      if (banner) return
-      banner = document.createElement('div')
-      banner.id = 'autotest-ai-recovery-banner'
-      banner.style.cssText = 'position:fixed;top:50%;right:24px;transform:translateY(-50%);z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;pointer-events:none'
-      banner.innerHTML = `<div style="background:linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%);color:#fff;padding:12px 16px;border-radius:8px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.3);font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px"><span>🤖</span> AI Recovery Mode Active</div>`
-      document.body.appendChild(banner)
-    })
-  } catch { /* non-fatal */ }
-}
 
 // ─── Core worker function ─────────────────────────────────────────────────────
 
@@ -5779,9 +5770,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
         viewport: { width: 1280, height: 800 },
         ignoreHTTPSErrors: true,
       })
-      await ctx.addInitScript(() => {
-        (window as any).__name = (fn: any) => fn;
-      });
+      await ctx.addInitScript('window.__name = (fn) => fn;');
       await ctx.tracing.start({ screenshots: true, snapshots: true })
       return { ctx, pg: await ctx.newPage() }
     }
@@ -5800,9 +5789,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
           viewport: { width: 1280, height: 800 },
           ignoreHTTPSErrors: true,
         })
-        await browserContext.addInitScript(() => {
-          (window as any).__name = (fn: any) => fn;
-        });
+        await browserContext.addInitScript('window.__name = (fn) => fn;');
         await browserContext.tracing.start({ screenshots: true, snapshots: true })
         page = await browserContext.newPage()
       } catch (loadErr) {
@@ -5972,39 +5959,10 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
         // Shows a live "AI Recovery" banner in the browser, then attempts one
         // recovery strategy. If it fails or CALL_HITL fires, we immediately
         // surface the HITL overlay — no prolonged retry loops.
-        let agentRecovered = false
         let agentFailureType: string | undefined
         let agentFailureReason: string | undefined
 
         if (isInteractive && page) {
-          // ── Show recovery-in-progress banner ─────────────────────────────
-          const stepValue = (step.value ?? '').trim()
-          const isLikelyBadData = !stepValue || stepValue.length < 2 || /^[-\u2013\u2014.?!_*#@~`\/\\]+$/.test(stepValue)
-          const bannerTitle = isLikelyBadData ? 'AI Recovery — Fixing Invalid Data…' : 'AI Recovery in Progress…'
-          const bannerSubtext = isLikelyBadData
-            ? `Step ${i + 1}: invalid value "${stepValue || '(empty)'}" — generating realistic data`
-            : `Step ${i + 1} failed — attempting autonomous fix`
-          await page.evaluate(({ stepNum, errMsg, title, subtext }: { stepNum: number; errMsg: string; title: string; subtext: string }) => {
-            document.getElementById('autotest-recovery-banner')?.remove()
-            const banner = document.createElement('div')
-            banner.id = 'autotest-recovery-banner'
-            banner.style.cssText = 'position:fixed;top:50%;right:24px;transform:translateY(-50%);z-index:2147483646;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;pointer-events:none'
-            banner.innerHTML = `<div style="background:linear-gradient(135deg,#1a1f2e,#232941);border:1px solid rgba(99,102,241,0.4);border-radius:16px;padding:16px 20px;width:360px;box-shadow:0 16px 48px rgba(0,0,0,0.5);display:flex;gap:12px;align-items:flex-start">
-              <div style="width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#6366f1,#818cf8);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">🤖</div>
-              <div style="flex:1;min-width:0">
-                <div style="color:#fff;font-size:13px;font-weight:700;margin-bottom:4px">${title}</div>
-                <div style="color:#94a3b8;font-size:11px;margin-bottom:8px">${subtext}</div>
-                <div style="background:rgba(99,102,241,0.12);border-radius:8px;padding:8px 10px;color:#a5b4fc;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${errMsg}</div>
-              </div>
-            </div>`
-            document.body.appendChild(banner)
-          }, {
-            stepNum: i + 1,
-            errMsg: (result.error ?? result.message ?? 'Step failed').slice(0, 80),
-            title: bannerTitle,
-            subtext: bannerSubtext,
-          }).catch(() => {})
-
           try {
             const pageHtml = await page.evaluate(() =>
               document.body ? document.body.innerHTML.slice(0, 3000) : ''
@@ -6012,148 +5970,98 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
             const screenshotB64 = await page.screenshot({ type: 'png' })
               .then(b => b.toString('base64')).catch(() => undefined)
 
-            // Single recovery attempt — agent escalates to HITL on attemptNum >= 2
-            // Hard 5-second timeout: if AI recovery hangs (slow LLM / DB), the banner
-            // auto-dismisses and we proceed directly to HITL without keeping the user waiting.
-            const RECOVERY_TIMEOUT_MS = 5_000
-            const recoveryTimeout = new Promise<{ action: string; hitlInvoked: boolean; failureType?: string; reason?: string }>(
-              (_, reject) => setTimeout(() => reject(new Error('Recovery timeout')), RECOVERY_TIMEOUT_MS)
+            // Run failure classification and suggestion planning
+            const plan = await planRecovery(
+              step,
+              result.error ?? result.message ?? 'Step failed',
+              pageHtml,
+              projectId,
+              executionId
             )
-            const recovery = await Promise.race([
-              handleStepFailure({
-                executionId,
-                projectId,
-                failedStep: step as any,
-                errorMessage: result.error ?? result.message ?? 'Step failed',
-                screenshot: screenshotB64,
-                pageHtml,
-                attemptNum: 1,
-              }),
-              recoveryTimeout,
-            ])
+            agentFailureType = plan.failureType
+            agentFailureReason = plan.reason
 
-            agentFailureType = recovery.failureType
-            agentFailureReason = recovery.reason
-
-            log.info(
-              { executionId, step: step.id, action: recovery.action, failureType: agentFailureType },
-              '[EXEC-AGENT] Recovery action returned',
-            )
-
-            if (recovery.action === 'WAIT_AND_RETRY') {
-              log.info(`[EXEC-AGENT] Waiting 2s then retrying step ${i + 1}`)
-              await page.waitForTimeout(2_000)
-              const retryResult = await executeStep(
-                page, step, i, isLastStep, execScreenDir, executionId,
-                browserContext ?? undefined, projectId, context.projectCategory, context,
-              )
-              if (retryResult.status === 'passed') {
-                stepResults[stepResults.length - 1] = retryResult
-                agentRecovered = true
-                log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via WAIT_AND_RETRY`)
-              }
-            } else if (recovery.action === 'DISMISS_MODAL') {
-              log.info(`[EXEC-AGENT] Dismissing modal then retrying step ${i + 1}`)
-              await page.keyboard.press('Escape').catch(() => {})
-              await page.waitForTimeout(1_000)
-              const retryResult = await executeStep(
-                page, step, i, isLastStep, execScreenDir, executionId,
-                browserContext ?? undefined, projectId, context.projectCategory, context,
-              )
-              if (retryResult.status === 'passed') {
-                stepResults[stepResults.length - 1] = retryResult
-                agentRecovered = true
-                log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via DISMISS_MODAL`)
-              }
-            } else if (recovery.action === 'SKIP_STEP') {
-              // INVALID_FIELD or known-skip scenario: auto-skip the step without HITL
-              // The field doesn't exist on the form — no human intervention can fix this
-              log.info(
-                { executionId, step: step.id, failureType: recovery.failureType, reason: recovery.reason },
-                `[EXEC-AGENT] ⏭ Auto-skipping step ${i + 1} (${recovery.failureType ?? 'SKIP_STEP'})`,
-              )
-              stepResults[stepResults.length - 1] = {
-                ...result,
-                status: 'skipped' as any,
-                message: `⏭ Step auto-skipped: ${recovery.reason ?? 'Field does not exist on this entity'}`,
-                error: recovery.reason ?? result.error,
-              }
-              agentRecovered = true
-            } else if (recovery.action === 'REGENERATE_AND_RETRY') {
-              // INVALID_TEST_DATA: the step value is placeholder/garbage — replace with corrected value and retry
-              const correctedValue = (recovery as any).correctedValue as string | undefined
-              if (correctedValue) {
-                log.info(
-                  { executionId, step: step.id, originalValue: step.value, correctedValue, failureType: recovery.failureType },
-                  `[EXEC-AGENT] 🔄 Retrying step ${i + 1} with corrected value (${recovery.failureType})`,
-                )
-
-                // Update the recovery banner to show the fix
-                await page.evaluate(({ corrected, fieldName }: { corrected: string; fieldName: string }) => {
-                  const banner = document.getElementById('autotest-recovery-banner')
-                  if (banner) {
-                    const msgEl = banner.querySelector('div > div:nth-child(2) > div:last-child') as HTMLElement | null
-                    if (msgEl) msgEl.textContent = `Fixing: "${fieldName}" \u2192 "${corrected}"`
-                    const titleEl = banner.querySelector('div > div:nth-child(2) > div:first-child') as HTMLElement | null
-                    if (titleEl) titleEl.textContent = 'AI Recovery \u2014 Replacing Bad Data\u2026'
+            // Map recovery plan to structured SuggestionOption objects
+            const structuredSuggestions: any[] = []
+            if (plan) {
+              // 1. INVALID_FIELD
+              if (plan.failureType === 'INVALID_FIELD') {
+                structuredSuggestions.push({
+                  label: `Skip and remove hallucinated field "${step.target}"`,
+                  action: step.action,
+                  target: step.target ?? '',
+                  value: step.value ?? '',
+                  opType: 'delete',
+                })
+                if (plan.availableFields && plan.availableFields.length > 0) {
+                  for (const field of plan.availableFields.slice(0, 2)) {
+                    structuredSuggestions.push({
+                      label: `Update field target to "${field}"`,
+                      action: step.action,
+                      target: field,
+                      value: step.value ?? '',
+                      opType: 'update',
+                    })
                   }
-                }, { corrected: correctedValue.slice(0, 40), fieldName: (step.target ?? '').slice(0, 30) }).catch(() => {})
-
-                // Create a corrected copy of the step with the new value
-                const correctedStep = { ...step, value: correctedValue }
-                await page.waitForTimeout(500)
-                const retryResult = await executeStep(
-                  page, correctedStep, i, isLastStep, execScreenDir, executionId,
-                  browserContext ?? undefined, projectId, context.projectCategory, context,
-                )
-                if (retryResult.status === 'passed') {
-                  stepResults[stepResults.length - 1] = {
-                    ...retryResult,
-                    message: `✅ Step auto-corrected: value changed from "${(step.value ?? '').slice(0, 20)}" to "${correctedValue.slice(0, 30)}"`,
-                  }
-                  agentRecovered = true
-                  log.info(`[EXEC-AGENT] ✅ Step ${i + 1} recovered via REGENERATE_AND_RETRY (value: "${correctedValue}")`)
-                } else {
-                  log.warn(
-                    { executionId, step: step.id, correctedValue },
-                    `[EXEC-AGENT] ❌ Step ${i + 1} still failed after REGENERATE_AND_RETRY`,
-                  )
                 }
-              } else {
-                // No corrected value available — skip the step
-                log.info(
-                  { executionId, step: step.id, failureType: recovery.failureType },
-                  `[EXEC-AGENT] ⏭ Auto-skipping step ${i + 1} (INVALID_TEST_DATA, no corrected value)`,
-                )
-                stepResults[stepResults.length - 1] = {
-                  ...result,
-                  status: 'skipped' as any,
-                  message: `⏭ Step auto-skipped: ${recovery.reason ?? 'Invalid test data with no replacement available'}`,
-                  error: recovery.reason ?? result.error,
-                }
-                agentRecovered = true
               }
-            } else if (recovery.hitlInvoked || recovery.action === 'HITL_INVOKED') {
-              agentRecovered = true // already paused via hitlTool
+              // 2. INVALID_TEST_DATA
+              else if (plan.failureType === 'INVALID_TEST_DATA' && plan.correctedValue) {
+                structuredSuggestions.push({
+                  label: `Update step with realistic test data: "${plan.correctedValue}"`,
+                  action: step.action,
+                  target: step.target ?? '',
+                  value: plan.correctedValue,
+                  opType: 'update',
+                })
+              }
+              // 3. ALTERNATIVE_LOCATOR
+              if (plan.locatorSuggestions && plan.locatorSuggestions.length > 0) {
+                for (const sug of plan.locatorSuggestions.slice(0, 3)) {
+                  structuredSuggestions.push({
+                    label: `Use alternative selector: ${sug.strategy} (confidence: ${Math.round(sug.confidence * 100)}%)`,
+                    action: step.action,
+                    target: sug.strategy,
+                    value: step.value ?? '',
+                    opType: 'update',
+                  })
+                }
+              } else if (plan.alternativeLocator) {
+                structuredSuggestions.push({
+                  label: `Use alternative selector: ${plan.alternativeLocator}`,
+                  action: step.action,
+                  target: plan.alternativeLocator,
+                  value: step.value ?? '',
+                  opType: 'update',
+                })
+              }
             }
+
+            // Always add default skip/delete fallback suggestions
+            structuredSuggestions.push({
+              label: `Skip this step and proceed`,
+              action: step.action,
+              target: step.target ?? '',
+              value: step.value ?? '',
+              opType: 'delete',
+            })
+
+            // Save the pre-calculated recommendations in the global HITL context store
+            hitlContextStore.set(executionId, {
+              agentName: 'execution',
+              executionId,
+              reason: plan?.reason ?? `Step "${step.target}" (${step.action}) failed: ${result.error ?? result.message ?? 'Unknown error'}`,
+              failedStep: step as any,
+              errorMessage: result.error ?? result.message ?? 'Step failed',
+              screenshot: screenshotB64,
+              suggestions: plan?.locatorSuggestions?.map((s: any) => s.strategy) ?? [],
+              structuredSuggestions,
+              metadata: { projectId },
+              createdAt: new Date().toISOString(),
+            } as any)
+
           } catch (agentErr) {
-            const isRecoveryTimeout = agentErr instanceof Error && agentErr.message === 'Recovery timeout'
-            if (isRecoveryTimeout) {
-              log.warn(`[EXEC-AGENT] ⏱ AI recovery timed out after 5s for step ${i + 1} — proceeding to HITL`)
-            } else {
-              log.warn({ agentErr }, '[EXEC-AGENT] Recovery attempt errored (non-fatal) — falling through to HITL overlay')
-            }
-          } finally {
-            // Always remove the recovery banner (on success, error, or timeout)
-            page.evaluate(() => document.getElementById('autotest-recovery-banner')?.remove()).catch(() => {})
-          }
-
-          if (agentRecovered) {
-            const latestResult = stepResults[stepResults.length - 1]
-            if (latestResult.status === 'passed') continue
-            finalStatus = 'FAILED'
-            firstFailedLocator = step.target ?? ''
-            break
+            log.warn({ agentErr }, '[HITL] Failed to generate pre-calculated AI suggestions (falling back to dynamic analysis)')
           }
         }
 
@@ -6257,16 +6165,16 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
 
           // ── Expose __hitlApplyStep ────────────────────────────────────────
           // Called by the overlay "Accept & Resume Testing" button.
-          // Inserts the confirmed step into the DB BEFORE the paused step, then
-          // settles the pause gate.  The gate-resolve handler below (lines after
-          // the Promise) re-fetches the updated steps and adjusts i so the new
-          // step runs FIRST, followed by the originally-failing step.
+          // Inserts or updates/deletes the confirmed step in the DB, then
+          // settles the pause gate. The gate-resolve handler below (lines after
+          // the Promise) re-fetches the updated steps and adjusts i so the new/updated
+          // step runs FIRST.
           //
           // We use a closure flag so the resume handler knows a step was injected.
           let hitlStepInserted = false
           try {
-            await page.exposeFunction('__hitlApplyStep', async (optionText: string, stepAction: string, stepTarget: string, stepValue: string) => {
-              log.info({ optionText, stepAction, stepTarget, stepValue }, '[HITL-APPLY] User accepted AI proposal — inserting step')
+            await page.exposeFunction('__hitlApplyStep', async (optionText: string, stepAction: string, stepTarget: string, stepValue: string, opType?: string) => {
+              log.info({ optionText, stepAction, stepTarget, stepValue, opType }, '[HITL-APPLY] User accepted AI proposal')
               try {
                 const finalAction = (stepAction || 'NAVIGATE').toUpperCase()
                 const finalTarget = stepTarget || optionText
@@ -6276,24 +6184,41 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
                   const tc = await prisma.test_cases.findUnique({ where: { id: testCaseId } })
                   if (tc) {
                     const dbSteps = (tc.steps as unknown as Record<string, unknown>[]) ?? []
-                    const insertIdx = i   // insert BEFORE the paused step (0-based)
+                    const insertIdx = i   // target index of the paused step (0-based)
                     const newStep = {
                       id:     `hitl-${Date.now()}`,
                       action: finalAction,
                       target: finalTarget,
                       value:  finalValue,
                     }
-                    const patched = [
-                      ...dbSteps.slice(0, insertIdx),
-                      newStep,
-                      ...dbSteps.slice(insertIdx),
-                    ]
+                    
+                    let patched: Record<string, unknown>[]
+                    const finalOp = opType || (['NAVIGATE', 'WAIT', 'SCROLL', 'HOVER'].includes(finalAction) ? 'insert' : 'update')
+                    
+                    if (finalOp === 'update') {
+                      patched = [
+                        ...dbSteps.slice(0, insertIdx),
+                        newStep,
+                        ...dbSteps.slice(insertIdx + 1),
+                      ]
+                      hitlStepInserted = true
+                    } else if (finalOp === 'delete') {
+                      patched = dbSteps.filter((_, idx) => idx !== insertIdx)
+                      hitlStepInserted = false
+                    } else {
+                      patched = [
+                        ...dbSteps.slice(0, insertIdx),
+                        newStep,
+                        ...dbSteps.slice(insertIdx),
+                      ]
+                      hitlStepInserted = true
+                    }
+                    
                     await prisma.test_cases.update({
                       where: { id: testCaseId },
                       data:  { steps: patched as any },
                     })
-                    hitlStepInserted = true
-                    log.info({ newStep, insertIdx }, '[HITL-APPLY] ✅ Step inserted into DB at index ' + insertIdx)
+                    log.info({ newStep, insertIdx, finalOp }, `[HITL-APPLY] ✅ Step ${finalOp}d in DB at index ` + insertIdx)
 
                     // ── HITL Learning: write confirmed button name back to metadata_canonical ──
                     // When the user applies a CLICK step with a button name via HITL,
@@ -6511,6 +6436,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
 
           // ── Post-pause: handle resume / skip ──────────────────────────────
 
+          hitlContextStore.delete(executionId)
           await removePauseOverlay(page)
           await updateBrowserState('running')
 
@@ -6730,6 +6656,7 @@ async function processExecution(job: Job<ExecutionJob>): Promise<void> {
     sfFieldMapRegistry.delete(executionId)
     sfMetadataMapRegistry.delete(executionId)
     clearPause(executionId)  // clean up HITL pause gate if still pending
+    hitlContextStore.delete(executionId)
     try { await browserContext?.close() } catch { /* ignore */ }
     try { await browser?.close() } catch { /* ignore */ }
   }
