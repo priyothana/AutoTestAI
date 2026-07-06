@@ -52,58 +52,76 @@ PROJECT_ID=<your-project-id> npx tsx scripts/sf-parity-check.ts
 
 ### Prerequisites
 
-- Docker and Docker Compose installed.
+- Node.js 22+ and npm
+- Docker and Docker Compose (recommended for database and Redis)
 
-### Running the Application
+### Running the Application (with Docker)
 
-1. Clone the repository (if not already).
+1. Clone the repository.
 2. Navigate to the project root:
    ```bash
-   cd "Auto Test AI"
+   cd AutoTestAI
    ```
-3. Start the services:
+3. Set up environment variables:
+   - Create a `.env` file in the root directory (matching the variables in `.env.example` in `services/api`) and make sure to populate `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
+4. Start the services:
    ```bash
-   docker-compose up --build
+   docker compose up --build
    ```
 
-4. Access the application:
-   - **Frontend**: [http://localhost:3000](http://localhost:3000)
-   - **Backend API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+5. Access the application:
+   - **Frontend**: [http://localhost:3002](http://localhost:3002)
+   - **Backend API**: [http://localhost:4000](http://localhost:4000)
+   - **Health Check**: [http://localhost:4000/health](http://localhost:4000/health)
 
 ### Default User
 
-You can sign up a new user via the UI at `/signup`.
+You can sign up a new user via the UI at `/signup` or login using the default seed administrator:
+- **Email**: `admin@autotest.ai`
+- **Password**: `password`
+
+---
 
 ## Running Without Docker (Manual Setup)
 
 If you clone this repo on a new system and want to run it without Docker:
 
+### Prerequisites
+
+- A running PostgreSQL 16 database.
+- A running Redis server.
+
 ### Backend Setup
 
 ```bash
-cd backend
+cd services/api
 
-# Create a virtual environment
-python3 -m venv venv
+# Copy environment variables template
+cp .env.example .env
 
-# Activate it
-source venv/bin/activate        # macOS/Linux
-# venv\Scripts\activate          # Windows
+# Install Node.js dependencies
+npm install
 
-# Install all dependencies
-pip install -r requirements.txt
+# Generate the Prisma client
+npm run db:generate
+
+# Push the schema to your PostgreSQL database
+npm run db:push
 
 # Install Playwright browsers (needed for test execution)
-playwright install
+npx playwright install --with-deps
 
-# Run the backend
-uvicorn app.main:app --reload
+# Run the backend API server
+npm run dev
 ```
 
 ### Frontend Setup
 
 ```bash
 cd frontend
+
+# Copy environment variables template
+cp .env.example .env.local
 
 # Install Node.js dependencies
 npm install
@@ -112,16 +130,27 @@ npm install
 npm run dev
 ```
 
-### Database
+By default, the local development server starts at [http://localhost:3000](http://localhost:3000). To run it on port 3002 (matching Docker setup configuration), use:
+```bash
+npm run dev -- -p 3002
+```
 
-You'll need a PostgreSQL 16 instance running. Update the database connection string in your `.env` file accordingly. You can initialize the schema using:
+### Database Initial Seed (Optional)
+
+If you prefer to initialize the database schema and seed data manually via SQL:
 
 ```bash
 psql -U <username> -d <database> -f scripts/init.sql
 ```
 
+---
+
 ## Development
 
 - **Frontend**: `cd frontend && npm run dev`
-- **Backend**: `cd backend && uvicorn app.main:app --reload`
-- **Database**: The `docker-compose` setup includes a PostgreSQL container.
+- **Backend API**: `cd services/api && npm run dev`
+- **BullMQ Workers**: The backend API service automatically boots the required background workers (execution, healing, notification, metadata-sync) in development. They can also be run individually in production:
+  - Execution Worker: `npm run worker:execution`
+  - Healing Worker: `npm run worker:healing`
+  - Notification Worker: `npm run worker:notification`
+  - Metadata Sync Worker: `npm run worker:metadata-sync`
