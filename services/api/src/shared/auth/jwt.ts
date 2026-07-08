@@ -15,11 +15,16 @@ import bcrypt from 'bcryptjs'
 export async function registerJwt(app: FastifyInstance) {
   await app.register(fastifyJwt, {
     secret: process.env.JWT_SECRET ?? process.env.SECRET_KEY ?? 'fallback-dev-secret-change-me',
+    cookie: {
+      cookieName: 'token',
+      signed: false,
+    },
     sign: {
       expiresIn: process.env.JWT_EXPIRES_IN ?? '7d',
     },
   })
 
+  // Authenticate decorator: verifies request JWT (either from Auth header or cookie)
   app.decorate(
     'authenticate',
     async (request: FastifyRequest, reply: FastifyReply) => {
@@ -27,6 +32,17 @@ export async function registerJwt(app: FastifyInstance) {
         await request.jwtVerify()
       } catch {
         reply.status(401).send({ detail: 'Not authenticated' })
+      }
+    },
+  )
+
+  // requireAdmin decorator: enforces ADMIN-only access
+  app.decorate(
+    'requireAdmin',
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const user = request.user as any
+      if (!user || user.role !== 'ADMIN') {
+        return reply.status(403).send({ detail: 'Forbidden: Admin access required' })
       }
     },
   )

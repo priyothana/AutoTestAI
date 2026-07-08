@@ -2,10 +2,15 @@
 
 import { use, useState, useEffect } from "react"
 import { usePathname } from "next/navigation"
+import Link from "next/link"
 import {
     LogOut,
     Menu,
-    Bell
+    Bell,
+    User,
+    CreditCard,
+    Users,
+    Settings
 } from "lucide-react"
 import ThemeToggle from "@/components/shared/ThemeToggle"
 import Logo from "@/components/shared/Logo"
@@ -32,17 +37,66 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
     use(params)
     const pathname = usePathname()
     const [mounted, setMounted] = useState(false)
+    const [user, setUser] = useState<{ username: string; email: string; full_name?: string; avatar_url?: string } | null>(null)
+
+    const handleLogout = async () => {
+        if (typeof window !== "undefined") {
+            try {
+                const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000"
+                await fetch(`${API}/api/auth/logout`, { 
+                    method: "POST", 
+                    credentials: "include" 
+                })
+            } catch (err) {
+                console.error("Logout API failed:", err)
+            } finally {
+                localStorage.removeItem("token")
+                window.location.href = "/login"
+            }
+        }
+    }
 
     useEffect(() => {
         setMounted(true)
+        
+        // 1. Immediately parse local storage token to prevent header layout delay
+        const token = localStorage.getItem("token")
+        if (token) {
+            try {
+                const payload = JSON.parse(atob(token.split('.')[1]))
+                setUser({
+                    username: payload.username,
+                    email: payload.email,
+                    full_name: payload.full_name || payload.username,
+                    avatar_url: payload.avatar_url,
+                })
+            } catch (e) {
+                console.error("Failed to parse local JWT token:", e)
+            }
+        }
+
+        // 2. Fetch fresh profile from API to ensure session is active
+        const fetchUser = async () => {
+            try {
+                const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000"
+                const res = await fetch(`${API}/api/auth/me`)
+                if (res.ok) {
+                    const data = await res.json()
+                    setUser(data)
+                } else if (res.status === 401) {
+                    handleLogout()
+                }
+            } catch (e) {
+                console.error("Failed to fetch fresh user details:", e)
+            }
+        }
+
+        fetchUser()
     }, [])
 
-    const handleLogout = () => {
-        if (typeof window !== "undefined") {
-            localStorage.removeItem("token")
-            window.location.href = "/"
-        }
-    }
+    const initials = user?.username 
+        ? user.username.substring(0, 2).toUpperCase() 
+        : (user?.email ? user.email.substring(0, 2).toUpperCase() : "US")
 
     return (
         <div className="flex min-h-screen" style={{ backgroundColor: 'var(--color-bg-base)' }}>
@@ -86,16 +140,47 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                                 <DropdownMenuTrigger asChild>
                                     <Button variant="ghost" className="relative h-8 w-8 rounded-full">
                                         <Avatar className="h-8 w-8">
-                                            <AvatarImage src="https://github.com/shadcn.png" alt="User" />
-                                            <AvatarFallback>JD</AvatarFallback>
+                                            {user?.avatar_url && <AvatarImage src={user.avatar_url} alt={user.full_name || user.username} />}
+                                            <AvatarFallback>{initials}</AvatarFallback>
                                         </Avatar>
                                     </Button>
                                 </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end">
-                                    <DropdownMenuLabel>My Account</DropdownMenuLabel>
+                                <DropdownMenuContent align="end" className="w-56">
+                                    <DropdownMenuLabel className="font-normal">
+                                        <div className="flex flex-col space-y-1">
+                                            <p className="text-sm font-medium leading-none">
+                                                {user?.full_name || user?.username || "User"}
+                                            </p>
+                                            <p className="text-xs leading-none text-muted-foreground">
+                                                {user?.email || ""}
+                                            </p>
+                                        </div>
+                                    </DropdownMenuLabel>
                                     <DropdownMenuSeparator />
-                                    <DropdownMenuItem>Profile</DropdownMenuItem>
-                                    <DropdownMenuItem>Billing</DropdownMenuItem>
+                                    <DropdownMenuItem asChild>
+                                        <Link href="/dashboard/profile" className="flex items-center w-full cursor-pointer">
+                                            <User className="mr-2 h-4 w-4" />
+                                            <span>My Profile</span>
+                                        </Link>
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem asChild>
+                                        <Link href="/dashboard/billing" className="flex items-center w-full cursor-pointer">
+                                            <CreditCard className="mr-2 h-4 w-4" />
+                                            <span>Billing & Plans</span>
+                                        </Link>
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem asChild>
+                                        <Link href="/dashboard/team" className="flex items-center w-full cursor-pointer">
+                                            <Users className="mr-2 h-4 w-4" />
+                                            <span>Team Members</span>
+                                        </Link>
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem asChild>
+                                        <Link href="/dashboard/settings" className="flex items-center w-full cursor-pointer">
+                                            <Settings className="mr-2 h-4 w-4" />
+                                            <span>App Settings</span>
+                                        </Link>
+                                    </DropdownMenuItem>
                                     <DropdownMenuSeparator />
                                     <DropdownMenuItem
                                         style={{ color: 'var(--color-danger)' }}
@@ -110,8 +195,7 @@ export default function DashboardLayout({ children, params }: DashboardLayoutPro
                         ) : (
                             <Button variant="ghost" className="relative h-8 w-8 rounded-full">
                                 <Avatar className="h-8 w-8">
-                                    <AvatarImage src="https://github.com/shadcn.png" alt="User" />
-                                    <AvatarFallback>JD</AvatarFallback>
+                                    <AvatarFallback>US</AvatarFallback>
                                 </Avatar>
                             </Button>
                         )}

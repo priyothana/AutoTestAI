@@ -14,6 +14,7 @@ import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import fastifyStatic from '@fastify/static'
 import { registerJwt } from './shared/auth/jwt.js'
+import fastifyCookie from '@fastify/cookie'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { mkdirSync, statSync, renameSync, createWriteStream } from 'fs'
@@ -169,7 +170,48 @@ export async function buildApp() {
     contentSecurityPolicy: false,
     crossOriginResourcePolicy: false 
   })
+  await app.register(fastifyCookie)
   await registerJwt(app)
+
+  // ── Global Authentication Hook ─────────────────────────────────────────────
+  app.addHook('preHandler', async (request, reply) => {
+    // Skip preflights
+    if (request.method === 'OPTIONS') {
+      return
+    }
+
+    const url = request.url
+
+    // Identify public routes
+    const isPublic = 
+      url === '/' ||
+      url === '/health' ||
+      url.startsWith('/static/') ||
+      url.startsWith('/screenshots/') ||
+      url.startsWith('/api/v1/users/login') ||
+      url.startsWith('/api/v1/users/signup') ||
+      url.startsWith('/api/v1/users/register') ||
+      url.startsWith('/api/v1/users/forgot-password') ||
+      url.startsWith('/api/v1/users/reset-password') ||
+      url.startsWith('/api/v1/users/google') ||
+      url.startsWith('/api/auth/login') ||
+      url.startsWith('/api/auth/signup') ||
+      url.startsWith('/api/auth/logout') ||
+      url.startsWith('/api/auth/forgot-password') ||
+      url.startsWith('/api/auth/reset-password') ||
+      url.startsWith('/api/auth/google')
+
+    if (isPublic) {
+      return
+    }
+
+    // Authenticate all other routes
+    try {
+      await request.jwtVerify()
+    } catch (err) {
+      return reply.status(401).send({ detail: 'Not authenticated' })
+    }
+  })
 
   // Static file serving
   try {
@@ -182,7 +224,8 @@ export async function buildApp() {
   // ─── Register each module with individual error reporting ────────────────
   type ModuleEntry = { name: string; fn: (a: ReturnType<typeof Fastify>, opts: object) => Promise<void>; prefix: string }
   const modules: ModuleEntry[] = [
-    { name: 'auth',         fn: authRoutes as never,         prefix: '/api/v1/users' },
+    { name: 'auth_v1',      fn: authRoutes as never,         prefix: '/api/v1/users' },
+    { name: 'auth_new',     fn: authRoutes as never,         prefix: '/api/auth' },
     { name: 'project',      fn: projectRoutes as never,      prefix: '/api/v1' },
     { name: 'test-case',    fn: testCaseRoutes as never,     prefix: '/api/v1' },
     { name: 'test-run',     fn: testRunRoutes as never,      prefix: '/api/v1/test-runs' },

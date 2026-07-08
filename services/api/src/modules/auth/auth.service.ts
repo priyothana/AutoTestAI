@@ -52,7 +52,7 @@ export async function createUser(data: UserCreate) {
       email: data.email,
       hashed_password: hashedPassword,
       full_name: data.full_name ?? null,
-      role: 'tester',
+      role: data.role,
       is_active: true,
     },
   })
@@ -95,11 +95,7 @@ export async function loginUser(data: UserLogin) {
 
   log.info(`[AUTH] Login successful for: ${identifier} (ID: ${user.id})`)
 
-  // Match Python response exactly
-  return {
-    access_token: 'fake-jwt-token-for-demo',
-    token_type: 'bearer',
-  }
+  return user
 }
 
 /**

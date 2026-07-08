@@ -820,6 +820,189 @@ export async function projectRoutes(app: FastifyInstance) {
       return handleErr(err, reply)
     }
   })
+
+  // ─── Project Members / Team Management ─────────────────────────────────────
+  // GET /api/v1/projects/:id/members
+  app.get('/projects/:id/members', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const project = await prisma.projects.findUnique({
+        where: { id },
+        select: { members: true, owner_id: true }
+      })
+
+      if (!project) {
+        return reply.status(404).send({ detail: 'Project not found' })
+      }
+
+      // Fetch owner details to include them as default Admin/Owner in members list
+      let ownerDetails: any = null
+      if (project.owner_id) {
+        const owner = await prisma.users.findUnique({
+          where: { id: project.owner_id },
+          select: { id: true, email: true, username: true, full_name: true, avatar_url: true }
+        })
+        if (owner) {
+          ownerDetails = {
+            id: owner.id,
+            email: owner.email,
+            username: owner.username,
+            full_name: owner.full_name,
+            avatar_url: owner.avatar_url,
+            role: 'Admin',
+            status: 'active',
+            is_owner: true
+          }
+        }
+      }
+
+      const rawMembers = Array.isArray(project.members) ? (project.members as any[]) : []
+      const members = ownerDetails ? [ownerDetails, ...rawMembers] : rawMembers
+
+      return reply.send(members)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // POST /api/v1/projects/:id/members
+  app.post('/projects/:id/members', async (request, reply) => {
+    try {
+      const { id } = request.params as { id: string }
+      const { email, role } = request.body as { email: string; role: string }
+
+      if (!email || !role) {
+        return reply.status(400).send({ detail: 'Email and role are required' })
+      }
+
+      const project = await prisma.projects.findUnique({
+        where: { id },
+        select: { members: true, owner_id: true }
+      })
+
+      if (!project) {
+        return reply.status(404).send({ detail: 'Project not found' })
+      }
+
+      // Check if email belongs to the owner
+      if (project.owner_id) {
+        const owner = await prisma.users.findUnique({
+          where: { id: project.owner_id },
+          select: { email: true }
+        })
+        if (owner?.email?.toLowerCase() === email.toLowerCase()) {
+          return reply.status(400).send({ detail: 'Owner is already a member of this project' })
+        }
+      }
+
+      const currentMembers = Array.isArray(project.members) ? (project.members as any[]) : []
+
+      // Check if already a member
+      if (currentMembers.some(m => m.email.toLowerCase() === email.toLowerCase())) {
+        return reply.status(400).send({ detail: 'User is already a member of this project' })
+      }
+
+      // Look up user details in the DB
+      const user = await prisma.users.findFirst({
+        where: { email: { equals: email.toLowerCase(), mode: 'insensitive' } },
+        select: { id: true, username: true, full_name: true, avatar_url: true }
+      })
+
+      const newMember = {
+        id: user?.id ?? null,
+        email: email.toLowerCase(),
+        username: user?.username ?? null,
+        full_name: user?.full_name ?? null,
+        avatar_url: user?.avatar_url ?? null,
+        role: role,
+        status: user ? 'active' : 'pending',
+        is_owner: false
+      }
+
+      const updatedMembers = [...currentMembers, newMember]
+
+      await prisma.projects.update({
+        where: { id },
+        data: { members: updatedMembers }
+      })
+
+      return reply.status(201).send(newMember)
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // PATCH /api/v1/projects/:id/members/:email
+  app.patch('/projects/:id/members/:email', async (request, reply) => {
+    try {
+      const { id, email } = request.params as { id: string; email: string }
+      const { role } = request.body as { role: string }
+
+      if (!role) {
+        return reply.status(400).send({ detail: 'Role is required' })
+      }
+
+      const project = await prisma.projects.findUnique({
+        where: { id },
+        select: { members: true }
+      })
+
+      if (!project) {
+        return reply.status(404).send({ detail: 'Project not found' })
+      }
+
+      const currentMembers = Array.isArray(project.members) ? (project.members as any[]) : []
+      const memberIndex = currentMembers.findIndex(m => m.email.toLowerCase() === decodeURIComponent(email).toLowerCase())
+
+      if (memberIndex === -1) {
+        return reply.status(404).send({ detail: 'Member not found' })
+      }
+
+      currentMembers[memberIndex].role = role
+
+      await prisma.projects.update({
+        where: { id },
+        data: { members: currentMembers }
+      })
+
+      return reply.send(currentMembers[memberIndex])
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
+  // DELETE /api/v1/projects/:id/members/:email
+  app.delete('/projects/:id/members/:email', async (request, reply) => {
+    try {
+      const { id, email } = request.params as { id: string; email: string }
+
+      const project = await prisma.projects.findUnique({
+        where: { id },
+        select: { members: true }
+      })
+
+      if (!project) {
+        return reply.status(404).send({ detail: 'Project not found' })
+      }
+
+      const currentMembers = Array.isArray(project.members) ? (project.members as any[]) : []
+      const filteredMembers = currentMembers.filter(m => m.email.toLowerCase() !== decodeURIComponent(email).toLowerCase())
+
+      if (currentMembers.length === filteredMembers.length) {
+        return reply.status(404).send({ detail: 'Member not found' })
+      }
+
+      await prisma.projects.update({
+        where: { id },
+        data: { members: filteredMembers }
+      })
+
+      return reply.status(204).send()
+    } catch (err: any) {
+      return handleErr(err, reply)
+    }
+  })
+
   // ─── AI Workflow Chat Endpoints ──────────────────────────────────────────────
 
   // GET /api/v1/projects/:id/discovered-workflows

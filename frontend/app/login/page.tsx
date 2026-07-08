@@ -61,9 +61,10 @@ function LoginPageInner() {
     setLoginError("")
     setLoading(true)
     try {
-      const res = await fetch(`${API}/api/v1/users/login`, {
+      const res = await fetch(`${API}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ username, password }),
       })
       if (!res.ok) {
@@ -104,7 +105,7 @@ function LoginPageInner() {
     setModalStep("sending")
 
     try {
-      const res = await fetch(`${API}/api/v1/users/forgot-password`, {
+      const res = await fetch(`${API}/api/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ identifier }),
@@ -135,7 +136,7 @@ function LoginPageInner() {
     if (resetNewPw !== resetConfirmPw) { setResetError("Passwords do not match."); return }
     setResetSubmitting(true)
     try {
-      const res = await fetch(`${API}/api/v1/users/reset-password`, {
+      const res = await fetch(`${API}/api/auth/reset-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: resetToken.trim(), new_password: resetNewPw }),
@@ -244,7 +245,7 @@ function LoginPageInner() {
               disabled={googleLoading}
               onClick={() => {
                 setGoogleLoading(true)
-                window.location.href = `${API}/api/v1/users/google`
+                window.location.href = `${API}/api/auth/google`
               }}
             >
               {googleLoading ? (

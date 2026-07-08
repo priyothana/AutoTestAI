@@ -17,6 +17,8 @@ export const metadata: Metadata = {
   description: "AI-powered Playwright test generation and execution platform. Generate, run, and self-heal browser tests with LLM assistance.",
 };
 
+import AuthInterceptor from "@/components/shared/AuthInterceptor";
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -31,17 +33,18 @@ export default function RootLayout({
             __html: `(function() {
   try {
     var theme = localStorage.getItem('autotest-theme');
-    if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    if (theme !== 'light') {
       document.documentElement.classList.add('dark');
     }
   } catch(e) {}
-})();`,
+  })();`,
           }}
         />
       </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
+        <AuthInterceptor />
         {children}
       </body>
     </html>

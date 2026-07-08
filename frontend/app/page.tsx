@@ -38,9 +38,10 @@ export default function LoginPage() {
     setLoginError("");
     setLoading(true);
     try {
-      const res = await fetch(`${API}/api/v1/users/login`, {
+      const res = await fetch(`${API}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ username, password }),
       });
       const contentType = res.headers.get("content-type");
@@ -86,7 +87,7 @@ export default function LoginPage() {
     setModalStep("sending");
 
     try {
-      const res = await fetch(`${API}/api/v1/users/forgot-password`, {
+      const res = await fetch(`${API}/api/auth/forgot-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ identifier }),
@@ -119,7 +120,7 @@ export default function LoginPage() {
     if (resetNewPw !== resetConfirmPw) { setResetError("Passwords do not match."); return; }
     setResetSubmitting(true);
     try {
-      const res = await fetch(`${API}/api/v1/users/reset-password`, {
+      const res = await fetch(`${API}/api/auth/reset-password`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: resetToken.trim(), new_password: resetNewPw }),
@@ -240,7 +241,13 @@ export default function LoginPage() {
                     </span>
                   </div>
                 </div>
-                <button className="mt-6 w-full py-3 px-4 border border-gray-300 dark:border-gray-600 rounded-lg font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition flex items-center justify-center gap-3">
+                <button 
+                  type="button"
+                  onClick={() => {
+                    window.location.href = `${API}/api/auth/google`;
+                  }}
+                  className="mt-6 w-full py-3 px-4 border border-gray-300 dark:border-gray-600 rounded-lg font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition flex items-center justify-center gap-3"
+                >
                   <svg className="h-5 w-5" viewBox="0 0 24 24">
                     <path
                       fill="currentColor"
